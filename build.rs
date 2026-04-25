@@ -1,18 +1,18 @@
 //! Build-time GLSL → SPIR-V compilation for VulkanForge.
 //!
-//! Phase 1, Step 1.1: compiles the Q4_K GEMV shader (and only that one)
-//! to a SPIR-V blob in `OUT_DIR`, ready to be embedded via
-//! `include_bytes!`. Defines mirror llama.cpp's `vulkan-shaders-gen`
-//! invocation for the `mul_mat_vec_q4_k_f32_f32` variant — see
-//! results/phase1_step_1.0_shader_analysis.md §3.3.
+//! Phase 2A — compiles every shader the decode pipeline needs into a
+//! SPIR-V blob in `OUT_DIR`. `src/backend/vulkan/shaders.rs` embeds the
+//! results via `include_bytes!`. Defines per shader mirror what
+//! llama.cpp's `vulkan-shaders-gen` passes to glslc for the same
+//! variant.
 
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 
 use shaderc::{
-    CompileOptions, Compiler, EnvVersion, IncludeType, OptimizationLevel, ResolvedInclude,
-    ShaderKind, SourceLanguage, TargetEnv,
+    CompileOptions, Compiler, EnvVersion, OptimizationLevel, ResolvedInclude, ShaderKind,
+    SourceLanguage, TargetEnv,
 };
 
 struct ShaderJob {
@@ -21,25 +21,100 @@ struct ShaderJob {
     defines: &'static [(&'static str, &'static str)],
 }
 
-const JOBS: &[ShaderJob] = &[ShaderJob {
-    out_name: "mul_mat_vec_q4_k_f32_f32.spv",
-    entry_source: "mul_mat_vec_q4_k.comp",
-    defines: &[
-        ("DATA_A_Q4_K", "1"),
-        ("B_TYPE", "float"),
-        ("B_TYPEV2", "vec2"),
-        ("B_TYPEV4", "vec4"),
-        ("D_TYPE", "float"),
-        ("FLOAT_TYPE", "float"),
-        ("FLOAT_TYPEV2", "vec2"),
-    ],
-}];
-
-const TRACKED_FILES: &[&str] = &[
-    "vk_shaders/mul_mat_vec_q4_k.comp",
-    "vk_shaders/mul_mat_vec_base.glsl",
-    "vk_shaders/mul_mat_vec_iface.glsl",
-    "vk_shaders/types.glsl",
+const JOBS: &[ShaderJob] = &[
+    // Q4_K decode GEMV (Phase 1 baseline). Defines per
+    // results/phase1_step_1.0_shader_analysis.md §3.3.
+    ShaderJob {
+        out_name: "mul_mat_vec_q4_k_f32_f32.spv",
+        entry_source: "mul_mat_vec_q4_k.comp",
+        defines: &[
+            ("DATA_A_Q4_K", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+        ],
+    },
+    // Q6_K decode GEMV. Same scaffolding as Q4_K, just a different
+    // weight storage format.
+    ShaderJob {
+        out_name: "mul_mat_vec_q6_k_f32_f32.spv",
+        entry_source: "mul_mat_vec_q6_k.comp",
+        defines: &[
+            ("DATA_A_Q6_K", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+        ],
+    },
+    // RMSNorm. generic_binary_head: 3 SSBOs (input A, weight B, output D).
+    ShaderJob {
+        out_name: "rms_norm_f32.spv",
+        entry_source: "rms_norm.comp",
+        defines: &[
+            ("A_TYPE", "float"),
+            ("B_TYPE", "float"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+        ],
+    },
+    // RoPE (rotated position embedding) — Llama-style "norm" variant.
+    // rope_head.glsl: 5 SSBOs (data, pos, ff, output, indices).
+    ShaderJob {
+        out_name: "rope_norm_f32.spv",
+        entry_source: "rope_norm.comp",
+        defines: &[("A_TYPE", "float"), ("ROPE_D_TYPE", "float")],
+    },
+    // Element-wise add (residual). generic_binary_head, 3 SSBOs.
+    ShaderJob {
+        out_name: "add_f32.spv",
+        entry_source: "add.comp",
+        defines: &[
+            ("A_TYPE", "float"),
+            ("B_TYPE", "float"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+        ],
+    },
+    // Element-wise multiply (gate * up in SwiGLU). generic_binary_head.
+    ShaderJob {
+        out_name: "mul_f32.spv",
+        entry_source: "mul.comp",
+        defines: &[
+            ("A_TYPE", "float"),
+            ("B_TYPE", "float"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+        ],
+    },
+    // SiLU activation. generic_head: 2 SSBOs (input, output).
+    ShaderJob {
+        out_name: "silu_f32.spv",
+        entry_source: "silu.comp",
+        defines: &[("A_TYPE", "float"), ("D_TYPE", "float")],
+    },
+    // Softmax (attention scores). Own header, ~3 SSBOs.
+    ShaderJob {
+        out_name: "soft_max_f32.spv",
+        entry_source: "soft_max.comp",
+        defines: &[
+            ("A_TYPE", "float"),
+            ("B_TYPE", "float"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+        ],
+    },
+    // Buffer copy / dtype conversion. generic_unary_head: 2 SSBOs.
+    ShaderJob {
+        out_name: "copy_f32_f32.spv",
+        entry_source: "copy.comp",
+        defines: &[("A_TYPE", "float"), ("D_TYPE", "float")],
+    },
 ];
 
 fn main() {
@@ -48,14 +123,20 @@ fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
 
     println!("cargo:rerun-if-changed=build.rs");
-    for f in TRACKED_FILES {
-        println!("cargo:rerun-if-changed={}", f);
+    // Be conservative: rebuild if any tracked shader source changes.
+    for entry in fs::read_dir(&shader_dir).expect("read vk_shaders/") {
+        let path = entry.expect("entry").path();
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        if ext == "comp" || ext == "glsl" {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
     }
 
-    let compiler = Compiler::new().expect("shaderc Compiler::new failed");
+    let compiler = Compiler::new().expect("shaderc Compiler::new");
+    let mut total_bytes: usize = 0;
 
     for job in JOBS {
-        let mut options = CompileOptions::new().expect("shaderc CompileOptions::new failed");
+        let mut options = CompileOptions::new().expect("shaderc CompileOptions::new");
         options.set_source_language(SourceLanguage::GLSL);
         options.set_target_env(TargetEnv::Vulkan, EnvVersion::Vulkan1_2 as u32);
         options.set_optimization_level(OptimizationLevel::Performance);
@@ -65,7 +146,6 @@ fn main() {
             options.add_macro_definition(k, Some(v));
         }
 
-        // #include resolution: relative paths resolve against vk_shaders/.
         let include_root = shader_dir.clone();
         options.set_include_callback(move |requested, _kind, _from, _depth| {
             let path = include_root.join(requested);
@@ -98,25 +178,29 @@ fn main() {
         }
 
         let spv_bytes = artifact.as_binary_u8();
-        assert!(spv_bytes.len() % 4 == 0, "SPIR-V byte length must be multiple of 4");
+        assert!(spv_bytes.len() % 4 == 0, "SPIR-V byte length must be % 4 == 0");
         assert!(
             spv_bytes.len() >= 4 && &spv_bytes[0..4] == [0x03, 0x02, 0x23, 0x07],
-            "SPIR-V magic number missing"
+            "SPIR-V magic missing for {}",
+            job.entry_source
         );
 
         let out_path = out_dir.join(job.out_name);
         fs::write(&out_path, spv_bytes)
             .unwrap_or_else(|e| panic!("write {}: {}", out_path.display(), e));
 
+        total_bytes += spv_bytes.len();
         println!(
-            "cargo:warning=compiled {} -> {} ({} bytes, {} u32 words)",
+            "cargo:warning=compiled {} -> {} ({} bytes)",
             job.entry_source,
             job.out_name,
-            spv_bytes.len(),
-            spv_bytes.len() / 4
+            spv_bytes.len()
         );
     }
 
-    // Touch include type so unused-import warnings stay quiet under future tweaks.
-    let _ = IncludeType::Relative;
+    println!(
+        "cargo:warning=total SPIR-V: {} bytes across {} shader(s)",
+        total_bytes,
+        JOBS.len()
+    );
 }

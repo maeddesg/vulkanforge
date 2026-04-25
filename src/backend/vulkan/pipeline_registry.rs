@@ -1,0 +1,169 @@
+//! Pipeline registry — owns one [`ComputeKernel`] per [`ShaderId`]
+//! plus a `VkPipelineCache` that persists between runs.
+//!
+//! Phase 2A — at startup we try to load a cache blob from
+//! `~/.vulkanforge/pipeline_cache.bin` (or wherever the caller
+//! requests). The blob's header is checked by the Vulkan loader
+//! itself: an incompatible cache (different driver, different vendor)
+//! is rejected silently and we start fresh. After all pipelines are
+//! created, `save_cache` writes the merged blob back so the next
+//! launch starts faster.
+
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use ash::vk;
+
+use super::pipeline::ComputeKernel;
+use super::shaders::{self, ShaderId};
+
+/// SMOKE_DEFAULT spec constants for the mul_mat_vec_*_k shaders —
+/// (BLOCK_SIZE, NUM_ROWS, NUM_COLS). Same values as the GLSL
+/// defaults; pinning them explicitly keeps RADV's pipeline cache
+/// happy and makes Phase-2A dispatch behaviour identical to Phase-1.
+const MMV_SPEC_DATA: [u32; 3] = [32, 1, 1];
+
+pub struct PipelineRegistry {
+    pipelines: HashMap<ShaderId, ComputeKernel>,
+    cache: vk::PipelineCache,
+    /// Path the cache was loaded from / will be written to.
+    cache_path: Option<PathBuf>,
+    /// Wall-time spent in `vkCreateComputePipelines` for the whole
+    /// inventory — useful for the "with vs without cache" report.
+    pub create_duration: Duration,
+}
+
+pub struct CacheStats {
+    pub loaded_bytes: usize,
+    pub saved_bytes: usize,
+}
+
+impl PipelineRegistry {
+    /// Build the registry, loading a pipeline cache from `cache_path`
+    /// when present. Returns the registry plus stats describing how
+    /// many bytes were loaded.
+    pub fn new(
+        device: &ash::Device,
+        cache_path: Option<&Path>,
+    ) -> Result<(Self, usize), Box<dyn std::error::Error>> {
+        // 1) Load cache blob if any.
+        let cache_blob: Vec<u8> = match cache_path {
+            Some(p) => fs::read(p).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let loaded_bytes = cache_blob.len();
+
+        // 2) Create VkPipelineCache. Vulkan's loader validates the
+        //    cache header itself; an incompatible blob is silently
+        //    discarded and we keep going with an empty cache.
+        let cache_info = vk::PipelineCacheCreateInfo::default().initial_data(&cache_blob);
+        let cache = unsafe { device.create_pipeline_cache(&cache_info, None)? };
+
+        // 3) Create one ComputeKernel per shader, timing the section
+        //    so the report can compare cold-start vs warm-start.
+        let started = Instant::now();
+        let mut pipelines: HashMap<ShaderId, ComputeKernel> = HashMap::new();
+        for &id in shaders::ALL_SHADERS {
+            let words = shaders::spv_words(id.spv_bytes());
+            // Pin spec constants for the GEMV shaders so the Phase-2A
+            // pipelines behave bit-identically to Phase 1. Other
+            // shaders go through `from_spv` (no override) and use
+            // their GLSL defaults.
+            let result = match id {
+                ShaderId::MulMatVecQ4K | ShaderId::MulMatVecQ6K => {
+                    let entries = [
+                        vk::SpecializationMapEntry { constant_id: 0, offset: 0, size: 4 },
+                        vk::SpecializationMapEntry { constant_id: 1, offset: 4, size: 4 },
+                        vk::SpecializationMapEntry { constant_id: 2, offset: 8, size: 4 },
+                    ];
+                    let bytes: [u8; 12] = bytemuck::cast(MMV_SPEC_DATA);
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, &bytes)
+                }
+                _ => ComputeKernel::from_spv(device, &words, cache),
+            };
+            let kernel = match result {
+                Ok(k) => k,
+                Err(e) => {
+                    // Tear down whatever we already built, plus the
+                    // cache, before bubbling the error up — leaving
+                    // anything alive would trip the validation layer
+                    // at exit.
+                    for (_, k) in pipelines.drain() {
+                        k.destroy(device);
+                    }
+                    unsafe { device.destroy_pipeline_cache(cache, None) };
+                    return Err(format!("ComputeKernel::from_spv({}) failed: {e}", id.name()).into());
+                }
+            };
+            pipelines.insert(id, kernel);
+        }
+        let create_duration = started.elapsed();
+
+        Ok((
+            Self {
+                pipelines,
+                cache,
+                cache_path: cache_path.map(|p| p.to_path_buf()),
+                create_duration,
+            },
+            loaded_bytes,
+        ))
+    }
+
+    pub fn get(&self, id: ShaderId) -> &ComputeKernel {
+        self.pipelines
+            .get(&id)
+            .unwrap_or_else(|| panic!("PipelineRegistry: missing pipeline for {:?}", id))
+    }
+
+    pub fn count(&self) -> usize {
+        self.pipelines.len()
+    }
+
+    /// Persist the current cache contents back to `cache_path`. Errors
+    /// are swallowed (cache failure is non-fatal — first start will
+    /// just be slower).
+    pub fn save_cache(&self, device: &ash::Device) -> CacheStats {
+        let mut stats = CacheStats {
+            loaded_bytes: 0,
+            saved_bytes: 0,
+        };
+        let Some(path) = &self.cache_path else {
+            return stats;
+        };
+        let data = match unsafe { device.get_pipeline_cache_data(self.cache) } {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!(
+                    "VulkanForge: pipeline_cache.bin save failed (get_pipeline_cache_data): {e}"
+                );
+                return stats;
+            }
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        match fs::write(path, &data) {
+            Ok(_) => stats.saved_bytes = data.len(),
+            Err(e) => eprintln!(
+                "VulkanForge: pipeline_cache.bin save failed (fs::write): {e}"
+            ),
+        }
+        stats
+    }
+
+    pub fn destroy(mut self, device: &ash::Device) {
+        for (_, k) in self.pipelines.drain() {
+            k.destroy(device);
+        }
+        unsafe { device.destroy_pipeline_cache(self.cache, None) };
+    }
+}
+
+/// Default cache location: `$HOME/.vulkanforge/pipeline_cache.bin`.
+pub fn default_cache_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".vulkanforge").join("pipeline_cache.bin"))
+}

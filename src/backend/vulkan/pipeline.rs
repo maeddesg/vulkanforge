@@ -1,36 +1,27 @@
 //! Compute-pipeline wrapper for a single SPIR-V kernel.
 //!
-//! Phase 1 / Step 1.2: builds the descriptor-set layout, pipeline
-//! layout (with the shader's 52-byte push-constant block), shader
-//! module, and compute pipeline for the Q4_K GEMV kernel.
+//! Phase 2A — `ComputeKernel::from_spv` reflects the SPIR-V at
+//! pipeline-create time and builds a matching descriptor-set layout
+//! and pipeline layout, no per-shader hard-coding. The
+//! [`PipelineRegistry`](super::pipeline_registry::PipelineRegistry)
+//! uses this to instantiate every shader in the inventory uniformly.
 //!
-//! The interface is hard-wired to the `mul_mat_vec_q4_k` shader
-//! family: 5 `STORAGE_BUFFER` bindings at descriptor set 0 (binding
-//! 0 = weights A, 1 = input B, 2 = output D, 3 = fuse0, 4 = fuse1)
-//! and three specialization constants (`BLOCK_SIZE`, `NUM_ROWS`,
-//! `NUM_COLS`). Variants for other quants/dtypes will reuse this
-//! shape — see results/phase1_step_1.0_shader_analysis.md §2.
+//! The interface still consists of:
+//!   - `pub pipeline: vk::Pipeline`
+//!   - `pub pipeline_layout: vk::PipelineLayout`
+//!   - `pub descriptor_set_layout: vk::DescriptorSetLayout`
+//!
+//! and an explicit `destroy(self, &Device)` — there is no `Drop` impl
+//! because the kernel does not own a `Device` handle.
 
 use ash::vk;
 
-/// Number of `STORAGE_BUFFER` bindings expected at descriptor set 0.
-/// Confirmed from SPIR-V disassembly in step 1.1.
-pub const NUM_BINDINGS: u32 = 5;
+use super::spirv_reflect::{self, ReflectedShader};
 
-/// Push-constant block size as declared in `mul_mat_vec_base.glsl` —
-/// 13 × `uint32_t`. Vulkan requires push-constant ranges to be a
-/// multiple of 4 (already true) and ≤ `maxPushConstantsSize` (≥ 128
-/// guaranteed by spec).
 pub const PUSH_CONSTANT_BYTES: u32 = 52;
 
-/// Matches `vk_mat_vec_push_constants` in llama.cpp's
-/// `ggml-vulkan.cpp:992` and the GLSL `parameter` block in
-/// `mul_mat_vec_base.glsl:16-41` (no MUL_MAT_ID branch). Kept
-/// `#[repr(C)]` so the byte layout fed to `vkCmdPushConstants` is
-/// the same the shader expects.
-///
-/// All strides are in *elements* (not bytes); the shader divides
-/// `batch_stride_a` by `QUANT_K` itself when indexing Q4_K blocks.
+/// llama.cpp's `vk_mat_vec_push_constants` layout (13 × u32 = 52 B).
+/// Used by callers that dispatch the Q4_K / Q6_K GEMV pipelines.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MatVecPushConstants {
@@ -52,24 +43,17 @@ pub struct MatVecPushConstants {
 const _: () =
     assert!(std::mem::size_of::<MatVecPushConstants>() == PUSH_CONSTANT_BYTES as usize);
 
-/// Specialization-constant values supplied at pipeline-create time.
-/// Keep this `#[repr(C)]` so the byte offsets fed to
-/// `VkSpecializationMapEntry` line up with the field order.
-#[repr(C)]
+/// GLSL-default specialization constants for the Q4_K / Q6_K GEMV
+/// shaders. Provided as a value object for callers that dispatch
+/// these kernels and want to record the values used at create time.
 #[derive(Clone, Copy, Debug)]
 pub struct SpecConstants {
-    /// SpecId 0 — also drives `local_size_x`.
     pub block_size: u32,
-    /// SpecId 1 — rows computed per workgroup.
     pub num_rows: u32,
-    /// SpecId 2 — columns computed per workgroup.
     pub num_cols: u32,
 }
 
 impl SpecConstants {
-    /// Defaults that match the GLSL declarations in
-    /// `mul_mat_vec_base.glsl:89-91`. Hardware-agnostic; the
-    /// RDNA4-tuned (64, 2, 1) variant comes in step 1.5.
     pub const SMOKE_DEFAULT: Self = Self {
         block_size: 32,
         num_rows: 1,
@@ -81,44 +65,78 @@ pub struct ComputeKernel {
     pub pipeline: vk::Pipeline,
     pub pipeline_layout: vk::PipelineLayout,
     pub descriptor_set_layout: vk::DescriptorSetLayout,
+    pub reflection: ReflectedShader,
 }
 
 impl ComputeKernel {
-    /// Build the kernel from a SPIR-V blob and a set of specialization
-    /// constants. Caller owns the resulting handles and must call
-    /// [`ComputeKernel::destroy`] before the [`ash::Device`] is torn
-    /// down.
-    pub fn new(
+    /// Build a kernel by reflecting the SPIR-V. No spec-constant
+    /// override — the GLSL defaults (or runtime spec lookup at
+    /// dispatch-time) decide the workgroup shape.
+    pub fn from_spv(
         device: &ash::Device,
         spv_words: &[u32],
-        spec: SpecConstants,
+        cache: vk::PipelineCache,
     ) -> Result<Self, vk::Result> {
-        // Descriptor set layout: 5 SSBO slots, all visible to the
-        // compute stage. SPIR-V variables that alias the same binding
-        // (binding 0 has 3 such aliases for block_q4_K /_packed16
-        // /_packed32 — see step 1.1 §4) collapse to a single Vulkan
-        // binding slot; descriptor_count stays at 1.
-        let bindings: [vk::DescriptorSetLayoutBinding; NUM_BINDINGS as usize] =
-            std::array::from_fn(|i| {
+        Self::from_spv_with_spec(device, spv_words, cache, &[], &[])
+    }
+
+    /// Like [`Self::from_spv`] but lets the caller pin specific
+    /// specialization constants. `spec_entries` lists `(constant_id,
+    /// offset, size)` triples and `spec_data` is the contiguous byte
+    /// buffer they reference.
+    pub fn from_spv_with_spec(
+        device: &ash::Device,
+        spv_words: &[u32],
+        cache: vk::PipelineCache,
+        spec_entries: &[vk::SpecializationMapEntry],
+        spec_data: &[u8],
+    ) -> Result<Self, vk::Result> {
+        let reflection = spirv_reflect::reflect(spv_words);
+
+        // Descriptor-set layout — single set 0, one binding per
+        // reflected resource. STORAGE_BUFFER for `buffer` blocks,
+        // UNIFORM_BUFFER for `uniform` blocks (none expected here, but
+        // the reflector handles both).
+        let mut bindings = Vec::with_capacity(reflection.bindings.len());
+        for b in &reflection.bindings {
+            // We only support one descriptor set today (set 0). If a
+            // shader declares set > 0 we still create a single layout
+            // but caller / dispatch-side will need to bind matching
+            // sets. Phase-2A inventory is set-0 only.
+            assert_eq!(
+                b.set, 0,
+                "shader declares descriptor set {} (only set 0 supported in Phase 2A)",
+                b.set
+            );
+            bindings.push(
                 vk::DescriptorSetLayoutBinding::default()
-                    .binding(i as u32)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .binding(b.binding)
+                    .descriptor_type(b.descriptor_type)
                     .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            });
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            );
+        }
 
         let dsl_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
         let descriptor_set_layout =
             unsafe { device.create_descriptor_set_layout(&dsl_info, None)? };
 
-        let push_range = vk::PushConstantRange::default()
+        // Pipeline layout: one descriptor-set layout, one push-constant
+        // range covering the reflected size. No range if the shader
+        // has no push constants — Vulkan rejects zero-size ranges.
+        let push_ranges_buf = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
-            .size(PUSH_CONSTANT_BYTES);
+            .size(reflection.push_constant_size)];
+        let push_ranges: &[vk::PushConstantRange] = if reflection.push_constant_size > 0 {
+            &push_ranges_buf
+        } else {
+            &[]
+        };
 
         let layout_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(std::slice::from_ref(&descriptor_set_layout))
-            .push_constant_ranges(std::slice::from_ref(&push_range));
+            .push_constant_ranges(push_ranges);
         let pipeline_layout = match unsafe { device.create_pipeline_layout(&layout_info, None) } {
             Ok(l) => l,
             Err(e) => {
@@ -139,49 +157,24 @@ impl ComputeKernel {
             }
         };
 
-        // Specialization constants: one entry per field in
-        // `SpecConstants`. constantID matches the GLSL SpecId
-        // decorations (0, 1, 2).
-        let spec_entries = [
-            vk::SpecializationMapEntry {
-                constant_id: 0,
-                offset: 0,
-                size: 4,
-            },
-            vk::SpecializationMapEntry {
-                constant_id: 1,
-                offset: 4,
-                size: 4,
-            },
-            vk::SpecializationMapEntry {
-                constant_id: 2,
-                offset: 8,
-                size: 4,
-            },
-        ];
-        let spec_bytes: [u8; 12] = bytemuck::cast([spec.block_size, spec.num_rows, spec.num_cols]);
         let spec_info = vk::SpecializationInfo::default()
-            .map_entries(&spec_entries)
-            .data(&spec_bytes);
-
-        let stage = vk::PipelineShaderStageCreateInfo::default()
+            .map_entries(spec_entries)
+            .data(spec_data);
+        let mut stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(shader_module)
-            .name(c"main")
-            .specialization_info(&spec_info);
+            .name(c"main");
+        if !spec_entries.is_empty() {
+            stage = stage.specialization_info(&spec_info);
+        }
 
         let pipeline_info = vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .layout(pipeline_layout);
 
         let pipeline_result = unsafe {
-            device.create_compute_pipelines(
-                vk::PipelineCache::null(),
-                std::slice::from_ref(&pipeline_info),
-                None,
-            )
+            device.create_compute_pipelines(cache, std::slice::from_ref(&pipeline_info), None)
         };
-        // Shader module is no longer needed after pipeline creation.
         unsafe { device.destroy_shader_module(shader_module, None) };
 
         let pipeline = match pipeline_result {
@@ -204,13 +197,10 @@ impl ComputeKernel {
             pipeline,
             pipeline_layout,
             descriptor_set_layout,
+            reflection,
         })
     }
 
-    /// Tear the kernel down. Must be called before the owning
-    /// `ash::Device` is dropped — there is no Drop impl on purpose,
-    /// because `ComputeKernel` does not hold a reference to the
-    /// device handle.
     pub fn destroy(self, device: &ash::Device) {
         unsafe {
             device.destroy_pipeline(self.pipeline, None);

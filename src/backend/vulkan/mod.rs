@@ -1,11 +1,9 @@
-//! Vulkan backend (compute-only). Currently exposes the minimal
-//! device-init wrapper used by the Phase-0 smoke test; future
-//! Phase-1 work adds memory allocator, descriptor sets, pipelines,
-//! and the Q4_K MMVQ dispatch.
-
 pub mod buffers;
 pub mod commands;
 pub mod device;
 pub mod pipeline;
+pub mod pipeline_registry;
 pub mod q4k;
 pub mod shaders;
+pub mod spirv_reflect;
+pub mod vram_arena;
