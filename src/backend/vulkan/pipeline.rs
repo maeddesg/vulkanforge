@@ -23,6 +23,35 @@ pub const NUM_BINDINGS: u32 = 5;
 /// guaranteed by spec).
 pub const PUSH_CONSTANT_BYTES: u32 = 52;
 
+/// Matches `vk_mat_vec_push_constants` in llama.cpp's
+/// `ggml-vulkan.cpp:992` and the GLSL `parameter` block in
+/// `mul_mat_vec_base.glsl:16-41` (no MUL_MAT_ID branch). Kept
+/// `#[repr(C)]` so the byte layout fed to `vkCmdPushConstants` is
+/// the same the shader expects.
+///
+/// All strides are in *elements* (not bytes); the shader divides
+/// `batch_stride_a` by `QUANT_K` itself when indexing Q4_K blocks.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct MatVecPushConstants {
+    pub ncols: u32,
+    pub stride_a: u32,
+    pub stride_b: u32,
+    pub stride_d: u32,
+    pub batch_stride_a: u32,
+    pub batch_stride_b: u32,
+    pub batch_stride_d: u32,
+    pub fusion_flags: u32,
+    pub base_work_group_y: u32,
+    pub ne02: u32,
+    pub ne12: u32,
+    pub broadcast2: u32,
+    pub broadcast3: u32,
+}
+
+const _: () =
+    assert!(std::mem::size_of::<MatVecPushConstants>() == PUSH_CONSTANT_BYTES as usize);
+
 /// Specialization-constant values supplied at pipeline-create time.
 /// Keep this `#[repr(C)]` so the byte offsets fed to
 /// `VkSpecializationMapEntry` line up with the field order.
