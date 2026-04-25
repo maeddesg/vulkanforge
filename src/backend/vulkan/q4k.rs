@@ -56,10 +56,22 @@ pub fn encode_block(b: &Q4KBlockSpec) -> [u8; BLOCK_BYTES] {
         out[4 + j] |= ((lm >> 4) & 0x03) << 6;
     }
 
-    for j in 0..128 {
-        let lo = b.nibbles[j] & 0x0F;
-        let hi = b.nibbles[j + 128] & 0x0F;
-        out[16 + j] = lo | (hi << 4);
+    // Nibble pair layout — see ggml-quants.c quantize_row_q4_K_ref:
+    //   for (j = 0; j < QK_K; j += 64)
+    //     for (l = 0; l < 32; ++l)
+    //       qs[l] = L[j+l] | (L[j+l+32] << 4)
+    //
+    // i.e. pair p (0..3) holds sub-blocks 2p (low nibble) and 2p+1
+    // (high nibble) in bytes 16+p*32 .. 16+p*32+31. NOT "low half =
+    // sb0..3, high half = sb4..7" — that interleaving only looks right
+    // for uniform-nibble blocks (smoke test passed under it because
+    // every nibble was identical).
+    for p in 0..4 {
+        for l in 0..32 {
+            let lo = b.nibbles[(2 * p) * 32 + l] & 0x0F;
+            let hi = b.nibbles[(2 * p + 1) * 32 + l] & 0x0F;
+            out[16 + p * 32 + l] = lo | (hi << 4);
+        }
     }
 
     out
@@ -92,14 +104,19 @@ pub fn dequant_block(block: &[u8; BLOCK_BYTES]) -> [f32; QUANT_K] {
     for sb in 0..8 {
         let scale = sub_scales[sb] as f32;
         let min = sub_mins[sb] as f32;
+        // Pair p (= sb / 2) lives in bytes p*32..p*32+31. Even sub-blocks
+        // are in the low nibble of each byte, odd sub-blocks in the high.
+        let pair = sb / 2;
+        let high_nibble = sb % 2 == 1;
         for k in 0..32 {
-            let i = sb * 32 + k;
-            let nibble = if sb < 4 {
-                qs[sb * 32 + k] & 0x0F
+            let pos = sb * 32 + k;
+            let byte = qs[pair * 32 + k];
+            let nibble = if high_nibble {
+                (byte >> 4) & 0x0F
             } else {
-                (qs[(sb - 4) * 32 + k] >> 4) & 0x0F
+                byte & 0x0F
             };
-            out[i] = d * scale * (nibble as f32) - dmin * min;
+            out[pos] = d * scale * (nibble as f32) - dmin * min;
         }
     }
     out
@@ -131,6 +148,83 @@ pub fn cpu_gemv(weights: &[u8], n_rows: usize, k: usize, input: &[f32]) -> Vec<f
         }
     }
     out
+}
+
+/// Tiny deterministic xorshift RNG. Used for reproducible random
+/// Q4_K weights and inputs in step 1.5; not a serious PRNG but fine
+/// for benchmark fixtures.
+struct XorShift64 {
+    state: u64,
+}
+
+impl XorShift64 {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed },
+        }
+    }
+    fn next_u32(&mut self) -> u32 {
+        let mut s = self.state;
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        self.state = s;
+        s as u32
+    }
+    /// Float in `[0, 1)`.
+    fn next_unit(&mut self) -> f32 {
+        ((self.next_u32() >> 8) as f32) / ((1u32 << 24) as f32)
+    }
+    /// Float in `[-range, range)`.
+    fn next_signed(&mut self, range: f32) -> f32 {
+        (self.next_unit() * 2.0 - 1.0) * range
+    }
+}
+
+/// Random Q4_K weight matrix with `m` rows × `k` elements per row
+/// (`k` must be a multiple of QUANT_K). Uses LLM-realistic small
+/// `d`/`dmin` so the resulting outputs stay in a few-units range —
+/// this keeps absolute-error thresholds meaningful when checked
+/// against the CPU reference.
+pub fn build_random_weights(m: usize, k: usize, seed: u64) -> Vec<u8> {
+    assert!(k % QUANT_K == 0, "k must be a multiple of QUANT_K");
+    let blocks_per_row = k / QUANT_K;
+    let total_blocks = m * blocks_per_row;
+
+    let mut rng = XorShift64::new(seed);
+    let mut bytes = Vec::with_capacity(total_blocks * BLOCK_BYTES);
+
+    for _ in 0..total_blocks {
+        // d ∈ [0.001, 0.011], dmin ∈ [0.0005, 0.0055] — small,
+        // similar in scale to real Q4_K weights.
+        let d = 0.001 + rng.next_unit() * 0.01;
+        let dmin = 0.0005 + rng.next_unit() * 0.005;
+        let mut sub_scales = [0u8; 8];
+        let mut sub_mins = [0u8; 8];
+        let mut nibbles = [0u8; QUANT_K];
+        for i in 0..8 {
+            sub_scales[i] = (rng.next_u32() % 64) as u8;
+            sub_mins[i] = (rng.next_u32() % 64) as u8;
+        }
+        for i in 0..QUANT_K {
+            nibbles[i] = (rng.next_u32() % 16) as u8;
+        }
+        let block = encode_block(&Q4KBlockSpec {
+            d,
+            dmin,
+            sub_scales,
+            sub_mins,
+            nibbles,
+        });
+        bytes.extend_from_slice(&block);
+    }
+    bytes
+}
+
+/// Random input vector in `[-range, range)`.
+pub fn build_random_input(k: usize, seed: u64, range: f32) -> Vec<f32> {
+    let mut rng = XorShift64::new(seed);
+    (0..k).map(|_| rng.next_signed(range)).collect()
 }
 
 /// Smoke-test weight matrix:
@@ -178,6 +272,66 @@ mod tests {
         let dq1 = dequant_block(row1);
         assert!(dq0.iter().all(|&w| (w - 1.0).abs() < 1e-6));
         assert!(dq1.iter().all(|&w| (w - 2.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn dequant_recovers_per_subblock_distinct_nibbles() {
+        // Distinct constant nibble per sub-block — a pair-layout bug
+        // would shuffle them and this test would fail.
+        let mut nibbles = [0u8; QUANT_K];
+        for sb in 0..8 {
+            for k in 0..32 {
+                nibbles[sb * 32 + k] = (sb as u8) + 1;
+            }
+        }
+        let block = encode_block(&Q4KBlockSpec {
+            d: 1.0,
+            dmin: 0.0,
+            sub_scales: [1; 8],
+            sub_mins: [0; 8],
+            nibbles,
+        });
+        let dq = dequant_block(&block);
+        for sb in 0..8 {
+            let expected = (sb as f32) + 1.0;
+            for k in 0..32 {
+                let pos = sb * 32 + k;
+                assert!(
+                    (dq[pos] - expected).abs() < 1e-6,
+                    "sb {sb} pos {pos}: got {got}, expected {expected}",
+                    got = dq[pos]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dequant_recovers_per_subblock_distinct_scales() {
+        // Distinct scale per sub-block, uniform nibble = 1 → output
+        // weight equals scale per sub-block.
+        let mut sub_scales = [0u8; 8];
+        for sb in 0..8 {
+            sub_scales[sb] = (sb as u8) + 1;
+        }
+        let block = encode_block(&Q4KBlockSpec {
+            d: 1.0,
+            dmin: 0.0,
+            sub_scales,
+            sub_mins: [0; 8],
+            nibbles: [1; QUANT_K],
+        });
+        let dq = dequant_block(&block);
+        for sb in 0..8 {
+            let expected = (sb as f32) + 1.0;
+            for k in 0..32 {
+                let pos = sb * 32 + k;
+                assert!(
+                    (dq[pos] - expected).abs() < 1e-6,
+                    "sb {sb} pos {pos}: got {got}, expected {expected}",
+                    got = dq[pos]
+                );
+            }
+        }
     }
 
     #[test]
