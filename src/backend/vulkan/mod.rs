@@ -3,6 +3,9 @@
 //! Phase-1 work adds memory allocator, descriptor sets, pipelines,
 //! and the Q4_K MMVQ dispatch.
 
+pub mod buffers;
+pub mod commands;
 pub mod device;
 pub mod pipeline;
+pub mod q4k;
 pub mod shaders;
