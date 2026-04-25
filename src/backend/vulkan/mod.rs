@@ -4,4 +4,5 @@
 //! and the Q4_K MMVQ dispatch.
 
 pub mod device;
+pub mod pipeline;
 pub mod shaders;
