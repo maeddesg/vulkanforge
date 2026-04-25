@@ -13,6 +13,7 @@ pub enum ShaderId {
     MulMatVecQ6K,
     RmsNorm,
     RopeNorm,
+    RopeNeox,
     Add,
     Mul,
     Silu,
@@ -27,6 +28,7 @@ impl ShaderId {
             ShaderId::MulMatVecQ6K => "mul_mat_vec_q6_k_f32_f32",
             ShaderId::RmsNorm => "rms_norm_f32",
             ShaderId::RopeNorm => "rope_norm_f32",
+            ShaderId::RopeNeox => "rope_neox_f32",
             ShaderId::Add => "add_f32",
             ShaderId::Mul => "mul_f32",
             ShaderId::Silu => "silu_f32",
@@ -41,6 +43,7 @@ impl ShaderId {
             ShaderId::MulMatVecQ6K => MUL_MAT_VEC_Q6_K_F32_F32,
             ShaderId::RmsNorm => RMS_NORM_F32,
             ShaderId::RopeNorm => ROPE_NORM_F32,
+            ShaderId::RopeNeox => ROPE_NEOX_F32,
             ShaderId::Add => ADD_F32,
             ShaderId::Mul => MUL_F32,
             ShaderId::Silu => SILU_F32,
@@ -55,6 +58,7 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::MulMatVecQ6K,
     ShaderId::RmsNorm,
     ShaderId::RopeNorm,
+    ShaderId::RopeNeox,
     ShaderId::Add,
     ShaderId::Mul,
     ShaderId::Silu,
@@ -68,6 +72,7 @@ pub const MUL_MAT_VEC_Q6_K_F32_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q6_k_f32_f32.spv"));
 pub const RMS_NORM_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm_f32.spv"));
 pub const ROPE_NORM_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope_norm_f32.spv"));
+pub const ROPE_NEOX_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope_neox_f32.spv"));
 pub const ADD_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/add_f32.spv"));
 pub const MUL_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_f32.spv"));
 pub const SILU_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silu_f32.spv"));

@@ -70,6 +70,14 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "rope_norm.comp",
         defines: &[("A_TYPE", "float"), ("ROPE_D_TYPE", "float")],
     },
+    // RoPE NeoX-style (split-half rotation). llama.cpp returns
+    // LLAMA_ROPE_TYPE_NEOX for LLM_ARCH_QWEN3 — see Phase-2B report
+    // §2 — so this is the variant the Qwen3 decode path actually uses.
+    ShaderJob {
+        out_name: "rope_neox_f32.spv",
+        entry_source: "rope_neox.comp",
+        defines: &[("A_TYPE", "float"), ("ROPE_D_TYPE", "float")],
+    },
     // Element-wise add (residual). generic_binary_head, 3 SSBOs.
     ShaderJob {
         out_name: "add_f32.spv",

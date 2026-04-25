@@ -14,6 +14,8 @@ use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 use vulkanforge::backend::vulkan::buffers::GpuBuffer;
 use vulkanforge::backend::vulkan::commands::CommandContext;
 use vulkanforge::backend::vulkan::device::VulkanDevice;
+use vulkanforge::backend::vulkan::gguf::{GgmlType, GgufFile, ModelConfig};
+use vulkanforge::backend::vulkan::loader::LoadedModel;
 use vulkanforge::backend::vulkan::pipeline::{MatVecPushConstants, PUSH_CONSTANT_BYTES};
 use vulkanforge::backend::vulkan::pipeline_registry::PipelineRegistry;
 use vulkanforge::backend::vulkan::q4k;
@@ -187,6 +189,80 @@ fn phase2a_vram_arena_oom_clean_error() {
         "expected AllocationTooLarge, got {:?}",
         result.as_ref().err()
     );
+}
+
+/// Phase-2B regression — the parser itself, no GPU. Skipped silently
+/// if the model file isn't present so CI machines don't fail.
+#[test]
+fn phase2b_gguf_parses_qwen3_8b() {
+    let Some(path) = qwen3_path() else { return };
+    let gguf = GgufFile::open(&path).expect("GgufFile::open");
+    assert_eq!(gguf.version, 3);
+    assert_eq!(gguf.tensor_count, 399);
+    let cfg = ModelConfig::from_gguf(&gguf).expect("ModelConfig::from_gguf");
+
+    assert_eq!(cfg.architecture, "qwen3");
+    assert_eq!(cfg.n_layers, 36);
+    assert_eq!(cfg.n_heads, 32);
+    assert_eq!(cfg.n_kv_heads, 8);
+    assert_eq!(cfg.hidden_dim, 4096);
+    assert_eq!(cfg.ffn_dim, 12288);
+    assert_eq!(cfg.head_dim, 128);
+    assert_eq!(cfg.vocab_size, 151936);
+    assert_eq!(cfg.context_length, 40960);
+    assert!((cfg.rope_freq_base - 1_000_000.0).abs() < 1e-3);
+    assert!(cfg.has_qk_norm, "Qwen3 should expose attn_q_norm/attn_k_norm");
+
+    // Spot check a few expected tensors and their dtypes.
+    let q = gguf.tensor("blk.0.attn_q.weight").expect("attn_q present");
+    assert_eq!(q.ggml_type, GgmlType::Q4K);
+    assert_eq!(q.dimensions, vec![4096, 4096]);
+
+    let down = gguf.tensor("blk.0.ffn_down.weight").expect("ffn_down present");
+    assert_eq!(down.ggml_type, GgmlType::Q6K);
+}
+
+/// Phase-2B regression — full VRAM upload of the Qwen3-8B GGUF.
+/// Skipped silently when the model isn't on disk; ~5 s on RX 9070 XT.
+#[test]
+fn phase2b_qwen3_loads_to_vram() {
+    let Some(path) = qwen3_path() else { return };
+    let gguf = GgufFile::open(&path).expect("open");
+    let dev = VulkanDevice::new().expect("VulkanDevice::new");
+    let mut allocator = Allocator::new(&AllocatorCreateDesc {
+        instance: dev.instance.clone(),
+        device: dev.device.clone(),
+        physical_device: dev.physical_device,
+        debug_settings: gpu_allocator::AllocatorDebugSettings::default(),
+        buffer_device_address: false,
+        allocation_sizes: gpu_allocator::AllocationSizes::default(),
+    })
+    .expect("Allocator::new");
+
+    let model = LoadedModel::load(&dev, &mut allocator, &gguf).expect("LoadedModel::load");
+    assert_eq!(model.tensors.len(), gguf.tensors.len());
+    // 4.68 GiB ± a bit — exact byte total can shift across builds; assert >= 4 GiB.
+    assert!(
+        model.bytes_uploaded >= 4 * 1024 * 1024 * 1024,
+        "uploaded only {} bytes",
+        model.bytes_uploaded
+    );
+    // A quick sanity buffer-handle check on a tensor we know exists.
+    let q = model.tensor("blk.0.attn_q.weight").expect("missing attn_q");
+    assert!(q.byte_size > 0);
+    assert_ne!(q.buffer.handle, vk::Buffer::null());
+
+    model.destroy(&dev.device, &mut allocator);
+    drop(allocator);
+}
+
+fn qwen3_path() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("VF_MODEL_PATH").map(PathBuf::from) {
+        return Some(p);
+    }
+    let home = std::env::var_os("HOME")?;
+    let p = PathBuf::from(home).join("models").join("Qwen3-8B-Q4_K_M.gguf");
+    if p.exists() { Some(p) } else { None }
 }
 
 /// Phase-1 regression: the original 1.4 smoke test. Bit-exact output

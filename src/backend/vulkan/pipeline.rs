@@ -43,6 +43,142 @@ pub struct MatVecPushConstants {
 const _: () =
     assert!(std::mem::size_of::<MatVecPushConstants>() == PUSH_CONSTANT_BYTES as usize);
 
+// ---- Phase-2B: per-shader push-constant structs ----------------------
+//
+// One `#[repr(C)]` struct per GLSL push-constant block, with the field
+// order taken straight from the shader source (see vk_shaders/*.glsl
+// or generic_*_head.glsl). Compile-time `assert!` pins the size against
+// the SPIR-V reflection result so a future shader-source edit can't
+// silently desynchronise the layout.
+
+/// `generic_binary_head.glsl` push block — used by `rms_norm`, `add`,
+/// `mul`. 29 × 4 = 116 B. All `nb*` are *element* strides
+/// (`ggml_nb / type_size`), not byte strides — matches llama.cpp's
+/// `vk_op_binary_push_constants`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GenericBinaryPushConstants {
+    pub ne: u32,
+    pub ne00: u32, pub ne01: u32, pub ne02: u32, pub ne03: u32,
+    pub nb00: u32, pub nb01: u32, pub nb02: u32, pub nb03: u32,
+    pub ne10: u32, pub ne11: u32, pub ne12: u32, pub ne13: u32,
+    pub nb10: u32, pub nb11: u32, pub nb12: u32, pub nb13: u32,
+    pub ne20: u32, pub ne21: u32, pub ne22: u32, pub ne23: u32,
+    pub nb20: u32, pub nb21: u32, pub nb22: u32, pub nb23: u32,
+    pub misalign_offsets: u32,
+    pub param1: f32,
+    pub param2: f32,
+    pub param3: i32,
+}
+const _: () = assert!(std::mem::size_of::<GenericBinaryPushConstants>() == 116);
+
+/// `generic_head.glsl` push block — used by `silu`. 6 × 4 = 24 B.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GenericHeadPushConstants {
+    pub kx: u32,
+    pub ky: u32,
+    pub param1: f32,
+    pub param2: f32,
+    pub param3: f32,
+    pub param4: f32,
+}
+const _: () = assert!(std::mem::size_of::<GenericHeadPushConstants>() == 24);
+
+/// `generic_unary_head.glsl` push block — used by `copy`. 32 × 4 = 128 B.
+/// The trailing six `ne0_*mp/L` and `ne1_*mp/L` fields are fastdiv
+/// constants (see [`init_fastdiv_values`]) — set them, do not leave
+/// them as 0 unless every relevant `ne*` is exactly 1.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GenericUnaryPushConstants {
+    pub ne: u32,
+    pub ne00: u32, pub ne01: u32, pub ne02: u32, pub ne03: u32,
+    pub nb00: u32, pub nb01: u32, pub nb02: u32, pub nb03: u32,
+    pub ne10: u32, pub ne11: u32, pub ne12: u32, pub ne13: u32,
+    pub nb10: u32, pub nb11: u32, pub nb12: u32, pub nb13: u32,
+    pub misalign_offsets: u32,
+    pub param1: f32,
+    pub param2: f32,
+    pub ne0_012mp: u32, pub ne0_012l: u32,
+    pub ne0_01mp: u32,  pub ne0_01l: u32,
+    pub ne0_0mp: u32,   pub ne0_0l: u32,
+    pub ne1_012mp: u32, pub ne1_012l: u32,
+    pub ne1_01mp: u32,  pub ne1_01l: u32,
+    pub ne1_0mp: u32,   pub ne1_0l: u32,
+}
+const _: () = assert!(std::mem::size_of::<GenericUnaryPushConstants>() == 128);
+
+/// `soft_max.comp` push block. 17 × 4 = 68 B.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SoftMaxPushConstants {
+    pub kx: u32,
+    pub ky: u32,
+    pub ne00: u32,
+    pub ne01: u32,
+    pub ne02: u32,
+    pub ne12: u32,
+    pub ne13: u32,
+    pub nb11: u32,
+    pub nb12: u32,
+    pub nb13: u32,
+    pub scale: f32,
+    pub max_bias: f32,
+    pub m0: f32,
+    pub m1: f32,
+    pub n_head_log2: u32,
+    pub nrows_x: u32,
+    pub has_sinks: u32,
+}
+const _: () = assert!(std::mem::size_of::<SoftMaxPushConstants>() == 68);
+
+/// `rope_params.glsl` struct — push-constant block for both `rope_norm`
+/// and `rope_neox`. 23 fields, 108 B (matches reflection).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct RopePushConstants {
+    pub rope_mode: u32,
+    pub nrows: u32,
+    pub n_dims: u32,
+    pub freq_scale: f32,
+    pub freq_base: f32,
+    pub ext_factor: f32,
+    pub attn_factor: f32,
+    pub corr_dims: [f32; 2],
+    pub theta_scale: f32,
+    pub has_ff: u32,
+    pub sections: [i32; 4],
+    pub is_imrope: u32,
+    pub is_back: u32,
+    pub set_rows_stride: u32,
+    pub ne00: u32,
+    pub ne01: u32,
+    pub ne02: u32,
+    pub nb01: u32,
+    pub nb02: u32,
+    pub nb03: u32,
+    pub nb11: u32,
+    pub nb12: u32,
+    pub nb13: u32,
+}
+const _: () = assert!(std::mem::size_of::<RopePushConstants>() == 108);
+
+/// llama.cpp's `init_fastdiv_values`. Used by [`GenericUnaryPushConstants`]
+/// to populate the `ne*_*mp/L` fields — without these, `copy`'s SPIR-V
+/// fastdiv path divides by a magic-of-zero and produces garbage indices.
+pub fn init_fastdiv_values(d: u32) -> (u32, u32) {
+    if d <= 1 {
+        return (1, 0);
+    }
+    let mut l = 0u32;
+    while l < 32 && (1u32 << l) < d {
+        l += 1;
+    }
+    let mp = (((1u64 << 32) * ((1u64 << l) - d as u64)) / d as u64 + 1) as u32;
+    (mp, l)
+}
+
 /// GLSL-default specialization constants for the Q4_K / Q6_K GEMV
 /// shaders. Provided as a value object for callers that dispatch
 /// these kernels and want to record the values used at create time.

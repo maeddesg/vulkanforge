@@ -1,6 +1,8 @@
 pub mod buffers;
 pub mod commands;
 pub mod device;
+pub mod gguf;
+pub mod loader;
 pub mod pipeline;
 pub mod pipeline_registry;
 pub mod q4k;

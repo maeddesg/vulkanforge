@@ -25,6 +25,14 @@ use super::shaders::{self, ShaderId};
 /// happy and makes Phase-2A dispatch behaviour identical to Phase-1.
 const MMV_SPEC_DATA: [u32; 3] = [32, 1, 1];
 
+fn entry(constant_id: u32, offset: u32, size: usize) -> vk::SpecializationMapEntry {
+    vk::SpecializationMapEntry {
+        constant_id,
+        offset,
+        size,
+    }
+}
+
 pub struct PipelineRegistry {
     pipelines: HashMap<ShaderId, ComputeKernel>,
     cache: vk::PipelineCache,
@@ -71,17 +79,45 @@ impl PipelineRegistry {
             // pipelines behave bit-identically to Phase 1. Other
             // shaders go through `from_spv` (no override) and use
             // their GLSL defaults.
+            // Phase-2A bug §4: RADV silently produces wrong output on
+            // GEMV pipelines unless spec consts are bound explicitly,
+            // even when the bound values match the GLSL defaults. The
+            // safe rule learnt from that bug — also enforced by Phase-2B
+            // prompt §6 — is to pin every spec const a shader exposes
+            // rather than trust the default path.
             let result = match id {
                 ShaderId::MulMatVecQ4K | ShaderId::MulMatVecQ6K => {
-                    let entries = [
-                        vk::SpecializationMapEntry { constant_id: 0, offset: 0, size: 4 },
-                        vk::SpecializationMapEntry { constant_id: 1, offset: 4, size: 4 },
-                        vk::SpecializationMapEntry { constant_id: 2, offset: 8, size: 4 },
-                    ];
-                    let bytes: [u8; 12] = bytemuck::cast(MMV_SPEC_DATA);
-                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, &bytes)
+                    let entries = [entry(0, 0, 4), entry(1, 4, 4), entry(2, 8, 4)];
+                    let bytes = bytemuck::bytes_of(&MMV_SPEC_DATA);
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
                 }
-                _ => ComputeKernel::from_spv(device, &words, cache),
+                ShaderId::RmsNorm => {
+                    // SpecId 0 = norepeat (false → broadcast-safe), 1 =
+                    // do_multiply (true → norm-with-gamma, which is the
+                    // standard transformer use case).
+                    let data: [u32; 2] = [0, 1];
+                    let entries = [entry(0, 0, 4), entry(1, 4, 4)];
+                    let bytes = bytemuck::bytes_of(&data);
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
+                }
+                ShaderId::Add | ShaderId::Mul => {
+                    // SpecId 0 = norepeat. false keeps broadcast support.
+                    let data: [u32; 1] = [0];
+                    let entries = [entry(0, 0, 4)];
+                    let bytes = bytemuck::bytes_of(&data);
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
+                }
+                ShaderId::SoftMax => {
+                    // SpecId 0 = BLOCK_SIZE (also drives local_size_x).
+                    let data: [u32; 1] = [32];
+                    let entries = [entry(0, 0, 4)];
+                    let bytes = bytemuck::bytes_of(&data);
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
+                }
+                // silu, copy, rope_norm, rope_neox: no spec consts.
+                ShaderId::Silu | ShaderId::Copy | ShaderId::RopeNorm | ShaderId::RopeNeox => {
+                    ComputeKernel::from_spv(device, &words, cache)
+                }
             };
             let kernel = match result {
                 Ok(k) => k,

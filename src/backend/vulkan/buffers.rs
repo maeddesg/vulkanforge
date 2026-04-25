@@ -65,19 +65,33 @@ impl GpuBuffer {
     /// Write up to `bytes.len()` host-visible bytes to the buffer.
     /// Errors if the buffer is GPU-only (not host-mappable).
     pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+        self.write_bytes_at(0, bytes)
+    }
+
+    /// Write at an offset — used by batched staging-buffer uploads.
+    pub fn write_bytes_at(
+        &mut self,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let alloc = self.allocation.as_mut().ok_or("buffer already freed")?;
         let slice = alloc
             .mapped_slice_mut()
             .ok_or("buffer is not host-visible")?;
-        if bytes.len() > slice.len() {
+        let off = offset as usize;
+        let end = off
+            .checked_add(bytes.len())
+            .ok_or("write offset+len overflows usize")?;
+        if end > slice.len() {
             return Err(format!(
-                "write of {} bytes exceeds buffer capacity {}",
+                "write of {} bytes at offset {} exceeds buffer capacity {}",
                 bytes.len(),
+                offset,
                 slice.len()
             )
             .into());
         }
-        slice[..bytes.len()].copy_from_slice(bytes);
+        slice[off..end].copy_from_slice(bytes);
         Ok(())
     }
 

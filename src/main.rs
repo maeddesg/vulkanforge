@@ -1,28 +1,20 @@
-//! VulkanForge — Vulkan-based LLM inference engine for AMD RDNA 4.
+//! VulkanForge — Phase 2B demo.
 //!
-//! Phase 2A demo: device init → PipelineRegistry (with on-disk
-//! pipeline cache) → VRAM arena → reflection summary table → clean
-//! teardown. The actual decode loop lives in Phase 2B/C.
+//! Loads `~/models/Qwen3-8B-Q4_K_M.gguf`, parses the metadata,
+//! reports the model config, uploads every tensor to VRAM, and
+//! dumps a small summary. The actual decode loop ships in Phase 2C.
 
+use std::path::PathBuf;
 use std::time::Instant;
 
 use ash::vk;
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 
-use vulkanforge::backend;
 use vulkanforge::backend::vulkan::device::VulkanDevice;
-use vulkanforge::backend::vulkan::pipeline_registry::{PipelineRegistry, default_cache_path};
+use vulkanforge::backend::vulkan::gguf::{GgmlType, GgufFile, ModelConfig};
+use vulkanforge::backend::vulkan::loader::LoadedModel;
+use vulkanforge::backend::vulkan::pipeline_registry::{default_cache_path, PipelineRegistry};
 use vulkanforge::backend::vulkan::shaders::ALL_SHADERS;
-use vulkanforge::backend::vulkan::vram_arena::{ArenaConfig, VramArena};
-
-/// Phase-2A arena demo budget. Real Phase-2B will use ~13 GB
-/// (Qwen3-8B Q4_K_M weights + KV cache); here a 256-MiB toy budget
-/// keeps the arena demo fast and CI-friendly.
-const ARENA_DEMO_CONFIG: ArenaConfig = ArenaConfig {
-    weights_bytes: 200 * 1024 * 1024,
-    kv_cache_bytes: 50 * 1024 * 1024,
-    scratch_bytes: 4 * 1024 * 1024,
-};
 
 fn main() {
     if let Err(e) = run() {
@@ -32,25 +24,12 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    println!("VulkanForge v0.1.0 — Phase 2A demo");
+    println!("VulkanForge v0.1.0 — Phase 2B demo");
 
     let dev = VulkanDevice::new()?;
     println!("✅ Vulkan device initialized");
 
-    let max_alloc = backend::vulkan::vram_arena::query_max_memory_allocation_size(
-        &dev.instance,
-        dev.physical_device,
-    );
-    println!(
-        "  maxMemoryAllocationSize: {:.1} GiB",
-        (max_alloc as f64) / (1024.0 * 1024.0 * 1024.0)
-    );
-
-    // gpu-allocator stays around for buffer-level helpers used by the
-    // Phase-1 regression dispatch — the new VramArena handles zones
-    // for actual model weights, but we keep gpu-allocator for the
-    // small ad-hoc storage / staging buffers in the dispatch test.
-    let allocator = Allocator::new(&AllocatorCreateDesc {
+    let mut allocator = Allocator::new(&AllocatorCreateDesc {
         instance: dev.instance.clone(),
         device: dev.device.clone(),
         physical_device: dev.physical_device,
@@ -60,145 +39,145 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     println!("✅ gpu_allocator initialized");
 
-    // ---- Step 2.1 / 2.2: Pipeline registry + pipeline cache ----
     let cache_path = default_cache_path();
-    let cache_path_display = cache_path
-        .as_deref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "<no $HOME>".into());
-    println!("  Pipeline cache: {cache_path_display}");
-
-    let cold_started = Instant::now();
-    let (registry, loaded_bytes) =
-        PipelineRegistry::new(&dev.device, cache_path.as_deref())?;
-    let total_setup = cold_started.elapsed();
-
+    let (registry, loaded_cache) = PipelineRegistry::new(&dev.device, cache_path.as_deref())?;
     println!(
-        "✅ PipelineRegistry: {} shaders, vkCreateComputePipelines = {:.3} ms (incl. shader-module setup), \
-         total registry setup = {:.3} ms",
+        "✅ PipelineRegistry: {} shaders ({:.1} ms create, {} B cache loaded)",
         registry.count(),
         registry.create_duration.as_secs_f64() * 1000.0,
-        total_setup.as_secs_f64() * 1000.0,
+        loaded_cache,
     );
-    if loaded_bytes > 0 {
-        println!("  Loaded {} B from existing pipeline cache (warm start)", loaded_bytes);
-    } else {
-        println!("  No existing cache — cold start");
-    }
+    let _ = ALL_SHADERS;
 
-    // Reflection summary table per shader.
-    println!("\n  ┌─────────────────────────────────┬──────┬────────┬─────────────┬────────────────┐");
-    println!("  │ Shader                          │ Bind │ PC (B) │ SpecIds     │ LocalSize      │");
-    println!("  ├─────────────────────────────────┼──────┼────────┼─────────────┼────────────────┤");
-    for &id in ALL_SHADERS {
-        let k = registry.get(id);
-        let r = &k.reflection;
-        let spec_str = if r.spec_constants.is_empty() {
-            "—".to_string()
-        } else {
-            r.spec_constants
-                .iter()
-                .map(|i| i.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        };
+    // ---- GGUF: parse + introspect.
+    let model_path = std::env::var("VF_MODEL_PATH")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(|h| PathBuf::from(h).join("models").join("Qwen3-8B-Q4_K_M.gguf"))
+                .expect("$HOME unset")
+        });
+    println!("\n  GGUF: {}", model_path.display());
+
+    let parse_started = Instant::now();
+    let gguf = GgufFile::open(&model_path)?;
+    let parse_dt = parse_started.elapsed();
+    println!(
+        "  parsed: {} tensors, {} metadata KVs, alignment {} B (parse {:.1} ms)",
+        gguf.tensor_count,
+        gguf.metadata.len(),
+        gguf.alignment,
+        parse_dt.as_secs_f64() * 1000.0,
+    );
+
+    let cfg = ModelConfig::from_gguf(&gguf)?;
+    print_config(&cfg);
+
+    // Tensor inventory by quant type.
+    let (mut by_type, mut total_bytes): (std::collections::BTreeMap<&str, (u32, u64)>, u64) =
+        (std::collections::BTreeMap::new(), 0);
+    for info in gguf.tensors.values() {
+        let key = ggml_type_name(info.ggml_type);
+        let entry = by_type.entry(key).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 += info.byte_size();
+        total_bytes += info.byte_size();
+    }
+    println!(
+        "\n  Tensor inventory ({} tensors, total {:.2} GiB):",
+        gguf.tensors.len(),
+        (total_bytes as f64) / (1024.0 * 1024.0 * 1024.0),
+    );
+    for (ty, (count, bytes)) in &by_type {
         println!(
-            "  │ {:<31} │ {:>4} │ {:>6} │ {:<11} │ {:>3}×{:>3}×{:>3}    │",
-            id.name(),
-            r.bindings.len(),
-            r.push_constant_size,
-            spec_str,
-            r.local_size[0],
-            r.local_size[1],
-            r.local_size[2],
+            "    {:<6}: {:>4} tensors, {:>10.2} MiB",
+            ty,
+            count,
+            (*bytes as f64) / (1024.0 * 1024.0)
         );
     }
-    println!("  └─────────────────────────────────┴──────┴────────┴─────────────┴────────────────┘");
 
-    // ---- Step 2.3: VRAM arena ----
-    let arena_total = ARENA_DEMO_CONFIG.weights_bytes
-        + ARENA_DEMO_CONFIG.kv_cache_bytes
-        + ARENA_DEMO_CONFIG.scratch_bytes;
+    // ---- Load every tensor to VRAM.
+    println!("\n  Uploading weights to VRAM (1-GiB staging buffer, batched)…");
+    let model = LoadedModel::load(&dev, &mut allocator, &gguf)?;
     println!(
-        "\n  Arena demo budget: {:.1} MiB total \
-         (weights {:.1} MiB, KV {:.1} MiB, scratch {:.1} MiB)",
-        (arena_total as f64) / (1024.0 * 1024.0),
-        (ARENA_DEMO_CONFIG.weights_bytes as f64) / (1024.0 * 1024.0),
-        (ARENA_DEMO_CONFIG.kv_cache_bytes as f64) / (1024.0 * 1024.0),
-        (ARENA_DEMO_CONFIG.scratch_bytes as f64) / (1024.0 * 1024.0),
+        "✅ LoadedModel: {} tensors, {:.2} GiB uploaded in {:.1} s ({:.1} GB/s)",
+        model.tensors.len(),
+        (model.bytes_uploaded as f64) / (1024.0 * 1024.0 * 1024.0),
+        model.upload_duration.as_secs_f64(),
+        (model.bytes_uploaded as f64 / 1e9) / model.upload_duration.as_secs_f64(),
     );
 
-    let arena = VramArena::new(
-        &dev.instance,
-        dev.physical_device,
-        &dev.device,
-        ARENA_DEMO_CONFIG,
-    )?;
-    println!(
-        "✅ VramArena: {} B allocated on memory_type_index {} (DEVICE_LOCAL), zone alignment {} B",
-        arena.total_bytes, arena.memory_type_index, arena.zone_alignment
-    );
-    println!(
-        "  Zones — weights: {}..{} (size {}), kv_cache: {}..{} (size {}), scratch: {}..{} (size {})",
-        arena.layout.weights.offset,
-        arena.layout.weights.offset + arena.layout.weights.size,
-        arena.layout.weights.size,
-        arena.layout.kv_cache.offset,
-        arena.layout.kv_cache.offset + arena.layout.kv_cache.size,
-        arena.layout.kv_cache.size,
-        arena.layout.scratch.offset,
-        arena.layout.scratch.offset + arena.layout.scratch.size,
-        arena.layout.scratch.size,
-    );
+    // Spot-check a couple tensors.
+    for name in [
+        "token_embd.weight",
+        "blk.0.attn_q.weight",
+        "blk.0.attn_q_norm.weight",
+        "blk.35.ffn_down.weight",
+        "output_norm.weight",
+    ] {
+        if let Some(t) = model.tensor(name) {
+            println!(
+                "  {:<35} shape={:?} type={:<5} {:>9} B",
+                name,
+                t.shape,
+                ggml_type_name(t.ggml_type),
+                t.byte_size,
+            );
+        } else {
+            println!("  {:<35} (missing)", name);
+        }
+    }
 
-    // Demo: create a buffer in each zone to verify bind paths work.
-    let weights_view = arena.create_buffer(
-        &dev.device,
-        arena.layout.weights.offset,
-        144 * 256, // 256 Q4_K blocks
-        vk::BufferUsageFlags::STORAGE_BUFFER,
-    )?;
-    let kv_view = arena.create_buffer(
-        &dev.device,
-        arena.layout.kv_cache.offset,
-        4096,
-        vk::BufferUsageFlags::STORAGE_BUFFER,
-    )?;
-    let (scratch0_off, scratch_half) = arena.scratch_for_layer(0);
-    let (scratch1_off, _) = arena.scratch_for_layer(1);
-    assert_ne!(scratch0_off, scratch1_off);
-    let scratch0_view = arena.create_buffer(
-        &dev.device,
-        scratch0_off,
-        scratch_half,
-        vk::BufferUsageFlags::STORAGE_BUFFER,
-    )?;
-    println!(
-        "  ✅ Buffer views: weights@{:#x}, kv@{:#x}, scratch_layer_0@{:#x}, scratch_layer_1_offset={:#x} (ping-pong)",
-        arena.layout.weights.offset,
-        arena.layout.kv_cache.offset,
-        scratch0_off,
-        scratch1_off,
-    );
-
-    // ---- Save pipeline cache for next start ----
+    // ---- Cleanup.
     let cache_stats = registry.save_cache(&dev.device);
     if cache_stats.saved_bytes > 0 {
         println!(
             "  Pipeline cache saved: {} B → {}",
-            cache_stats.saved_bytes, cache_path_display
+            cache_stats.saved_bytes,
+            cache_path.as_deref().map(|p| p.display().to_string()).unwrap_or_default()
         );
     }
 
-    // ---- Teardown — buffers → arena → registry → allocator → device.
-    unsafe {
-        dev.device.destroy_buffer(weights_view, None);
-        dev.device.destroy_buffer(kv_view, None);
-        dev.device.destroy_buffer(scratch0_view, None);
-    }
-    arena.destroy(&dev.device);
+    model.destroy(&dev.device, &mut allocator);
     registry.destroy(&dev.device);
     drop(allocator);
-    println!("✅ Phase 2A teardown clean");
+    println!("✅ Phase 2B teardown clean");
     Ok(())
+}
+
+fn print_config(c: &ModelConfig) {
+    println!("\n  ModelConfig:");
+    println!("    architecture        : {}", c.architecture);
+    println!("    n_layers            : {}", c.n_layers);
+    println!("    n_heads             : {}", c.n_heads);
+    println!("    n_kv_heads          : {} (GQA group size {})", c.n_kv_heads, c.n_heads / c.n_kv_heads);
+    println!("    hidden_dim          : {}", c.hidden_dim);
+    println!("    ffn_dim             : {}", c.ffn_dim);
+    println!("    head_dim            : {}", c.head_dim);
+    println!("    rope_freq_base      : {}", c.rope_freq_base);
+    println!("    context_length      : {}", c.context_length);
+    println!("    vocab_size          : {}", c.vocab_size);
+    println!("    rms_norm_eps        : {:e}", c.rms_norm_eps);
+    println!("    has_qk_norm         : {}", c.has_qk_norm);
+}
+
+fn ggml_type_name(t: GgmlType) -> &'static str {
+    match t {
+        GgmlType::F32 => "F32",
+        GgmlType::F16 => "F16",
+        GgmlType::Q4_0 => "Q4_0",
+        GgmlType::Q4_1 => "Q4_1",
+        GgmlType::Q5_0 => "Q5_0",
+        GgmlType::Q5_1 => "Q5_1",
+        GgmlType::Q8_0 => "Q8_0",
+        GgmlType::Q8_1 => "Q8_1",
+        GgmlType::Q2K => "Q2_K",
+        GgmlType::Q3K => "Q3_K",
+        GgmlType::Q4K => "Q4_K",
+        GgmlType::Q5K => "Q5_K",
+        GgmlType::Q6K => "Q6_K",
+        GgmlType::Q8K => "Q8_K",
+    }
 }
