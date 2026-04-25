@@ -14,9 +14,12 @@ use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 use vulkanforge::backend::vulkan::buffers::GpuBuffer;
 use vulkanforge::backend::vulkan::commands::CommandContext;
 use vulkanforge::backend::vulkan::device::VulkanDevice;
+use vulkanforge::backend::vulkan::forward::Forward;
 use vulkanforge::backend::vulkan::gguf::{GgmlType, GgufFile, ModelConfig};
+use vulkanforge::backend::vulkan::kv_cache::{KvCache, KvCacheConfig};
 use vulkanforge::backend::vulkan::loader::LoadedModel;
 use vulkanforge::backend::vulkan::pipeline::{MatVecPushConstants, PUSH_CONSTANT_BYTES};
+use vulkanforge::backend::vulkan::q4k as q4k_module;
 use vulkanforge::backend::vulkan::pipeline_registry::PipelineRegistry;
 use vulkanforge::backend::vulkan::q4k;
 use vulkanforge::backend::vulkan::shaders::{self, ShaderId, ALL_SHADERS};
@@ -253,6 +256,93 @@ fn phase2b_qwen3_loads_to_vram() {
     assert_ne!(q.buffer.handle, vk::Buffer::null());
 
     model.destroy(&dev.device, &mut allocator);
+    drop(allocator);
+}
+
+/// Phase-2C regression — full forward pass through Qwen3-8B with a
+/// real Q4_K embedding row produces finite logits with a non-trivial
+/// distribution. Skipped silently when the model file isn't present.
+#[test]
+fn phase2c_forward_token_qwen3_finite_logits() {
+    let Some(path) = qwen3_path() else { return };
+    let dev = VulkanDevice::new().expect("VulkanDevice::new");
+    let mut allocator = Allocator::new(&AllocatorCreateDesc {
+        instance: dev.instance.clone(),
+        device: dev.device.clone(),
+        physical_device: dev.physical_device,
+        debug_settings: gpu_allocator::AllocatorDebugSettings::default(),
+        buffer_device_address: false,
+        allocation_sizes: gpu_allocator::AllocationSizes::default(),
+    })
+    .expect("Allocator::new");
+    let (registry, _) = PipelineRegistry::new(&dev.device, None).expect("registry");
+    let cmd_ctx = vulkanforge::backend::vulkan::commands::CommandContext::new(
+        &dev.device, dev.queue_family_index,
+    )
+    .expect("cmd_ctx");
+    let gguf = GgufFile::open(&path).expect("open");
+    let cfg = ModelConfig::from_gguf(&gguf).expect("config");
+    let model = LoadedModel::load(&dev, &mut allocator, &gguf).expect("load");
+
+    let kv_cache = KvCache::new(
+        &dev.device,
+        &mut allocator,
+        KvCacheConfig {
+            n_layers: cfg.n_layers,
+            n_kv_heads: cfg.n_kv_heads,
+            head_dim: cfg.head_dim,
+            max_seq_len: 512, // small to keep allocator pressure low
+        },
+    )
+    .expect("kv_cache");
+
+    let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None).expect("forward");
+
+    // CPU dequant the token-0 row of token_embd.weight.
+    let info = gguf.tensor("token_embd.weight").expect("token_embd");
+    let blocks_per_row = (cfg.hidden_dim as usize) / q4k_module::QUANT_K;
+    let row_bytes = blocks_per_row * q4k_module::BLOCK_BYTES;
+    let bytes = gguf.tensor_bytes(info);
+    let token_id: u32 = 9707;
+    let row_off = (token_id as usize) * row_bytes;
+    let mut embd = Vec::with_capacity(cfg.hidden_dim as usize);
+    for b in 0..blocks_per_row {
+        let blk_off = row_off + b * q4k_module::BLOCK_BYTES;
+        let block: &[u8; q4k_module::BLOCK_BYTES] = (&bytes[blk_off..blk_off + q4k_module::BLOCK_BYTES])
+            .try_into().unwrap();
+        embd.extend_from_slice(&q4k_module::dequant_block(block));
+    }
+
+    forward
+        .forward_token(&dev, &registry, &cmd_ctx, &model, &embd, 0)
+        .expect("forward_token");
+    let logits = forward.logits().expect("logits");
+
+    assert_eq!(logits.len(), cfg.vocab_size as usize);
+    let any_nan = logits.iter().any(|v| !v.is_finite());
+    assert!(!any_nan, "logits contain NaN/Inf");
+    let all_zero = logits.iter().all(|&v| v == 0.0);
+    assert!(!all_zero, "logits are all zero");
+    let max_abs = logits.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    assert!(max_abs > 0.1, "logits look saturated to ~0 (max_abs={max_abs})");
+
+    // Top-1 should be a real token id, not garbage.
+    let top1 = logits
+        .iter()
+        .copied()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+        .unwrap();
+    assert!(
+        top1.0 < cfg.vocab_size as usize,
+        "top-1 token id out of range: {}",
+        top1.0
+    );
+
+    forward.destroy(&dev.device, &mut allocator);
+    cmd_ctx.destroy(&dev.device);
+    model.destroy(&dev.device, &mut allocator);
+    registry.destroy(&dev.device);
     drop(allocator);
 }
 

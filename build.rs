@@ -123,6 +123,12 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "copy.comp",
         defines: &[("A_TYPE", "float"), ("D_TYPE", "float")],
     },
+    // VulkanForge Phase-2C scalar single-token attention.
+    ShaderJob {
+        out_name: "scalar_attn_f32.spv",
+        entry_source: "scalar_attn.comp",
+        defines: &[],
+    },
 ];
 
 fn main() {

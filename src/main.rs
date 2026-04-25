@@ -1,8 +1,7 @@
-//! VulkanForge — Phase 2B demo.
+//! VulkanForge — Phase 2C debug walk.
 //!
-//! Loads `~/models/Qwen3-8B-Q4_K_M.gguf`, parses the metadata,
-//! reports the model config, uploads every tensor to VRAM, and
-//! dumps a small summary. The actual decode loop ships in Phase 2C.
+//! Runs the forward pass one layer at a time, reading back the
+//! activations between layers to find the first NaN-producing layer.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -10,11 +9,16 @@ use std::time::Instant;
 use ash::vk;
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 
+use vulkanforge::backend::vulkan::commands::CommandContext;
 use vulkanforge::backend::vulkan::device::VulkanDevice;
-use vulkanforge::backend::vulkan::gguf::{GgmlType, GgufFile, ModelConfig};
+use vulkanforge::backend::vulkan::forward::Forward;
+use vulkanforge::backend::vulkan::gguf::{GgufFile, ModelConfig};
+use vulkanforge::backend::vulkan::kv_cache::{KvCache, KvCacheConfig};
 use vulkanforge::backend::vulkan::loader::LoadedModel;
 use vulkanforge::backend::vulkan::pipeline_registry::{default_cache_path, PipelineRegistry};
-use vulkanforge::backend::vulkan::shaders::ALL_SHADERS;
+use vulkanforge::backend::vulkan::q4k;
+
+const MAX_SEQ_LEN: u32 = 2048;
 
 fn main() {
     if let Err(e) = run() {
@@ -24,11 +28,9 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    println!("VulkanForge v0.1.0 — Phase 2B demo");
+    println!("VulkanForge v0.1.0 — Phase 2C debug walk");
 
     let dev = VulkanDevice::new()?;
-    println!("✅ Vulkan device initialized");
-
     let mut allocator = Allocator::new(&AllocatorCreateDesc {
         instance: dev.instance.clone(),
         device: dev.device.clone(),
@@ -37,19 +39,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         buffer_device_address: false,
         allocation_sizes: gpu_allocator::AllocationSizes::default(),
     })?;
-    println!("✅ gpu_allocator initialized");
-
     let cache_path = default_cache_path();
-    let (registry, loaded_cache) = PipelineRegistry::new(&dev.device, cache_path.as_deref())?;
-    println!(
-        "✅ PipelineRegistry: {} shaders ({:.1} ms create, {} B cache loaded)",
-        registry.count(),
-        registry.create_duration.as_secs_f64() * 1000.0,
-        loaded_cache,
-    );
-    let _ = ALL_SHADERS;
+    let (registry, _) = PipelineRegistry::new(&dev.device, cache_path.as_deref())?;
+    let cmd_ctx = CommandContext::new(&dev.device, dev.queue_family_index)?;
 
-    // ---- GGUF: parse + introspect.
     let model_path = std::env::var("VF_MODEL_PATH")
         .ok()
         .map(PathBuf::from)
@@ -58,126 +51,218 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|h| PathBuf::from(h).join("models").join("Qwen3-8B-Q4_K_M.gguf"))
                 .expect("$HOME unset")
         });
-    println!("\n  GGUF: {}", model_path.display());
+    println!("  GGUF: {}", model_path.display());
 
-    let parse_started = Instant::now();
+    let parse_start = Instant::now();
     let gguf = GgufFile::open(&model_path)?;
-    let parse_dt = parse_started.elapsed();
-    println!(
-        "  parsed: {} tensors, {} metadata KVs, alignment {} B (parse {:.1} ms)",
-        gguf.tensor_count,
-        gguf.metadata.len(),
-        gguf.alignment,
-        parse_dt.as_secs_f64() * 1000.0,
-    );
-
     let cfg = ModelConfig::from_gguf(&gguf)?;
-    print_config(&cfg);
+    println!("  parsed in {:.1} ms", parse_start.elapsed().as_secs_f64() * 1000.0);
 
-    // Tensor inventory by quant type.
-    let (mut by_type, mut total_bytes): (std::collections::BTreeMap<&str, (u32, u64)>, u64) =
-        (std::collections::BTreeMap::new(), 0);
-    for info in gguf.tensors.values() {
-        let key = ggml_type_name(info.ggml_type);
-        let entry = by_type.entry(key).or_insert((0, 0));
-        entry.0 += 1;
-        entry.1 += info.byte_size();
-        total_bytes += info.byte_size();
-    }
-    println!(
-        "\n  Tensor inventory ({} tensors, total {:.2} GiB):",
-        gguf.tensors.len(),
-        (total_bytes as f64) / (1024.0 * 1024.0 * 1024.0),
-    );
-    for (ty, (count, bytes)) in &by_type {
-        println!(
-            "    {:<6}: {:>4} tensors, {:>10.2} MiB",
-            ty,
-            count,
-            (*bytes as f64) / (1024.0 * 1024.0)
-        );
-    }
-
-    // ---- Load every tensor to VRAM.
-    println!("\n  Uploading weights to VRAM (1-GiB staging buffer, batched)…");
+    let load_start = Instant::now();
     let model = LoadedModel::load(&dev, &mut allocator, &gguf)?;
     println!(
-        "✅ LoadedModel: {} tensors, {:.2} GiB uploaded in {:.1} s ({:.1} GB/s)",
+        "✅ {} tensors, {:.2} GiB in {:.1} s",
         model.tensors.len(),
         (model.bytes_uploaded as f64) / (1024.0 * 1024.0 * 1024.0),
-        model.upload_duration.as_secs_f64(),
-        (model.bytes_uploaded as f64 / 1e9) / model.upload_duration.as_secs_f64(),
+        load_start.elapsed().as_secs_f64()
     );
 
-    // Spot-check a couple tensors.
-    for name in [
-        "token_embd.weight",
-        "blk.0.attn_q.weight",
-        "blk.0.attn_q_norm.weight",
-        "blk.35.ffn_down.weight",
-        "output_norm.weight",
-    ] {
-        if let Some(t) = model.tensor(name) {
-            println!(
-                "  {:<35} shape={:?} type={:<5} {:>9} B",
-                name,
-                t.shape,
-                ggml_type_name(t.ggml_type),
-                t.byte_size,
-            );
-        } else {
-            println!("  {:<35} (missing)", name);
+    let kv_cache = KvCache::new(
+        &dev.device, &mut allocator,
+        KvCacheConfig {
+            n_layers: cfg.n_layers,
+            n_kv_heads: cfg.n_kv_heads,
+            head_dim: cfg.head_dim,
+            max_seq_len: MAX_SEQ_LEN,
+        },
+    )?;
+
+    let profiler = if std::env::var("VF_PROFILE").is_ok() {
+        Some(vulkanforge::backend::vulkan::profiler::ShaderProfiler::new(
+            &dev.instance, dev.physical_device, dev.queue_family_index, &dev.device, 1024,
+        )?)
+    } else {
+        None
+    };
+    let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), profiler)?;
+
+    // Initial input — choose by env var:
+    //   VF_INPUT=zero      → all zeros
+    //   VF_INPUT=linspace  → 0.02 * linspace(-0.5, 0.5)
+    //   VF_INPUT=embd      → real CPU-dequant of token_embd row (default)
+    //   VF_TOKEN=N         → token id for VF_INPUT=embd (default 9707)
+    let kind = std::env::var("VF_INPUT").unwrap_or_else(|_| "embd".into());
+    let token_id: u32 = std::env::var("VF_TOKEN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(9707);
+    let mut act: Vec<f32> = match kind.as_str() {
+        "zero" => vec![0.0; cfg.hidden_dim as usize],
+        "linspace" => (0..cfg.hidden_dim as usize)
+            .map(|i| 0.02 * ((i as f32) / (cfg.hidden_dim as f32) - 0.5))
+            .collect(),
+        _ => embedding_row(&gguf, &cfg, token_id)?,
+    };
+    println!(
+        "\n  layer-walk debug — initial input stats: {}",
+        stats(&act)
+    );
+
+    let position: u32 = 0;
+    let max_layers = std::env::var("VF_MAX_LAYERS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(cfg.n_layers);
+
+    // Optional intra-layer step debug for layer 0.
+    if std::env::var("VF_TRACE_L0").is_ok() {
+        use vulkanforge::backend::vulkan::forward::DebugTarget;
+        for tgt in [
+            DebugTarget::AttnNorm, DebugTarget::QProj, DebugTarget::KProj, DebugTarget::VProj,
+            DebugTarget::QNormRope, DebugTarget::KNormRope, DebugTarget::AttnOut,
+        ] {
+            let v = forward.forward_layer_debug_intermediate(
+                &dev, &registry, &cmd_ctx, &model,
+                0, position, &act, tgt,
+            )?;
+            println!("    layer 0, {:?}: {}", tgt, stats(&v));
         }
+        return Ok(());
     }
 
-    // ---- Cleanup.
-    let cache_stats = registry.save_cache(&dev.device);
-    if cache_stats.saved_bytes > 0 {
+    if std::env::var("VF_FULL").is_ok() {
+        // Full forward + LM head, like the Phase-2C demo proper.
+        let stats_obj = forward.forward_token(
+            &dev, &registry, &cmd_ctx, &model, &act, position,
+        )?;
+        let logits = forward.logits()?;
         println!(
-            "  Pipeline cache saved: {} B → {}",
-            cache_stats.saved_bytes,
-            cache_path.as_deref().map(|p| p.display().to_string()).unwrap_or_default()
+            "  Forward total: {:.2} ms",
+            stats_obj.total.as_secs_f64() * 1000.0
         );
+        if !stats_obj.per_shader.is_empty() {
+            let total_us: f64 = stats_obj.per_shader.values().map(|(d, _)| d.as_secs_f64() * 1e6).sum();
+            println!("  Per-shader breakdown ({} shader entries):", stats_obj.per_shader.len());
+            let mut bd: Vec<_> = stats_obj.per_shader.iter().collect();
+            bd.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+            for (name, (d, n)) in bd.iter().take(12) {
+                println!(
+                    "    {:<22} {:>4} calls  {:>9.3} µs  {:>5.1}%",
+                    name, n,
+                    d.as_secs_f64() * 1e6,
+                    d.as_secs_f64() * 1e6 / total_us * 100.0,
+                );
+            }
+            if !stats_obj.per_layer.is_empty() {
+                let lus: Vec<f64> = stats_obj.per_layer.iter().map(|d| d.as_secs_f64() * 1e6).collect();
+                let min = lus.iter().cloned().fold(f64::INFINITY, f64::min);
+                let max = lus.iter().cloned().fold(0.0_f64, f64::max);
+                let mean = lus.iter().sum::<f64>() / lus.len() as f64;
+                println!(
+                    "  Per-layer time (µs): min={:.0}  mean={:.0}  max={:.0}  ({} layers)",
+                    min, mean, max, lus.len()
+                );
+            }
+        }
+        let nan = logits.iter().any(|v| !v.is_finite());
+        println!(
+            "  Logits: {} elements  any NaN/Inf: {}",
+            logits.len(), nan
+        );
+        let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (rank, (idx, val)) in indexed[..10].iter().enumerate() {
+            println!("    #{:>2}  id={:>6}  logit={:.4}", rank + 1, idx, val);
+        }
+        forward.destroy(&dev.device, &mut allocator);
+        cmd_ctx.destroy(&dev.device);
+        model.destroy(&dev.device, &mut allocator);
+        registry.destroy(&dev.device);
+        drop(allocator);
+        let _ = vk::Buffer::null();
+        return Ok(());
     }
 
+    for layer in 0..max_layers {
+        let out = forward.forward_layer_debug(
+            &dev, &registry, &cmd_ctx, &model,
+            layer, position, &act,
+        )?;
+        let st = stats(&out);
+        let nan = st.contains("NaN") || st.contains("Inf");
+        let marker = if nan { "❌" } else { "✓ " };
+        println!("    layer {:>2}: {} {}", layer, marker, st);
+        if nan {
+            println!("\n  → first NaN-producing layer: {layer}");
+            // Dump first 16 values of the input and output to help
+            // narrow down WHICH dispatch in this layer caused it.
+            print!("    input[..8]:  ");
+            for v in &act[..8] { print!("{:>10.5} ", v); }
+            println!();
+            print!("    output[..8]: ");
+            for v in &out[..8] { print!("{:>10.5} ", v); }
+            println!();
+            break;
+        }
+        act = out;
+    }
+
+    forward.destroy(&dev.device, &mut allocator);
+    cmd_ctx.destroy(&dev.device);
     model.destroy(&dev.device, &mut allocator);
     registry.destroy(&dev.device);
     drop(allocator);
-    println!("✅ Phase 2B teardown clean");
+    let _ = vk::Buffer::null();
     Ok(())
 }
 
-fn print_config(c: &ModelConfig) {
-    println!("\n  ModelConfig:");
-    println!("    architecture        : {}", c.architecture);
-    println!("    n_layers            : {}", c.n_layers);
-    println!("    n_heads             : {}", c.n_heads);
-    println!("    n_kv_heads          : {} (GQA group size {})", c.n_kv_heads, c.n_heads / c.n_kv_heads);
-    println!("    hidden_dim          : {}", c.hidden_dim);
-    println!("    ffn_dim             : {}", c.ffn_dim);
-    println!("    head_dim            : {}", c.head_dim);
-    println!("    rope_freq_base      : {}", c.rope_freq_base);
-    println!("    context_length      : {}", c.context_length);
-    println!("    vocab_size          : {}", c.vocab_size);
-    println!("    rms_norm_eps        : {:e}", c.rms_norm_eps);
-    println!("    has_qk_norm         : {}", c.has_qk_norm);
+/// CPU-side embedding lookup: read a Q4_K row from token_embd.weight
+/// straight out of the mmap'd GGUF and dequantise to f32.
+fn embedding_row(
+    gguf: &GgufFile,
+    cfg: &ModelConfig,
+    token_id: u32,
+) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    let info = gguf
+        .tensor("token_embd.weight")
+        .ok_or("token_embd.weight not in GGUF")?;
+    let blocks_per_row = (cfg.hidden_dim as usize) / q4k::QUANT_K;
+    let row_bytes = blocks_per_row * q4k::BLOCK_BYTES;
+    let bytes = gguf.tensor_bytes(info);
+    let row_off = (token_id as usize) * row_bytes;
+    if row_off + row_bytes > bytes.len() {
+        return Err(format!("token_id {} out of range", token_id).into());
+    }
+    let mut out = Vec::with_capacity(cfg.hidden_dim as usize);
+    for b in 0..blocks_per_row {
+        let blk_off = row_off + b * q4k::BLOCK_BYTES;
+        let block: &[u8; q4k::BLOCK_BYTES] =
+            (&bytes[blk_off..blk_off + q4k::BLOCK_BYTES]).try_into().unwrap();
+        let dq = q4k::dequant_block(block);
+        out.extend_from_slice(&dq);
+    }
+    Ok(out)
 }
 
-fn ggml_type_name(t: GgmlType) -> &'static str {
-    match t {
-        GgmlType::F32 => "F32",
-        GgmlType::F16 => "F16",
-        GgmlType::Q4_0 => "Q4_0",
-        GgmlType::Q4_1 => "Q4_1",
-        GgmlType::Q5_0 => "Q5_0",
-        GgmlType::Q5_1 => "Q5_1",
-        GgmlType::Q8_0 => "Q8_0",
-        GgmlType::Q8_1 => "Q8_1",
-        GgmlType::Q2K => "Q2_K",
-        GgmlType::Q3K => "Q3_K",
-        GgmlType::Q4K => "Q4_K",
-        GgmlType::Q5K => "Q5_K",
-        GgmlType::Q6K => "Q6_K",
-        GgmlType::Q8K => "Q8_K",
+fn stats(v: &[f32]) -> String {
+    let n = v.len();
+    let nan = v.iter().any(|x| x.is_nan());
+    let inf = v.iter().any(|x| x.is_infinite());
+    let finite_n = v.iter().filter(|x| x.is_finite()).count();
+    if nan || inf {
+        return format!("len={n} NaN={nan} Inf={inf} finite={finite_n}/{n}");
     }
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    let mut sum = 0.0f64;
+    let mut sum_sq = 0.0f64;
+    for &x in v {
+        if x < min { min = x; }
+        if x > max { max = x; }
+        sum += x as f64;
+        sum_sq += (x as f64) * (x as f64);
+    }
+    let mean = sum / n as f64;
+    let std = (sum_sq / n as f64 - mean * mean).max(0.0).sqrt();
+    format!("len={n}  min={:.4}  mean={:.4}  std={:.4}  max={:.4}", min, mean, std, max)
 }

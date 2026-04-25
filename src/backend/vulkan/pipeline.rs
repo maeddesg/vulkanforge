@@ -164,6 +164,19 @@ pub struct RopePushConstants {
 }
 const _: () = assert!(std::mem::size_of::<RopePushConstants>() == 108);
 
+/// `scalar_attn.comp` push block. 5 × u32 + 1 × f32 = 24 B.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ScalarAttnPushConstants {
+    pub n_heads: u32,
+    pub n_kv_heads: u32,
+    pub head_dim: u32,
+    pub seq_len: u32,
+    pub max_seq: u32,
+    pub scale: f32,
+}
+const _: () = assert!(std::mem::size_of::<ScalarAttnPushConstants>() == 24);
+
 /// llama.cpp's `init_fastdiv_values`. Used by [`GenericUnaryPushConstants`]
 /// to populate the `ne*_*mp/L` fields — without these, `copy`'s SPIR-V
 /// fastdiv path divides by a magic-of-zero and produces garbage indices.

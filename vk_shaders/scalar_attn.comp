@@ -1,0 +1,74 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+// VulkanForge Phase 2C — single-token decode attention.
+//
+// One workgroup per Q-head, one thread per workgroup. Computes
+// scores = Q·K^T·scale, softmax(scores), then output = scores·V
+// for the head. Slow on purpose: correctness-first per Phase-2C
+// prompt §2.6.2. Phase-3 swaps this for Flash-Attention.
+
+layout (constant_id = 0) const uint MAX_SEQ = 2048;
+
+layout (local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer Q { float q[]; };  // [n_heads, head_dim]
+layout (binding = 1) readonly  buffer K { float k[]; };  // [pos, n_kv_heads, head_dim] — pos-major
+layout (binding = 2) readonly  buffer V { float v[]; };  // [pos, n_kv_heads, head_dim] — pos-major
+layout (binding = 3) writeonly buffer O { float o[]; };  // [n_heads, head_dim]
+
+layout (push_constant) uniform Params {
+    uint n_heads;       // 32
+    uint n_kv_heads;    // 8
+    uint head_dim;      // 128
+    uint seq_len;       // current context length (≤ MAX_SEQ)
+    uint max_seq;       // K/V row stride per head, in elements
+    float scale;        // 1 / sqrt(head_dim)
+} p;
+
+shared float scores[MAX_SEQ];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    if (h >= p.n_heads) {
+        return;
+    }
+    uint group_size = p.n_heads / p.n_kv_heads;   // = 4 for Qwen3 GQA
+    uint kvh = h / group_size;
+
+    uint q_off    = h   * p.head_dim;
+    uint o_off    = h   * p.head_dim;
+    uint pos_stride = p.n_kv_heads * p.head_dim;
+    uint head_off   = kvh * p.head_dim;
+
+    // Pass 1 — Q · K_t for every t, scaled.
+    float max_score = -1e30;
+    for (uint t = 0; t < p.seq_len; ++t) {
+        uint k_pos_off = t * pos_stride + head_off;
+        float s = 0.0;
+        for (uint d = 0; d < p.head_dim; ++d) {
+            s += q[q_off + d] * k[k_pos_off + d];
+        }
+        s *= p.scale;
+        scores[t] = s;
+        if (s > max_score) max_score = s;
+    }
+
+    // Pass 2 — softmax.
+    float sum = 0.0;
+    for (uint t = 0; t < p.seq_len; ++t) {
+        scores[t] = exp(scores[t] - max_score);
+        sum += scores[t];
+    }
+    float inv_sum = 1.0 / sum;
+
+    // Pass 3 — weighted V sum.
+    for (uint d = 0; d < p.head_dim; ++d) {
+        float acc = 0.0;
+        for (uint t = 0; t < p.seq_len; ++t) {
+            uint v_pos_off = t * pos_stride + head_off;
+            acc += scores[t] * inv_sum * v[v_pos_off + d];
+        }
+        o[o_off + d] = acc;
+    }
+}

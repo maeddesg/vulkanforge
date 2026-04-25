@@ -118,6 +118,15 @@ impl PipelineRegistry {
                 ShaderId::Silu | ShaderId::Copy | ShaderId::RopeNorm | ShaderId::RopeNeox => {
                     ComputeKernel::from_spv(device, &words, cache)
                 }
+                ShaderId::ScalarAttn => {
+                    // SpecId 0 = MAX_SEQ — sets the size of the
+                    // shared `scores[]` buffer. 2048 covers Phase-2
+                    // contexts; bump in Phase 3 for longer windows.
+                    let data: [u32; 1] = [2048];
+                    let entries = [entry(0, 0, 4)];
+                    let bytes = bytemuck::bytes_of(&data);
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
+                }
             };
             let kernel = match result {
                 Ok(k) => k,

@@ -15,7 +15,7 @@ use vulkanforge::backend::vulkan::device::VulkanDevice;
 use vulkanforge::backend::vulkan::pipeline::{
     init_fastdiv_values, ComputeKernel, GenericBinaryPushConstants,
     GenericHeadPushConstants, GenericUnaryPushConstants, RopePushConstants,
-    SoftMaxPushConstants,
+    ScalarAttnPushConstants, SoftMaxPushConstants,
 };
 use vulkanforge::backend::vulkan::pipeline_registry::PipelineRegistry;
 use vulkanforge::backend::vulkan::shaders::ShaderId;
@@ -508,6 +508,232 @@ fn rope_neox_case(pos: i32, abs_threshold: f32) {
         &gpu[..8],
         &cpu[..8]
     );
+    fix.teardown();
+}
+
+/// Phase-2C diagnostic: same as `test_scalar_attn_qwen3_dims_seq1`
+/// but bind K and V with a non-zero descriptor offset and an
+/// explicit range (matches what `Forward` does to slice per-layer
+/// K/V out of the multi-layer cache buffer).
+#[test]
+fn test_scalar_attn_qwen3_dims_with_binding_offset() {
+    let mut fix = Fixture::new();
+    let n_heads: u32 = 32;
+    let n_kv_heads: u32 = 8;
+    let head_dim: u32 = 128;
+    let max_seq: u32 = 2048;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    let q = vec![0.1f32; (n_heads * head_dim) as usize];
+    // 2-layer-equivalent buffer; bind starting at layer 1's offset.
+    let layer_size = (max_seq * n_kv_heads * head_dim) as usize;
+    let mut k_full = vec![999.0f32; layer_size * 2]; // layer 0 = garbage
+    let mut v_full = vec![999.0f32; layer_size * 2];
+    for i in 0..layer_size {
+        k_full[layer_size + i] = 0.1; // layer 1 K
+        v_full[layer_size + i] = 1.0; // layer 1 V
+    }
+    let q_h = fix.host_buffer_f32(&q, "q");
+    let k_h = fix.host_buffer_f32(&k_full, "k");
+    let v_h = fix.host_buffer_f32(&v_full, "v");
+    let o_h = fix.output_buffer_f32((n_heads * head_dim) as usize, "o");
+
+    // Manually craft the descriptor set: offset=layer 1, range=layer_size_bytes.
+    let kernel: &ComputeKernel = fix.registry().get(ShaderId::ScalarAttn);
+    let pool_sizes = [vk::DescriptorPoolSize {
+        ty: vk::DescriptorType::STORAGE_BUFFER,
+        descriptor_count: 4,
+    }];
+    let pool_info = vk::DescriptorPoolCreateInfo::default()
+        .max_sets(1)
+        .pool_sizes(&pool_sizes);
+    let pool = unsafe { fix.dev.device.create_descriptor_pool(&pool_info, None) }.unwrap();
+    let layouts = [kernel.descriptor_set_layout];
+    let alloc = vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(pool)
+        .set_layouts(&layouts);
+    let set = unsafe { fix.dev.device.allocate_descriptor_sets(&alloc) }.unwrap()[0];
+
+    let layer_off_bytes = (layer_size * 4) as u64;
+    let layer_range_bytes = (layer_size * 4) as u64;
+    let infos = [
+        vk::DescriptorBufferInfo { buffer: q_h, offset: 0, range: vk::WHOLE_SIZE },
+        vk::DescriptorBufferInfo { buffer: k_h, offset: layer_off_bytes, range: layer_range_bytes },
+        vk::DescriptorBufferInfo { buffer: v_h, offset: layer_off_bytes, range: layer_range_bytes },
+        vk::DescriptorBufferInfo { buffer: o_h, offset: 0, range: vk::WHOLE_SIZE },
+    ];
+    let writes: [vk::WriteDescriptorSet; 4] = std::array::from_fn(|i| {
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(i as u32)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&infos[i..i + 1])
+    });
+    unsafe { fix.dev.device.update_descriptor_sets(&writes, &[]) };
+
+    let pc = ScalarAttnPushConstants {
+        n_heads, n_kv_heads, head_dim,
+        seq_len: 1,
+        max_seq, scale,
+    };
+    let device = fix.dev.device.clone();
+    let queue = fix.dev.compute_queue;
+    let pipeline = kernel.pipeline;
+    let layout = kernel.pipeline_layout;
+    fix.cmd_ctx().one_shot(&device, queue, |cmd| unsafe {
+        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+        device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE,
+            layout, 0, &[set], &[]);
+        device.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE,
+            0, bytemuck::bytes_of(&pc));
+        device.cmd_dispatch(cmd, n_heads, 1, 1);
+        // post-barrier
+        let post = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(o_h)
+            .offset(0)
+            .size(vk::WHOLE_SIZE);
+        device.cmd_pipeline_barrier(cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            &[], std::slice::from_ref(&post), &[]);
+    }).unwrap();
+    unsafe { fix.dev.device.destroy_descriptor_pool(pool, None) };
+
+    let gpu = fix.read_output(o_h, (n_heads * head_dim) as usize);
+    let nan = gpu.iter().any(|x| !x.is_finite());
+    let max_abs_from_one = gpu.iter().map(|&x| (x - 1.0).abs()).fold(0.0f32, f32::max);
+    assert!(!nan,
+        "scalar_attn with binding offset produced NaN/Inf — first 8: {:?}",
+        &gpu[..8]);
+    assert!(max_abs_from_one < 1e-5,
+        "scalar_attn with binding offset wrong — max_abs_from_one = {max_abs_from_one}");
+    fix.teardown();
+}
+
+/// Phase-2C diagnostic: scalar_attn at full Qwen3 dimensions
+/// (32 heads, 8 kv-heads, head_dim=128) — match the forward path
+/// to expose dim-dependent bugs.
+#[test]
+fn test_scalar_attn_qwen3_dims_seq1() {
+    let mut fix = Fixture::new();
+    let n_heads: u32 = 32;
+    let n_kv_heads: u32 = 8;
+    let head_dim: u32 = 128;
+    let max_seq: u32 = 2048;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    let q = vec![0.1f32; (n_heads * head_dim) as usize];
+    let kv_size = (max_seq * n_kv_heads * head_dim) as usize;
+    let k = vec![0.1f32; kv_size];
+    let v = vec![1.0f32; kv_size];
+
+    let q_h = fix.host_buffer_f32(&q, "q");
+    let k_h = fix.host_buffer_f32(&k, "k");
+    let v_h = fix.host_buffer_f32(&v, "v");
+    let o_h = fix.output_buffer_f32((n_heads * head_dim) as usize, "o");
+    let pc = ScalarAttnPushConstants {
+        n_heads, n_kv_heads, head_dim,
+        seq_len: 1,
+        max_seq, scale,
+    };
+    fix.dispatch(ShaderId::ScalarAttn, &[q_h, k_h, v_h, o_h],
+                 bytemuck::bytes_of(&pc), (n_heads, 1, 1));
+    let gpu = fix.read_output(o_h, (n_heads * head_dim) as usize);
+    let nan = gpu.iter().any(|x| !x.is_finite());
+    let max_abs_from_one = gpu.iter().map(|&x| (x - 1.0).abs()).fold(0.0f32, f32::max);
+    assert!(!nan, "scalar_attn(qwen3 dims, seq=1) produced NaN/Inf\nfirst 8: {:?}", &gpu[..8]);
+    assert!(max_abs_from_one < 1e-5, "max_abs_from_one = {max_abs_from_one}");
+    fix.teardown();
+}
+
+/// Phase-2C diagnostic: scalar_attn with seq_len=2 to see if the
+/// across-token loop produces NaN.
+#[test]
+fn test_scalar_attn_two_tokens() {
+    let mut fix = Fixture::new();
+    let n_heads: u32 = 4;
+    let n_kv_heads: u32 = 2;
+    let head_dim: u32 = 32;
+    let max_seq: u32 = 2048;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    let q = vec![0.1f32; (n_heads * head_dim) as usize];
+    let kv_size = (max_seq * n_kv_heads * head_dim) as usize;
+    let mut k = vec![0.1f32; kv_size];
+    let mut v = vec![1.0f32; kv_size];
+    // pos=1 has different values to make the test non-trivial.
+    let pos1_off = (n_kv_heads * head_dim) as usize;
+    for i in 0..(n_kv_heads * head_dim) as usize {
+        k[pos1_off + i] = 0.2;
+        v[pos1_off + i] = 2.0;
+    }
+
+    let q_h = fix.host_buffer_f32(&q, "q");
+    let k_h = fix.host_buffer_f32(&k, "k");
+    let v_h = fix.host_buffer_f32(&v, "v");
+    let o_h = fix.output_buffer_f32((n_heads * head_dim) as usize, "o");
+    let pc = ScalarAttnPushConstants {
+        n_heads, n_kv_heads, head_dim,
+        seq_len: 2,
+        max_seq, scale,
+    };
+    fix.dispatch(ShaderId::ScalarAttn, &[q_h, k_h, v_h, o_h],
+                 bytemuck::bytes_of(&pc), (n_heads, 1, 1));
+    let gpu = fix.read_output(o_h, (n_heads * head_dim) as usize);
+    let nan = gpu.iter().any(|x| !x.is_finite());
+    assert!(!nan, "scalar_attn(seq=2) produced NaN/Inf");
+    fix.teardown();
+}
+
+/// Phase-2C diagnostic: scalar_attn with single-token KV (seq_len=1)
+/// and known Q/K/V values. With Q=0.1, K=0.1, V=1.0:
+///   score[0] = dot(Q, K) * scale = 128*0.01 / sqrt(128) ≈ 0.113
+///   softmax(scores) = [1.0]   (single element)
+///   output[d] = 1.0 * V[0, d] = 1.0 for all d.
+#[test]
+fn test_scalar_attn_single_token() {
+    let mut fix = Fixture::new();
+    let n_heads: u32 = 4;
+    let n_kv_heads: u32 = 2;
+    let head_dim: u32 = 32;
+    let max_seq: u32 = 2048;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    let q = vec![0.1f32; (n_heads * head_dim) as usize];
+    // Pos-major K/V layout: [pos, kv_head, dim]
+    let kv_size = (max_seq * n_kv_heads * head_dim) as usize;
+    let k = vec![0.1f32; kv_size];
+    let v = vec![1.0f32; kv_size];
+
+    let q_h = fix.host_buffer_f32(&q, "q");
+    let k_h = fix.host_buffer_f32(&k, "k");
+    let v_h = fix.host_buffer_f32(&v, "v");
+    let o_h = fix.output_buffer_f32((n_heads * head_dim) as usize, "o");
+
+    let pc = ScalarAttnPushConstants {
+        n_heads, n_kv_heads, head_dim,
+        seq_len: 1,
+        max_seq, scale,
+    };
+    fix.dispatch(ShaderId::ScalarAttn, &[q_h, k_h, v_h, o_h],
+                 bytemuck::bytes_of(&pc), (n_heads, 1, 1));
+    let gpu = fix.read_output(o_h, (n_heads * head_dim) as usize);
+
+    let nan = gpu.iter().any(|x| !x.is_finite());
+    assert!(!nan, "scalar_attn produced NaN/Inf with bounded input");
+    let max_abs = gpu
+        .iter()
+        .map(|&x| (x - 1.0).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_abs < 1e-5,
+            "scalar_attn(seq=1, K=0.1, V=1.0) max_abs from 1.0 = {max_abs:e}\n\
+             gpu first 8: {:?}",
+            &gpu[..8]);
     fix.teardown();
 }
 

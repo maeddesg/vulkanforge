@@ -19,6 +19,7 @@ pub enum ShaderId {
     Silu,
     SoftMax,
     Copy,
+    ScalarAttn,
 }
 
 impl ShaderId {
@@ -34,6 +35,7 @@ impl ShaderId {
             ShaderId::Silu => "silu_f32",
             ShaderId::SoftMax => "soft_max_f32",
             ShaderId::Copy => "copy_f32_f32",
+            ShaderId::ScalarAttn => "scalar_attn_f32",
         }
     }
 
@@ -49,6 +51,7 @@ impl ShaderId {
             ShaderId::Silu => SILU_F32,
             ShaderId::SoftMax => SOFT_MAX_F32,
             ShaderId::Copy => COPY_F32_F32,
+            ShaderId::ScalarAttn => SCALAR_ATTN_F32,
         }
     }
 }
@@ -64,6 +67,7 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::Silu,
     ShaderId::SoftMax,
     ShaderId::Copy,
+    ShaderId::ScalarAttn,
 ];
 
 pub const MUL_MAT_VEC_Q4_K_F32_F32: &[u8] =
@@ -78,6 +82,8 @@ pub const MUL_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_f32.spv
 pub const SILU_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silu_f32.spv"));
 pub const SOFT_MAX_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/soft_max_f32.spv"));
 pub const COPY_F32_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/copy_f32_f32.spv"));
+pub const SCALAR_ATTN_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/scalar_attn_f32.spv"));
 
 /// Decode a SPIR-V byte blob into u32 words. Vulkan consumes SPIR-V
 /// as `&[u32]`; `include_bytes!` only gives us `&[u8]` whose alignment

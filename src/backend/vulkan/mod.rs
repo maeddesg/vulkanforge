@@ -1,10 +1,13 @@
 pub mod buffers;
 pub mod commands;
 pub mod device;
+pub mod forward;
 pub mod gguf;
+pub mod kv_cache;
 pub mod loader;
 pub mod pipeline;
 pub mod pipeline_registry;
+pub mod profiler;
 pub mod q4k;
 pub mod shaders;
 pub mod spirv_reflect;
