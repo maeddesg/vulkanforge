@@ -56,27 +56,87 @@ impl CommandContext {
     where
         F: FnOnce(vk::CommandBuffer),
     {
+        self.one_shot_profiled(device, queue, record).map(|_| ())
+    }
+
+    /// Same as `one_shot` but returns the wall-time breakdown for the
+    /// reset / begin / record / end / submit / wait phases. Used by
+    /// Phase-5A profiling (where exactly does the per-token CPU
+    /// overhead live?).
+    pub fn one_shot_profiled<F>(
+        &self,
+        device: &ash::Device,
+        queue: vk::Queue,
+        record: F,
+    ) -> Result<OneShotTimings, Box<dyn std::error::Error>>
+    where
+        F: FnOnce(vk::CommandBuffer),
+    {
+        use std::time::Instant;
         let cmd = self.cmd;
         let fence = self.fence;
 
+        let t = Instant::now();
         unsafe {
-            // Reset command buffer + fence for this dispatch.
             device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
             device.reset_fences(std::slice::from_ref(&fence))?;
         }
+        let reset = t.elapsed();
 
+        let t = Instant::now();
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe { device.begin_command_buffer(cmd, &begin)? };
-        record(cmd);
-        unsafe { device.end_command_buffer(cmd)? };
+        let begin_t = t.elapsed();
 
+        let t = Instant::now();
+        record(cmd);
+        let record_t = t.elapsed();
+
+        let t = Instant::now();
+        unsafe { device.end_command_buffer(cmd)? };
+        let end_t = t.elapsed();
+
+        let t = Instant::now();
         let cmds_arr = [cmd];
         let submit = vk::SubmitInfo::default().command_buffers(&cmds_arr);
         unsafe {
             device.queue_submit(queue, std::slice::from_ref(&submit), fence)?;
+        }
+        let submit_t = t.elapsed();
+
+        let t = Instant::now();
+        unsafe {
             device.wait_for_fences(&[fence], true, u64::MAX)?;
         }
-        Ok(())
+        let wait_t = t.elapsed();
+
+        Ok(OneShotTimings {
+            reset,
+            begin: begin_t,
+            record: record_t,
+            end: end_t,
+            submit: submit_t,
+            wait: wait_t,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OneShotTimings {
+    pub reset: std::time::Duration,
+    pub begin: std::time::Duration,
+    pub record: std::time::Duration,
+    pub end: std::time::Duration,
+    pub submit: std::time::Duration,
+    pub wait: std::time::Duration,
+}
+
+impl OneShotTimings {
+    pub fn cpu_recording(&self) -> std::time::Duration {
+        self.reset + self.begin + self.record + self.end + self.submit
+    }
+    pub fn total(&self) -> std::time::Duration {
+        self.reset + self.begin + self.record + self.end + self.submit + self.wait
     }
 }

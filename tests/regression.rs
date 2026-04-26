@@ -959,3 +959,101 @@ fn phase1_q4k_smoke_dispatch_bit_exact() {
     registry.destroy(&dev.device);
     drop(allocator);
 }
+
+/// Phase 5A-2 Stage 2D — descriptor-set cache parity.
+///
+/// Two `Forward` instances run the same 16-token sequence on Qwen3-8B:
+/// one with `cache_enabled=false` (Direct-Path), one with
+/// `cache_enabled=true` (CB-Reuse). Per-position logits must agree
+/// within `< 1e-6` max abs error, and the argmax must be identical
+/// at every step.
+#[test]
+fn phase5a_cb_reuse_parity_qwen3() {
+    let Some(path) = qwen3_path() else { return };
+    let dev = VulkanDevice::new().expect("VulkanDevice::new");
+    let mut allocator = Allocator::new(&AllocatorCreateDesc {
+        instance: dev.instance.clone(),
+        device: dev.device.clone(),
+        physical_device: dev.physical_device,
+        debug_settings: gpu_allocator::AllocatorDebugSettings::default(),
+        buffer_device_address: false,
+        allocation_sizes: gpu_allocator::AllocationSizes::default(),
+    })
+    .expect("Allocator::new");
+    let (registry, _) = PipelineRegistry::new(&dev.device, None).expect("registry");
+    let cmd_ctx = CommandContext::new(&dev.device, dev.queue_family_index).expect("cmd_ctx");
+    let gguf = GgufFile::open(&path).expect("open");
+    let cfg = ModelConfig::from_gguf(&gguf).expect("config");
+    let model = LoadedModel::load(&dev, &mut allocator, &gguf).expect("load");
+
+    // Use a varied token sequence so we exercise different embedding
+    // values and different attention positions.
+    let token_seq: Vec<u32> = (0..16u32).map(|i| (i * 1009 + 13) % 100_000).collect();
+
+    // ---- Path A: cache disabled (Direct-Path) ----
+    let kv_a = KvCache::new(&dev.device, &mut allocator, KvCacheConfig {
+        n_layers: cfg.n_layers, n_kv_heads: cfg.n_kv_heads,
+        head_dim: cfg.head_dim, max_seq_len: 256,
+    }).expect("kv_a");
+    let mut fwd_a = Forward::new(&dev, &mut allocator, kv_a, cfg.clone(), None)
+        .expect("forward_a");
+    fwd_a.set_cache_enabled(false);
+    let mut logits_a: Vec<Vec<f32>> = Vec::with_capacity(token_seq.len());
+    for (pos, &tid) in token_seq.iter().enumerate() {
+        let embd = embedding_row(&gguf, &cfg, tid).expect("embd_a");
+        fwd_a.forward_token(&dev, &registry, &cmd_ctx, &model, &embd, pos as u32)
+            .expect("fwd_a step");
+        logits_a.push(fwd_a.logits().expect("logits_a"));
+    }
+    fwd_a.destroy(&dev.device, &mut allocator);
+
+    // ---- Path B: cache enabled (CB-Reuse) ----
+    let kv_b = KvCache::new(&dev.device, &mut allocator, KvCacheConfig {
+        n_layers: cfg.n_layers, n_kv_heads: cfg.n_kv_heads,
+        head_dim: cfg.head_dim, max_seq_len: 256,
+    }).expect("kv_b");
+    let mut fwd_b = Forward::new(&dev, &mut allocator, kv_b, cfg.clone(), None)
+        .expect("forward_b");
+    fwd_b.set_cache_enabled(true);
+    assert!(fwd_b.cache_enabled(), "set_cache_enabled(true) didn't stick");
+    let mut logits_b: Vec<Vec<f32>> = Vec::with_capacity(token_seq.len());
+    for (pos, &tid) in token_seq.iter().enumerate() {
+        let embd = embedding_row(&gguf, &cfg, tid).expect("embd_b");
+        fwd_b.forward_token(&dev, &registry, &cmd_ctx, &model, &embd, pos as u32)
+            .expect("fwd_b step");
+        logits_b.push(fwd_b.logits().expect("logits_b"));
+    }
+    fwd_b.destroy(&dev.device, &mut allocator);
+
+    // ---- Compare ----
+    assert_eq!(logits_a.len(), logits_b.len());
+    let argmax = |v: &[f32]| -> usize {
+        v.iter().enumerate()
+            .max_by(|x, y| x.1.partial_cmp(y.1).unwrap()).unwrap().0
+    };
+    for (pos, (la, lb)) in logits_a.iter().zip(logits_b.iter()).enumerate() {
+        assert_eq!(la.len(), lb.len(), "logits len mismatch at pos {pos}");
+        let mut max_abs = 0f32;
+        for (&a, &b) in la.iter().zip(lb.iter()) {
+            let d = (a - b).abs();
+            if d > max_abs { max_abs = d; }
+        }
+        let am_a = argmax(la);
+        let am_b = argmax(lb);
+        eprintln!(
+            "[parity] pos={:>2}  max_abs_err={:.3e}  argmax_a={}  argmax_b={}",
+            pos, max_abs, am_a, am_b,
+        );
+        assert!(
+            max_abs < 1e-6,
+            "Stage 2D parity break at pos {pos}: max abs err {max_abs:.6e} ≥ 1e-6 \
+             — the cache must produce IDENTICAL logits to the direct path",
+        );
+        assert_eq!(am_a, am_b, "argmax differs at pos {pos}: {am_a} vs {am_b}");
+    }
+
+    cmd_ctx.destroy(&dev.device);
+    model.destroy(&dev.device, &mut allocator);
+    registry.destroy(&dev.device);
+    drop(allocator);
+}

@@ -23,10 +23,11 @@
 //!         residual1 + Wdown_out ──→ next-layer input
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use ash::vk;
+use ash::vk::Handle;
 use gpu_allocator::MemoryLocation;
 use gpu_allocator::vulkan::Allocator;
 
@@ -46,6 +47,62 @@ use super::pipeline_registry::PipelineRegistry;
 use super::profiler::{ShaderProfiler, TimingSample};
 use super::shaders::ShaderId;
 
+// ---- Phase 5A-2 Stage 2D: descriptor-set cache key ----
+//
+// We cache a `vk::DescriptorSet` per unique binding signature to avoid
+// the per-dispatch `vkAllocateDescriptorSets` + `vkUpdateDescriptorSets`
+// pair on the decode hot path. Buffer handles, offsets and ranges are
+// stable across tokens (only buffer *contents* change), so the same
+// pre-written set can be re-bound for every token.
+//
+// The signature key is fixed-size (no allocation) so HashMap insert
+// + lookup stay cheap. `MAX_BINDINGS_PER_SET = 8` covers our largest
+// shader (`flash_attn_split.comp` uses 6 bindings).
+
+const MAX_BINDINGS_PER_SET: usize = 8;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+struct BindingEntry {
+    binding: u32,
+    buffer: u64,
+    offset: u64,
+    range: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct BindingSignature {
+    layout: u64,
+    n: u8,
+    entries: [BindingEntry; MAX_BINDINGS_PER_SET],
+}
+
+impl BindingSignature {
+    fn new(
+        layout: vk::DescriptorSetLayout,
+        bindings: &[(u32, vk::Buffer, vk::DeviceSize, vk::DeviceSize)],
+    ) -> Self {
+        assert!(
+            bindings.len() <= MAX_BINDINGS_PER_SET,
+            "BindingSignature: {} > MAX_BINDINGS_PER_SET={}",
+            bindings.len(), MAX_BINDINGS_PER_SET,
+        );
+        let mut entries = [BindingEntry::default(); MAX_BINDINGS_PER_SET];
+        for (i, &(b, buf, off, range)) in bindings.iter().enumerate() {
+            entries[i] = BindingEntry {
+                binding: b,
+                buffer: buf.as_raw(),
+                offset: off,
+                range,
+            };
+        }
+        Self {
+            layout: layout.as_raw(),
+            n: bindings.len() as u8,
+            entries,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DebugTarget {
     AttnNorm,
@@ -62,6 +119,42 @@ pub struct ForwardStats {
     pub per_shader: BTreeMap<String, (Duration, u32)>,
     pub per_layer: Vec<Duration>,
     pub samples: Vec<TimingSample>,
+}
+
+/// CPU-side time breakdown of one `forward_token` call. Phase 5A-2
+/// uses this to localise the per-token overhead.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ForwardTokenProfile {
+    /// `embedding` upload + RoPE-pos write + descriptor-pool reset.
+    pub pre_setup: Duration,
+    /// `vkResetCommandBuffer` + fence reset.
+    pub reset: Duration,
+    /// `vkBeginCommandBuffer`.
+    pub begin: Duration,
+    /// The whole record block — every per-layer Rust setup (HashMap
+    /// pipeline lookup, push-constants struct build, dispatch-dim
+    /// math) plus every `vkCmdBindPipeline` / `vkCmdPushConstants` /
+    /// `vkCmdDispatch` / `vkCmdPipelineBarrier` call.
+    pub record: Duration,
+    /// `vkEndCommandBuffer`.
+    pub end: Duration,
+    /// `vkQueueSubmit` (host-side; does not include GPU work).
+    pub submit: Duration,
+    /// `vkWaitForFences` — pure GPU wall-clock until the queue drains.
+    pub gpu_wait: Duration,
+    /// Logits readback (`read_bytes` from host-visible buffer + cast).
+    pub readback: Duration,
+}
+
+impl ForwardTokenProfile {
+    /// Sum of all CPU phases (everything except `gpu_wait`).
+    pub fn cpu_total(&self) -> Duration {
+        self.pre_setup + self.reset + self.begin + self.record + self.end
+            + self.submit + self.readback
+    }
+    pub fn total(&self) -> Duration {
+        self.cpu_total() + self.gpu_wait
+    }
 }
 
 pub struct Forward {
@@ -91,6 +184,12 @@ pub struct Forward {
     pub config: ModelConfig,
 
     descriptor_pool: vk::DescriptorPool,
+    /// Phase 5A-2 Stage 2D: descriptor-set cache for the
+    /// `forward_token` hot path. When `cache_enabled` is true (env
+    /// `VULKANFORGE_CB_REUSE=1` at construction), `alloc_or_get_set`
+    /// reuses sets across tokens instead of resetting the pool.
+    set_cache: HashMap<BindingSignature, vk::DescriptorSet>,
+    cache_enabled: bool,
     pub profiler: Option<ShaderProfiler>,
 
     rope_theta_scale: f32,
@@ -266,8 +365,14 @@ impl Forward {
         // attention-loop sets + 2 residuals.
         // For max_pp = 256: (14 + 5*256 + 2) × 36 = 46656; round up.
         let per_layer_sets = 16 + 5 * max_prefill_tokens.max(1);
-        let dispatches = per_layer_sets * config.n_layers + 64;
-        let max_descriptors = dispatches * 5;
+        // Phase 5A-2 Stage 2D: when CB-reuse is on, the pool is no
+        // longer reset between forwards — sets accumulate in the cache
+        // for the lifetime of the Forward instance. Headroom of 4×
+        // covers the worst case (a prefill_batch run that fills the
+        // attention-loop bucket, followed by many decode tokens that
+        // populate the per-(layer,slot) bucket).
+        let dispatches = (per_layer_sets * config.n_layers + 64) * 4;
+        let max_descriptors = dispatches * 8;
         let pool_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
             descriptor_count: max_descriptors,
@@ -276,6 +381,13 @@ impl Forward {
             .max_sets(dispatches)
             .pool_sizes(&pool_sizes);
         let descriptor_pool = unsafe { device.create_descriptor_pool(&pool_info, None)? };
+
+        let cache_enabled = std::env::var("VULKANFORGE_CB_REUSE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        // Note for tests: callers that need to override the env-var
+        // pick can use `set_cache_enabled` after construction.
 
         let attn_scale = 1.0_f32 / (config.head_dim as f32).sqrt();
         let rope_theta_scale =
@@ -290,6 +402,8 @@ impl Forward {
             rope_pos_buf, rope_ff_buf, rope_idx_buf,
             kv_cache, config,
             descriptor_pool,
+            set_cache: HashMap::new(),
+            cache_enabled,
             profiler,
             rope_theta_scale, attn_scale,
             fa_scratch_out, fa_scratch_max, fa_scratch_sum,
@@ -297,6 +411,185 @@ impl Forward {
             batch_input, batch_residual, batch_norm, batch_q8,
             batch_q, batch_k, batch_v, batch_attn_out, batch_o,
             batch_gate, batch_up, batch_ffn_hidden, batch_ffn_out,
+        })
+    }
+
+    /// Phase 5A-2 drill-down: same wall-time semantics as
+    /// `forward_token_profile` but additionally captures, INSIDE the
+    /// command-buffer record block, per-layer wall time and a tally of
+    /// `dispatch_final`'s wall time. Use this to decide whether
+    /// command-buffer reuse should target the Rust-side per-layer
+    /// setup (HashMap lookup, push-constants struct build) or the raw
+    /// `vkCmd*` call cost.
+    pub fn forward_token_profile_layers(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd_ctx: &CommandContext,
+        model: &LoadedModel,
+        embedding: &[f32],
+        position: u32,
+    ) -> Result<(ForwardTokenProfile, Vec<Duration>, Duration), Box<dyn std::error::Error>> {
+        use std::time::Instant;
+        let pre_start = Instant::now();
+        if embedding.len() != self.config.hidden_dim as usize {
+            return Err("embedding length mismatch".into());
+        }
+        self.scratch_a.write_bytes(bytemuck::cast_slice(embedding))?;
+        self.rope_pos_buf
+            .write_bytes(bytemuck::bytes_of(&(position as u32)))?;
+        // Phase 5A-2 Stage 2D: skip the per-forward pool reset when
+        // CB-reuse is on — cached sets stay alive across tokens.
+        if !self.cache_enabled {
+            unsafe {
+                dev.device.reset_descriptor_pool(
+                    self.descriptor_pool, vk::DescriptorPoolResetFlags::empty(),
+                )?;
+            }
+        }
+        let pre_setup = pre_start.elapsed();
+
+        let n_layers = self.config.n_layers as usize;
+        let mut per_layer: Vec<Duration> = Vec::with_capacity(n_layers);
+        let mut final_dispatch = Duration::ZERO;
+
+        let timings = cmd_ctx.one_shot_profiled(&dev.device, dev.compute_queue, |cmd| {
+            let mut input = self.scratch_a.handle;
+            let mut output = self.scratch_b.handle;
+            for layer in 0..self.config.n_layers {
+                let t = Instant::now();
+                self.dispatch_layer(dev, registry, cmd, model, layer, position, input, output);
+                per_layer.push(t.elapsed());
+                std::mem::swap(&mut input, &mut output);
+            }
+            let t = Instant::now();
+            self.dispatch_final(dev, registry, cmd, model, input);
+            let post = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.logits_buf.handle)
+                .offset(0)
+                .size(vk::WHOLE_SIZE);
+            unsafe {
+                dev.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &[], &[post], &[],
+                );
+            }
+            final_dispatch = t.elapsed();
+        })?;
+
+        let read_start = Instant::now();
+        let bytes = self.logits_buf.read_bytes()?;
+        let _logits = bytemuck::cast_slice::<u8, f32>(
+            &bytes[..(self.config.vocab_size as usize) * 4],
+        )
+        .to_vec();
+        let readback = read_start.elapsed();
+
+        self.kv_cache.current_seq_len = position + 1;
+
+        let profile = ForwardTokenProfile {
+            pre_setup,
+            reset: timings.reset,
+            begin: timings.begin,
+            record: timings.record,
+            end: timings.end,
+            submit: timings.submit,
+            gpu_wait: timings.wait,
+            readback,
+        };
+        Ok((profile, per_layer, final_dispatch))
+    }
+
+    /// Like [`forward_token`] but returns a CPU-time breakdown
+    /// (host setup / record / submit / GPU-wait / readback). Phase-5A
+    /// profiling: feeds the "where do the 3.3 ms go" question with
+    /// real numbers so the optimisation target is data-driven.
+    pub fn forward_token_profile(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd_ctx: &CommandContext,
+        model: &LoadedModel,
+        embedding: &[f32],
+        position: u32,
+    ) -> Result<ForwardTokenProfile, Box<dyn std::error::Error>> {
+        use std::time::Instant;
+        let pre_start = Instant::now();
+        if embedding.len() != self.config.hidden_dim as usize {
+            return Err(format!(
+                "embedding length {} != hidden_dim {}",
+                embedding.len(),
+                self.config.hidden_dim
+            )
+            .into());
+        }
+        self.scratch_a.write_bytes(bytemuck::cast_slice(embedding))?;
+        self.rope_pos_buf
+            .write_bytes(bytemuck::bytes_of(&(position as u32)))?;
+        // Phase 5A-2 Stage 2D: skip the per-forward pool reset when
+        // CB-reuse is on — cached sets stay alive across tokens.
+        if !self.cache_enabled {
+            unsafe {
+                dev.device.reset_descriptor_pool(
+                    self.descriptor_pool, vk::DescriptorPoolResetFlags::empty(),
+                )?;
+            }
+        }
+        let pre_setup = pre_start.elapsed();
+
+        let timings = cmd_ctx.one_shot_profiled(&dev.device, dev.compute_queue, |cmd| {
+            let mut input = self.scratch_a.handle;
+            let mut output = self.scratch_b.handle;
+            for layer in 0..self.config.n_layers {
+                self.dispatch_layer(dev, registry, cmd, model, layer, position, input, output);
+                std::mem::swap(&mut input, &mut output);
+            }
+            self.dispatch_final(dev, registry, cmd, model, input);
+            let post = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.logits_buf.handle)
+                .offset(0)
+                .size(vk::WHOLE_SIZE);
+            unsafe {
+                dev.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &[], &[post], &[],
+                );
+            }
+        })?;
+
+        let read_start = Instant::now();
+        let bytes = self.logits_buf.read_bytes()?;
+        let _logits = bytemuck::cast_slice::<u8, f32>(
+            &bytes[..(self.config.vocab_size as usize) * 4],
+        )
+        .to_vec();
+        let readback = read_start.elapsed();
+
+        self.kv_cache.current_seq_len = position + 1;
+
+        Ok(ForwardTokenProfile {
+            pre_setup,
+            reset: timings.reset,
+            begin: timings.begin,
+            record: timings.record,
+            end: timings.end,
+            submit: timings.submit,
+            gpu_wait: timings.wait,
+            readback,
         })
     }
 
@@ -328,10 +621,14 @@ impl Forward {
         self.rope_pos_buf
             .write_bytes(bytemuck::bytes_of(&(position as u32)))?;
 
-        // Reset descriptor pool for fresh allocations this forward.
-        unsafe {
-            dev.device
-                .reset_descriptor_pool(self.descriptor_pool, vk::DescriptorPoolResetFlags::empty())?;
+        // Reset descriptor pool for fresh allocations this forward —
+        // skipped when CB-reuse is on; cached sets stay valid.
+        if !self.cache_enabled {
+            unsafe {
+                dev.device.reset_descriptor_pool(
+                    self.descriptor_pool, vk::DescriptorPoolResetFlags::empty(),
+                )?;
+            }
         }
 
         // Pre-snapshot: we'll record per-layer profile boundaries.
@@ -447,10 +744,9 @@ impl Forward {
         self.scratch_a.write_bytes(bytemuck::cast_slice(input_data))?;
         self.rope_pos_buf
             .write_bytes(bytemuck::bytes_of(&(position as u32)))?;
-        unsafe {
-            dev.device
-                .reset_descriptor_pool(self.descriptor_pool, vk::DescriptorPoolResetFlags::empty())?;
-        }
+        // Debug path uses a partial layer dispatch with non-stable
+        // bindings — invalidate any cached sets from prior decode runs.
+        self.reset_descriptor_pool_and_cache(dev)?;
         cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
             self.dispatch_layer_partial(
                 dev, registry, cmd, model, layer, position,
@@ -642,10 +938,7 @@ impl Forward {
         self.scratch_a.write_bytes(bytemuck::cast_slice(input_data))?;
         self.rope_pos_buf
             .write_bytes(bytemuck::bytes_of(&(position as u32)))?;
-        unsafe {
-            dev.device
-                .reset_descriptor_pool(self.descriptor_pool, vk::DescriptorPoolResetFlags::empty())?;
-        }
+        self.reset_descriptor_pool_and_cache(dev)?;
         cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
             self.dispatch_layer(
                 dev, registry, cmd, model, layer, position,
@@ -1019,6 +1312,60 @@ impl Forward {
             .expect("descriptor_set alloc")[0]
     }
 
+    /// Override the cache-enabled flag set by `Forward::new` from
+    /// `VULKANFORGE_CB_REUSE`. Used by the parity regression test to
+    /// build two Forward instances with explicit cache settings; not
+    /// part of the normal lifecycle.
+    pub fn set_cache_enabled(&mut self, enabled: bool) {
+        self.cache_enabled = enabled;
+    }
+
+    pub fn cache_enabled(&self) -> bool {
+        self.cache_enabled
+    }
+
+    /// Phase 5A-2 Stage 2D: cache-aware descriptor-set fetch. When
+    /// `cache_enabled` is true and the (layout, bindings) key matches
+    /// a previously-built set, the cached handle is returned without
+    /// any further Vulkan calls. Otherwise the set is allocated +
+    /// written + cached. When `cache_enabled` is false, behaves
+    /// exactly like `alloc_set + write_bindings` did before.
+    fn alloc_or_get_set(
+        &mut self,
+        dev: &VulkanDevice,
+        layout: vk::DescriptorSetLayout,
+        bindings: &[(u32, vk::Buffer, vk::DeviceSize, vk::DeviceSize)],
+    ) -> vk::DescriptorSet {
+        if !self.cache_enabled {
+            let set = self.alloc_set(dev, layout);
+            self.write_bindings(dev, set, bindings);
+            return set;
+        }
+        let key = BindingSignature::new(layout, bindings);
+        if let Some(&set) = self.set_cache.get(&key) {
+            return set;
+        }
+        let set = self.alloc_set(dev, layout);
+        self.write_bindings(dev, set, bindings);
+        self.set_cache.insert(key, set);
+        set
+    }
+
+    /// Reset the descriptor pool *and* clear the cache. Used by
+    /// `prefill_batch` and the debug helpers, which need fresh sets
+    /// because their bindings vary across calls (per-token offsets,
+    /// pos-buf sub-ranges).
+    fn reset_descriptor_pool_and_cache(&mut self, dev: &VulkanDevice) -> Result<(), vk::Result> {
+        unsafe {
+            dev.device.reset_descriptor_pool(
+                self.descriptor_pool,
+                vk::DescriptorPoolResetFlags::empty(),
+            )?;
+        }
+        self.set_cache.clear();
+        Ok(())
+    }
+
     fn write_bindings(
         &self,
         dev: &VulkanDevice,
@@ -1077,9 +1424,8 @@ impl Forward {
         label: &str,
     ) {
         let kernel = registry.get(shader);
-        let set = self.alloc_set(dev, kernel.descriptor_set_layout);
-        self.write_bindings(
-            dev, set,
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
             &[
                 (0, weights, 0, 0),
                 (1, input, 0, 0),
@@ -1130,9 +1476,8 @@ impl Forward {
         label: &str,
     ) {
         let kernel = registry.get(ShaderId::RmsNorm);
-        let set = self.alloc_set(dev, kernel.descriptor_set_layout);
-        self.write_bindings(
-            dev, set,
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
             &[(0, input, 0, 0), (1, weight, 0, 0), (2, output, 0, 0)],
         );
         let pc = GenericBinaryPushConstants {
@@ -1208,9 +1553,8 @@ impl Forward {
             crate::backend::vulkan::gguf::RopeVariant::Norm => (ShaderId::RopeNorm, 0u32),
         };
         let kernel = registry.get(shader_id);
-        let set = self.alloc_set(dev, kernel.descriptor_set_layout);
-        self.write_bindings(
-            dev, set,
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
             &[
                 (0, input, 0, 0),
                 // 4-byte slot starting at pos_buf_offset.
@@ -1284,14 +1628,13 @@ impl Forward {
         // Phase 4B: forward path now dispatches the online-softmax
         // flash_attn shader instead of the Phase-3A tiled scalar_attn.
         let kernel = registry.get(ShaderId::FlashAttn);
-        let set = self.alloc_set(dev, kernel.descriptor_set_layout);
         let layer_off = self.kv_cache.layer_offset_bytes(layer);
         let layer_size = (self.kv_cache.config.max_seq_len as u64)
             * (cfg.n_kv_heads as u64)
             * (cfg.head_dim as u64)
             * 4;
-        self.write_bindings(
-            dev, set,
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
             &[
                 (0, self.q_buf.handle, 0, 0),
                 (1, self.kv_cache.k_buffer.handle, layer_off, layer_size),
@@ -1345,9 +1688,8 @@ impl Forward {
 
         // ---- Split-K worker ----
         let split_kernel = registry.get(ShaderId::FlashAttnSplit);
-        let split_set = self.alloc_set(dev, split_kernel.descriptor_set_layout);
-        self.write_bindings(
-            dev, split_set,
+        let split_set = self.alloc_or_get_set(
+            dev, split_kernel.descriptor_set_layout,
             &[
                 (0, self.q_buf.handle, 0, 0),
                 (1, self.kv_cache.k_buffer.handle, layer_off, layer_size),
@@ -1387,9 +1729,8 @@ impl Forward {
 
         // ---- Reduce ----
         let red_kernel = registry.get(ShaderId::FlashAttnReduce);
-        let red_set = self.alloc_set(dev, red_kernel.descriptor_set_layout);
-        self.write_bindings(
-            dev, red_set,
+        let red_set = self.alloc_or_get_set(
+            dev, red_kernel.descriptor_set_layout,
             &[
                 (0, self.fa_scratch_out.handle, 0, 0),
                 (1, self.fa_scratch_max.handle, 0, 0),
@@ -1431,8 +1772,10 @@ impl Forward {
         label: &str,
     ) {
         let kernel = registry.get(shader);
-        let set = self.alloc_set(dev, kernel.descriptor_set_layout);
-        self.write_bindings(dev, set, &[(0, a, 0, 0), (1, b, 0, 0), (2, d, 0, 0)]);
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[(0, a, 0, 0), (1, b, 0, 0), (2, d, 0, 0)],
+        );
         let pc = GenericBinaryPushConstants {
             ne: n,
             ne00: n, ne01: 1, ne02: 1, ne03: 1,
@@ -1470,8 +1813,10 @@ impl Forward {
         label: &str,
     ) {
         let kernel = registry.get(ShaderId::Silu);
-        let set = self.alloc_set(dev, kernel.descriptor_set_layout);
-        self.write_bindings(dev, set, &[(0, input, 0, 0), (1, output, 0, 0)]);
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[(0, input, 0, 0), (1, output, 0, 0)],
+        );
         let pc = GenericHeadPushConstants {
             kx: n, ky: 1,
             param1: 0.0, param2: 0.0, param3: 0.0, param4: 0.0,
@@ -1508,8 +1853,10 @@ impl Forward {
         label: &'static str,
     ) {
         let kernel = registry.get(ShaderId::QuantizeQ8_1);
-        let set = self.alloc_set(dev, kernel.descriptor_set_layout);
-        self.write_bindings(dev, set, &[(0, input, 0, 0), (1, output, 0, 0)]);
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[(0, input, 0, 0), (1, output, 0, 0)],
+        );
         let num_blocks = (n_elements + 127) / 128;
         let pc = Q8_1QuantizePushConstants {
             ne: n_elements,
@@ -1550,9 +1897,8 @@ impl Forward {
         label: &'static str,
     ) {
         let kernel = registry.get(shader_id);
-        let set = self.alloc_set(dev, kernel.descriptor_set_layout);
-        self.write_bindings(
-            dev, set,
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
             &[
                 (0, weights, 0, 0),
                 (1, activations_q8, 0, 0),
@@ -1672,11 +2018,10 @@ impl Forward {
         self.rope_pos_buf
             .write_bytes(bytemuck::cast_slice(&positions))?;
 
-        unsafe {
-            dev.device.reset_descriptor_pool(
-                self.descriptor_pool, vk::DescriptorPoolResetFlags::empty(),
-            )?;
-        }
+        // prefill_batch's per-token attention loop binds varying
+        // pos_buf sub-ranges, so cached sets from a prior decode
+        // can't be reused. Drop them up-front.
+        self.reset_descriptor_pool_and_cache(dev)?;
 
         cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
             // Seed residual chain from the embedded inputs. A single
