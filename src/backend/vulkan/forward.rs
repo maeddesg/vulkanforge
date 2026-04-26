@@ -37,6 +37,7 @@ use super::gguf::{GgmlType, ModelConfig};
 use super::kv_cache::KvCache;
 use super::loader::LoadedModel;
 use super::pipeline::{
+    FlashAttnReducePushConstants, FlashAttnSplitPushConstants,
     GenericBinaryPushConstants, GenericHeadPushConstants, MatVecPushConstants,
     MmqPushConstants, Q8_1QuantizePushConstants, RopePushConstants,
     ScalarAttnPushConstants,
@@ -94,6 +95,15 @@ pub struct Forward {
 
     rope_theta_scale: f32,
     attn_scale: f32,
+
+    // ---- Phase-4C split-K attention scratch ----
+    // Sized once at construction for the worst-case max_seq_len.
+    // Written by `flash_attn_split.comp` and read by
+    // `flash_attn_reduce.comp`. Single-buffer per kind — only one
+    // attention dispatch is in flight at a time.
+    fa_scratch_out: GpuBuffer,
+    fa_scratch_max: GpuBuffer,
+    fa_scratch_sum: GpuBuffer,
 
     // ---- Phase-3E batch-prefill scratch ----
     // Allocated once in `new` based on `max_prefill_tokens`. Memory
@@ -192,6 +202,33 @@ impl Forward {
             (max_prefill_tokens.max(1) as u64) * 4,
             MemoryLocation::CpuToGpu, "rope_pos",
         )?;
+
+        // Phase-4C scratch for split-K attention. Sized for the
+        // worst case at max_seq_len; per-call dispatches use only the
+        // prefix that matches the current `n_tiles`.
+        const FA_TILE: u64 = 64;
+        let fa_max_tiles =
+            (kv_cache.config.max_seq_len as u64 + FA_TILE - 1) / FA_TILE;
+        let fa_scratch_out_bytes = (config.n_heads as u64)
+            * fa_max_tiles
+            * (config.head_dim as u64)
+            * 4;
+        let fa_scratch_red_bytes = (config.n_heads as u64) * fa_max_tiles * 4;
+        let fa_scratch_out = mk_storage(
+            fa_scratch_out_bytes,
+            MemoryLocation::GpuOnly,
+            "fa_scratch_out",
+        )?;
+        let fa_scratch_max = mk_storage(
+            fa_scratch_red_bytes,
+            MemoryLocation::GpuOnly,
+            "fa_scratch_max",
+        )?;
+        let fa_scratch_sum = mk_storage(
+            fa_scratch_red_bytes,
+            MemoryLocation::GpuOnly,
+            "fa_scratch_sum",
+        )?;
         let rope_ff_buf = mk_storage(16, MemoryLocation::GpuOnly, "rope_ff_dummy")?;
         let rope_idx_buf = mk_storage(16, MemoryLocation::GpuOnly, "rope_idx_dummy")?;
 
@@ -255,6 +292,7 @@ impl Forward {
             descriptor_pool,
             profiler,
             rope_theta_scale, attn_scale,
+            fa_scratch_out, fa_scratch_max, fa_scratch_sum,
             max_prefill_tokens,
             batch_input, batch_residual, batch_norm, batch_q8,
             batch_q, batch_k, batch_v, batch_attn_out, batch_o,
@@ -732,6 +770,9 @@ impl Forward {
         self.rope_pos_buf.destroy(device, allocator);
         self.rope_ff_buf.destroy(device, allocator);
         self.rope_idx_buf.destroy(device, allocator);
+        self.fa_scratch_out.destroy(device, allocator);
+        self.fa_scratch_max.destroy(device, allocator);
+        self.fa_scratch_sum.destroy(device, allocator);
         self.batch_input.destroy(device, allocator);
         self.batch_residual.destroy(device, allocator);
         self.batch_norm.destroy(device, allocator);
@@ -1216,13 +1257,21 @@ impl Forward {
         position: u32,
     ) {
         let cfg = self.config.clone();
+        // Phase 4C: pick the multi-WG split-K path when there are
+        // enough tiles to amortise the second dispatch + barrier.
+        // Threshold of 2 means seq_len > TILE (= 64) goes through
+        // split+reduce; everything shorter takes the Phase-4B
+        // single-WG flash_attn path.
+        const FA_TILE: u32 = 64;
+        const MULTI_WG_MIN_TILES: u32 = 2;
+        let seq_len = position + 1;
+        let n_tiles = (seq_len + FA_TILE - 1) / FA_TILE;
+        if n_tiles >= MULTI_WG_MIN_TILES {
+            self.run_flash_attn_split_reduce(dev, registry, cmd, layer, position, n_tiles);
+            return;
+        }
         // Phase 4B: forward path now dispatches the online-softmax
         // flash_attn shader instead of the Phase-3A tiled scalar_attn.
-        // Both share descriptor layout + push-constants; flash_attn
-        // uses far less LDS (256 B vs 8 KB) and yields better
-        // wavefront occupancy on RDNA 4. The scalar_attn pipeline is
-        // still built and exercised by the dedicated correctness
-        // tests so we can A/B in the future if needed.
         let kernel = registry.get(ShaderId::FlashAttn);
         let set = self.alloc_set(dev, kernel.descriptor_set_layout);
         let layer_off = self.kv_cache.layer_offset_bytes(layer);
@@ -1258,6 +1307,102 @@ impl Forward {
                 cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
             );
             dev.device.cmd_dispatch(cmd, cfg.n_heads, 1, 1);
+        });
+    }
+
+    /// Phase-4C split-K attention: dispatches the per-tile worker
+    /// across `(n_heads, n_tiles, 1)` workgroups, then a reducer over
+    /// `(n_heads, 1, 1)` that combines the partials with online-softmax
+    /// correction.  Inserts the required compute→compute barrier
+    /// between the two passes (the reducer reads the worker's writes
+    /// out of `fa_scratch_*`).
+    fn run_flash_attn_split_reduce(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        layer: u32,
+        position: u32,
+        n_tiles: u32,
+    ) {
+        let cfg = self.config.clone();
+        let layer_off = self.kv_cache.layer_offset_bytes(layer);
+        let layer_size = (self.kv_cache.config.max_seq_len as u64)
+            * (cfg.n_kv_heads as u64)
+            * (cfg.head_dim as u64)
+            * 4;
+
+        // ---- Split-K worker ----
+        let split_kernel = registry.get(ShaderId::FlashAttnSplit);
+        let split_set = self.alloc_set(dev, split_kernel.descriptor_set_layout);
+        self.write_bindings(
+            dev, split_set,
+            &[
+                (0, self.q_buf.handle, 0, 0),
+                (1, self.kv_cache.k_buffer.handle, layer_off, layer_size),
+                (2, self.kv_cache.v_buffer.handle, layer_off, layer_size),
+                (3, self.fa_scratch_out.handle, 0, 0),
+                (4, self.fa_scratch_max.handle, 0, 0),
+                (5, self.fa_scratch_sum.handle, 0, 0),
+            ],
+        );
+        let split_pc = FlashAttnSplitPushConstants {
+            n_heads: cfg.n_heads,
+            n_kv_heads: cfg.n_kv_heads,
+            head_dim: cfg.head_dim,
+            seq_len: position + 1,
+            max_seq: self.kv_cache.config.max_seq_len,
+            scale: self.attn_scale,
+            n_tiles,
+        };
+        let split_layout = split_kernel.pipeline_layout;
+        let split_pipeline = split_kernel.pipeline;
+        let n_heads = cfg.n_heads;
+        self.profile("fa_split", dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, split_pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, split_layout, 0, &[split_set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, split_layout, vk::ShaderStageFlags::COMPUTE, 0,
+                bytemuck::bytes_of(&split_pc),
+            );
+            dev.device.cmd_dispatch(cmd, n_heads, n_tiles, 1);
+        });
+
+        // Compute → compute barrier: the reducer reads what the
+        // worker just wrote into the three fa_scratch_* buffers.
+        compute_barrier(dev, cmd);
+
+        // ---- Reduce ----
+        let red_kernel = registry.get(ShaderId::FlashAttnReduce);
+        let red_set = self.alloc_set(dev, red_kernel.descriptor_set_layout);
+        self.write_bindings(
+            dev, red_set,
+            &[
+                (0, self.fa_scratch_out.handle, 0, 0),
+                (1, self.fa_scratch_max.handle, 0, 0),
+                (2, self.fa_scratch_sum.handle, 0, 0),
+                (3, self.attn_out.handle, 0, 0),
+            ],
+        );
+        let red_pc = FlashAttnReducePushConstants {
+            n_heads: cfg.n_heads,
+            head_dim: cfg.head_dim,
+            n_tiles,
+        };
+        let red_layout = red_kernel.pipeline_layout;
+        let red_pipeline = red_kernel.pipeline;
+        self.profile("fa_reduce", dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, red_pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, red_layout, 0, &[red_set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, red_layout, vk::ShaderStageFlags::COMPUTE, 0,
+                bytemuck::bytes_of(&red_pc),
+            );
+            dev.device.cmd_dispatch(cmd, n_heads, 1, 1);
         });
     }
 

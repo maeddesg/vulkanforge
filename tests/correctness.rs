@@ -13,7 +13,8 @@ use vulkanforge::backend::vulkan::buffers::GpuBuffer;
 use vulkanforge::backend::vulkan::commands::CommandContext;
 use vulkanforge::backend::vulkan::device::VulkanDevice;
 use vulkanforge::backend::vulkan::pipeline::{
-    init_fastdiv_values, ComputeKernel, GenericBinaryPushConstants,
+    init_fastdiv_values, ComputeKernel, FlashAttnReducePushConstants,
+    FlashAttnSplitPushConstants, GenericBinaryPushConstants,
     GenericHeadPushConstants, GenericUnaryPushConstants, MmqPushConstants,
     Q8_1QuantizePushConstants, RopePushConstants, ScalarAttnPushConstants,
     SoftMaxPushConstants,
@@ -1186,6 +1187,115 @@ fn test_flash_attn_seq200_vs_cpu() {
     // 3.125 × TILE — tail-tile bounds path exercised. Phase-2-baseline
     // pos=200 regime; the very situation that motivates the rewrite.
     run_flash_attn_seqlen(200, 1e-3);
+}
+
+/// Phase-4C split-K parity: dispatch (FlashAttnSplit + FlashAttnReduce)
+/// against the same Q/K/V tensors that drive Phase-4B's `flash_attn`,
+/// and compare outputs. The split path's online-softmax-merge maths
+/// must produce numerically equivalent output to the single-WG
+/// formulation — within an f32 round-off envelope.
+fn run_split_attn_seqlen(seq_len: u32, abs_threshold: f32) {
+    let mut fix = Fixture::new();
+    let n_heads: u32 = 32;
+    let n_kv_heads: u32 = 8;
+    let head_dim: u32 = 128;
+    let max_seq: u32 = 2048;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    const TILE: u32 = 64;
+    let n_tiles = (seq_len + TILE - 1) / TILE;
+
+    let pos_stride = (n_kv_heads * head_dim) as usize;
+    let kv_size = (max_seq as usize) * pos_stride;
+    let mut q = vec![0.0f32; (n_heads * head_dim) as usize];
+    let mut k = vec![0.0f32; kv_size];
+    let mut v = vec![0.0f32; kv_size];
+    for (i, x) in q.iter_mut().enumerate() {
+        *x = ((i as f32) * 0.001).sin();
+    }
+    for t in 0..(seq_len as usize) {
+        for kvh in 0..(n_kv_heads as usize) {
+            for d in 0..(head_dim as usize) {
+                let off = t * pos_stride + kvh * (head_dim as usize) + d;
+                k[off] = ((t as f32 + 1.0) * 0.01 + d as f32 * 0.001).cos();
+                v[off] = ((t as f32) * 0.013 + (kvh as f32) * 0.7 + d as f32 * 0.0007).sin();
+            }
+        }
+    }
+    // CPU reference for absolute correctness check.
+    let cpu = cpu_attention_reference(&q, &k, &v, n_heads, n_kv_heads, head_dim, seq_len, scale);
+
+    let q_h = fix.host_buffer_f32(&q, "q");
+    let k_h = fix.host_buffer_f32(&k, "k");
+    let v_h = fix.host_buffer_f32(&v, "v");
+
+    // Scratch buffers — sized for the worst case at seq_len=2048,
+    // n_tiles = 32, head_dim = 128.
+    let scratch_max_tiles = (max_seq + TILE - 1) / TILE;
+    let scratch_out_count = (n_heads * scratch_max_tiles * head_dim) as usize;
+    let scratch_max_count = (n_heads * scratch_max_tiles) as usize;
+    let scratch_out = fix.output_buffer_f32(scratch_out_count, "scratch_out");
+    let scratch_max = fix.output_buffer_f32(scratch_max_count, "scratch_max");
+    let scratch_sum = fix.output_buffer_f32(scratch_max_count, "scratch_sum");
+
+    // Final output buffer.
+    let o_split = fix.output_buffer_f32((n_heads * head_dim) as usize, "o_split");
+
+    // ---- Dispatch split worker ----
+    let split_pc = FlashAttnSplitPushConstants {
+        n_heads, n_kv_heads, head_dim,
+        seq_len, max_seq, scale,
+        n_tiles,
+    };
+    fix.dispatch(
+        ShaderId::FlashAttnSplit,
+        &[q_h, k_h, v_h, scratch_out, scratch_max, scratch_sum],
+        bytemuck::bytes_of(&split_pc),
+        (n_heads, n_tiles, 1),
+    );
+
+    // ---- Dispatch reduce ----
+    let reduce_pc = FlashAttnReducePushConstants {
+        n_heads, head_dim, n_tiles,
+    };
+    fix.dispatch(
+        ShaderId::FlashAttnReduce,
+        &[scratch_out, scratch_max, scratch_sum, o_split],
+        bytemuck::bytes_of(&reduce_pc),
+        (n_heads, 1, 1),
+    );
+
+    let gpu = fix.read_output(o_split, (n_heads * head_dim) as usize);
+    let nan = gpu.iter().any(|x| !x.is_finite());
+    assert!(!nan, "split+reduce(seq={seq_len}) NaN/Inf — first 8: {:?}", &gpu[..8]);
+    let max_abs = max_abs_err(&gpu, &cpu);
+    assert!(
+        max_abs < abs_threshold,
+        "split+reduce(seq={seq_len}) vs CPU max_abs_err = {max_abs:e} >= {abs_threshold:e}\n\
+         GPU first 8: {:?}\n CPU first 8: {:?}",
+        &gpu[..8], &cpu[..8],
+    );
+    fix.teardown();
+}
+
+#[test]
+fn test_split_attn_seq64_vs_cpu() {
+    // n_tiles = 1 — the degenerate case. Should still produce correct
+    // output (1-tile reduce is just normalisation by sum).
+    run_split_attn_seqlen(64, 1e-3);
+}
+
+#[test]
+fn test_split_attn_seq200_vs_cpu() {
+    // n_tiles = 4 — the canonical "split-K kicks in" case. This is
+    // the regime that motivates the rewrite (Phase-3 baseline pos=200).
+    run_split_attn_seqlen(200, 1e-3);
+}
+
+#[test]
+fn test_split_attn_seq2048_vs_cpu() {
+    // n_tiles = 32 — max reasonable context for the Phase-2 KV cache.
+    // Stresses the online-softmax merge over 32 partial accumulators.
+    run_split_attn_seqlen(2048, 1e-3);
 }
 
 #[test]

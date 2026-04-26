@@ -1,0 +1,118 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic      : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// VulkanForge Phase 4C — Split-K Flash-Attention worker.
+//
+// One workgroup per (Q-head, K/V-tile) pair. Each WG processes
+// exactly TILE = 64 K/V positions, computes its own (tile_max,
+// tile_sum, tile_partial_out), and writes the three to a scratch
+// buffer. A separate `flash_attn_reduce.comp` pass combines all
+// tiles per head with the standard online-softmax correction.
+//
+// Dispatch: (n_heads, n_tiles, 1)  with  n_tiles = ceil(seq_len / 64).
+//
+// VS Phase-4B `flash_attn.comp`: same online-softmax math per tile,
+// same TILE = 64, same per-thread V-coverage (2 of 128 dims), but
+// each WG now handles exactly ONE tile instead of looping over all
+// of them. With 32 heads and (e.g.) 4 tiles at pos=200 we dispatch
+// 128 WGs into 128 SIMDs — the SIMD-coverage gap from §3.2 of the
+// Phase-3 RGP analysis closes.
+
+const uint WGSIZE = 64;
+const uint TILE = WGSIZE;
+layout (local_size_x = WGSIZE) in;
+
+layout (binding = 0) readonly  buffer Q          { float q[]; };
+layout (binding = 1) readonly  buffer K          { float k[]; };
+layout (binding = 2) readonly  buffer V          { float v[]; };
+layout (binding = 3) writeonly buffer ScratchOut { float scratch_out[]; };
+layout (binding = 4) writeonly buffer ScratchMax { float scratch_max[]; };
+layout (binding = 5) writeonly buffer ScratchSum { float scratch_sum[]; };
+
+layout (push_constant) uniform Params {
+    uint  n_heads;
+    uint  n_kv_heads;
+    uint  head_dim;
+    uint  seq_len;
+    uint  max_seq;     // unused at runtime, kept for binary compat
+    float scale;
+    uint  n_tiles;     // total tile count = ceil(seq_len / TILE)
+} p;
+
+shared float scores_lds[TILE];
+
+void main() {
+    uint h        = gl_WorkGroupID.x;
+    uint tile_idx = gl_WorkGroupID.y;
+    uint tid      = gl_LocalInvocationID.x;
+
+    if (h >= p.n_heads || tile_idx >= p.n_tiles) {
+        return;
+    }
+    uint group_size = p.n_heads / p.n_kv_heads;
+    uint kvh        = h / group_size;
+
+    uint q_off      = h   * p.head_dim;
+    uint pos_stride = p.n_kv_heads * p.head_dim;
+    uint head_off   = kvh * p.head_dim;
+
+    uint tile_base = tile_idx * TILE;
+    uint t         = tile_base + tid;
+    bool valid     = t < p.seq_len;
+
+    // ---- Tile-local score = Q · K[t] · scale ----
+    float score = -1e30;
+    if (valid) {
+        uint k_pos_off = t * pos_stride + head_off;
+        float s = 0.0;
+        for (uint d = 0; d < p.head_dim; ++d) {
+            s += q[q_off + d] * k[k_pos_off + d];
+        }
+        score = s * p.scale;
+    }
+
+    // ---- Tile-local max + softmax + sum ----
+    float tile_max = subgroupMax(score);
+    float pscore   = valid ? exp(score - tile_max) : 0.0;
+    float tile_sum = subgroupAdd(pscore);
+
+    scores_lds[tid] = pscore;
+    barrier();
+
+    // ---- Weighted V-sum, parallel over output dim ----
+    // Each thread takes 2 output dims (`tid` and `tid + 64`) — same
+    // pattern as Phase-4B `flash_attn.comp`. Bounds-checked for
+    // future head_dim != 128 deployments.
+    float my_out0 = 0.0;
+    float my_out1 = 0.0;
+    bool d1_valid = (tid + 64) < p.head_dim;
+    uint  tile_size = min(TILE, p.seq_len - tile_base);
+    for (uint i = 0; i < tile_size; ++i) {
+        uint global_t  = tile_base + i;
+        uint v_pos_off = global_t * pos_stride + head_off;
+        float pi = scores_lds[i];
+        my_out0 += pi * v[v_pos_off + tid];
+        if (d1_valid) {
+            my_out1 += pi * v[v_pos_off + tid + 64];
+        }
+    }
+
+    // ---- Write partials to scratch ----
+    // Layout: scratch_out[h * n_tiles * head_dim + tile_idx * head_dim + d]
+    //         scratch_max[h * n_tiles + tile_idx]
+    //         scratch_sum[h * n_tiles + tile_idx]
+    uint partial_idx = h * p.n_tiles + tile_idx;
+
+    if (tid == 0) {
+        scratch_max[partial_idx] = tile_max;
+        scratch_sum[partial_idx] = tile_sum;
+    }
+    if (tid < p.head_dim) {
+        scratch_out[partial_idx * p.head_dim + tid] = my_out0;
+    }
+    if (d1_valid) {
+        scratch_out[partial_idx * p.head_dim + tid + 64] = my_out1;
+    }
+}

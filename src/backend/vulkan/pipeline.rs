@@ -214,6 +214,36 @@ pub struct Q8_1QuantizePushConstants {
 }
 const _: () = assert!(std::mem::size_of::<Q8_1QuantizePushConstants>() == 8);
 
+/// Phase-4C split-K worker (`flash_attn_split.comp`) push block.
+/// 6 × u32 + 1 × f32 + 1 × u32 = 32 B. Drop-in additions over
+/// `ScalarAttnPushConstants`: one extra `n_tiles` field tells the
+/// shader the dispatch's Y dimension so it can compute its
+/// `partial_idx = h * n_tiles + tile_idx` without round-tripping to
+/// the host.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct FlashAttnSplitPushConstants {
+    pub n_heads: u32,
+    pub n_kv_heads: u32,
+    pub head_dim: u32,
+    pub seq_len: u32,
+    pub max_seq: u32,
+    pub scale: f32,
+    pub n_tiles: u32,
+}
+const _: () = assert!(std::mem::size_of::<FlashAttnSplitPushConstants>() == 28);
+
+/// Phase-4C split-K reducer (`flash_attn_reduce.comp`) push block.
+/// 3 × u32 = 12 B.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct FlashAttnReducePushConstants {
+    pub n_heads: u32,
+    pub head_dim: u32,
+    pub n_tiles: u32,
+}
+const _: () = assert!(std::mem::size_of::<FlashAttnReducePushConstants>() == 12);
+
 /// llama.cpp's `init_fastdiv_values`. Used by [`GenericUnaryPushConstants`]
 /// to populate the `ne*_*mp/L` fields — without these, `copy`'s SPIR-V
 /// fastdiv path divides by a magic-of-zero and produces garbage indices.

@@ -137,6 +137,20 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "flash_attn.comp",
         defines: &[],
     },
+    // VulkanForge Phase-4C split-K worker. Dispatched as
+    // (n_heads, n_tiles, 1); writes per-tile partials to scratch.
+    ShaderJob {
+        out_name: "flash_attn_split_f32.spv",
+        entry_source: "flash_attn_split.comp",
+        defines: &[],
+    },
+    // VulkanForge Phase-4C split-K reducer. Dispatched as (n_heads,
+    // 1, 1); combines partials with online-softmax correction.
+    ShaderJob {
+        out_name: "flash_attn_reduce_f32.spv",
+        entry_source: "flash_attn_reduce.comp",
+        defines: &[],
+    },
     // Phase-3C: Q4_K integer-MMQ GEMM. Mirrors the defines
     // llama.cpp's vulkan-shaders-gen passes for a non-MoE, non-coopmat
     // Q4_K mul_mmq build. Used by Forward::prefill_batch (TBD) and

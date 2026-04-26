@@ -27,6 +27,11 @@ pub enum ShaderId {
     QuantizeQ8_1,
     // Phase 4B — online-softmax decode attention; drop-in for ScalarAttn.
     FlashAttn,
+    // Phase 4C — split-K (multi-WG-per-head) attention worker + reducer.
+    // Dispatched together when n_tiles >= MULTI_WG_MIN_TILES; otherwise
+    // forward.rs falls back to FlashAttn (single WG per head).
+    FlashAttnSplit,
+    FlashAttnReduce,
 }
 
 impl ShaderId {
@@ -47,6 +52,8 @@ impl ShaderId {
             ShaderId::MulMmqQ6K => "mul_mmq_q6_k_f32",
             ShaderId::QuantizeQ8_1 => "quantize_q8_1_f32",
             ShaderId::FlashAttn => "flash_attn_f32",
+            ShaderId::FlashAttnSplit => "flash_attn_split_f32",
+            ShaderId::FlashAttnReduce => "flash_attn_reduce_f32",
         }
     }
 
@@ -67,6 +74,8 @@ impl ShaderId {
             ShaderId::MulMmqQ6K => MUL_MMQ_Q6_K_F32,
             ShaderId::QuantizeQ8_1 => QUANTIZE_Q8_1_F32,
             ShaderId::FlashAttn => FLASH_ATTN_F32,
+            ShaderId::FlashAttnSplit => FLASH_ATTN_SPLIT_F32,
+            ShaderId::FlashAttnReduce => FLASH_ATTN_REDUCE_F32,
         }
     }
 }
@@ -87,6 +96,8 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::MulMmqQ6K,
     ShaderId::QuantizeQ8_1,
     ShaderId::FlashAttn,
+    ShaderId::FlashAttnSplit,
+    ShaderId::FlashAttnReduce,
 ];
 
 pub const MUL_MAT_VEC_Q4_K_F32_F32: &[u8] =
@@ -111,6 +122,10 @@ pub const QUANTIZE_Q8_1_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/quantize_q8_1_f32.spv"));
 pub const FLASH_ATTN_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_f32.spv"));
+pub const FLASH_ATTN_SPLIT_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_split_f32.spv"));
+pub const FLASH_ATTN_REDUCE_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_reduce_f32.spv"));
 
 /// Decode a SPIR-V byte blob into u32 words. Vulkan consumes SPIR-V
 /// as `&[u32]`; `include_bytes!` only gives us `&[u8]` whose alignment

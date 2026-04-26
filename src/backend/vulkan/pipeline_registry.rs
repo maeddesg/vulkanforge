@@ -193,6 +193,12 @@ impl PipelineRegistry {
                     let bytes = bytemuck::bytes_of(&data);
                     ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
                 }
+                ShaderId::FlashAttnSplit | ShaderId::FlashAttnReduce => {
+                    // No spec constants — TILE = 64 is hard-coded in
+                    // both .comp files (matches Phase-4B `flash_attn`'s
+                    // workgroup geometry).
+                    ComputeKernel::from_spv(device, &words, cache)
+                }
             };
             let kernel = match result {
                 Ok(k) => k,
