@@ -184,6 +184,15 @@ impl PipelineRegistry {
                     let bytes = bytemuck::bytes_of(&data);
                     ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
                 }
+                ShaderId::FlashAttn => {
+                    // SpecId 0 = MAX_SEQ — same convention as scalar_attn.
+                    // 2048 covers the Phase-2 contexts; bump in Phase 4 if
+                    // we go past 2048 tokens of context.
+                    let data: [u32; 1] = [2048];
+                    let entries = [entry(0, 0, 4)];
+                    let bytes = bytemuck::bytes_of(&data);
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
+                }
             };
             let kernel = match result {
                 Ok(k) => k,

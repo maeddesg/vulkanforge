@@ -1216,7 +1216,14 @@ impl Forward {
         position: u32,
     ) {
         let cfg = self.config.clone();
-        let kernel = registry.get(ShaderId::ScalarAttn);
+        // Phase 4B: forward path now dispatches the online-softmax
+        // flash_attn shader instead of the Phase-3A tiled scalar_attn.
+        // Both share descriptor layout + push-constants; flash_attn
+        // uses far less LDS (256 B vs 8 KB) and yields better
+        // wavefront occupancy on RDNA 4. The scalar_attn pipeline is
+        // still built and exercised by the dedicated correctness
+        // tests so we can A/B in the future if needed.
+        let kernel = registry.get(ShaderId::FlashAttn);
         let set = self.alloc_set(dev, kernel.descriptor_set_layout);
         let layer_off = self.kv_cache.layer_offset_bytes(layer);
         let layer_size = (self.kv_cache.config.max_seq_len as u64)

@@ -129,6 +129,14 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "scalar_attn.comp",
         defines: &[],
     },
+    // VulkanForge Phase-4B online-softmax decode attention. Drop-in
+    // compatible bindings + push-constants with scalar_attn; one WG
+    // per Q-head, TILE=64 K positions per pass, no big scores[] LDS.
+    ShaderJob {
+        out_name: "flash_attn_f32.spv",
+        entry_source: "flash_attn.comp",
+        defines: &[],
+    },
     // Phase-3C: Q4_K integer-MMQ GEMM. Mirrors the defines
     // llama.cpp's vulkan-shaders-gen passes for a non-MoE, non-coopmat
     // Q4_K mul_mmq build. Used by Forward::prefill_batch (TBD) and

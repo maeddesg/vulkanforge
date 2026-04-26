@@ -25,6 +25,8 @@ pub enum ShaderId {
     MulMmqQ4K,
     MulMmqQ6K,
     QuantizeQ8_1,
+    // Phase 4B — online-softmax decode attention; drop-in for ScalarAttn.
+    FlashAttn,
 }
 
 impl ShaderId {
@@ -44,6 +46,7 @@ impl ShaderId {
             ShaderId::MulMmqQ4K => "mul_mmq_q4_k_f32",
             ShaderId::MulMmqQ6K => "mul_mmq_q6_k_f32",
             ShaderId::QuantizeQ8_1 => "quantize_q8_1_f32",
+            ShaderId::FlashAttn => "flash_attn_f32",
         }
     }
 
@@ -63,6 +66,7 @@ impl ShaderId {
             ShaderId::MulMmqQ4K => MUL_MMQ_Q4_K_F32,
             ShaderId::MulMmqQ6K => MUL_MMQ_Q6_K_F32,
             ShaderId::QuantizeQ8_1 => QUANTIZE_Q8_1_F32,
+            ShaderId::FlashAttn => FLASH_ATTN_F32,
         }
     }
 }
@@ -82,6 +86,7 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::MulMmqQ4K,
     ShaderId::MulMmqQ6K,
     ShaderId::QuantizeQ8_1,
+    ShaderId::FlashAttn,
 ];
 
 pub const MUL_MAT_VEC_Q4_K_F32_F32: &[u8] =
@@ -104,6 +109,8 @@ pub const MUL_MMQ_Q6_K_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mmq_q6_k_f32.spv"));
 pub const QUANTIZE_Q8_1_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/quantize_q8_1_f32.spv"));
+pub const FLASH_ATTN_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_f32.spv"));
 
 /// Decode a SPIR-V byte blob into u32 words. Vulkan consumes SPIR-V
 /// as `&[u32]`; `include_bytes!` only gives us `&[u8]` whose alignment

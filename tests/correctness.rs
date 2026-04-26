@@ -1104,6 +1104,154 @@ fn test_tiled_attn_seq200_vs_cpu() {
 }
 
 // -----------------------------------------------------------------
+// Phase-4B flash-attention parity tests.
+// flash_attn.comp is a drop-in replacement for scalar_attn.comp with
+// the same bindings + push constants but online-softmax internals
+// (no scores[2048] LDS array, single pass instead of three). It must
+// produce numerically equivalent output for every seq_len we use in
+// production.
+
+fn run_flash_attn_seqlen(seq_len: u32, abs_threshold: f32) {
+    let mut fix = Fixture::new();
+    let n_heads: u32 = 32;
+    let n_kv_heads: u32 = 8;
+    let head_dim: u32 = 128;
+    let max_seq: u32 = 2048;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    let pos_stride = (n_kv_heads * head_dim) as usize;
+    let kv_size = (max_seq as usize) * pos_stride;
+    let mut q = vec![0.0f32; (n_heads * head_dim) as usize];
+    let mut k = vec![0.0f32; kv_size];
+    let mut v = vec![0.0f32; kv_size];
+
+    for (i, x) in q.iter_mut().enumerate() {
+        *x = ((i as f32) * 0.001).sin();
+    }
+    for t in 0..(seq_len as usize) {
+        for kvh in 0..(n_kv_heads as usize) {
+            for d in 0..(head_dim as usize) {
+                let off = t * pos_stride + kvh * (head_dim as usize) + d;
+                k[off] = ((t as f32 + 1.0) * 0.01 + d as f32 * 0.001).cos();
+                v[off] = ((t as f32) * 0.013 + (kvh as f32) * 0.7 + d as f32 * 0.0007).sin();
+            }
+        }
+    }
+
+    let cpu = cpu_attention_reference(&q, &k, &v, n_heads, n_kv_heads, head_dim, seq_len, scale);
+
+    let q_h = fix.host_buffer_f32(&q, "q");
+    let k_h = fix.host_buffer_f32(&k, "k");
+    let v_h = fix.host_buffer_f32(&v, "v");
+    let o_h = fix.output_buffer_f32((n_heads * head_dim) as usize, "o");
+    let pc = ScalarAttnPushConstants {
+        n_heads, n_kv_heads, head_dim,
+        seq_len, max_seq, scale,
+    };
+    fix.dispatch(
+        ShaderId::FlashAttn,
+        &[q_h, k_h, v_h, o_h],
+        bytemuck::bytes_of(&pc),
+        (n_heads, 1, 1),
+    );
+    let gpu = fix.read_output(o_h, (n_heads * head_dim) as usize);
+    let nan = gpu.iter().any(|x| !x.is_finite());
+    assert!(!nan, "flash_attn(seq={seq_len}) produced NaN/Inf — first 8: {:?}", &gpu[..8]);
+    let max_abs = max_abs_err(&gpu, &cpu);
+    assert!(
+        max_abs < abs_threshold,
+        "flash_attn(seq={seq_len}) vs CPU max_abs_err = {max_abs:e} >= {abs_threshold:e}\n\
+         GPU first 8: {:?}\n CPU first 8: {:?}",
+        &gpu[..8], &cpu[..8],
+    );
+    fix.teardown();
+}
+
+#[test]
+fn test_flash_attn_seq1_vs_cpu() {
+    // seq_len=1 is the minimum (only the new token's KV is in cache).
+    // softmax(1 score) = 1.0, output should be exactly V[0].
+    // Exact same input as scalar_attn's test, easy correctness gate.
+    run_flash_attn_seqlen(1, 1e-3);
+}
+
+#[test]
+fn test_flash_attn_seq64_vs_cpu() {
+    // One full TILE — exercises the tile-loop boundary exactly once.
+    run_flash_attn_seqlen(64, 1e-3);
+}
+
+#[test]
+fn test_flash_attn_seq200_vs_cpu() {
+    // 3.125 × TILE — tail-tile bounds path exercised. Phase-2-baseline
+    // pos=200 regime; the very situation that motivates the rewrite.
+    run_flash_attn_seqlen(200, 1e-3);
+}
+
+#[test]
+fn test_flash_attn_matches_scalar_attn_seq200() {
+    // The strongest signal: same Q/K/V through scalar_attn (Phase-3A
+    // tiled, three-pass) and through flash_attn (Phase-4B online
+    // softmax). Both must produce numerically equivalent output —
+    // softmax is mathematically order-invariant so the only difference
+    // is f32 rounding through different operation orders.
+    let mut fix = Fixture::new();
+    let n_heads: u32 = 32;
+    let n_kv_heads: u32 = 8;
+    let head_dim: u32 = 128;
+    let max_seq: u32 = 2048;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let seq_len: u32 = 200;
+
+    let pos_stride = (n_kv_heads * head_dim) as usize;
+    let kv_size = (max_seq as usize) * pos_stride;
+    let mut q = vec![0.0f32; (n_heads * head_dim) as usize];
+    let mut k = vec![0.0f32; kv_size];
+    let mut v = vec![0.0f32; kv_size];
+    for (i, x) in q.iter_mut().enumerate() {
+        *x = ((i as f32) * 0.001).sin();
+    }
+    for t in 0..(seq_len as usize) {
+        for kvh in 0..(n_kv_heads as usize) {
+            for d in 0..(head_dim as usize) {
+                let off = t * pos_stride + kvh * (head_dim as usize) + d;
+                k[off] = ((t as f32 + 1.0) * 0.01 + d as f32 * 0.001).cos();
+                v[off] = ((t as f32) * 0.013 + (kvh as f32) * 0.7 + d as f32 * 0.0007).sin();
+            }
+        }
+    }
+    let q_a = fix.host_buffer_f32(&q, "q");
+    let k_a = fix.host_buffer_f32(&k, "k");
+    let v_a = fix.host_buffer_f32(&v, "v");
+    let o_a = fix.output_buffer_f32((n_heads * head_dim) as usize, "o_scalar");
+    let q_b = fix.host_buffer_f32(&q, "q2");
+    let k_b = fix.host_buffer_f32(&k, "k2");
+    let v_b = fix.host_buffer_f32(&v, "v2");
+    let o_b = fix.output_buffer_f32((n_heads * head_dim) as usize, "o_flash");
+    let pc = ScalarAttnPushConstants {
+        n_heads, n_kv_heads, head_dim, seq_len, max_seq, scale,
+    };
+    fix.dispatch(
+        ShaderId::ScalarAttn, &[q_a, k_a, v_a, o_a],
+        bytemuck::bytes_of(&pc), (n_heads, 1, 1),
+    );
+    fix.dispatch(
+        ShaderId::FlashAttn, &[q_b, k_b, v_b, o_b],
+        bytemuck::bytes_of(&pc), (n_heads, 1, 1),
+    );
+    let scalar = fix.read_output(o_a, (n_heads * head_dim) as usize);
+    let flash  = fix.read_output(o_b, (n_heads * head_dim) as usize);
+    let max_abs = max_abs_err(&flash, &scalar);
+    assert!(
+        max_abs < 1e-3,
+        "flash_attn vs scalar_attn at seq=200: max_abs_err = {max_abs:e} ≥ 1e-3\n\
+         scalar first 8: {:?}\n flash  first 8: {:?}",
+        &scalar[..8], &flash[..8],
+    );
+    fix.teardown();
+}
+
+// -----------------------------------------------------------------
 // Helpers for push-constant boilerplate.
 
 fn binary_pc_1d(n: u32) -> GenericBinaryPushConstants {
