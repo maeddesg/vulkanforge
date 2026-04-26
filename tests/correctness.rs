@@ -1,3 +1,10 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::unnecessary_cast,
+)]
+
 //! Phase-2B correctness tests for every elementwise / utility shader
 //! the decode pipeline depends on.
 //!

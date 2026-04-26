@@ -1,3 +1,5 @@
+#![allow(clippy::print_literal)]
+
 //! Phase-3C 15-prompt benchmark — runs `inference_test_prompts_15.json`
 //! through VulkanForge with KV-cache reset between prompts and prints
 //! a per-prompt + aggregate tok/s table for the 4-system comparison.

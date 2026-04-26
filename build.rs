@@ -1,3 +1,5 @@
+#![allow(clippy::ptr_arg, clippy::op_ref)]
+
 //! Build-time GLSL → SPIR-V compilation for VulkanForge.
 //!
 //! Phase 2A — compiles every shader the decode pipeline needs into a

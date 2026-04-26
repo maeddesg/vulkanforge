@@ -1,3 +1,19 @@
+// See lib.rs for rationale.
+#![allow(
+    clippy::too_many_arguments,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::unnecessary_cast,
+    clippy::unnecessary_map_or,
+    clippy::ptr_arg,
+    clippy::print_literal,
+    clippy::op_ref,
+    clippy::needless_question_mark,
+    clippy::match_like_matches_macro,
+    clippy::doc_lazy_continuation,
+    clippy::collapsible_else_if,
+)]
+
 //! VulkanForge — Phase 3B interactive chat REPL.
 //!
 //! Loads Qwen3-8B once at startup, then drops into a `>` prompt
