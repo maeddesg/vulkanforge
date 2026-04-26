@@ -960,7 +960,14 @@ impl Forward {
             dev.device.cmd_push_constants(
                 cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
             );
-            dev.device.cmd_dispatch(cmd, m, 1, 1);
+            // Phase-3C: GEMV pipeline is now built with NUM_ROWS = MMV_NUM_ROWS
+            // (= 2). Each workgroup writes NUM_ROWS output rows, so the
+            // dispatch count divides — ceiling-div to handle a tail
+            // workgroup when m isn't a multiple of NUM_ROWS (the shader
+            // bounds-checks via `first_row + NUM_ROWS <= stride_d`).
+            let n_rows = super::pipeline_registry::MMV_NUM_ROWS;
+            let groups = (m + n_rows - 1) / n_rows;
+            dev.device.cmd_dispatch(cmd, groups, 1, 1);
         });
     }
 

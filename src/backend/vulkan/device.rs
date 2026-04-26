@@ -131,18 +131,30 @@ impl VulkanDevice {
         //   StorageBuffer16BitAccess  — Vulkan 1.1 feature
         //   StorageBuffer8BitAccess   — Vulkan 1.2 feature
         //   shaderInt8                — Vulkan 1.2 feature
+        // Phase 3C adds Vulkan 1.3 `shaderIntegerDotProduct` so the
+        // mul_mmq.comp SPIR-V (compile-probe in this phase, full
+        // dispatch in 3D) can declare its `DotProduct` capabilities
+        // cleanly — RADV/gfx1201 reports both 8-bit accelerated paths
+        // available.
+        let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
+            .shader_integer_dot_product(true);
         let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
             .storage_buffer8_bit_access(true)
             .shader_int8(true);
         let mut features11 = vk::PhysicalDeviceVulkan11Features::default()
             .storage_buffer16_bit_access(true);
-        let mut features2 = vk::PhysicalDeviceFeatures2::default();
+        // shaderInt16 is also pulled in by mul_mmq's i16 unpack helpers.
+        // It's a base 1.0 feature so it lives on PhysicalDeviceFeatures,
+        // not in the 1.1/1.2/1.3 extension chains.
+        let core_features = vk::PhysicalDeviceFeatures::default().shader_int16(true);
+        let mut features2 = vk::PhysicalDeviceFeatures2::default().features(core_features);
 
         let device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_create_info))
             .push_next(&mut features2)
             .push_next(&mut features11)
-            .push_next(&mut features12);
+            .push_next(&mut features12)
+            .push_next(&mut features13);
 
         let device =
             unsafe { instance.create_device(physical_device, &device_create_info, None)? };

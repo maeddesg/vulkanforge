@@ -23,7 +23,13 @@ use super::shaders::{self, ShaderId};
 /// (BLOCK_SIZE, NUM_ROWS, NUM_COLS). Same values as the GLSL
 /// defaults; pinning them explicitly keeps RADV's pipeline cache
 /// happy and makes Phase-2A dispatch behaviour identical to Phase-1.
-const MMV_SPEC_DATA: [u32; 3] = [32, 1, 1];
+// Phase-3C spec-tuning. BLOCK_SIZE=64 (was 32) makes one workgroup
+// equal one Wave64 subgroup, eliminating the cross-subgroup tree
+// reduction. NUM_ROWS=1 stays as Phase-2A measured: NUM_ROWS=2 was
+// ~5% faster at pos=0 but ~4% slower at pos=200, a wash on average.
+// `forward.rs::run_gemv` reads `MMV_NUM_ROWS` so the two stay in sync.
+pub const MMV_NUM_ROWS: u32 = 1;
+const MMV_SPEC_DATA: [u32; 3] = [64, MMV_NUM_ROWS, 1];
 
 fn entry(constant_id: u32, offset: u32, size: usize) -> vk::SpecializationMapEntry {
     vk::SpecializationMapEntry {
@@ -123,6 +129,54 @@ impl PipelineRegistry {
                     // shared `scores[]` buffer. 2048 covers Phase-2
                     // contexts; bump in Phase 3 for longer windows.
                     let data: [u32; 1] = [2048];
+                    let entries = [entry(0, 0, 4)];
+                    let bytes = bytemuck::bytes_of(&data);
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
+                }
+                ShaderId::MulMmqQ4K | ShaderId::MulMmqQ6K => {
+                    // Phase-3C compile probe — pin the 11 spec
+                    // constants llama.cpp's vulkan-shaders-gen pins
+                    // for a non-coopmat MMQ build. Layout:
+                    //   id 0  BLOCK_SIZE     (also drives local_size_x_id=0)
+                    //   id 1  BM             tile rows
+                    //   id 2  BN             tile cols
+                    //   id 4  WM             warp-tile rows
+                    //   id 5  WN             warp-tile cols
+                    //   id 6  WMITER         warp-tile rows / warp
+                    //   id 7  TM             thread-tile rows
+                    //   id 8  TN             thread-tile cols
+                    //   id 9  TK             1 for non-coopmat
+                    //   id 10 WARP           subgroup width
+                    let entries = [
+                        entry(0, 0, 4),
+                        entry(1, 4, 4),
+                        entry(2, 8, 4),
+                        entry(4, 12, 4),
+                        entry(5, 16, 4),
+                        entry(6, 20, 4),
+                        entry(7, 24, 4),
+                        entry(8, 28, 4),
+                        entry(9, 32, 4),
+                        entry(10, 36, 4),
+                    ];
+                    let data: [u32; 10] = [
+                        128, // BLOCK_SIZE — 64 warp × 2 sub-warps
+                        64,  // BM
+                        64,  // BN
+                        32,  // WM
+                        32,  // WN
+                        2,   // WMITER
+                        4,   // TM
+                        2,   // TN
+                        1,   // TK
+                        64,  // WARP — RDNA Wave64
+                    ];
+                    let bytes = bytemuck::bytes_of(&data);
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
+                }
+                ShaderId::QuantizeQ8_1 => {
+                    // SpecId 0 = GROUP_SIZE (drives local_size_x).
+                    let data: [u32; 1] = [32];
                     let entries = [entry(0, 0, 4)];
                     let bytes = bytemuck::bytes_of(&data);
                     ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)

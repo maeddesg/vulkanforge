@@ -129,6 +129,45 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "scalar_attn.comp",
         defines: &[],
     },
+    // Phase-3C: Q4_K integer-MMQ GEMM. Mirrors the defines
+    // llama.cpp's vulkan-shaders-gen passes for a non-MoE, non-coopmat
+    // Q4_K mul_mmq build. Used by Forward::prefill_batch (TBD) and
+    // microbenchmarks.
+    ShaderJob {
+        out_name: "mul_mmq_q4_k_f32.spv",
+        entry_source: "mul_mmq.comp",
+        defines: &[
+            ("DATA_A_Q4_K", "1"),
+            ("A_TYPE", "block_q4_K"),
+            ("A_TYPE_PACKED32", "block_q4_K_packed32"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("ACC_TYPE", "float"),
+        ],
+    },
+    // Q6_K integer-MMQ GEMM (mixed-quant: attn_v + ffn_down).
+    // Q6_K only ships a packed16 variant in types.glsl — match it.
+    ShaderJob {
+        out_name: "mul_mmq_q6_k_f32.spv",
+        entry_source: "mul_mmq.comp",
+        defines: &[
+            ("DATA_A_Q6_K", "1"),
+            ("A_TYPE", "block_q6_K"),
+            ("A_TYPE_PACKED16", "block_q6_K_packed16"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("ACC_TYPE", "float"),
+        ],
+    },
+    // Quantize FP32 activations → block_q8_1_x4 — needed before each
+    // mul_mmq dispatch since B is consumed as Q8_1.
+    ShaderJob {
+        out_name: "quantize_q8_1_f32.spv",
+        entry_source: "quantize_q8_1.comp",
+        defines: &[("QBLOCK_X4", "1")],
+    },
 ];
 
 fn main() {

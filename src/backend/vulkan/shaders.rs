@@ -20,6 +20,11 @@ pub enum ShaderId {
     SoftMax,
     Copy,
     ScalarAttn,
+    // Phase 3C — integer-MMQ GEMM for Prefill (compiled and registered;
+    // dispatch wiring lands in Phase 3D).
+    MulMmqQ4K,
+    MulMmqQ6K,
+    QuantizeQ8_1,
 }
 
 impl ShaderId {
@@ -36,6 +41,9 @@ impl ShaderId {
             ShaderId::SoftMax => "soft_max_f32",
             ShaderId::Copy => "copy_f32_f32",
             ShaderId::ScalarAttn => "scalar_attn_f32",
+            ShaderId::MulMmqQ4K => "mul_mmq_q4_k_f32",
+            ShaderId::MulMmqQ6K => "mul_mmq_q6_k_f32",
+            ShaderId::QuantizeQ8_1 => "quantize_q8_1_f32",
         }
     }
 
@@ -52,6 +60,9 @@ impl ShaderId {
             ShaderId::SoftMax => SOFT_MAX_F32,
             ShaderId::Copy => COPY_F32_F32,
             ShaderId::ScalarAttn => SCALAR_ATTN_F32,
+            ShaderId::MulMmqQ4K => MUL_MMQ_Q4_K_F32,
+            ShaderId::MulMmqQ6K => MUL_MMQ_Q6_K_F32,
+            ShaderId::QuantizeQ8_1 => QUANTIZE_Q8_1_F32,
         }
     }
 }
@@ -68,6 +79,9 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::SoftMax,
     ShaderId::Copy,
     ShaderId::ScalarAttn,
+    ShaderId::MulMmqQ4K,
+    ShaderId::MulMmqQ6K,
+    ShaderId::QuantizeQ8_1,
 ];
 
 pub const MUL_MAT_VEC_Q4_K_F32_F32: &[u8] =
@@ -84,6 +98,12 @@ pub const SOFT_MAX_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/soft_m
 pub const COPY_F32_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/copy_f32_f32.spv"));
 pub const SCALAR_ATTN_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/scalar_attn_f32.spv"));
+pub const MUL_MMQ_Q4_K_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mmq_q4_k_f32.spv"));
+pub const MUL_MMQ_Q6_K_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mmq_q6_k_f32.spv"));
+pub const QUANTIZE_Q8_1_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/quantize_q8_1_f32.spv"));
 
 /// Decode a SPIR-V byte blob into u32 words. Vulkan consumes SPIR-V
 /// as `&[u32]`; `include_bytes!` only gives us `&[u8]` whose alignment
