@@ -28,6 +28,9 @@ use super::shaders::{self, ShaderId};
 // reduction. NUM_ROWS=1 stays as Phase-2A measured: NUM_ROWS=2 was
 // ~5% faster at pos=0 but ~4% slower at pos=200, a wash on average.
 // `forward.rs::run_gemv` reads `MMV_NUM_ROWS` so the two stay in sync.
+// Phase-4A also tested BLOCK_SIZE=128 → also a wash (62.3 vs 61.8 at
+// pos=0, identical at pos=200) — VGPR pressure isn't moved by
+// spec-constant tuning, see results/phase4_step_4a_vgpr_reduction.md.
 pub const MMV_NUM_ROWS: u32 = 1;
 const MMV_SPEC_DATA: [u32; 3] = [64, MMV_NUM_ROWS, 1];
 
