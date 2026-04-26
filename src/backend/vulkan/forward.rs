@@ -181,7 +181,17 @@ impl Forward {
         let logits_buf = mk_storage(logits_bytes, MemoryLocation::GpuToCpu, "logits_buf")?;
         let fuse0 = mk_storage(16, MemoryLocation::GpuOnly, "fuse0_dummy")?;
         let fuse1 = mk_storage(16, MemoryLocation::GpuOnly, "fuse1_dummy")?;
-        let rope_pos_buf = mk_storage(4, MemoryLocation::CpuToGpu, "rope_pos")?;
+        // Phase 3E drift-fix: rope_pos_buf must hold one slot per
+        // prefill token (otherwise the per-token host writes during
+        // command-buffer recording all collapse to the last value
+        // by the time the GPU executes — every token gets the same
+        // RoPE position). Forward_token uses slot 0 of this buffer;
+        // prefill_batch writes positions 0..seq_len into slots
+        // 0..seq_len-1 before submit and binds with per-token offset.
+        let rope_pos_buf = mk_storage(
+            (max_prefill_tokens.max(1) as u64) * 4,
+            MemoryLocation::CpuToGpu, "rope_pos",
+        )?;
         let rope_ff_buf = mk_storage(16, MemoryLocation::GpuOnly, "rope_ff_dummy")?;
         let rope_idx_buf = mk_storage(16, MemoryLocation::GpuOnly, "rope_idx_dummy")?;
 
@@ -1118,14 +1128,41 @@ impl Forward {
         position: u32,
         label: &str,
     ) {
-        let _ = position; // already written into rope_pos_buf
+        // Bind rope_pos_buf at slot 0 (the legacy single-position
+        // path used by forward_token). prefill_batch uses
+        // run_rope_neox_with_pos_offset to read its own slot.
+        self.run_rope_neox_with_pos_offset(
+            dev, registry, cmd, input, output, head_dim, n_rows,
+            position, /* pos_buf_offset = */ 0, label,
+        );
+    }
+
+    /// Variant of `run_rope_neox` that binds `rope_pos_buf` starting
+    /// at `pos_buf_offset` bytes — required by `prefill_batch` to give
+    /// each per-token RoPE dispatch its own pre-staged position slot.
+    #[allow(clippy::too_many_arguments)]
+    fn run_rope_neox_with_pos_offset(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        input: vk::Buffer,
+        output: vk::Buffer,
+        head_dim: u32,
+        n_rows: u32,
+        position: u32,
+        pos_buf_offset: u64,
+        label: &str,
+    ) {
+        let _ = position; // The pos value is in rope_pos_buf at offset; not in PC.
         let kernel = registry.get(ShaderId::RopeNeox);
         let set = self.alloc_set(dev, kernel.descriptor_set_layout);
         self.write_bindings(
             dev, set,
             &[
                 (0, input, 0, 0),
-                (1, self.rope_pos_buf.handle, 0, 0),
+                // 4-byte slot starting at pos_buf_offset.
+                (1, self.rope_pos_buf.handle, pos_buf_offset, 4),
                 (2, self.rope_ff_buf.handle, 0, 0),
                 (3, output, 0, 0),
                 (4, self.rope_idx_buf.handle, 0, 0),
@@ -1459,13 +1496,18 @@ impl Forward {
             return Err("prefill_batch: embeddings length mismatch".into());
         }
 
-        // CPU → batch_input (host-visible). Subsequent GPU work reads
-        // from the residual ping-pong (initialised below).
+        // CPU → batch_input (host-visible).
         self.batch_input.write_bytes(bytemuck::cast_slice(embeddings))?;
 
-        // Pre-write per-token RoPE positions into rope_pos_buf — but
-        // RoPE shader takes a single u32 per dispatch, so we'll set it
-        // inside the per-token loop by re-uploading. Cheap.
+        // Pre-stage RoPE positions for every token in the batch.
+        // CRITICAL: all GPU dispatches in this submit run AFTER all
+        // host writes complete, so we must write every per-token
+        // position into a separate slot of rope_pos_buf BEFORE we
+        // start recording — otherwise the per-token RoPE dispatches
+        // would all read the last-written value (Phase 3E drift bug).
+        let positions: Vec<u32> = (0..seq_len).map(|t| base_pos + t).collect();
+        self.rope_pos_buf
+            .write_bytes(bytemuck::cast_slice(&positions))?;
 
         unsafe {
             dev.device.reset_descriptor_pool(
@@ -1624,10 +1666,9 @@ impl Forward {
         let wkn = layer_weight(model, layer, "attn_k_norm.weight");
         for t in 0..seq_len {
             let pos = base_pos + t;
-            // Per-token RoPE position.
-            self.rope_pos_buf
-                .write_bytes(bytemuck::bytes_of(&pos))
-                .expect("rope pos write");
+            // RoPE position lives at slot `t` of rope_pos_buf — written
+            // upfront in prefill_batch (see drift-fix comment there).
+            let rope_pos_offset = (t as u64) * 4;
             // Pull token-row Q/K/V into single-token scratch.
             let q_off = (t as u64) * q_bytes;
             let kv_off = (t as u64) * kv_bytes;
@@ -1656,14 +1697,14 @@ impl Forward {
                 cfg.head_dim, cfg.n_kv_heads, cfg.rms_norm_eps, "rms_norm_k_b",
             );
             compute_barrier(dev, cmd);
-            // RoPE.
-            self.run_rope_neox(
+            // RoPE — each dispatch reads its OWN position slot.
+            self.run_rope_neox_with_pos_offset(
                 dev, registry, cmd, self.q_buf.handle, self.q_buf.handle,
-                cfg.head_dim, cfg.n_heads, pos, "rope_q_b",
+                cfg.head_dim, cfg.n_heads, pos, rope_pos_offset, "rope_q_b",
             );
-            self.run_rope_neox(
+            self.run_rope_neox_with_pos_offset(
                 dev, registry, cmd, self.k_buf.handle, self.k_buf.handle,
-                cfg.head_dim, cfg.n_kv_heads, pos, "rope_k_b",
+                cfg.head_dim, cfg.n_kv_heads, pos, rope_pos_offset, "rope_k_b",
             );
             compute_barrier(dev, cmd);
             // KV-cache write at this token's position.

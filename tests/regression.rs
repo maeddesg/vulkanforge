@@ -730,13 +730,16 @@ fn phase3e_prefill_batch_matches_token_by_token_top5() {
          Top-5 b: {:?}",
         top1_a, top1_b, top5_a, top5_b,
     );
-    // Top-5 overlap of ≥ 1 (the top-1 itself) is the soft signal
-    // — this catches catastrophic drift (NaN logits, all-zero, etc.)
-    // without flagging the natural Q8_1 reordering.
+    // Phase-3E-drift-fix tightened gate: with the per-token RoPE
+    // position bug fixed (each token now reads its own slot in
+    // rope_pos_buf instead of all collapsing to the last host write),
+    // top-5 overlap should be ≥ 4/5. Pre-fix it was 1/5 — path B's
+    // top-5 was dominated by structural tokens (<|im_start|>,
+    // <|im_end|>, …) because every position decoded as the last one.
     assert!(
-        overlap >= 1,
-        "Top-5 disjoint — likely NaN or layout bug: {:?} vs {:?}",
-        top5_a, top5_b,
+        overlap >= 4,
+        "Top-5 overlap {}/5 too low — RoPE drift bug regressed?\n  A: {:?}\n  B: {:?}",
+        overlap, top5_a, top5_b,
     );
 
     cmd_ctx.destroy(&dev.device);
