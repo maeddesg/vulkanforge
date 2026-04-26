@@ -110,6 +110,7 @@ fn unescape_json(s: &str) -> String {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // Debug-printed; some fields kept for future use.
 struct Row {
     id: u32,
     name: String,

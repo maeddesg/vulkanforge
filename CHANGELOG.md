@@ -1,5 +1,91 @@
 # Changelog
 
+## Phase 5A — CB-Reuse via Persistent Descriptor Sets (2026-04-26)
+
+### Headline numbers (RX 9070 XT, gfx1201, 15-prompt suite)
+
+| Model | Decode median tok/s | Δ vs 4D |
+|---|---:|---:|
+| Qwen3-8B-Q4_K_M | **88.5** | +22 % (was 72.4) |
+| Meta-Llama-3.1-8B-Instruct-Q4_K_M | **94.6** | +16 % (was 81.5) |
+| DeepSeek-R1-Distill-Llama-8B-Q4_K_M | **94.8** | +17 % (was 81.3) |
+
+Forward-pass per-token CPU breakdown (Qwen3, pos=100):
+
+| Phase | Phase 4D | Phase 5A | Δ |
+|---|---:|---:|---:|
+| RECORD wall | 3.57 ms | **1.96 ms** | -45 % |
+| per-layer | 96 µs | **51 µs** | -47 % |
+| TOTAL | 13.7 ms | **11.2 ms** | -18 % |
+
+### Added
+- `Forward::alloc_or_get_set` — descriptor-set cache keyed on
+  `(layout, bindings)` signature (8-binding fixed-size key, no heap
+  alloc per call). On the decode hot path, every dispatch now does a
+  `HashMap::get` instead of `vkAllocateDescriptorSets +
+  vkUpdateDescriptorSets`.
+- `BindingSignature` / `BindingEntry` types in `forward.rs`.
+- `Forward::reset_descriptor_pool_and_cache` — used by paths whose
+  bindings vary across calls (`prefill_batch`, `forward_layer_debug{,
+  _intermediate}`).
+- `CommandContext::one_shot_profiled` + `OneShotTimings` — wall-time
+  breakdown for reset / begin / record / end / submit / wait. Used by
+  the new `forward_token_profile` / `forward_token_profile_layers`
+  paths and the `examples/profile_forward` driver.
+- `examples/profile_forward.rs` — Phase-5A profiling harness:
+  per-position phase breakdown plus drill-down into per-layer
+  dispatch time inside the record block.
+- New regression test `phase5a_cb_reuse_parity_qwen3` — runs Qwen3-8B
+  for 16 tokens with `cache_enabled=false` and `cache_enabled=true`,
+  asserts max abs logit diff `< 1e-6` and identical argmax at every
+  step. Bit-exact (max abs err = 0) in practice.
+- `Forward::set_cache_enabled` / `cache_enabled` — overrides the env
+  var pick for tests.
+- `results/phase5a_step_1_dgc_poc.md` — VK_EXT_device_generated_commands
+  spec + RADV implementation study. NO-GO: the spec disallows
+  intra-sequence barriers, capping host-call reduction at ~37 %, and
+  ash 0.38 lacks EXT bindings. Documented as-is.
+- `results/phase5a_step_2_cb_reuse.md` — CPU profile + Stage 2D
+  implementation report.
+- `results/phase5a_step_3_ship.md` — full 15-prompt benchmark on all
+  three supported models with cache default-on.
+
+### Changed
+- **CB-reuse is now the DEFAULT.** `VULKANFORGE_CB_REUSE=0` (or
+  `false`) opts back into the Phase-4D direct path for debugging /
+  A/B comparisons. Any other value (or unset) keeps the cache on.
+- `forward_token` skips `reset_descriptor_pool` when the cache is on
+  — sets accumulate for the lifetime of the `Forward` instance.
+- Descriptor pool sized 4× larger (`max_sets *= 4`) so a prefill_batch
+  invalidation followed by a long decode can rebuild the cache without
+  hitting the limit.
+- All 19 `alloc_set + write_bindings` call-pairs in `forward.rs` now
+  go through `alloc_or_get_set`. `dispatch_layer` and `dispatch_final`
+  unchanged structurally.
+- `forward.rs` removed dead `cpu_embedding_lookup` and unused
+  `hidden_bytes` local; `examples/run_15prompt_bench.rs` gated dead
+  fields with `#[allow(dead_code)]`.
+
+### Verified
+- 17/17 regression + 25/25 correctness tests pass with cache **on**.
+- 17/17 regression + 25/25 correctness tests pass with cache **off**
+  (`VULKANFORGE_CB_REUSE=0`).
+- Bit-exact parity (`max_abs_err = 0e0`) at all 16 tested positions on
+  Qwen3-8B.
+- Coherent decode on all three supported models in the full
+  15-prompt suite (some bench-heuristic false-negatives on
+  digits-only / emoji-only outputs — outputs themselves are correct).
+
+### Deferred (still on Phase 5+ backlog)
+- Stage 2A — pipeline-handle cache + push-constant templates. After
+  Stage 2D the per-layer time is already 51 µs, so additional savings
+  from 2A are projected at ~5-7 µs/layer → ~+1-2 % decode. Not worth
+  the additional code surface right now.
+- Stage 2B — full CB reuse via UBO-driven dynamic parameters. Would
+  require shader changes for ~17 shaders for at most ~+10 % decode
+  beyond Stage 2D. Off the table since 2D alone landed > 80 tok/s.
+- VK_EXT_device_generated_commands. NO-GO documented.
+
 ## Phase 4D — Multi-Model + Polish (2026-04-26)
 
 ### Added

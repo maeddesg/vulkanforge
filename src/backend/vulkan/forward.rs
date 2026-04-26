@@ -382,9 +382,16 @@ impl Forward {
             .pool_sizes(&pool_sizes);
         let descriptor_pool = unsafe { device.create_descriptor_pool(&pool_info, None)? };
 
-        let cache_enabled = std::env::var("VULKANFORGE_CB_REUSE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        // Phase 5A-3: descriptor-set cache is now ON by default.
+        // `VULKANFORGE_CB_REUSE=0` (or `false`) opts back out for
+        // debugging or A/B comparisons; any other value (or unset)
+        // keeps the cache enabled. The Stage 2D parity test
+        // (`phase5a_cb_reuse_parity_qwen3`) confirmed bit-exact output
+        // against the direct path, so the cache is safe as default.
+        let cache_enabled = match std::env::var("VULKANFORGE_CB_REUSE") {
+            Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
+            _ => true,
+        };
 
         // Note for tests: callers that need to override the env-var
         // pick can use `set_cache_enabled` after construction.
@@ -1278,27 +1285,6 @@ impl Forward {
         );
     }
 
-    fn cpu_embedding_lookup(
-        &self,
-        _model: &LoadedModel,
-        _token_id: u32,
-    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-        // Phase-2C shortcut: small-magnitude deterministic input.
-        // Real embedding read from token_embd.weight ships in
-        // Phase 2D once we keep the GgufFile mmap alongside the
-        // LoadedModel. For Phase 2C we only check "logits aren't
-        // all-zero / NaN", which is dominated by weights.
-        //
-        // Magnitude tuned small (~0.02 RMS) so the chain
-        //     embd → 36 layers w/ residuals → final norm → LM head
-        // doesn't blow up to overflow / underflow on any single
-        // RMSNorm step.
-        let n = self.config.hidden_dim as usize;
-        // DEBUG: temporarily zero input to isolate NaN source.
-        let v = vec![0.0f32; n];
-        Ok(v)
-    }
-
     // -------------------------------------------------------------
     // Per-shader dispatch methods.
     // -------------------------------------------------------------
@@ -2119,7 +2105,6 @@ impl Forward {
         let kv_dim = cfg.n_kv_heads * cfg.head_dim;
         let q_dim = cfg.n_heads * cfg.head_dim;
         let ffn = cfg.ffn_dim;
-        let hidden_bytes = (hidden as u64) * 4;
         let kv_bytes = (kv_dim as u64) * 4;
         let q_bytes = (q_dim as u64) * 4;
         let ffn_bytes = (ffn as u64) * 4;

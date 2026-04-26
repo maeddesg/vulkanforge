@@ -24,24 +24,36 @@ GPT-2 byte-level BPE today; an SPM unigram decoder is planned for Phase 5.
 Gemma-4 is out of scope for Phase 4D (different arch, requires Gemma-specific
 tensor layout work).
 
-## Performance (RX 9070 XT, 5-prompt subset of the 15-prompt suite)
+## Performance (RX 9070 XT, gfx1201, RDNA 4 — full 15-prompt suite)
 
 | Model | Decode tok/s (median) | Prefill tok/s (median) | Coherent |
 |---|---:|---:|---:|
-| Qwen3-8B (reference) | 72.4 | 288.1 | 5/5 |
-| Llama-3.1-8B-Instruct | 81.5 | 358.2 | 5/5 |
-| DeepSeek-R1-Distill-Llama-8B | 81.3 | 306.7 | 5/5 |
+| Qwen3-8B-Q4_K_M | 88.5 | 404.9 | 14/15 |
+| Meta-Llama-3.1-8B-Instruct-Q4_K_M | 94.6 | 489.9 | 13/15 |
+| DeepSeek-R1-Distill-Llama-8B-Q4_K_M | 94.8 | 433.9 | 15/15 |
 
-Llama-3.1 decode is ~12% faster than Qwen3 because Llama has 32 layers (Qwen3
-has 36) and no Q/K-norm dispatches per layer. Reference numbers from Phase 4C:
-llama.cpp Vulkan 114 tok/s, llama.cpp ROCm 88 tok/s on the same hardware.
+`Coherent` is the bench's automatic ✓/✗ heuristic; the false-negatives on
+Qwen3 (1) and Llama-3.1 (2) are digits-only / emoji-only outputs that the
+heuristic flags but are actually correct.
+
+Reference 4-system comparison on the same hardware:
+
+| System | Decode tok/s | Prefill tok/s |
+|---|---:|---:|
+| llama.cpp Vulkan | 114.2 | 4314 |
+| **VulkanForge (this repo, Phase 5A)** | **88.5–94.8** | **404–489** |
+| llama.cpp ROCm | 87.5 | 3684 |
+| ROCmForge (HIP backend) | 95.4 | 768.6 |
+
+Decode performance is now within ~17 % of llama.cpp Vulkan and ahead of
+llama.cpp ROCm. Prefill remains a Phase 5B target.
 
 ## Build
 
 ```bash
 cargo build --release             # ~2-3 s after first build (SPIR-V is cached)
 cargo run --release               # Phase 0 device-init smoke
-cargo test --release --tests      # 16 + 25 = 41 tests
+cargo test --release --tests      # 17 + 25 = 42 tests
 ```
 
 MSRV is **Rust 1.85** (edition 2024). Build dependencies require a working
@@ -83,6 +95,10 @@ VF_MODEL_PATH=$HOME/models/<file>.gguf \
 * `src/backend/vulkan/forward.rs` — single-token + batched prefill graph.
 * `src/backend/vulkan/forward.rs::run_flash_attn_split_reduce` — Phase-4C
   multi-WG attention (worker + reducer with online softmax merge).
+* `src/backend/vulkan/forward.rs::alloc_or_get_set` — Phase-5A descriptor-
+  set cache (eliminates the per-token `vkAllocateDescriptorSets` /
+  `vkUpdateDescriptorSets` overhead on the decode hot path; on by default,
+  set `VULKANFORGE_CB_REUSE=0` to disable).
 
 ## Conventions
 
@@ -98,7 +114,10 @@ Phase write-ups live in `results/`:
 * `phase4_step_4a_vgpr_reduction.md` — negative result on shader-side VGPR cuts
 * `phase4_step_4b_flash_attention.md` — online-softmax flash-attention drop-in
 * `phase4_step_4c_multi_wg_attention.md` — split-K multi-WG attention (+41%)
-* `phase4_step_4d_multi_model_release.md` — this phase
+* `phase4_step_4d_multi_model_release.md` — multi-model + chat templates
+* `phase5a_step_1_dgc_poc.md` — VK_EXT_device_generated_commands study (NO-GO)
+* `phase5a_step_2_cb_reuse.md` — CPU-profile + descriptor-set-cache (Stage 2D)
+* `phase5a_step_3_ship.md` — CB-reuse default-on + 15-prompt all models
 
 ## Limitations
 
@@ -106,5 +125,6 @@ Phase write-ups live in `results/`:
 * No quantized cache (KV is f32, ~2 GiB at 8k context).
 * Single batch — concurrent sessions need separate `Forward` instances.
 * SPM tokenizer not implemented — Mistral / Llama-2 are blocked on this.
-* No coopmat / WMMA path — Phase 4 attention work brought decode to ~70%
-  of llama.cpp Vulkan; closing the rest is Phase 5+ work.
+* No coopmat / WMMA path — Phase 4 attention + Phase 5A CB-reuse brought
+  decode to ~83 % of llama.cpp Vulkan; closing the remaining ~17 % is
+  Phase 5+ work (likely a coopmat-style GEMV / improved attention shader).
