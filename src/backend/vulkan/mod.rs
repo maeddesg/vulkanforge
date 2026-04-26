@@ -1,4 +1,5 @@
 pub mod buffers;
+pub mod chat;
 pub mod commands;
 pub mod decode;
 pub mod device;

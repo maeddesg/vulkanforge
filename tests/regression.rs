@@ -12,8 +12,9 @@ use gpu_allocator::MemoryLocation;
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 
 use vulkanforge::backend::vulkan::buffers::GpuBuffer;
+use vulkanforge::backend::vulkan::chat::ChatSession;
 use vulkanforge::backend::vulkan::commands::CommandContext;
-use vulkanforge::backend::vulkan::decode::{generate, GenerateConfig};
+use vulkanforge::backend::vulkan::decode::{generate, GenerateConfig, ThinkFilter};
 use vulkanforge::backend::vulkan::device::VulkanDevice;
 use vulkanforge::backend::vulkan::forward::Forward;
 use vulkanforge::backend::vulkan::gguf::{GgmlType, GgufFile, ModelConfig};
@@ -465,6 +466,7 @@ fn phase2d_decode_produces_coherent_text() {
         &GenerateConfig {
             max_tokens: 80,
             print_stream: false,
+            think_filter: false,
         },
     )
     .expect("generate");
@@ -479,6 +481,197 @@ fn phase2d_decode_produces_coherent_text() {
     );
 
     forward.destroy(&dev.device, &mut allocator);
+    cmd_ctx.destroy(&dev.device);
+    model.destroy(&dev.device, &mut allocator);
+    registry.destroy(&dev.device);
+    drop(allocator);
+}
+
+// -----------------------------------------------------------------
+// Phase 3B — ChatSession (multi-turn) + ThinkFilter regression tests.
+
+/// `ThinkFilter::strip_all` is the unit-level check; this test
+/// exercises the same filter applied to a real generated stream that
+/// contains a complete `<think>...</think>` block. Cheap (no GPU).
+#[test]
+fn phase3b_think_filter_strips_real_text() {
+    let raw = "<think>\nOkay, the user asked about mutexes.\n</think>\n\nA mutex is a synchronization primitive.";
+    let visible = ThinkFilter::strip_all(raw);
+    assert!(
+        !visible.contains("<think>") && !visible.contains("</think>"),
+        "filtered text still has tags: {visible:?}"
+    );
+    assert!(
+        !visible.contains("Okay, the user asked"),
+        "filtered text leaked think content: {visible:?}"
+    );
+    assert!(
+        visible.contains("synchronization primitive"),
+        "filtered text dropped the answer: {visible:?}"
+    );
+}
+
+/// Multi-Turn carries context across turns. Tells the assistant a
+/// fact in Turn 1, asks for it in Turn 2, then `/reset`s and verifies
+/// the fact is gone.
+///
+/// Greedy decode is deterministic, so the model's first response
+/// fixes the second-turn context exactly. Asking "What is my name?"
+/// after telling it "My name is Alice" must produce text containing
+/// "Alice"; after `/reset` it must not.
+#[test]
+fn phase3b_chat_session_multi_turn_carries_and_resets() {
+    let Some(path) = qwen3_path() else { return };
+    let dev = VulkanDevice::new().expect("VulkanDevice::new");
+    let mut allocator = Allocator::new(&AllocatorCreateDesc {
+        instance: dev.instance.clone(),
+        device: dev.device.clone(),
+        physical_device: dev.physical_device,
+        debug_settings: gpu_allocator::AllocatorDebugSettings::default(),
+        buffer_device_address: false,
+        allocation_sizes: gpu_allocator::AllocationSizes::default(),
+    })
+    .expect("Allocator::new");
+    let (registry, _) = PipelineRegistry::new(&dev.device, None).expect("registry");
+    let cmd_ctx = CommandContext::new(&dev.device, dev.queue_family_index).expect("cmd_ctx");
+    let gguf = GgufFile::open(&path).expect("open");
+    let cfg = ModelConfig::from_gguf(&gguf).expect("config");
+    let model = LoadedModel::load(&dev, &mut allocator, &gguf).expect("load");
+    let tokenizer = Tokenizer::from_gguf(&gguf).expect("tokenizer");
+
+    let kv_cache = KvCache::new(
+        &dev.device,
+        &mut allocator,
+        KvCacheConfig {
+            n_layers: cfg.n_layers,
+            n_kv_heads: cfg.n_kv_heads,
+            head_dim: cfg.head_dim,
+            // 2 turns × ≈70 tokens each fits comfortably in 768.
+            max_seq_len: 768,
+        },
+    )
+    .expect("kv_cache");
+    let forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None).expect("forward");
+    let mut session = ChatSession::new(forward, "You are a helpful assistant.");
+    let cfg_g = GenerateConfig {
+        max_tokens: 80,
+        print_stream: false,
+        // Filter <think> chatter out of the *visible* text we assert on
+        // — the model frequently muses inside <think>; we want the
+        // post-think answer.
+        think_filter: true,
+    };
+
+    // Turn 1: tell it the user's name.
+    let _r1 = session
+        .send(
+            &dev, &registry, &cmd_ctx, &model, &gguf, &cfg, &tokenizer,
+            "My name is Alice. Please remember it.",
+            &cfg_g,
+        )
+        .expect("turn 1");
+    assert_eq!(session.turn_count, 1, "turn count after first send");
+    assert!(session.current_pos > 0, "current_pos should advance after turn 1");
+
+    // Turn 2: ask for it back.
+    let r2 = session
+        .send(
+            &dev, &registry, &cmd_ctx, &model, &gguf, &cfg, &tokenizer,
+            "What is my name?",
+            &cfg_g,
+        )
+        .expect("turn 2");
+    assert_eq!(session.turn_count, 2, "turn count after second send");
+    let visible_lower = r2.visible_text.to_lowercase();
+    let raw_lower = r2.generated_text.to_lowercase();
+    assert!(
+        visible_lower.contains("alice") || raw_lower.contains("alice"),
+        "Multi-turn lost context — Turn 2 answer:\n  visible: {:?}\n  raw:     {:?}",
+        r2.visible_text, r2.generated_text,
+    );
+
+    // /reset wipes both KV state and history.
+    session.reset();
+    assert_eq!(session.current_pos, 0);
+    assert_eq!(session.turn_count, 0);
+    assert!(session.history.is_empty());
+
+    // Turn 3 (post-reset): asking the same question should NOT find
+    // "alice" because the session has no memory of it.
+    let r3 = session
+        .send(
+            &dev, &registry, &cmd_ctx, &model, &gguf, &cfg, &tokenizer,
+            "What is my name?",
+            &cfg_g,
+        )
+        .expect("turn 3");
+    let post_reset_lower = r3.visible_text.to_lowercase();
+    assert!(
+        !post_reset_lower.contains("alice"),
+        "post-reset answer leaked Turn 1's context — answer was {:?}",
+        r3.visible_text,
+    );
+
+    session.forward.destroy(&dev.device, &mut allocator);
+    cmd_ctx.destroy(&dev.device);
+    model.destroy(&dev.device, &mut allocator);
+    registry.destroy(&dev.device);
+    drop(allocator);
+}
+
+/// Context-overflow surfaces as a structured `ChatError::ContextOverflow`,
+/// not a panic.
+#[test]
+fn phase3b_chat_session_context_overflow_clean_error() {
+    let Some(path) = qwen3_path() else { return };
+    let dev = VulkanDevice::new().expect("VulkanDevice::new");
+    let mut allocator = Allocator::new(&AllocatorCreateDesc {
+        instance: dev.instance.clone(),
+        device: dev.device.clone(),
+        physical_device: dev.physical_device,
+        debug_settings: gpu_allocator::AllocatorDebugSettings::default(),
+        buffer_device_address: false,
+        allocation_sizes: gpu_allocator::AllocationSizes::default(),
+    })
+    .expect("Allocator::new");
+    let (registry, _) = PipelineRegistry::new(&dev.device, None).expect("registry");
+    let cmd_ctx = CommandContext::new(&dev.device, dev.queue_family_index).expect("cmd_ctx");
+    let gguf = GgufFile::open(&path).expect("open");
+    let cfg = ModelConfig::from_gguf(&gguf).expect("config");
+    let model = LoadedModel::load(&dev, &mut allocator, &gguf).expect("load");
+    let tokenizer = Tokenizer::from_gguf(&gguf).expect("tokenizer");
+
+    // Tiny KV cache so a single send overflows immediately.
+    let kv_cache = KvCache::new(
+        &dev.device,
+        &mut allocator,
+        KvCacheConfig {
+            n_layers: cfg.n_layers,
+            n_kv_heads: cfg.n_kv_heads,
+            head_dim: cfg.head_dim,
+            max_seq_len: 64,
+        },
+    )
+    .expect("kv_cache");
+    let forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None).expect("forward");
+    let mut session = ChatSession::new(forward, "You are a helpful assistant.");
+
+    let err = session
+        .send(
+            &dev, &registry, &cmd_ctx, &model, &gguf, &cfg, &tokenizer,
+            // The chat template alone is ~25 tokens; with max_tokens=80
+            // we ask for ~110, well over max_seq_len=64.
+            "Tell me everything you know about distributed systems.",
+            &GenerateConfig { max_tokens: 80, print_stream: false, think_filter: false },
+        )
+        .expect_err("expected ChatError::ContextOverflow");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("context overflow"),
+        "expected context overflow error, got: {msg}"
+    );
+
+    session.forward.destroy(&dev.device, &mut allocator);
     cmd_ctx.destroy(&dev.device);
     model.destroy(&dev.device, &mut allocator);
     registry.destroy(&dev.device);

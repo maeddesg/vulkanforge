@@ -1,35 +1,34 @@
-//! VulkanForge — Phase 2D demo driver: tokenizer + decode loop +
-//! 5-prompt validation suite.
+//! VulkanForge — Phase 3B interactive chat REPL.
 //!
-//! Modes (env-driven, mutually exclusive):
-//!   default              → 5-prompt validation suite, prints
-//!                          per-prompt summary + median tok/s.
-//!   VF_PROMPT="..."     → run a single user prompt, stream output
-//!                          to stdout.
-//!   VF_TRACE_L0=1        → Phase-2C intra-layer-0 debug trace
-//!                          (kept for regression-debugging).
-//!   VF_LAYER_WALK=1      → Phase-2C per-layer NaN walk on the raw
-//!                          token-9707 embedding (kept for the same
-//!                          reason).
-//!   VF_FULL=1            → one full forward + LM-head dump (no
-//!                          tokenizer, no decode loop).
+//! Loads Qwen3-8B once at startup, then drops into a `>` prompt
+//! that runs each user turn through [`ChatSession::send_streaming`].
+//! KV cache is shared across turns; slash-commands let the user
+//! reset, query, or quit.
 //!
-//! Other env vars:
-//!   VF_MODEL_PATH=...    → override model file (default
-//!                          $HOME/models/Qwen3-8B-Q4_K_M.gguf).
-//!   VF_MAX_TOKENS=N      → cap decode length (default 200).
-//!   VF_PROFILE=1         → enable shader timestamp profiler in
-//!                          forward passes (slower, prints
-//!                          per-shader breakdown for VF_FULL).
+//! Slash-commands:
+//!   /reset    — clear KV cache + history, start fresh
+//!   /quit     — exit cleanly
+//!   /stats    — context usage, turn count, last decode tok/s
+//!   /think    — toggle the think-filter (default ON)
+//!   /help     — list commands
+//!
+//! Env vars:
+//!   VF_MODEL_PATH        path to GGUF (default ~/models/Qwen3-8B-Q4_K_M.gguf)
+//!   VF_MAX_TOKENS        per-turn cap (default 400)
+//!   VF_SYSTEM            system prompt (default "You are a helpful assistant.")
+//!   VF_NO_THINK_FILTER   set to disable the think-filter
+//!   VF_PROMPT="..."     run a single turn non-interactively (CI / regression)
 
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
 use ash::vk;
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 
+use vulkanforge::backend::vulkan::chat::{ChatError, ChatSession, TurnResult};
 use vulkanforge::backend::vulkan::commands::CommandContext;
-use vulkanforge::backend::vulkan::decode::{generate, GenerateConfig, GenerateResult};
+use vulkanforge::backend::vulkan::decode::GenerateConfig;
 use vulkanforge::backend::vulkan::device::VulkanDevice;
 use vulkanforge::backend::vulkan::forward::Forward;
 use vulkanforge::backend::vulkan::gguf::{GgufFile, ModelConfig};
@@ -39,14 +38,7 @@ use vulkanforge::backend::vulkan::pipeline_registry::{default_cache_path, Pipeli
 use vulkanforge::backend::vulkan::tokenizer::Tokenizer;
 
 const MAX_SEQ_LEN: u32 = 2048;
-
-const VALIDATION_PROMPTS: &[&str] = &[
-    "Explain what a mutex is in one sentence.",
-    "Write a haiku about programming.",
-    "What is 2 + 2?",
-    "Translate 'hello world' to German.",
-    "List three prime numbers.",
-];
+const DEFAULT_SYSTEM: &str = "You are a helpful assistant.";
 
 fn main() {
     if let Err(e) = run() {
@@ -56,8 +48,6 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    println!("VulkanForge v0.1.0 — Phase 2D decode driver");
-
     let dev = VulkanDevice::new()?;
     let mut allocator = Allocator::new(&AllocatorCreateDesc {
         instance: dev.instance.clone(),
@@ -68,7 +58,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         allocation_sizes: gpu_allocator::AllocationSizes::default(),
     })?;
     let cache_path = default_cache_path();
-    let (registry, _) = PipelineRegistry::new(&dev.device, cache_path.as_deref())?;
+    let (registry, pipelines_loaded) =
+        PipelineRegistry::new(&dev.device, cache_path.as_deref())?;
     let cmd_ctx = CommandContext::new(&dev.device, dev.queue_family_index)?;
 
     let model_path = std::env::var("VF_MODEL_PATH")
@@ -79,33 +70,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|h| PathBuf::from(h).join("models").join("Qwen3-8B-Q4_K_M.gguf"))
                 .expect("$HOME unset")
         });
-    println!("  GGUF: {}", model_path.display());
-
-    let parse_start = Instant::now();
-    let gguf = GgufFile::open(&model_path)?;
-    let cfg = ModelConfig::from_gguf(&gguf)?;
-    println!(
-        "  parsed in {:.1} ms",
-        parse_start.elapsed().as_secs_f64() * 1000.0
-    );
+    let max_tokens: u32 = std::env::var("VF_MAX_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(400);
+    let system_prompt = std::env::var("VF_SYSTEM").unwrap_or_else(|_| DEFAULT_SYSTEM.to_string());
+    let mut think_filter = std::env::var("VF_NO_THINK_FILTER").is_err();
 
     let load_start = Instant::now();
+    let gguf = GgufFile::open(&model_path)?;
+    let cfg = ModelConfig::from_gguf(&gguf)?;
     let model = LoadedModel::load(&dev, &mut allocator, &gguf)?;
-    println!(
-        "✅ {} tensors, {:.2} GiB in {:.1} s",
-        model.tensors.len(),
-        (model.bytes_uploaded as f64) / (1024.0 * 1024.0 * 1024.0),
-        load_start.elapsed().as_secs_f64()
-    );
-
-    let tok_start = Instant::now();
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
-    println!(
-        "✅ tokenizer: {} tokens in {:.1} ms",
-        tokenizer.vocab_size(),
-        tok_start.elapsed().as_secs_f64() * 1000.0
-    );
-
     let kv_cache = KvCache::new(
         &dev.device,
         &mut allocator,
@@ -116,38 +92,87 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             max_seq_len: MAX_SEQ_LEN,
         },
     )?;
+    let forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;
 
-    let profiler = if std::env::var("VF_PROFILE").is_ok() {
-        Some(vulkanforge::backend::vulkan::profiler::ShaderProfiler::new(
-            &dev.instance,
-            dev.physical_device,
-            dev.queue_family_index,
-            &dev.device,
-            1024,
-        )?)
-    } else {
-        None
-    };
-    let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), profiler)?;
+    print_banner(
+        &model_path,
+        &cfg,
+        model.bytes_uploaded,
+        load_start.elapsed().as_secs_f64(),
+        pipelines_loaded,
+        think_filter,
+        max_tokens,
+    );
 
-    let max_tokens: u32 = std::env::var("VF_MAX_TOKENS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(200);
+    let mut session = ChatSession::new(forward, system_prompt.clone());
+    let mut last_turn: Option<TurnResult> = None;
 
     if let Ok(prompt) = std::env::var("VF_PROMPT") {
-        run_single(
-            &mut forward, &dev, &registry, &cmd_ctx, &model, &gguf, &cfg, &tokenizer,
-            &prompt, max_tokens,
-        )?;
+        // Non-interactive: run one turn, print stats, exit.
+        match send_turn(&mut session, &dev, &registry, &cmd_ctx, &model, &gguf, &cfg,
+                        &tokenizer, &prompt, max_tokens, think_filter)
+        {
+            Ok(r) => last_turn = Some(r),
+            Err(ChatError::ContextOverflow { .. }) => {
+                eprintln!("\n[context overflow]");
+            }
+            Err(e) => return Err(Box::new(e)),
+        }
+        if let Some(r) = &last_turn {
+            print_inline_stats(r);
+        }
     } else {
-        run_validation_suite(
-            &mut forward, &dev, &registry, &cmd_ctx, &model, &gguf, &cfg, &tokenizer,
-            max_tokens,
-        )?;
+        // Interactive REPL.
+        let stdin = std::io::stdin();
+        let mut lines = stdin.lock().lines();
+        loop {
+            print!("\n> ");
+            std::io::stdout().flush().ok();
+            let line = match lines.next() {
+                Some(Ok(s)) => s,
+                Some(Err(_)) | None => break, // EOF (Ctrl-D)
+            };
+            let trimmed = line.trim();
+            match trimmed {
+                "" => continue,
+                "/quit" | "/q" | "/exit" => break,
+                "/help" | "/h" => print_help(),
+                "/reset" => {
+                    session.reset();
+                    last_turn = None;
+                    println!("  (context cleared)");
+                }
+                "/stats" => print_stats(&session, last_turn.as_ref()),
+                "/think" => {
+                    think_filter = !think_filter;
+                    println!("  think-filter: {}", if think_filter { "on" } else { "off" });
+                }
+                _ => {
+                    println!();
+                    match send_turn(
+                        &mut session, &dev, &registry, &cmd_ctx, &model, &gguf, &cfg,
+                        &tokenizer, trimmed, max_tokens, think_filter,
+                    ) {
+                        Ok(r) => {
+                            print_inline_stats(&r);
+                            last_turn = Some(r);
+                        }
+                        Err(ChatError::ContextOverflow { current_pos, needed, max_seq_len }) => {
+                            eprintln!(
+                                "\n  [context overflow: {current_pos} + {needed} > {max_seq_len}]"
+                            );
+                            eprintln!("  Use /reset to start a new conversation.");
+                        }
+                        Err(e) => {
+                            eprintln!("\n  [error: {e}]");
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    forward.destroy(&dev.device, &mut allocator);
+    session.forward.destroy(&dev.device, &mut allocator);
     cmd_ctx.destroy(&dev.device);
     model.destroy(&dev.device, &mut allocator);
     registry.destroy(&dev.device);
@@ -157,8 +182,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_single(
-    forward: &mut Forward,
+fn send_turn(
+    session: &mut ChatSession,
     dev: &VulkanDevice,
     registry: &PipelineRegistry,
     cmd_ctx: &CommandContext,
@@ -166,104 +191,98 @@ fn run_single(
     gguf: &GgufFile,
     cfg: &ModelConfig,
     tokenizer: &Tokenizer,
-    prompt: &str,
+    user_message: &str,
     max_tokens: u32,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("\n=== Single prompt ===");
-    println!("> {prompt}\n");
+    think_filter: bool,
+) -> Result<TurnResult, ChatError> {
     let cfg_g = GenerateConfig {
         max_tokens,
-        print_stream: true,
+        print_stream: false,
+        think_filter,
     };
-    let r = generate(
-        forward, dev, registry, cmd_ctx, model, gguf, cfg, tokenizer,
-        prompt, &cfg_g,
-    )?;
-    print_result_summary(&r);
-    Ok(())
+    session.send_streaming(
+        dev, registry, cmd_ctx, model, gguf, cfg, tokenizer,
+        user_message, &cfg_g,
+        |visible| {
+            print!("{visible}");
+            std::io::stdout().flush().ok();
+        },
+    )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_validation_suite(
-    forward: &mut Forward,
-    dev: &VulkanDevice,
-    registry: &PipelineRegistry,
-    cmd_ctx: &CommandContext,
-    model: &LoadedModel,
-    gguf: &GgufFile,
+fn print_banner(
+    model_path: &PathBuf,
     cfg: &ModelConfig,
-    tokenizer: &Tokenizer,
+    bytes_uploaded: u64,
+    load_secs: f64,
+    pipelines_loaded: usize,
+    think_filter: bool,
     max_tokens: u32,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("\n=== 5-Prompt Validation Suite ===");
-    let mut results: Vec<(String, GenerateResult)> = Vec::new();
-
-    for (i, &prompt) in VALIDATION_PROMPTS.iter().enumerate() {
-        println!("\n--- Prompt {} ---", i + 1);
-        println!("> {prompt}");
-        let r = generate(
-            forward, dev, registry, cmd_ctx, model, gguf, cfg, tokenizer,
-            prompt,
-            &GenerateConfig {
-                max_tokens,
-                print_stream: false,
-            },
-        )?;
-        println!("\n{}", r.generated_text);
-        println!(
-            "  [prompt={} gen={} stopped_on_eos={} prefill={:.0} tok/s decode={:.1} tok/s]",
-            r.prompt_tokens,
-            r.generated_tokens,
-            r.stopped_on_eos,
-            r.prefill_tok_s(),
-            r.decode_tok_s(),
-        );
-        results.push((prompt.to_string(), r));
-    }
-
-    println!("\n=== Summary ===");
+) {
+    println!("\nVulkanForge v0.1.0 — Phase 3B chat REPL");
+    println!("  Model:   {}", model_path.display());
     println!(
-        "{:<54}  {:>6}  {:>5}  {:>9}  {:>10}",
-        "Prompt", "Prompt", "Gen", "Prefill", "Decode"
+        "    {:.2} GiB · {} layers · hidden={} · heads={} · kv_heads={} · head_dim={}",
+        (bytes_uploaded as f64) / (1024.0 * 1024.0 * 1024.0),
+        cfg.n_layers,
+        cfg.hidden_dim,
+        cfg.n_heads,
+        cfg.n_kv_heads,
+        cfg.head_dim,
     );
     println!(
-        "{:<54}  {:>6}  {:>5}  {:>9}  {:>10}",
-        "", "(tok)", "(tok)", "(tok/s)", "(tok/s)"
+        "    vocab={} · ctx_max={} · rope_freq_base={:.0}",
+        cfg.vocab_size, MAX_SEQ_LEN, cfg.rope_freq_base,
     );
-    for (p, r) in &results {
-        let short = if p.len() > 50 { format!("{}…", &p[..49]) } else { p.clone() };
-        println!(
-            "{:<54}  {:>6}  {:>5}  {:>9.0}  {:>10.1}",
-            short,
-            r.prompt_tokens,
-            r.generated_tokens,
-            r.prefill_tok_s(),
-            r.decode_tok_s(),
-        );
-    }
-    let mut decodes: Vec<f64> = results.iter().map(|(_, r)| r.decode_tok_s()).collect();
-    let mut prefills: Vec<f64> = results.iter().map(|(_, r)| r.prefill_tok_s()).collect();
-    decodes.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    prefills.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let med_d = decodes[decodes.len() / 2];
-    let med_p = prefills[prefills.len() / 2];
+    println!("  Loaded in {:.1} s", load_secs);
     println!(
-        "{:<54}  {:>6}  {:>5}  {:>9.0}  {:>10.1}",
-        "MEDIAN", "—", "—", med_p, med_d,
+        "  Pipeline cache: {} bytes loaded · {} shaders ready",
+        pipelines_loaded,
+        vulkanforge::backend::vulkan::shaders::ALL_SHADERS.len(),
     );
-    Ok(())
+    println!(
+        "  think-filter: {} · max_tokens/turn: {}",
+        if think_filter { "on" } else { "off" },
+        max_tokens,
+    );
+    println!("  Type /help for commands, /quit to exit.");
 }
 
-fn print_result_summary(r: &GenerateResult) {
-    println!("\n--- summary ---");
+fn print_help() {
+    println!("  /reset     clear KV cache + history");
+    println!("  /quit      exit");
+    println!("  /stats     show context usage and last-turn timing");
+    println!("  /think     toggle <think>…</think> filter");
+    println!("  /help      this list");
+}
+
+fn print_stats(session: &ChatSession, last: Option<&TurnResult>) {
     println!(
-        "prompt_tokens   = {}\ngenerated_tokens= {}\nstopped_on_eos  = {}\nprefill_time    = {:.2} ms ({:.0} tok/s)\ndecode_time     = {:.2} ms ({:.1} tok/s)",
+        "  Context: {}/{} tokens used  ({} free)",
+        session.current_pos,
+        session.max_seq_len(),
+        session.remaining_tokens(),
+    );
+    println!("  Turns:   {}", session.turn_count);
+    if let Some(r) = last {
+        println!(
+            "  Last turn: {} prompt → {} gen, prefill {:.0} tok/s, decode {:.1} tok/s, stopped_on_eos={}",
+            r.prompt_tokens,
+            r.generated_tokens,
+            r.prefill_tok_s(),
+            r.decode_tok_s(),
+            r.stopped_on_eos,
+        );
+    }
+}
+
+fn print_inline_stats(r: &TurnResult) {
+    println!(
+        "\n  [{} prompt, {} gen, prefill {:.0} tok/s, decode {:.1} tok/s{}]",
         r.prompt_tokens,
         r.generated_tokens,
-        r.stopped_on_eos,
-        r.prefill_time.as_secs_f64() * 1000.0,
         r.prefill_tok_s(),
-        r.decode_time.as_secs_f64() * 1000.0,
         r.decode_tok_s(),
+        if r.stopped_on_eos { "" } else { ", capped" },
     );
 }
