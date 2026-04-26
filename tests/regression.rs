@@ -396,14 +396,16 @@ fn phase2d_chat_template_qwen3() {
     let tok = Tokenizer::from_gguf(&gguf).expect("tokenizer");
 
     let prompt = apply_chat_template(&tok, "Hi", None);
+    let im_start = tok.im_start_id.expect("Qwen3 tokenizer has <|im_start|>");
+    let im_end = tok.im_end_id.expect("Qwen3 tokenizer has <|im_end|>");
     // Must start with <|im_start|>system and end with <|im_start|>assistant\n.
-    assert_eq!(prompt[0], tok.im_start_id);
+    assert_eq!(prompt[0], im_start);
     assert!(
-        prompt.iter().filter(|&&id| id == tok.im_start_id).count() == 3,
+        prompt.iter().filter(|&&id| id == im_start).count() == 3,
         "expected 3 <|im_start|> in chat template, got {prompt:?}",
     );
     assert!(
-        prompt.iter().filter(|&&id| id == tok.im_end_id).count() == 2,
+        prompt.iter().filter(|&&id| id == im_end).count() == 2,
         "expected 2 <|im_end|> in chat template",
     );
     let rendered = tok.decode(&prompt);

@@ -16,6 +16,7 @@ use ash::vk;
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 
 use vulkanforge::backend::vulkan::chat::{ChatSession, TurnResult};
+use vulkanforge::backend::vulkan::chat_template::ChatTemplate;
 use vulkanforge::backend::vulkan::commands::CommandContext;
 use vulkanforge::backend::vulkan::decode::GenerateConfig;
 use vulkanforge::backend::vulkan::device::VulkanDevice;
@@ -133,8 +134,13 @@ fn main() {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let prompts_path = std::env::var("VF_PROMPTS")
         .unwrap_or_else(|_| "inference_test_prompts_15.json".to_string());
-    let prompts = parse_prompts(&prompts_path)?;
-    println!("VulkanForge — 15-prompt benchmark ({} prompts)", prompts.len());
+    let mut prompts = parse_prompts(&prompts_path)?;
+    if let Ok(limit) = std::env::var("VF_NUM_PROMPTS") {
+        if let Ok(n) = limit.parse::<usize>() {
+            prompts.truncate(n);
+        }
+    }
+    println!("VulkanForge — {}-prompt benchmark", prompts.len());
 
     let dev = VulkanDevice::new()?;
     let mut allocator = Allocator::new(&AllocatorCreateDesc {
@@ -177,7 +183,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     let forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;
-    let mut session = ChatSession::new(forward, "You are a helpful assistant.");
+    let template = ChatTemplate::detect(&gguf, &tokenizer);
+    println!(
+        "  arch={} rope={:?} template={:?} qk_norm={}",
+        cfg.architecture, cfg.rope_variant, template, cfg.has_qk_norm,
+    );
+    let mut session = ChatSession::new_with_template(
+        forward, "You are a helpful assistant.", template,
+    );
 
     let mut rows: Vec<Row> = Vec::new();
     let mut total_prefill_tok = 0u32;

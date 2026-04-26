@@ -567,16 +567,18 @@ impl Forward {
         }
         compute_barrier(dev, cmd);
 
-        // Q/K norm
-        let wqn = layer_weight(model, layer, "attn_q_norm.weight");
-        let wkn = layer_weight(model, layer, "attn_k_norm.weight");
-        self.run_rms_norm(dev, registry, cmd,
-                         self.q_buf.handle, wqn, self.q_buf.handle,
-                         cfg.head_dim, cfg.n_heads, cfg.rms_norm_eps, "rms_norm_q");
-        self.run_rms_norm(dev, registry, cmd,
-                         self.k_buf.handle, wkn, self.k_buf.handle,
-                         cfg.head_dim, cfg.n_kv_heads, cfg.rms_norm_eps, "rms_norm_k");
-        compute_barrier(dev, cmd);
+        // Q/K norm — Qwen-only (Phase 4D: gated on cfg.has_qk_norm).
+        if cfg.has_qk_norm {
+            let wqn = layer_weight(model, layer, "attn_q_norm.weight");
+            let wkn = layer_weight(model, layer, "attn_k_norm.weight");
+            self.run_rms_norm(dev, registry, cmd,
+                             self.q_buf.handle, wqn, self.q_buf.handle,
+                             cfg.head_dim, cfg.n_heads, cfg.rms_norm_eps, "rms_norm_q");
+            self.run_rms_norm(dev, registry, cmd,
+                             self.k_buf.handle, wkn, self.k_buf.handle,
+                             cfg.head_dim, cfg.n_kv_heads, cfg.rms_norm_eps, "rms_norm_k");
+            compute_barrier(dev, cmd);
+        }
 
         // RoPE
         self.run_rope_neox(dev, registry, cmd, self.q_buf.handle, self.q_buf.handle,
@@ -835,16 +837,18 @@ impl Forward {
                       cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, "gemv_v");
         compute_barrier(dev, cmd);
 
-        // (c) Q/K norm (per head)
-        let wqn = layer_weight(model, layer, "attn_q_norm.weight");
-        let wkn = layer_weight(model, layer, "attn_k_norm.weight");
-        self.run_rms_norm(dev, registry, cmd,
-                         self.q_buf.handle, wqn, self.q_buf.handle,
-                         cfg.head_dim, cfg.n_heads, cfg.rms_norm_eps, "rms_norm_q");
-        self.run_rms_norm(dev, registry, cmd,
-                         self.k_buf.handle, wkn, self.k_buf.handle,
-                         cfg.head_dim, cfg.n_kv_heads, cfg.rms_norm_eps, "rms_norm_k");
-        compute_barrier(dev, cmd);
+        // (c) Q/K norm (per head) — only Qwen* sets this (Phase 4D).
+        if cfg.has_qk_norm {
+            let wqn = layer_weight(model, layer, "attn_q_norm.weight");
+            let wkn = layer_weight(model, layer, "attn_k_norm.weight");
+            self.run_rms_norm(dev, registry, cmd,
+                             self.q_buf.handle, wqn, self.q_buf.handle,
+                             cfg.head_dim, cfg.n_heads, cfg.rms_norm_eps, "rms_norm_q");
+            self.run_rms_norm(dev, registry, cmd,
+                             self.k_buf.handle, wkn, self.k_buf.handle,
+                             cfg.head_dim, cfg.n_kv_heads, cfg.rms_norm_eps, "rms_norm_k");
+            compute_barrier(dev, cmd);
+        }
 
         // (d) RoPE NeoX on Q and K
         self.run_rope_neox(dev, registry, cmd, self.q_buf.handle, self.q_buf.handle,
@@ -1196,7 +1200,14 @@ impl Forward {
         label: &str,
     ) {
         let _ = position; // The pos value is in rope_pos_buf at offset; not in PC.
-        let kernel = registry.get(ShaderId::RopeNeox);
+        // Phase-4D: pick the variant-correct shader. Qwen* uses NeoX
+        // (rotates [i, i+n_dims/2] pairs); Llama / Mistral / DeepSeek
+        // use the standard adjacent-pair form (rope_norm.comp).
+        let (shader_id, rope_mode) = match self.config.rope_variant {
+            crate::backend::vulkan::gguf::RopeVariant::Neox => (ShaderId::RopeNeox, 2u32),
+            crate::backend::vulkan::gguf::RopeVariant::Norm => (ShaderId::RopeNorm, 0u32),
+        };
+        let kernel = registry.get(shader_id);
         let set = self.alloc_set(dev, kernel.descriptor_set_layout);
         self.write_bindings(
             dev, set,
@@ -1210,7 +1221,7 @@ impl Forward {
             ],
         );
         let pc = RopePushConstants {
-            rope_mode: 2, // GGML_ROPE_TYPE_NEOX
+            rope_mode, // 0 = NORM, 2 = NEOX
             nrows: n_rows,
             n_dims: head_dim,
             freq_scale: 1.0,
@@ -1814,8 +1825,14 @@ impl Forward {
         // For each token t: copy batch row into single-token buf,
         // run Q/K-norm + RoPE, KV-cache write, attention, then store
         // attn_out[t] back into batch_attn_out.
-        let wqn = layer_weight(model, layer, "attn_q_norm.weight");
-        let wkn = layer_weight(model, layer, "attn_k_norm.weight");
+        let qk_norm_weights: Option<(vk::Buffer, vk::Buffer)> = if cfg.has_qk_norm {
+            Some((
+                layer_weight(model, layer, "attn_q_norm.weight"),
+                layer_weight(model, layer, "attn_k_norm.weight"),
+            ))
+        } else {
+            None
+        };
         for t in 0..seq_len {
             let pos = base_pos + t;
             // RoPE position lives at slot `t` of rope_pos_buf — written
@@ -1839,16 +1856,18 @@ impl Forward {
                     std::slice::from_ref(&bar), &[], &[],
                 );
             }
-            // Q/K-norm.
-            self.run_rms_norm(
-                dev, registry, cmd, self.q_buf.handle, wqn, self.q_buf.handle,
-                cfg.head_dim, cfg.n_heads, cfg.rms_norm_eps, "rms_norm_q_b",
-            );
-            self.run_rms_norm(
-                dev, registry, cmd, self.k_buf.handle, wkn, self.k_buf.handle,
-                cfg.head_dim, cfg.n_kv_heads, cfg.rms_norm_eps, "rms_norm_k_b",
-            );
-            compute_barrier(dev, cmd);
+            // Q/K-norm — Qwen-only.
+            if let Some((wqn, wkn)) = qk_norm_weights {
+                self.run_rms_norm(
+                    dev, registry, cmd, self.q_buf.handle, wqn, self.q_buf.handle,
+                    cfg.head_dim, cfg.n_heads, cfg.rms_norm_eps, "rms_norm_q_b",
+                );
+                self.run_rms_norm(
+                    dev, registry, cmd, self.k_buf.handle, wkn, self.k_buf.handle,
+                    cfg.head_dim, cfg.n_kv_heads, cfg.rms_norm_eps, "rms_norm_k_b",
+                );
+                compute_barrier(dev, cmd);
+            }
             // RoPE — each dispatch reads its OWN position slot.
             self.run_rope_neox_with_pos_offset(
                 dev, registry, cmd, self.q_buf.handle, self.q_buf.handle,

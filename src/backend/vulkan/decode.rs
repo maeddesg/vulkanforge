@@ -21,6 +21,7 @@
 use std::io::Write;
 use std::time::{Duration, Instant};
 
+use super::chat_template::ChatTemplate;
 use super::commands::CommandContext;
 use super::device::VulkanDevice;
 use super::forward::Forward;
@@ -28,7 +29,7 @@ use super::gguf::{GgufFile, ModelConfig};
 use super::loader::LoadedModel;
 use super::pipeline_registry::PipelineRegistry;
 use super::q4k;
-use super::tokenizer::{apply_chat_template, Tokenizer};
+use super::tokenizer::Tokenizer;
 
 #[derive(Debug, Clone)]
 pub struct GenerateConfig {
@@ -90,7 +91,9 @@ pub fn generate(
     prompt: &str,
     config: &GenerateConfig,
 ) -> Result<GenerateResult, Box<dyn std::error::Error>> {
-    let prompt_tokens = apply_chat_template(tokenizer, prompt, None);
+    let template = ChatTemplate::detect(gguf, tokenizer);
+    let prompt_tokens =
+        template.render_first_turn(tokenizer, "You are a helpful assistant.", prompt);
     forward.kv_cache.reset();
     if config.print_stream {
         let mut filter = ThinkFilter::new();

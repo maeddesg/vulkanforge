@@ -20,9 +20,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Tokenizer loaded in {:.2} s", t0.elapsed().as_secs_f64());
     println!("  vocab_size = {}", tok.vocab_size());
     println!("  bos_id     = {:?}", tok.bos_id);
-    println!("  endoftext  = {} ({:?})", tok.endoftext_id, tok.token_str(tok.endoftext_id));
-    println!("  im_start_id= {} ({:?})", tok.im_start_id, tok.token_str(tok.im_start_id));
-    println!("  im_end_id  = {} ({:?})", tok.im_end_id, tok.token_str(tok.im_end_id));
+    println!("  eos_id     = {} ({:?})", tok.eos_id, tok.token_str(tok.eos_id));
+    if let Some(et) = tok.endoftext_id {
+        println!("  endoftext  = {} ({:?})", et, tok.token_str(et));
+    }
+    if let Some(s) = tok.im_start_id {
+        println!("  im_start_id= {} ({:?})", s, tok.token_str(s));
+    }
+    if let Some(e) = tok.im_end_id {
+        println!("  im_end_id  = {} ({:?})", e, tok.token_str(e));
+    }
 
     for sample in [
         "Hello world",

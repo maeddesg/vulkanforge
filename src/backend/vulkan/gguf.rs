@@ -337,6 +337,15 @@ impl GgufFile {
     }
 }
 
+/// Layout convention for RoPE. `Neox` rotates `[i, i + n_dims/2]`
+/// pairs (Qwen / Qwen2 / Qwen3); `Norm` rotates adjacent `[2k, 2k+1]`
+/// pairs (Llama / Mistral / DeepSeek-R1-Distill-Llama).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RopeVariant {
+    Norm,
+    Neox,
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub architecture: String,
@@ -349,6 +358,7 @@ pub struct ModelConfig {
     pub head_dim: u32,
     pub rope_freq_base: f32,
     pub rope_dim: u32,
+    pub rope_variant: RopeVariant,
     pub context_length: u32,
     pub has_qk_norm: bool,
     pub rms_norm_eps: f32,
@@ -398,6 +408,16 @@ impl ModelConfig {
         let has_qk_norm = gguf.tensor("blk.0.attn_q_norm.weight").is_some()
             && gguf.tensor("blk.0.attn_k_norm.weight").is_some();
 
+        // RoPE layout follows the architecture: Qwen* uses NeoX
+        // (rotates [i, i+n_dims/2] pairs), llama / mistral / deepseek
+        // use the standard adjacent-pair form. Mirrors llama.cpp's
+        // `llama_rope_type()` switch in llama-arch.cpp.
+        let rope_variant = match arch {
+            "qwen2" | "qwen2moe" | "qwen2vl" | "qwen3" | "qwen3moe" | "phi2" | "phi3"
+            | "gpt-neox" | "gpt-neox-japanese" | "stablelm" => RopeVariant::Neox,
+            _ => RopeVariant::Norm,
+        };
+
         Ok(Self {
             architecture,
             n_layers,
@@ -409,6 +429,7 @@ impl ModelConfig {
             head_dim,
             rope_freq_base,
             rope_dim,
+            rope_variant,
             context_length,
             has_qk_norm,
             rms_norm_eps,

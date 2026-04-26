@@ -20,6 +20,7 @@
 
 use std::time::Duration;
 
+use super::chat_template::ChatTemplate;
 use super::commands::CommandContext;
 use super::decode::{generate_from_tokens, GenerateConfig};
 use super::device::VulkanDevice;
@@ -73,6 +74,7 @@ pub struct ChatSession {
     pub forward: Forward,
     pub history: Vec<ChatTurn>,
     pub system_prompt: String,
+    pub template: ChatTemplate,
     /// Next free position in the KV cache. After Turn 1's prefill+gen,
     /// this is `prompt_tokens + generated_tokens`. Increments
     /// monotonically across turns until [`reset`] is called.
@@ -84,10 +86,19 @@ pub struct ChatSession {
 
 impl ChatSession {
     pub fn new(forward: Forward, system_prompt: impl Into<String>) -> Self {
+        Self::new_with_template(forward, system_prompt, ChatTemplate::ChatML)
+    }
+
+    pub fn new_with_template(
+        forward: Forward,
+        system_prompt: impl Into<String>,
+        template: ChatTemplate,
+    ) -> Self {
         Self {
             forward,
             history: Vec::new(),
             system_prompt: system_prompt.into(),
+            template,
             current_pos: 0,
             turn_count: 0,
         }
@@ -110,32 +121,14 @@ impl ChatSession {
     }
 
     /// Build the prefill-token sequence for `user_message` based on
-    /// whether this is the first turn or a continuation.
+    /// whether this is the first turn or a continuation. Dispatches
+    /// to the configured [`ChatTemplate`].
     pub fn build_prefill_tokens(&self, tokenizer: &Tokenizer, user_message: &str) -> Vec<u32> {
-        let mut tokens: Vec<u32> = Vec::new();
         if self.turn_count == 0 {
-            // Full template: <|im_start|>system\n{system}<|im_end|>\n
-            tokens.push(tokenizer.im_start_id);
-            tokens.extend(tokenizer.encode("system\n"));
-            tokens.extend(tokenizer.encode(&self.system_prompt));
-            tokens.push(tokenizer.im_end_id);
-            tokens.extend(tokenizer.encode("\n"));
+            self.template.render_first_turn(tokenizer, &self.system_prompt, user_message)
         } else {
-            // Continuation — prepend the <|im_end|>\n we caught as EOS
-            // but didn't commit at the end of the previous turn.
-            tokens.push(tokenizer.im_end_id);
-            tokens.extend(tokenizer.encode("\n"));
+            self.template.render_continuation(tokenizer, user_message)
         }
-        // <|im_start|>user\n{msg}<|im_end|>\n
-        tokens.push(tokenizer.im_start_id);
-        tokens.extend(tokenizer.encode("user\n"));
-        tokens.extend(tokenizer.encode(user_message));
-        tokens.push(tokenizer.im_end_id);
-        tokens.extend(tokenizer.encode("\n"));
-        // <|im_start|>assistant\n  ← model continues from here
-        tokens.push(tokenizer.im_start_id);
-        tokens.extend(tokenizer.encode("assistant\n"));
-        tokens
     }
 
     /// Send a user message, prefill it on top of the existing KV

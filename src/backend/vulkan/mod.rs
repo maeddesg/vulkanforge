@@ -1,5 +1,6 @@
 pub mod buffers;
 pub mod chat;
+pub mod chat_template;
 pub mod commands;
 pub mod decode;
 pub mod device;

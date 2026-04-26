@@ -1,11 +1,14 @@
-//! Byte-level BPE tokenizer for Qwen3 (model="gpt2", pre="qwen2").
+//! Byte-level BPE tokenizer for `tokenizer.ggml.model=="gpt2"` GGUFs.
 //!
-//! Phase 2D / Schritt 2.8. The vocabulary, merges, and special-token
-//! ids are pulled out of the GGUF metadata table (`tokenizer.ggml.*`).
+//! Originally Phase 2D / Schritt 2.8 for Qwen3 (`pre="qwen2"`).
+//! Phase 4D extends it to Llama-3 family (`pre="llama-bpe"`) which
+//! shares the same byte-level encoding and merge format but uses a
+//! slightly different pre-split regex (`\p{N}{1,3}` rather than
+//! `\p{N}+`) and a different special-token namespace.
 //!
 //! Pipeline (encode):
 //!   text (UTF-8)
-//!     → pre-split via Qwen2 regex (Unicode-aware, with `(?!\S)` lookahead)
+//!     → pre-split via the architecture-specific PAT regex
 //!     → for each chunk: byte-level encode (byte → unicode char)
 //!     → BPE-merge using the merges table (lowest priority wins)
 //!     → vocab lookup → token ids
@@ -13,10 +16,11 @@
 //! Decode is the inverse: token id → vocab byte-encoded string,
 //! concatenated across the run, then byte-decoded back to UTF-8.
 //!
-//! Special tokens (`<|im_start|>`, `<|im_end|>`, …) are not scanned
-//! for inside `encode()`. Callers that need them (chat-template
-//! application) emit the ids directly via [`Tokenizer::im_start_id`]
-//! etc., and call `encode()` only on the regular text between them.
+//! Special tokens are not scanned for inside `encode()`. Callers that
+//! need them (chat-template application) emit the ids directly via
+//! [`Tokenizer::special_id`] (or the convenience `im_start_id` /
+//! `im_end_id` accessors which return the Qwen3 ids when present),
+//! and call `encode()` only on the regular text between them.
 
 use std::collections::HashMap;
 
@@ -30,6 +34,21 @@ use super::gguf::GgufFile;
 const QWEN2_PRE_REGEX: &str = "(?i:'s|'t|'re|'ve|'m|'ll|'d)\
 |[^\\r\\n\\p{L}\\p{N}]?\\p{L}+\
 |\\p{N}+\
+| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*\
+|\\s*[\\r\\n]+\
+|\\s+(?!\\S)\
+|\\s+";
+
+/// Llama-3 pre-tokenizer regex. Differs from Qwen2 in two ways:
+///   * digit runs are split into chunks of length 1..=3 (not greedy),
+///   * the apostrophe contractions are case-insensitive only on ASCII
+///     (we keep `(?i:…)` — same observable behaviour for ASCII).
+/// Same PAT used by `tiktoken_bpe`'s `cl100k_base` is the basis but
+/// llama-bpe matches the exact form used in `tokenizer.json` for
+/// Meta-Llama-3.
+const LLAMA3_PRE_REGEX: &str = "(?i:'s|'t|'re|'ve|'m|'ll|'d)\
+|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+\
+|\\p{N}{1,3}\
 | ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*\
 |\\s*[\\r\\n]+\
 |\\s+(?!\\S)\
@@ -64,12 +83,23 @@ impl std::fmt::Display for TokenizerError {
 
 impl std::error::Error for TokenizerError {}
 
+/// Which pre-tokenizer / special-token namespace this BPE was built
+/// for. Set from `tokenizer.ggml.pre` at load time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenizerFlavour {
+    /// Qwen2 / Qwen3 — `pre="qwen2"`. ChatML special tokens.
+    Qwen2,
+    /// Llama-3 family — `pre="llama-bpe"`. Header-id / eot_id specials.
+    Llama3,
+}
+
 pub struct Tokenizer {
     vocab: Vec<String>,
     token_to_id: HashMap<String, u32>,
     /// concatenated-pair → priority (lower = applied first).
     merges: HashMap<String, u32>,
     pre_split: Regex,
+    flavour: TokenizerFlavour,
 
     /// GPT-2 byte-level encoding tables. `byte_to_char[b]` is the
     /// unicode char that represents byte `b` in the vocab.
@@ -77,9 +107,20 @@ pub struct Tokenizer {
     char_to_byte: HashMap<char, u8>,
 
     pub bos_id: Option<u32>,
-    pub endoftext_id: u32,      // <|endoftext|>
-    pub im_start_id: u32,       // <|im_start|>
-    pub im_end_id: u32,         // <|im_end|>
+    /// Primary EOS id from `tokenizer.ggml.eos_token_id` — varies per
+    /// model (Qwen3=151645 `<|im_end|>`, Llama-3.1=128009 `<|eot_id|>`,
+    /// DeepSeek-R1-Distill-Llama=128001 `<|end_of_text|>`).
+    pub eos_id: u32,
+    /// Extra ids treated as end-of-stream by `is_eos`. For Qwen3 this
+    /// holds `<|endoftext|>`; for Llama-3 it holds the alternates from
+    /// the chat-template (e.g. `<|eom_id|>`).
+    extra_eos_ids: Vec<u32>,
+    /// Qwen3 ChatML ids. Populated for `Qwen2` flavour, `None`
+    /// otherwise. Kept here so the ChatML chat-template code can stay
+    /// terse; non-Qwen callers go through [`Tokenizer::special_id`].
+    pub im_start_id: Option<u32>,
+    pub im_end_id: Option<u32>,
+    pub endoftext_id: Option<u32>,
 }
 
 impl Tokenizer {
@@ -90,8 +131,26 @@ impl Tokenizer {
             .and_then(|v| v.as_str())
             .ok_or(TokenizerError::MissingMetadata("tokenizer.ggml.model"))?;
         if model != "gpt2" {
+            // Mistral / Llama-2 GGUFs use `model="llama"` (SentencePiece
+            // unigram) — we don't have an SPM decoder yet (Phase 4D
+            // deferred), so reject up-front with a clear message.
             return Err(TokenizerError::BadModel(model.to_string()));
         }
+
+        let pre = gguf
+            .metadata
+            .get("tokenizer.ggml.pre")
+            .and_then(|v| v.as_str())
+            .unwrap_or("default");
+        let flavour = match pre {
+            "qwen2" => TokenizerFlavour::Qwen2,
+            "llama-bpe" => TokenizerFlavour::Llama3,
+            other => return Err(TokenizerError::BadModel(format!("pre={other}"))),
+        };
+        let pre_regex = match flavour {
+            TokenizerFlavour::Qwen2 => QWEN2_PRE_REGEX,
+            TokenizerFlavour::Llama3 => LLAMA3_PRE_REGEX,
+        };
 
         // Vocab — Array<string>.
         let tokens_arr = gguf
@@ -145,19 +204,45 @@ impl Tokenizer {
             .metadata
             .get("tokenizer.ggml.bos_token_id")
             .and_then(|v| v.as_u32());
-        let endoftext_id = *token_to_id
-            .get("<|endoftext|>")
-            .ok_or(TokenizerError::MissingMetadata("<|endoftext|> token"))?;
-        let im_start_id = *token_to_id
-            .get("<|im_start|>")
-            .ok_or(TokenizerError::MissingMetadata("<|im_start|> token"))?;
-        let im_end_id = *token_to_id
-            .get("<|im_end|>")
-            .ok_or(TokenizerError::MissingMetadata("<|im_end|> token"))?;
+        let eos_id = gguf
+            .metadata
+            .get("tokenizer.ggml.eos_token_id")
+            .and_then(|v| v.as_u32())
+            .ok_or(TokenizerError::MissingMetadata("tokenizer.ggml.eos_token_id"))?;
+        let endoftext_id = token_to_id.get("<|endoftext|>").copied();
+        let im_start_id = token_to_id.get("<|im_start|>").copied();
+        let im_end_id = token_to_id.get("<|im_end|>").copied();
+
+        // For Llama-3 we want both `<|eot_id|>` (turn end) and
+        // `<|end_of_text|>` (sequence end) to terminate decode; the
+        // primary `eos_id` covers one, the other goes into extras.
+        let mut extra_eos_ids: Vec<u32> = Vec::new();
+        match flavour {
+            TokenizerFlavour::Qwen2 => {
+                if let Some(et) = endoftext_id {
+                    if et != eos_id {
+                        extra_eos_ids.push(et);
+                    }
+                }
+            }
+            TokenizerFlavour::Llama3 => {
+                for name in [
+                    "<|eot_id|>",
+                    "<|end_of_text|>",
+                    "<|eom_id|>",
+                ] {
+                    if let Some(&id) = token_to_id.get(name) {
+                        if id != eos_id && !extra_eos_ids.contains(&id) {
+                            extra_eos_ids.push(id);
+                        }
+                    }
+                }
+            }
+        }
 
         let (byte_to_char, char_to_byte) = build_byte_unicode_tables();
 
-        let pre_split = Regex::new(QWEN2_PRE_REGEX)
+        let pre_split = Regex::new(pre_regex)
             .map_err(|e| TokenizerError::BadRegex(format!("{e}")))?;
 
         Ok(Self {
@@ -165,13 +250,26 @@ impl Tokenizer {
             token_to_id,
             merges,
             pre_split,
+            flavour,
             byte_to_char,
             char_to_byte,
             bos_id,
-            endoftext_id,
+            eos_id,
+            extra_eos_ids,
             im_start_id,
             im_end_id,
+            endoftext_id,
         })
+    }
+
+    pub fn flavour(&self) -> TokenizerFlavour {
+        self.flavour
+    }
+
+    /// Look up a special-token id by its literal vocab string
+    /// (e.g. `"<|begin_of_text|>"` for Llama-3).
+    pub fn special_id(&self, name: &str) -> Option<u32> {
+        self.token_to_id.get(name).copied()
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -298,41 +396,51 @@ impl Tokenizer {
         self.vocab.get(id as usize).map(|s| s.as_str())
     }
 
-    /// True for `<|im_end|>` and `<|endoftext|>` — both end an
-    /// assistant turn in Qwen3.
+    /// True for the model's primary EOS plus any architecture-specific
+    /// alternates (Qwen3 also stops on `<|endoftext|>`; Llama-3 also
+    /// stops on `<|end_of_text|>` / `<|eom_id|>`).
     pub fn is_eos(&self, id: u32) -> bool {
-        id == self.im_end_id || id == self.endoftext_id
+        id == self.eos_id || self.extra_eos_ids.contains(&id)
     }
 }
 
-/// Apply Qwen3's chat template manually. We don't run the Jinja2
-/// template embedded in the GGUF — for Phase 2 the simple form below
-/// matches the `add_generation_prompt=True` rendering that
-/// llama.cpp emits.
+/// Apply Qwen3's ChatML template — matches the `add_generation_prompt
+/// =True` rendering of the Jinja template embedded in the GGUF. For
+/// other architectures use [`super::chat_template::apply_chat_template`].
+///
+/// Panics if invoked on a non-Qwen tokenizer (the ChatML special ids
+/// are absent there).
 pub fn apply_chat_template(
     tokenizer: &Tokenizer,
     user_message: &str,
     system_prompt: Option<&str>,
 ) -> Vec<u32> {
+    let im_start = tokenizer
+        .im_start_id
+        .expect("apply_chat_template: tokenizer is not ChatML / Qwen2 flavour");
+    let im_end = tokenizer
+        .im_end_id
+        .expect("apply_chat_template: tokenizer is not ChatML / Qwen2 flavour");
+
     let system = system_prompt.unwrap_or("You are a helpful assistant.");
     let mut tokens = Vec::new();
 
     // <|im_start|>system\n{system}<|im_end|>\n
-    tokens.push(tokenizer.im_start_id);
+    tokens.push(im_start);
     tokens.extend(tokenizer.encode("system\n"));
     tokens.extend(tokenizer.encode(system));
-    tokens.push(tokenizer.im_end_id);
+    tokens.push(im_end);
     tokens.extend(tokenizer.encode("\n"));
 
     // <|im_start|>user\n{user}<|im_end|>\n
-    tokens.push(tokenizer.im_start_id);
+    tokens.push(im_start);
     tokens.extend(tokenizer.encode("user\n"));
     tokens.extend(tokenizer.encode(user_message));
-    tokens.push(tokenizer.im_end_id);
+    tokens.push(im_end);
     tokens.extend(tokenizer.encode("\n"));
 
     // <|im_start|>assistant\n  ← model continues from here
-    tokens.push(tokenizer.im_start_id);
+    tokens.push(im_start);
     tokens.extend(tokenizer.encode("assistant\n"));
 
     tokens
