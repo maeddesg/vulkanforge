@@ -161,10 +161,26 @@ pub fn generate_from_tokens(
     // ---- Prefill ----
     let prefill_start = Instant::now();
     let mut pos = start_pos;
-    for &tid in prefill_tokens {
-        let embd = embedding_row(gguf, cfg, tid)?;
-        forward.forward_token(dev, registry, cmd_ctx, model, &embd, pos)?;
-        pos += 1;
+    let prefill_len = prefill_tokens.len() as u32;
+    if prefill_len > 0 && prefill_len <= forward.max_prefill_tokens {
+        // Phase 3E batched-GEMM path: build a contiguous embedding
+        // tensor and call prefill_batch in one submit.
+        let mut all_embeds: Vec<f32> =
+            Vec::with_capacity(prefill_tokens.len() * cfg.hidden_dim as usize);
+        for &tid in prefill_tokens {
+            all_embeds.extend(embedding_row(gguf, cfg, tid)?);
+        }
+        forward.prefill_batch(
+            dev, registry, cmd_ctx, model, &all_embeds, prefill_len, pos,
+        )?;
+        pos += prefill_len;
+    } else {
+        // Token-by-token fallback (long prompt or empty batch path).
+        for &tid in prefill_tokens {
+            let embd = embedding_row(gguf, cfg, tid)?;
+            forward.forward_token(dev, registry, cmd_ctx, model, &embd, pos)?;
+            pos += 1;
+        }
     }
     let mut last_logits = forward.logits()?;
     let prefill_time = prefill_start.elapsed();

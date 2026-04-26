@@ -319,13 +319,18 @@ fn is_repeating_garbage(s: &str) -> bool {
     if s.len() < 8 {
         return false;
     }
-    // Any run of 12+ identical bytes is almost certainly degenerate.
+    // Any run of 16+ identical *non-whitespace* bytes is almost
+    // certainly degenerate (catches NaN-runs and total gibberish).
+    // Whitespace runs are normal in code (deep indentation) and in
+    // prose (paragraph breaks), so they're excluded.
     let bytes = s.as_bytes();
     let mut run = 1usize;
     for w in bytes.windows(2) {
-        if w[0] == w[1] {
+        let same = w[0] == w[1];
+        let is_ws = w[0] == b' ' || w[0] == b'\n' || w[0] == b'\t';
+        if same && !is_ws {
             run += 1;
-            if run >= 12 {
+            if run >= 16 {
                 return true;
             }
         } else {

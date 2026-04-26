@@ -37,8 +37,9 @@ use super::gguf::{GgmlType, ModelConfig};
 use super::kv_cache::KvCache;
 use super::loader::LoadedModel;
 use super::pipeline::{
-    ComputeKernel, GenericBinaryPushConstants, GenericHeadPushConstants,
-    MatVecPushConstants, RopePushConstants, ScalarAttnPushConstants,
+    GenericBinaryPushConstants, GenericHeadPushConstants, MatVecPushConstants,
+    MmqPushConstants, Q8_1QuantizePushConstants, RopePushConstants,
+    ScalarAttnPushConstants,
 };
 use super::pipeline_registry::PipelineRegistry;
 use super::profiler::{ShaderProfiler, TimingSample};
@@ -93,6 +94,34 @@ pub struct Forward {
 
     rope_theta_scale: f32,
     attn_scale: f32,
+
+    // ---- Phase-3E batch-prefill scratch ----
+    // Allocated once in `new` based on `max_prefill_tokens`. Memory
+    // budget at the default (256 tokens) is ~60 MB — well within the
+    // 10 GiB free after Qwen3-8B weight upload.
+    pub max_prefill_tokens: u32,
+    /// `[max_pp × hidden_dim]` host-visible — caller writes the
+    /// per-token f32 embeddings here before dispatching `prefill_batch`.
+    batch_input: GpuBuffer,
+    /// `[max_pp × hidden_dim]` ping-pong target for the per-layer
+    /// residual chain.
+    batch_residual: GpuBuffer,
+    /// `[max_pp × hidden_dim]` post-RMSNorm activations.
+    batch_norm: GpuBuffer,
+    /// `[max_pp × hidden_dim]` Q8_1-quantised activations (input to
+    /// every GEMM in `prefill_batch`).
+    batch_q8: GpuBuffer,
+    /// Q-projection batch output: `[max_pp × n_heads × head_dim]` f32,
+    /// laid out as N×M row-major (see Phase 3D §4.1).
+    batch_q: GpuBuffer,
+    batch_k: GpuBuffer,
+    batch_v: GpuBuffer,
+    batch_attn_out: GpuBuffer,
+    batch_o: GpuBuffer,
+    batch_gate: GpuBuffer,
+    batch_up: GpuBuffer,
+    batch_ffn_hidden: GpuBuffer,
+    batch_ffn_out: GpuBuffer,
 }
 
 impl Forward {
@@ -102,6 +131,19 @@ impl Forward {
         kv_cache: KvCache,
         config: ModelConfig,
         profiler: Option<ShaderProfiler>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_prefill(dev, allocator, kv_cache, config, profiler, 256)
+    }
+
+    /// Like `new` but accepts an explicit `max_prefill_tokens` cap so
+    /// tests can keep VRAM small.
+    pub fn new_with_prefill(
+        dev: &VulkanDevice,
+        allocator: &mut Allocator,
+        kv_cache: KvCache,
+        config: ModelConfig,
+        profiler: Option<ShaderProfiler>,
+        max_prefill_tokens: u32,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let device = &dev.device;
         let mut mk_storage = |size: u64, location: MemoryLocation, name: &str| {
@@ -143,11 +185,41 @@ impl Forward {
         let rope_ff_buf = mk_storage(16, MemoryLocation::GpuOnly, "rope_ff_dummy")?;
         let rope_idx_buf = mk_storage(16, MemoryLocation::GpuOnly, "rope_idx_dummy")?;
 
-        // Descriptor pool sized for one full forward: 18 dispatches/layer
-        // × n_layers + a handful of extras (final_norm + lm_head + a
-        // safety margin so we never spuriously hit OUT_OF_POOL_MEMORY).
-        // Up to 5 storage descriptors per dispatch.
-        let dispatches = 25 * config.n_layers + 32;
+        // ---- Phase-3E batch-prefill scratch buffers ----
+        // Allocations sized for the largest prompt we'll batch in one
+        // submit. ~60 MB at the 256-token default — comfortable within
+        // the ~10 GiB free after weights.
+        let max_pp = max_prefill_tokens as u64;
+        let pp_hidden = max_pp * (config.hidden_dim as u64) * 4;
+        let pp_kv     = max_pp * (config.n_kv_heads as u64) * (config.head_dim as u64) * 4;
+        let pp_q      = max_pp * (config.n_heads as u64)   * (config.head_dim as u64) * 4;
+        let pp_ffn    = max_pp * (config.ffn_dim as u64) * 4;
+        // Q8_1_x4 packs 128 elements / 144 bytes.
+        let pp_q8     = max_pp * (config.hidden_dim as u64) / 128 * 144;
+        let pp_q8_ffn = max_pp * (config.ffn_dim as u64)    / 128 * 144;
+        let pp_q8_max = pp_q8.max(pp_q8_ffn);
+
+        let batch_input      = mk_storage(pp_hidden, MemoryLocation::CpuToGpu, "batch_input")?;
+        let batch_residual   = mk_storage(pp_hidden, MemoryLocation::GpuOnly,  "batch_residual")?;
+        let batch_norm       = mk_storage(pp_hidden, MemoryLocation::GpuOnly,  "batch_norm")?;
+        let batch_q8         = mk_storage(pp_q8_max, MemoryLocation::GpuOnly,  "batch_q8")?;
+        let batch_q          = mk_storage(pp_q,      MemoryLocation::GpuOnly,  "batch_q")?;
+        let batch_k          = mk_storage(pp_kv,     MemoryLocation::GpuOnly,  "batch_k")?;
+        let batch_v          = mk_storage(pp_kv,     MemoryLocation::GpuOnly,  "batch_v")?;
+        let batch_attn_out   = mk_storage(pp_q,      MemoryLocation::GpuOnly,  "batch_attn_out")?;
+        let batch_o          = mk_storage(pp_hidden, MemoryLocation::GpuOnly,  "batch_o")?;
+        let batch_gate       = mk_storage(pp_ffn,    MemoryLocation::GpuOnly,  "batch_gate")?;
+        let batch_up         = mk_storage(pp_ffn,    MemoryLocation::GpuOnly,  "batch_up")?;
+        let batch_ffn_hidden = mk_storage(pp_ffn,    MemoryLocation::GpuOnly,  "batch_ffn_hidden")?;
+        let batch_ffn_out    = mk_storage(pp_hidden, MemoryLocation::GpuOnly,  "batch_ffn_out")?;
+
+        // Descriptor pool sized for one prefill_batch submit at
+        // max_prefill_tokens, plus the per-token forward fallback.
+        // Per-layer set count: 14 GEMM/quantize/norm + 5 × seq_len
+        // attention-loop sets + 2 residuals.
+        // For max_pp = 256: (14 + 5*256 + 2) × 36 = 46656; round up.
+        let per_layer_sets = 16 + 5 * max_prefill_tokens.max(1);
+        let dispatches = per_layer_sets * config.n_layers + 64;
         let max_descriptors = dispatches * 5;
         let pool_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -173,6 +245,10 @@ impl Forward {
             descriptor_pool,
             profiler,
             rope_theta_scale, attn_scale,
+            max_prefill_tokens,
+            batch_input, batch_residual, batch_norm, batch_q8,
+            batch_q, batch_k, batch_v, batch_attn_out, batch_o,
+            batch_gate, batch_up, batch_ffn_hidden, batch_ffn_out,
         })
     }
 
@@ -646,6 +722,19 @@ impl Forward {
         self.rope_pos_buf.destroy(device, allocator);
         self.rope_ff_buf.destroy(device, allocator);
         self.rope_idx_buf.destroy(device, allocator);
+        self.batch_input.destroy(device, allocator);
+        self.batch_residual.destroy(device, allocator);
+        self.batch_norm.destroy(device, allocator);
+        self.batch_q8.destroy(device, allocator);
+        self.batch_q.destroy(device, allocator);
+        self.batch_k.destroy(device, allocator);
+        self.batch_v.destroy(device, allocator);
+        self.batch_attn_out.destroy(device, allocator);
+        self.batch_o.destroy(device, allocator);
+        self.batch_gate.destroy(device, allocator);
+        self.batch_up.destroy(device, allocator);
+        self.batch_ffn_hidden.destroy(device, allocator);
+        self.batch_ffn_out.destroy(device, allocator);
         self.kv_cache.destroy(device, allocator);
         if let Some(p) = self.profiler {
             p.destroy(device);
@@ -1200,6 +1289,548 @@ impl Forward {
             );
             dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
         });
+    }
+
+    // -----------------------------------------------------------------
+    // Phase-3E batch GEMM dispatch helpers + prefill_batch orchestration.
+    // -----------------------------------------------------------------
+
+    /// Dispatch `quantize_q8_1` over `n_elements` floats, packing them
+    /// into `block_q8_1_x4` blocks (128 elements / 144 bytes each).
+    fn run_quantize_q8_1(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        input: vk::Buffer,
+        output: vk::Buffer,
+        n_elements: u32,
+        label: &'static str,
+    ) {
+        let kernel = registry.get(ShaderId::QuantizeQ8_1);
+        let set = self.alloc_set(dev, kernel.descriptor_set_layout);
+        self.write_bindings(dev, set, &[(0, input, 0, 0), (1, output, 0, 0)]);
+        let num_blocks = (n_elements + 127) / 128;
+        let pc = Q8_1QuantizePushConstants {
+            ne: n_elements,
+            num_blocks,
+        };
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, num_blocks, 1, 1);
+        });
+    }
+
+    /// Dispatch `mul_mmq` GEMM. Layout per Phase 3D §4.1:
+    ///   A = weights, M×K row-major, `stride_a = K`
+    ///   B = activations, Q8_1 packed, virtual stride_b = K (in elements)
+    ///   D = output, N×M row-major, `stride_d = M`
+    /// Each output row holds one token's `M`-dim projection.
+    #[allow(clippy::too_many_arguments)]
+    fn run_gemm(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        shader_id: ShaderId,
+        weights: vk::Buffer,
+        activations_q8: vk::Buffer,
+        output: vk::Buffer,
+        m: u32,
+        n: u32,
+        k: u32,
+        label: &'static str,
+    ) {
+        let kernel = registry.get(shader_id);
+        let set = self.alloc_set(dev, kernel.descriptor_set_layout);
+        self.write_bindings(
+            dev, set,
+            &[
+                (0, weights, 0, 0),
+                (1, activations_q8, 0, 0),
+                (2, output, 0, 0),
+            ],
+        );
+        let pc = MmqPushConstants {
+            m, n, k,
+            stride_a: k,
+            stride_b: k,
+            stride_d: m,
+            batch_stride_a: m * k,
+            batch_stride_b: n * k,
+            batch_stride_d: m * n,
+            base_work_group_z: 0,
+            num_batches: 1,
+            k_split: k,
+            ne02: 1,
+            ne12: 1,
+            broadcast2: 1,
+            broadcast3: 1,
+        };
+        // BM = BN = 64 (matches the spec-constants pinned in PipelineRegistry).
+        let groups_x = (m + 63) / 64;
+        let groups_y = (n + 63) / 64;
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, groups_x, groups_y, 1);
+        });
+    }
+
+    /// Copy one row out of an `[seq_len, dim]` batched GEMM output
+    /// into a single-token buffer so the existing per-token RMSNorm
+    /// / RoPE / attention helpers can run unchanged.
+    fn copy_batch_row(
+        &self,
+        dev: &VulkanDevice,
+        cmd: vk::CommandBuffer,
+        src: vk::Buffer,
+        src_offset: u64,
+        dst: vk::Buffer,
+        bytes: u64,
+    ) {
+        let copy = vk::BufferCopy::default()
+            .src_offset(src_offset)
+            .dst_offset(0)
+            .size(bytes);
+        unsafe {
+            dev.device.cmd_copy_buffer(cmd, src, dst, std::slice::from_ref(&copy));
+        }
+    }
+
+    /// Phase-3E prefill_batch — runs `token_ids` through all 36 layers
+    /// in **one** command buffer using batched GEMMs for the 7 weight
+    /// projections per layer. Per-token loops handle elementwise
+    /// (RMSNorm / RoPE / SiLU / Add / Mul) and the causal attention.
+    ///
+    /// On exit:
+    /// * `kv_cache.current_seq_len` advances by `token_ids.len()`.
+    /// * The last token's logits are in `self.logits_buf`, ready for
+    ///   the decode loop's argmax.
+    ///
+    /// Caller must supply pre-computed FP32 embeddings for every token
+    /// (one row of `token_embd.weight` Q4_K-dequantised, see
+    /// `decode::embedding_row`). The flattened `[seq_len × hidden_dim]`
+    /// goes into `batch_input`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_batch(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd_ctx: &CommandContext,
+        model: &LoadedModel,
+        embeddings: &[f32],
+        seq_len: u32,
+        base_pos: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if seq_len == 0 {
+            return Ok(());
+        }
+        if seq_len > self.max_prefill_tokens {
+            return Err(format!(
+                "prefill_batch: seq_len {seq_len} > max_prefill_tokens {}",
+                self.max_prefill_tokens
+            ).into());
+        }
+        let cfg = self.config.clone();
+        let hidden = cfg.hidden_dim;
+        let kv_dim = cfg.n_kv_heads * cfg.head_dim;
+        let q_dim = cfg.n_heads * cfg.head_dim;
+        let ffn = cfg.ffn_dim;
+        let hidden_bytes = (hidden as u64) * 4;
+        let kv_bytes = (kv_dim as u64) * 4;
+        let q_bytes = (q_dim as u64) * 4;
+        if (embeddings.len() as u32) != seq_len * hidden {
+            return Err("prefill_batch: embeddings length mismatch".into());
+        }
+
+        // CPU → batch_input (host-visible). Subsequent GPU work reads
+        // from the residual ping-pong (initialised below).
+        self.batch_input.write_bytes(bytemuck::cast_slice(embeddings))?;
+
+        // Pre-write per-token RoPE positions into rope_pos_buf — but
+        // RoPE shader takes a single u32 per dispatch, so we'll set it
+        // inside the per-token loop by re-uploading. Cheap.
+
+        unsafe {
+            dev.device.reset_descriptor_pool(
+                self.descriptor_pool, vk::DescriptorPoolResetFlags::empty(),
+            )?;
+        }
+
+        cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
+            // Seed residual chain from the embedded inputs. A single
+            // device-side copy is cheaper than a host re-write.
+            let total_bytes = (seq_len as u64) * hidden_bytes;
+            let copy = vk::BufferCopy::default()
+                .src_offset(0).dst_offset(0).size(total_bytes);
+            unsafe {
+                dev.device.cmd_copy_buffer(
+                    cmd, self.batch_input.handle, self.batch_residual.handle,
+                    std::slice::from_ref(&copy),
+                );
+            }
+            let bar = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            unsafe {
+                dev.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&bar), &[], &[],
+                );
+            }
+
+            for layer in 0..cfg.n_layers {
+                self.dispatch_layer_batch(
+                    dev, registry, cmd, model, layer, seq_len, base_pos,
+                );
+            }
+
+            // Final norm + LM head — only the LAST token needs logits.
+            // Copy the last row of batch_residual into scratch_a and
+            // run the existing per-token final path.
+            let last_off = ((seq_len - 1) as u64) * hidden_bytes;
+            self.copy_batch_row(
+                dev, cmd, self.batch_residual.handle, last_off,
+                self.scratch_a.handle, hidden_bytes,
+            );
+            let bar = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            unsafe {
+                dev.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&bar), &[], &[],
+                );
+            }
+            self.dispatch_final(dev, registry, cmd, model, self.scratch_a.handle);
+
+            // Logits → host.
+            let post = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.logits_buf.handle)
+                .offset(0).size(vk::WHOLE_SIZE);
+            unsafe {
+                dev.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &[], &[post], &[],
+                );
+            }
+            // Silence unused locals.
+            let _ = (kv_bytes, q_bytes, ffn);
+        })?;
+
+        self.kv_cache.current_seq_len = base_pos + seq_len;
+        Ok(())
+    }
+
+    /// One layer's worth of batched dispatches, recorded into `cmd`.
+    /// Reads from `batch_residual`, writes back to `batch_residual`.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_layer_batch(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        model: &LoadedModel,
+        layer: u32,
+        seq_len: u32,
+        base_pos: u32,
+    ) {
+        let cfg = self.config.clone();
+        let hidden = cfg.hidden_dim;
+        let kv_dim = cfg.n_kv_heads * cfg.head_dim;
+        let q_dim = cfg.n_heads * cfg.head_dim;
+        let ffn = cfg.ffn_dim;
+        let hidden_bytes = (hidden as u64) * 4;
+        let kv_bytes = (kv_dim as u64) * 4;
+        let q_bytes = (q_dim as u64) * 4;
+        let ffn_bytes = (ffn as u64) * 4;
+
+        // ---- (a) attn_norm: per-token RMSNorm into batch_norm. ----
+        let w_attn_norm = layer_weight(model, layer, "attn_norm.weight");
+        // RMSNorm shader supports rows>1 via ne01 — dispatch all tokens at once.
+        self.run_rms_norm(
+            dev, registry, cmd,
+            self.batch_residual.handle, w_attn_norm, self.batch_norm.handle,
+            hidden, seq_len, cfg.rms_norm_eps, "rms_norm_attn_b",
+        );
+        compute_barrier(dev, cmd);
+
+        // ---- (b) Quantize attn_norm output → Q8_1 ----
+        self.run_quantize_q8_1(
+            dev, registry, cmd,
+            self.batch_norm.handle, self.batch_q8.handle,
+            seq_len * hidden, "quantize_attn",
+        );
+        compute_barrier(dev, cmd);
+
+        // ---- (c) Q/K/V GEMMs. Mixed-quant: V uses Q6_K. ----
+        let wq = layer_weight(model, layer, "attn_q.weight");
+        let wk = layer_weight(model, layer, "attn_k.weight");
+        let wv = layer_weight(model, layer, "attn_v.weight");
+        let sq = layer_weight_shader_mmq(model, layer, "attn_q.weight");
+        let sk = layer_weight_shader_mmq(model, layer, "attn_k.weight");
+        let sv = layer_weight_shader_mmq(model, layer, "attn_v.weight");
+        self.run_gemm(
+            dev, registry, cmd, sq, wq,
+            self.batch_q8.handle, self.batch_q.handle,
+            q_dim, seq_len, hidden, "gemm_q",
+        );
+        self.run_gemm(
+            dev, registry, cmd, sk, wk,
+            self.batch_q8.handle, self.batch_k.handle,
+            kv_dim, seq_len, hidden, "gemm_k",
+        );
+        self.run_gemm(
+            dev, registry, cmd, sv, wv,
+            self.batch_q8.handle, self.batch_v.handle,
+            kv_dim, seq_len, hidden, "gemm_v",
+        );
+        compute_barrier(dev, cmd);
+
+        // ---- (d) Per-token attention loop ---
+        // For each token t: copy batch row into single-token buf,
+        // run Q/K-norm + RoPE, KV-cache write, attention, then store
+        // attn_out[t] back into batch_attn_out.
+        let wqn = layer_weight(model, layer, "attn_q_norm.weight");
+        let wkn = layer_weight(model, layer, "attn_k_norm.weight");
+        for t in 0..seq_len {
+            let pos = base_pos + t;
+            // Per-token RoPE position.
+            self.rope_pos_buf
+                .write_bytes(bytemuck::bytes_of(&pos))
+                .expect("rope pos write");
+            // Pull token-row Q/K/V into single-token scratch.
+            let q_off = (t as u64) * q_bytes;
+            let kv_off = (t as u64) * kv_bytes;
+            self.copy_batch_row(dev, cmd, self.batch_q.handle, q_off, self.q_buf.handle, q_bytes);
+            self.copy_batch_row(dev, cmd, self.batch_k.handle, kv_off, self.k_buf.handle, kv_bytes);
+            self.copy_batch_row(dev, cmd, self.batch_v.handle, kv_off, self.v_buf.handle, kv_bytes);
+            let bar = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            unsafe {
+                dev.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&bar), &[], &[],
+                );
+            }
+            // Q/K-norm.
+            self.run_rms_norm(
+                dev, registry, cmd, self.q_buf.handle, wqn, self.q_buf.handle,
+                cfg.head_dim, cfg.n_heads, cfg.rms_norm_eps, "rms_norm_q_b",
+            );
+            self.run_rms_norm(
+                dev, registry, cmd, self.k_buf.handle, wkn, self.k_buf.handle,
+                cfg.head_dim, cfg.n_kv_heads, cfg.rms_norm_eps, "rms_norm_k_b",
+            );
+            compute_barrier(dev, cmd);
+            // RoPE.
+            self.run_rope_neox(
+                dev, registry, cmd, self.q_buf.handle, self.q_buf.handle,
+                cfg.head_dim, cfg.n_heads, pos, "rope_q_b",
+            );
+            self.run_rope_neox(
+                dev, registry, cmd, self.k_buf.handle, self.k_buf.handle,
+                cfg.head_dim, cfg.n_kv_heads, pos, "rope_k_b",
+            );
+            compute_barrier(dev, cmd);
+            // KV-cache write at this token's position.
+            let row_bytes = self.kv_cache.row_bytes();
+            let dst_off = self.kv_cache.pos_offset_bytes(layer, pos);
+            let copy = vk::BufferCopy::default()
+                .src_offset(0).dst_offset(dst_off).size(row_bytes);
+            unsafe {
+                dev.device.cmd_copy_buffer(
+                    cmd, self.k_buf.handle, self.kv_cache.k_buffer.handle,
+                    std::slice::from_ref(&copy),
+                );
+                dev.device.cmd_copy_buffer(
+                    cmd, self.v_buf.handle, self.kv_cache.v_buffer.handle,
+                    std::slice::from_ref(&copy),
+                );
+            }
+            let kv_bar = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            unsafe {
+                dev.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&kv_bar), &[], &[],
+                );
+            }
+            // Attention with seq_len = pos+1 (causal — only positions
+            // 0..=pos in the cache).
+            self.run_scalar_attn(dev, registry, cmd, layer, pos);
+            compute_barrier(dev, cmd);
+            // Store attn_out[t] back into batch_attn_out.
+            let copy_back = vk::BufferCopy::default()
+                .src_offset(0).dst_offset((t as u64) * q_bytes).size(q_bytes);
+            unsafe {
+                dev.device.cmd_copy_buffer(
+                    cmd, self.attn_out.handle, self.batch_attn_out.handle,
+                    std::slice::from_ref(&copy_back),
+                );
+            }
+            let pst = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            unsafe {
+                dev.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&pst), &[], &[],
+                );
+            }
+        }
+
+        // ---- (e) Output projection: GEMM(attn_out → o_batch). ----
+        self.run_quantize_q8_1(
+            dev, registry, cmd,
+            self.batch_attn_out.handle, self.batch_q8.handle,
+            seq_len * q_dim, "quantize_attn_out",
+        );
+        compute_barrier(dev, cmd);
+        let wo = layer_weight(model, layer, "attn_output.weight");
+        let so = layer_weight_shader_mmq(model, layer, "attn_output.weight");
+        self.run_gemm(
+            dev, registry, cmd, so, wo,
+            self.batch_q8.handle, self.batch_o.handle,
+            hidden, seq_len, q_dim, "gemm_o",
+        );
+        compute_barrier(dev, cmd);
+
+        // ---- (f) Residual1 = batch_residual + batch_o (in-place). ----
+        // run_binary uses GenericBinary which iterates over `ne` elems
+        // — with seq_len*hidden it covers the full batch.
+        self.run_binary(
+            dev, registry, cmd, ShaderId::Add,
+            self.batch_residual.handle, self.batch_o.handle, self.batch_residual.handle,
+            seq_len * hidden, "add_res1_b",
+        );
+        compute_barrier(dev, cmd);
+
+        // ---- (g) FFN norm. ----
+        let w_ffn_norm = layer_weight(model, layer, "ffn_norm.weight");
+        self.run_rms_norm(
+            dev, registry, cmd,
+            self.batch_residual.handle, w_ffn_norm, self.batch_norm.handle,
+            hidden, seq_len, cfg.rms_norm_eps, "rms_norm_ffn_b",
+        );
+        compute_barrier(dev, cmd);
+
+        // ---- (h) Quantize FFN-norm output. ----
+        self.run_quantize_q8_1(
+            dev, registry, cmd,
+            self.batch_norm.handle, self.batch_q8.handle,
+            seq_len * hidden, "quantize_ffn",
+        );
+        compute_barrier(dev, cmd);
+
+        // ---- (i) Gate + Up GEMMs. ----
+        let wg = layer_weight(model, layer, "ffn_gate.weight");
+        let wu = layer_weight(model, layer, "ffn_up.weight");
+        let sg = layer_weight_shader_mmq(model, layer, "ffn_gate.weight");
+        let su = layer_weight_shader_mmq(model, layer, "ffn_up.weight");
+        self.run_gemm(
+            dev, registry, cmd, sg, wg,
+            self.batch_q8.handle, self.batch_gate.handle,
+            ffn, seq_len, hidden, "gemm_gate",
+        );
+        self.run_gemm(
+            dev, registry, cmd, su, wu,
+            self.batch_q8.handle, self.batch_up.handle,
+            ffn, seq_len, hidden, "gemm_up",
+        );
+        compute_barrier(dev, cmd);
+
+        // ---- (j) silu(gate) * up → batch_ffn_hidden. ----
+        self.run_silu(
+            dev, registry, cmd, self.batch_gate.handle, self.batch_gate.handle,
+            seq_len * ffn, "silu_b",
+        );
+        compute_barrier(dev, cmd);
+        self.run_binary(
+            dev, registry, cmd, ShaderId::Mul,
+            self.batch_gate.handle, self.batch_up.handle, self.batch_ffn_hidden.handle,
+            seq_len * ffn, "mul_gate_up_b",
+        );
+        compute_barrier(dev, cmd);
+
+        // ---- (k) Quantize ffn_hidden + Down-proj GEMM (Q6_K). ----
+        self.run_quantize_q8_1(
+            dev, registry, cmd,
+            self.batch_ffn_hidden.handle, self.batch_q8.handle,
+            seq_len * ffn, "quantize_ffn_h",
+        );
+        compute_barrier(dev, cmd);
+        let wd = layer_weight(model, layer, "ffn_down.weight");
+        let sd = layer_weight_shader_mmq(model, layer, "ffn_down.weight");
+        self.run_gemm(
+            dev, registry, cmd, sd, wd,
+            self.batch_q8.handle, self.batch_ffn_out.handle,
+            hidden, seq_len, ffn, "gemm_down",
+        );
+        compute_barrier(dev, cmd);
+
+        // ---- (l) Residual2 = residual + ffn_out (in-place). ----
+        self.run_binary(
+            dev, registry, cmd, ShaderId::Add,
+            self.batch_residual.handle, self.batch_ffn_out.handle, self.batch_residual.handle,
+            seq_len * hidden, "add_res2_b",
+        );
+        compute_barrier(dev, cmd);
+        let _ = (kv_bytes, ffn_bytes); // some bytes locals only used by debug paths
+    }
+}
+
+/// Same shape as `layer_weight_shader` but returns the integer-MMQ
+/// (GEMM) variant. Used by `prefill_batch`.
+fn layer_weight_shader_mmq(model: &LoadedModel, layer: u32, suffix: &str) -> ShaderId {
+    let key = format!("blk.{layer}.{suffix}");
+    match model
+        .tensor(&key)
+        .unwrap_or_else(|| panic!("missing tensor '{key}'"))
+        .ggml_type
+    {
+        GgmlType::Q6K => ShaderId::MulMmqQ6K,
+        _ => ShaderId::MulMmqQ4K,
     }
 }
 
