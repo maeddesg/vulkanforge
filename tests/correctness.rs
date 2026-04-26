@@ -738,6 +738,147 @@ fn test_scalar_attn_single_token() {
 }
 
 // -----------------------------------------------------------------
+// Phase-3A tiled attention regression — seq_len=64 (one wavefront)
+// and seq_len=200 (≈ Phase 2 baseline pos=200) compared against a
+// CPU reference. The shader file `vk_shaders/scalar_attn.comp` was
+// rewritten as a 64-thread tiled implementation; the four `test_scalar_attn_*`
+// tests above already verify drop-in compatibility on the original
+// Phase-2C fixtures.
+
+/// CPU attention reference. Inputs in pos-major K/V layout, GQA aware.
+fn cpu_attention_reference(
+    q: &[f32],
+    k_full: &[f32],
+    v_full: &[f32],
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    scale: f32,
+) -> Vec<f32> {
+    let group_size = n_heads / n_kv_heads;
+    let pos_stride = (n_kv_heads * head_dim) as usize;
+    let head_dim_us = head_dim as usize;
+    let mut out = vec![0.0f32; (n_heads * head_dim) as usize];
+    for h in 0..n_heads {
+        let kvh = h / group_size;
+        let q_off = (h * head_dim) as usize;
+        let head_off = (kvh * head_dim) as usize;
+
+        let mut scores = vec![0.0f32; seq_len as usize];
+        let mut max_score = f32::NEG_INFINITY;
+        for t in 0..seq_len {
+            let kt = (t as usize) * pos_stride + head_off;
+            let mut s = 0.0f64;
+            for d in 0..head_dim_us {
+                s += (q[q_off + d] as f64) * (k_full[kt + d] as f64);
+            }
+            let s = s as f32 * scale;
+            scores[t as usize] = s;
+            if s > max_score {
+                max_score = s;
+            }
+        }
+        let mut sum = 0.0f64;
+        for s in scores.iter_mut() {
+            *s = (*s - max_score).exp();
+            sum += *s as f64;
+        }
+        let inv = 1.0 / sum as f32;
+        let o_off = (h * head_dim) as usize;
+        for d in 0..head_dim_us {
+            let mut acc = 0.0f64;
+            for t in 0..seq_len {
+                let vt = (t as usize) * pos_stride + head_off;
+                acc += (scores[t as usize] as f64) * (v_full[vt + d] as f64);
+            }
+            out[o_off + d] = (acc * inv as f64) as f32;
+        }
+    }
+    out
+}
+
+fn run_tiled_attn_seqlen(seq_len: u32, abs_threshold: f32) {
+    let mut fix = Fixture::new();
+    // Use Qwen3 dimensions exactly so we exercise the same code path
+    // the forward pass takes.
+    let n_heads: u32 = 32;
+    let n_kv_heads: u32 = 8;
+    let head_dim: u32 = 128;
+    let max_seq: u32 = 2048;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    let pos_stride = (n_kv_heads * head_dim) as usize;
+    let kv_size = (max_seq as usize) * pos_stride;
+    let mut q = vec![0.0f32; (n_heads * head_dim) as usize];
+    let mut k = vec![0.0f32; kv_size];
+    let mut v = vec![0.0f32; kv_size];
+
+    // Deterministic non-trivial inputs that exercise both head_dim
+    // and pos dependencies. No two heads/positions are identical, so
+    // a buggy wavefront layout would surface.
+    for (i, x) in q.iter_mut().enumerate() {
+        *x = ((i as f32) * 0.001).sin();
+    }
+    for t in 0..(seq_len as usize) {
+        for kvh in 0..(n_kv_heads as usize) {
+            for d in 0..(head_dim as usize) {
+                let off = t * pos_stride + kvh * (head_dim as usize) + d;
+                k[off] = ((t as f32 + 1.0) * 0.01 + d as f32 * 0.001).cos();
+                v[off] = ((t as f32) * 0.013 + (kvh as f32) * 0.7 + d as f32 * 0.0007).sin();
+            }
+        }
+    }
+
+    let cpu = cpu_attention_reference(&q, &k, &v, n_heads, n_kv_heads, head_dim, seq_len, scale);
+
+    let q_h = fix.host_buffer_f32(&q, "q");
+    let k_h = fix.host_buffer_f32(&k, "k");
+    let v_h = fix.host_buffer_f32(&v, "v");
+    let o_h = fix.output_buffer_f32((n_heads * head_dim) as usize, "o");
+    let pc = ScalarAttnPushConstants {
+        n_heads, n_kv_heads, head_dim,
+        seq_len, max_seq, scale,
+    };
+    fix.dispatch(
+        ShaderId::ScalarAttn,
+        &[q_h, k_h, v_h, o_h],
+        bytemuck::bytes_of(&pc),
+        (n_heads, 1, 1),
+    );
+    let gpu = fix.read_output(o_h, (n_heads * head_dim) as usize);
+
+    let nan = gpu.iter().any(|x| !x.is_finite());
+    assert!(!nan, "tiled scalar_attn(seq={seq_len}) produced NaN/Inf");
+    let max_abs = max_abs_err(&gpu, &cpu);
+    assert!(
+        max_abs < abs_threshold,
+        "tiled scalar_attn(seq={seq_len}) vs CPU max_abs_err = {max_abs:e} >= {abs_threshold:e}\n\
+         GPU first 8: {:?}\nCPU first 8: {:?}",
+        &gpu[..8],
+        &cpu[..8],
+    );
+    fix.teardown();
+}
+
+#[test]
+fn test_tiled_attn_seq64_vs_cpu() {
+    // One full wavefront of work — every thread does exactly one t.
+    // 1e-3 threshold accounts for the f32-vs-f64 rounding of the
+    // softmax + accumulation chain (CPU reference uses f64 internally).
+    run_tiled_attn_seqlen(64, 1e-3);
+}
+
+#[test]
+fn test_tiled_attn_seq200_vs_cpu() {
+    // ≈ Phase 2 baseline `pos=200`. seq_len=200 is 3.125 × WGSIZE,
+    // so threads do uneven work (some 3, some 4 t-iterations) — this
+    // is the regime that broke the Phase-2 scalar shader's perf and
+    // is the reason the tiled rewrite exists.
+    run_tiled_attn_seqlen(200, 1e-3);
+}
+
+// -----------------------------------------------------------------
 // Helpers for push-constant boilerplate.
 
 fn binary_pc_1d(n: u32) -> GenericBinaryPushConstants {

@@ -1,20 +1,34 @@
 #version 450
 #extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic      : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
 
-// VulkanForge Phase 2C — single-token decode attention.
+// VulkanForge Phase 3A — tiled single-token decode attention.
 //
-// One workgroup per Q-head, one thread per workgroup. Computes
-// scores = Q·K^T·scale, softmax(scores), then output = scores·V
-// for the head. Slow on purpose: correctness-first per Phase-2C
-// prompt §2.6.2. Phase-3 swaps this for Flash-Attention.
+// Replaces the Phase-2C scalar shader (1 thread/workgroup, sequential
+// scan over the KV history). The new shader keeps the same bindings,
+// push constants, and dispatch size (n_heads workgroups), but each
+// workgroup is now a 64-thread Wave64 wavefront cooperating on one
+// Q-head:
+//   Phase 1: parallel scoring — thread `tid` does t = tid, tid+64, …
+//   Phase 2: subgroupMax over the wavefront → numerically stable softmax
+//   Phase 3: parallel exp(s − max) + subgroupAdd for the denominator
+//   Phase 4: weighted V-sum, parallelised over output dimensions
+//            (head_dim=128 with WGSIZE=64 → 2 d-values per thread).
+//
+// On RADV/gfx1201 (RDNA 4) the queried VkPhysicalDeviceSubgroupProperties
+// reports subgroupSize=64 and SUBGROUP_FEATURE_ARITHMETIC_BIT, so a
+// workgroup of 64 == exactly one subgroup and `subgroupAdd`/`subgroupMax`
+// are workgroup-wide reductions in a single instruction.
 
 layout (constant_id = 0) const uint MAX_SEQ = 2048;
 
-layout (local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+const uint WGSIZE = 64;
+layout (local_size_x = WGSIZE) in;
 
 layout (binding = 0) readonly  buffer Q { float q[]; };  // [n_heads, head_dim]
-layout (binding = 1) readonly  buffer K { float k[]; };  // [pos, n_kv_heads, head_dim] — pos-major
-layout (binding = 2) readonly  buffer V { float v[]; };  // [pos, n_kv_heads, head_dim] — pos-major
+layout (binding = 1) readonly  buffer K { float k[]; };  // [pos, n_kv_heads, head_dim]  pos-major
+layout (binding = 2) readonly  buffer V { float v[]; };  // [pos, n_kv_heads, head_dim]  pos-major
 layout (binding = 3) writeonly buffer O { float o[]; };  // [n_heads, head_dim]
 
 layout (push_constant) uniform Params {
@@ -22,28 +36,29 @@ layout (push_constant) uniform Params {
     uint n_kv_heads;    // 8
     uint head_dim;      // 128
     uint seq_len;       // current context length (≤ MAX_SEQ)
-    uint max_seq;       // K/V row stride per head, in elements
+    uint max_seq;       // unused at runtime — kept for binary compat
     float scale;        // 1 / sqrt(head_dim)
 } p;
 
 shared float scores[MAX_SEQ];
 
 void main() {
-    uint h = gl_WorkGroupID.x;
+    uint h   = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
     if (h >= p.n_heads) {
         return;
     }
     uint group_size = p.n_heads / p.n_kv_heads;   // = 4 for Qwen3 GQA
-    uint kvh = h / group_size;
+    uint kvh        = h / group_size;
 
-    uint q_off    = h   * p.head_dim;
-    uint o_off    = h   * p.head_dim;
+    uint q_off      = h   * p.head_dim;
+    uint o_off      = h   * p.head_dim;
     uint pos_stride = p.n_kv_heads * p.head_dim;
     uint head_off   = kvh * p.head_dim;
 
-    // Pass 1 — Q · K_t for every t, scaled.
-    float max_score = -1e30;
-    for (uint t = 0; t < p.seq_len; ++t) {
+    // ---- Phase 1: scores = Q · K[t] · scale, parallel over t. ----
+    float my_max = -1e30;
+    for (uint t = tid; t < p.seq_len; t += WGSIZE) {
         uint k_pos_off = t * pos_stride + head_off;
         float s = 0.0;
         for (uint d = 0; d < p.head_dim; ++d) {
@@ -51,24 +66,38 @@ void main() {
         }
         s *= p.scale;
         scores[t] = s;
-        if (s > max_score) max_score = s;
+        my_max = max(my_max, s);
     }
 
-    // Pass 2 — softmax.
-    float sum = 0.0;
-    for (uint t = 0; t < p.seq_len; ++t) {
-        scores[t] = exp(scores[t] - max_score);
-        sum += scores[t];
-    }
-    float inv_sum = 1.0 / sum;
+    // ---- Phase 2: subgroup max-reduction → numerically stable softmax. ----
+    float global_max = subgroupMax(my_max);
 
-    // Pass 3 — weighted V sum.
-    for (uint d = 0; d < p.head_dim; ++d) {
+    // Make `scores[]` writes from Phase 1 visible before Phase 3 reads them.
+    barrier();
+
+    // ---- Phase 3: exp(s − max) and ∑exp. ----
+    float my_sum = 0.0;
+    for (uint t = tid; t < p.seq_len; t += WGSIZE) {
+        float e = exp(scores[t] - global_max);
+        scores[t] = e;
+        my_sum += e;
+    }
+    float global_sum = subgroupAdd(my_sum);
+    float inv_sum = 1.0 / global_sum;
+
+    // Make Phase 3's `scores[]` writes visible to Phase 4's all-thread reads.
+    barrier();
+
+    // ---- Phase 4: weighted V-sum, parallel over output dimensions. ----
+    // head_dim=128 split across WGSIZE=64 threads ⇒ 2 d-values per thread
+    // for Qwen3. The inner t-loop is sequential per thread but the d-loop
+    // is what's parallelised.
+    for (uint d = tid; d < p.head_dim; d += WGSIZE) {
         float acc = 0.0;
         for (uint t = 0; t < p.seq_len; ++t) {
             uint v_pos_off = t * pos_stride + head_off;
-            acc += scores[t] * inv_sum * v[v_pos_off + d];
+            acc += scores[t] * v[v_pos_off + d];
         }
-        o[o_off + d] = acc;
+        o[o_off + d] = acc * inv_sum;
     }
 }
