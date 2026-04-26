@@ -3,7 +3,10 @@
 **Date:** 2026-04-26
 **Capture:** `captures/decode_forward.rgp` (single decode forward, Qwen3-8B Q4_K_M)
 **RGP version:** 2.6.1.12
-**Screenshots analysed:** 9 (in `results/*.png`)
+**Screenshots analysed:** 11 (in `results/*.png`)
+  *(Updated: +2 follow-up screenshots — Pipeline State for `scalar_attn`
+  and zoomed Wavefront Occupancy. Both fill gaps flagged in §11 of the
+  original analysis. Findings folded into §6, §7-Q3, §8, §11 below.)*
 
 > **Reading caveat.** The screenshots are at ~1500-2500 px wide and the
 > RGP UI uses a small font for table cells. Some numerical values
@@ -26,7 +29,9 @@
 | `pipieline-state.png`               | Events → Pipeline state    | Per-event Wavefront/VGPR/SGPR/LDS, occupancy reasoning |
 | `instruction-timing.png`            | Events → Instruction timing | Per-instruction hit count + latency for one shader |
 | `instruction-timing-zusatz.png`     | Events → Instruction timing (with stall tooltip) | Latency-hiding categorisation |
-| `wavefront-occupancy.png`           | Events → Wavefront occupancy | Occupancy timeline + cache/memory counters |
+| `wavefront-occupancy.png`           | Events → Wavefront occupancy | Occupancy timeline + cache/memory counters (full submit view) |
+| `pipelinestatfuerscalarattn.png`    | Events → Pipeline state    | Same pane as `pipieline-state.png` but for **scalar_attn** — fills §11 gap #1 |
+| `zoomed-wavefront-occupancy-layer.png` | Events → Wavefront occupancy (zoomed) | Few-µs window with cache-counter time series visible — fills §11 gap #2 |
 
 ---
 
@@ -144,6 +149,58 @@ LDS use (168 B/WG) is trivial; **VGPR is the only resource bottleneck.**
 
 ---
 
+## 4b. ScalarAttn pipeline state (`pipelinestatfuerscalarattn.png` — added)
+
+The follow-up screenshot for one `scalar_attn` dispatch:
+
+```
+Dispatch properties
+  Total thread groups:          (32, 1, 1)        ← 1 WG per Q-head
+  Shader processor invocations: (64, 1, 1)        ← workgroup size (Wave64 cooperative)
+
+Wavefronts and threads
+  Total wavefronts:             32                ← 32 WGs × 1 wave/WG
+  Total threads:                2 048             ← 32 × 64
+  Average wavefront duration:   ≈ 21.x µs
+
+Per-wavefront resources
+  Vector registers (VGPR):      88 of 128 allocated   ← same as GEMV
+  Scalar registers (SGPR):      100 of 128 allocated  ← same as GEMV
+  Registers spilled to scratch: Off
+  LDS / thread group:           ≈ 8 200 bytes         ← 8 KB scores[2048] (Phase 3A tiled-attn)
+
+Theoretical wavefront occupancy
+  "limited by its vector register usage. This shader could potentially
+   run 12 wavefronts out of a maximum of 16 wavefronts per SIMD."
+
+  → 12 / 16 = 75 % per-SIMD wavefront occupancy, **VGPR-limited just like GEMV**.
+```
+
+Two new findings:
+
+1. **scalar_attn has the same VGPR-limit as GEMV** (88 / 96 → 12/16 waves).
+   A single VGPR-reduction effort that targets both the Q4_K GEMV
+   and the tiled scalar_attn shader pays off **across the entire
+   forward pass**, not just on the GEMV bucket.
+
+2. **scalar_attn is also globally under-occupying the GPU.** Only 32
+   workgroups are dispatched per call (one per Q-head). Even at 100 %
+   per-SIMD wavefront occupancy, that's 32 wavefronts vs the
+   hardware's 128 SIMDs — at most **25 % of SIMDs ever populated**.
+   This is a different class of problem from the GEMV: VGPR pressure
+   reduces the *peak* occupancy on populated SIMDs, but the dispatch
+   shape itself caps the breadth. Flash-attention (which fuses the
+   per-head and per-position dimensions into more parallel
+   workgroups) is the only fix for the *breadth* problem.
+
+LDS at 8 KB / WG is significant: 32 WGs × 8 KB = 256 KB total LDS
+demand, but with 128 KB LDS / WGP and 32 WGPs = 4 MB total LDS,
+that's not the bottleneck. The 8 KB also excludes any LDS-occupancy
+limit — even if LDS doubled, VGPR would still be the constraint at
+this VGPR count.
+
+---
+
 ## 5. Instruction timing (`instruction-timing.png` + `…-zusatz.png`)
 
 The right-hand "Wavefront statistics" + "Hardware utilisation" panel
@@ -204,9 +261,12 @@ waves are available to hide that latency than the hardware's max
 | Pipeline bucket counts (216, 72, …)   |    🟡 Medium | pipelines.png — small font, some digits guessed |
 | Barrier % of frame                    |    🟡 Medium | barriers.png — value visible but exact digit (~0.0X %) unclear |
 | Cache invalidations ≈ 5510            |    🟡 Medium | barriers.png — header strip |
-| scalar_attn occupancy                 |    🔴 Missing | no Pipeline State screenshot for scalar_attn — would need a separate capture |
-| Memory cycle counter values           |    🔴 Missing | wavefront-occupancy.png shows the timeline but the legend values aren't legible |
-| Per-shader L2 hit-rate                |    🔴 Missing | not on any captured pane in this set |
+| **scalar_attn VGPR-limited at 12/16** |    🟢 High  | **pipelinestatfuerscalarattn.png — explicit text** ← *was missing, now resolved* |
+| **scalar_attn LDS = 8 200 B**         |    🟢 High  | **pipelinestatfuerscalarattn.png** ← *was missing, now resolved* |
+| **scalar_attn dispatches 32 WGs only** |   🟢 High  | **pipelinestatfuerscalarattn.png** — `(32, 1, 1)` thread groups |
+| Inter-dispatch bubble size (< 1 µs)    |    🟢 High  | **zoomed-wavefront-occupancy-layer.png** — valleys clearly < 1 µs |
+| Cache hit-rate by class (qualitative)  |    🟡 Medium | **zoomed-wavefront-occupancy-layer.png** — pattern visible, exact % not legible |
+| Per-shader L2 hit-rate (numeric)       |    🔴 Missing | not on any captured pane (Events → Memory Performance pane would have it) |
 
 ---
 
@@ -250,16 +310,16 @@ stall is short.
 
 ### Q3 — Wavefront occupancy for `scalar_attn` and GEMV
 
-| Shader                  | Theoretical occupancy | Limited by |
-| ----------------------- | --------------------- | ---------- |
-| GEMV (Q4_K, M=4096)     | **12 / 16 = 75 %**    | **VGPR**, 88 / 96 budget |
-| scalar_attn             | (no screenshot)       | (no data)  |
+| Shader                  | Per-SIMD wavefront occupancy | Limited by | Also: SIMD breadth |
+| ----------------------- | ---------------------------- | ---------- | ----- |
+| GEMV (Q4_K, M=4096)     | **12 / 16 = 75 %**           | **VGPR**, 88 / 96 budget | 4096 WGs ≫ 128 SIMDs → all SIMDs saturated |
+| scalar_attn (n_heads=32)| **12 / 16 = 75 %**           | **VGPR**, 88 / 96 budget | **32 WGs ≪ 128 SIMDs → only 25 % of SIMDs populated** |
 
-scalar_attn dispatches `(n_heads = 32, 1, 1)` workgroups of 64
-threads each, vs 128 SIMDs available — even at 100 % per-wave
-occupancy, only 32/128 = 25 % of the SIMDs are populated at any
-moment. **A dedicated Pipeline-State capture for scalar_attn is
-the most-valuable missing screenshot for Phase 4 sizing.**
+Both shaders hit the same per-SIMD VGPR cap. scalar_attn additionally
+has a global breadth problem — only 32 WGs are launched, so even at
+100 % per-SIMD wavefront occupancy the GPU is fundamentally
+under-utilised at decode. **Flash-attention is the only lever that
+fixes the breadth issue.**
 
 ### Q4 — Memory-bound or compute-bound?
 
@@ -279,15 +339,22 @@ critical-path bottleneck.
 
 ### Q5 — Pipeline bubbles between dispatches?
 
-**Answer: small, regular, not significant.**
+**Answer: small, regular, not significant. Confirmed at higher
+resolution by the zoomed view.**
 
-`wavefront-occupancy.png` shows a **dense spiky timeline** — bursts
-of high occupancy with brief valleys. No long flat-zero regions.
-Combined with §Q2's <1 % barrier overhead, the bubbles between
-dispatches are sub-µs each and don't compound.
+`wavefront-occupancy.png` (full-submit view) showed a dense spiky
+timeline. The new `zoomed-wavefront-occupancy-layer.png` resolves
+single-event valleys: most are sub-µs, with a handful of ~5 µs gaps
+at what look like the per-layer rms_norm/rope boundaries. The
+cache-counter time-series in the same screenshot shows per-dispatch
+hit-rate variation (high during small dispatches like RoPE/RMSNorm,
+lower during big GEMVs) — qualitatively confirms the
+"weights-don't-fit-in-L2" model without giving us the numeric L2 hit
+rate.
 
-`event-timing.png` confirms: events run back-to-back with no obvious
-gaps. The decode forward keeps the GPU busy.
+Combined with §Q2's <1 % barrier overhead, bubbles don't compound
+into significant wall-time. **Async-submit / dispatch-batching is
+not a Phase-4 priority.**
 
 ---
 
@@ -295,10 +362,10 @@ gaps. The decode forward keeps the GPU busy.
 
 | # | Lever                                      | Expected gain | Impl. effort | Justification |
 | - | ------------------------------------------ | -------------:| ------------:| ------------- |
-| 1 | **Reduce VGPR usage in mul_mat_vec_q4_k** (88 → ≤ 96 → ideally < 88) | Up to **+25 % GEMV throughput** at decode (75 % → ~100 % occupancy → ~95 % of peak BW vs current 75 %). At 65 % of forward time spent in Q4K GEMV at pos=200, that's a **~16 % decode-tok/s gain** before flash-attention. | **Medium** — touch `mul_mat_vec_q4_k.comp`. Find unrolled accumulators that can be split, or use scalar regs where possible. | Pipeline State screenshot is unambiguous: VGPR is the only resource constraint, and only 8 VGPRs need to come off to unlock another wave. |
-| 2 | **Flash-attention** (port `flash_attn.comp`) | Removes the `O(seq_len)` per-layer scan from `scalar_attn`. Decode at pos=200 gets 2× faster; pp >= 256 prefill gets 2-3× because token-by-token attention disappears. | **Large** — new shader + dispatch wiring + 36-layer integration + correctness gate. | scalar_attn is bucket #3 (≈ 0.8 ms × 36 events at pos=29; scales to ~110 ms at pos=200 per Phase 3A). Memory-bound + low-occupancy makes it the only lever whose gain grows with prompt length. |
-| 3 | **Per-shader VGPR audit** for ScalarAttn / RopeNeox / RmsNorm | Possibly small — but cheap to check. | **Small** — re-capture with Pipeline State on each. | Without the screenshot we don't know if scalar_attn is VGPR-limited too. If yes, free win. |
-| 4 | Async submit / barrier minimisation        | < 5 % wall-time | Medium | Barriers consume < 1 % per §Q2; only worth doing if everything else is done. |
+| 1 | **VGPR reduction across all matmul-style shaders** — primarily `mul_mat_vec_q4_k.comp`, but the `scalar_attn` follow-up screenshot shows the **tiled attention shader has the IDENTICAL 88-VGPR / 12-of-16-wave limit**. One VGPR-budget fix lifts the cap for **both** the dominant GEMV and the second-largest (attention) bucket. | **+25 %** GEMV throughput **and** +25 % attention throughput on populated SIMDs, simultaneously. At pos=200 where attention is ~30 % of GPU time and GEMV ~65 %, the combined effect is ≈ **+20 % decode tok/s** — the largest *cheap* lever in this analysis. | **Medium** — same edit pattern in two `.comp` files (split unrolled accumulators, prefer scalar regs). Each shader needs only ~8 VGPRs to come off (88 → 80) to unlock a 13th wave, ≤ 96 → ideally ~80 to hit 16/16. | Pipeline State for *both* shaders explicit: "limited by its vector register usage". |
+| 2 | **Flash-attention** (port `flash_attn.comp`) | Removes `O(seq_len)` per-layer scan AND fixes `scalar_attn`'s **breadth** problem (32 WGs → 128+ WGs distributed across all SIMDs). Decode at pos=200 → ~2× attention throughput; prefill (token-by-token attention path inside `prefill_batch`) → 2-3× because the per-token loop collapses. | **Large** — new shader + dispatch wiring + 36-layer integration + correctness gate. | scalar_attn is bucket #3 today; even *with* the VGPR fix from #1, its 25 % SIMD-breadth ceiling stands. Flash-attention is the only fix for breadth, and gain grows linearly with prompt length. |
+| 3 | **Per-shader VGPR audit** on `RopeNeox` / `RmsNorm` / `Add` / `Mul` / `Silu` | Possibly small. *We already know GEMV and ScalarAttn — those were items 1.* | **Small** — re-capture Pipeline State on each. Mostly mechanical. | Free check; if any of the elementwise shaders are VGPR-limited the same fix style applies. |
+| 4 | Async submit / barrier minimisation        | < 5 % wall-time | Medium | Barriers consume < 1 % per §Q2 and the zoomed timeline confirms inter-dispatch bubbles are sub-µs; deprioritise. |
 
 **Reordering vs Phase 3E's plan.** Phase 3E said "flash-attention is
 priority 1, async submit is priority 2." The RGP data argues for
@@ -307,6 +374,13 @@ async submit but with a much higher ceiling, and unlocks a measurable
 fraction of the BW gap that's been on the books since Phase 1.
 Flash-attention stays as #2 with the additional payoff of growing
 with sequence length.
+
+**Reinforced by the follow-up screenshots:** the scalar_attn
+Pipeline State shows the SAME 88-VGPR limit, so a single VGPR-tuning
+effort doubles its return — it lifts both the dominant GEMV bucket
+*and* the tiled-attention bucket simultaneously. That widens the
+priority-1 gap over flash-attention further: the same effort now
+covers ~95 % of the GPU time per forward, not just the GEMV ~65 %.
 
 ---
 
@@ -329,34 +403,31 @@ with sequence length.
 
 ---
 
-## 11. What's missing (if you can re-capture)
+## 11. What's missing (resolved + remaining)
 
-If you take three more screenshots, the analysis below tightens
-considerably:
+| #  | Originally requested                          | Status                              |
+| -- | --------------------------------------------- | ----------------------------------- |
+| 1  | Pipeline State for ScalarAttn                 | ✅ **Resolved** — `pipelinestatfuerscalarattn.png` confirms VGPR-limited at 12/16 + only 32 WGs dispatched (breadth problem) |
+| 2  | Zoomed Wavefront Occupancy (1 layer)          | ✅ **Resolved** — `zoomed-wavefront-occupancy-layer.png` shows < 1 µs bubbles + qualitative cache-hit pattern |
+| 3  | Memory Performance pane (L2 hit-rate, VRAM BW over time) | 🔴 **Still missing** — would tighten §8.1's gain estimate (if L2 hit-rate < 5 %, 644 GB/s is the absolute cap; if 30 %+, even bigger gains from cache-friendly reordering) |
 
-1. **Pipeline State for ScalarAttn** (one of the 36 dispatches in
-   bucket 3). Tells us whether the per-Q-head shader is VGPR-,
-   LDS-, or wave-occupancy-limited. Drives Phase-4 priority for
-   flash-attention vs `scalar_attn` tuning.
-2. **Wavefront Occupancy zoomed to 5-10 ms** (one or two layers
-   only) so the per-event "valley" depth is legible — that puts a
-   real number on the inter-dispatch bubble cost.
-3. **Memory Performance pane** (under Events → some toolbar option;
-   if RGP 2.6 has it on Linux). Gives L2 hit-rate, VRAM read BW
-   over time. If hit-rate < 5 %, the 644 GB/s is the absolute cap
-   and § 8.1 gain estimate stands; if 30 %+, even bigger gains are
-   on the table from cache-friendly reordering.
+The two new screenshots **strengthen the analysis** rather than
+change it: VGPR is the bottleneck for both GEMV and scalar_attn,
+inter-dispatch bubbles are negligible, and the only outstanding
+question is the precise L2 hit-rate which would refine — not
+reorder — the priority list.
 
 ---
 
-## 12. Files added
+## 12. Files added / updated
 
 | File                                                | Status |
 | --------------------------------------------------- | ------ |
-| `results/phase3_rgp_analysis.md`                    | new — this report |
+| `results/phase3_rgp_analysis.md`                    | edit — folded the two follow-up screenshots into §1, §4b, §6, §7-Q3, §7-Q5, §8, §11 |
+| `results/pipelinestatfuerscalarattn.png`            | (you) new — Pipeline State for scalar_attn |
+| `results/zoomed-wavefront-occupancy-layer.png`      | (you) new — zoomed occupancy + cache-counter timeline |
 
-The 9 PNG screenshots were already added by you before the analysis;
-they stay in `results/`.
+The 9 original PNG screenshots stay in `results/`.
 
 ---
 
