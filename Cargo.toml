@@ -7,6 +7,7 @@ rust-version = "1.85"
 [dependencies]
 ash = "0.38"
 bytemuck = { version = "1", features = ["derive"] }
+fancy-regex = "0.13"
 gpu-allocator = "0.27"
 half = "2"
 memmap2 = "0.9"

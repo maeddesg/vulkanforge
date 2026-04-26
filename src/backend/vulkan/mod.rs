@@ -1,5 +1,6 @@
 pub mod buffers;
 pub mod commands;
+pub mod decode;
 pub mod device;
 pub mod forward;
 pub mod gguf;
@@ -11,4 +12,5 @@ pub mod profiler;
 pub mod q4k;
 pub mod shaders;
 pub mod spirv_reflect;
+pub mod tokenizer;
 pub mod vram_arena;

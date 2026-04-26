@@ -177,6 +177,20 @@ impl MetadataValue {
             _ => None,
         }
     }
+    pub fn as_array(&self) -> Option<&[MetadataValue]> {
+        match self {
+            MetadataValue::Array(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+    pub fn as_i32(&self) -> Option<i32> {
+        match self {
+            MetadataValue::I32(v) => Some(*v),
+            MetadataValue::U32(v) if *v <= i32::MAX as u32 => Some(*v as i32),
+            MetadataValue::I64(v) if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 => Some(*v as i32),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

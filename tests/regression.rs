@@ -13,6 +13,7 @@ use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 
 use vulkanforge::backend::vulkan::buffers::GpuBuffer;
 use vulkanforge::backend::vulkan::commands::CommandContext;
+use vulkanforge::backend::vulkan::decode::{generate, GenerateConfig};
 use vulkanforge::backend::vulkan::device::VulkanDevice;
 use vulkanforge::backend::vulkan::forward::Forward;
 use vulkanforge::backend::vulkan::gguf::{GgmlType, GgufFile, ModelConfig};
@@ -24,6 +25,7 @@ use vulkanforge::backend::vulkan::pipeline_registry::PipelineRegistry;
 use vulkanforge::backend::vulkan::q4k;
 use vulkanforge::backend::vulkan::shaders::{self, ShaderId, ALL_SHADERS};
 use vulkanforge::backend::vulkan::spirv_reflect;
+use vulkanforge::backend::vulkan::tokenizer::{apply_chat_template, Tokenizer};
 use vulkanforge::backend::vulkan::vram_arena::{
     ArenaConfig, ArenaError, BufferViewError, VramArena,
 };
@@ -353,6 +355,134 @@ fn qwen3_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     let p = PathBuf::from(home).join("models").join("Qwen3-8B-Q4_K_M.gguf");
     if p.exists() { Some(p) } else { None }
+}
+
+// -----------------------------------------------------------------
+// Phase 2D — tokenizer + decode loop regression tests.
+
+/// Tokenizer roundtrips simple ASCII strings exactly. Encodes through
+/// the Qwen2 pre-tokenizer + GPT-2 byte-level BPE, decodes back.
+#[test]
+fn phase2d_tokenizer_roundtrip() {
+    let Some(path) = qwen3_path() else { return };
+    let gguf = GgufFile::open(&path).expect("open");
+    let tok = Tokenizer::from_gguf(&gguf).expect("tokenizer");
+    assert_eq!(tok.vocab_size(), 151936);
+    for s in [
+        "Hello world",
+        "Hello world!",
+        "Explain what a mutex is.",
+        " leading space",
+        "Two\nlines",
+    ] {
+        let ids = tok.encode(s);
+        let back = tok.decode(&ids);
+        assert_eq!(back, s, "roundtrip mismatch for {s:?}: got {back:?}");
+    }
+    // Known Qwen3 tokenisation: "Hello" → 9707, " world" → 1879.
+    let ids = tok.encode("Hello world");
+    assert_eq!(ids, vec![9707, 1879]);
+}
+
+/// Chat template emits `<|im_start|>` / `<|im_end|>` as single ids,
+/// places them where the spec calls for, and renders back to the
+/// expected Qwen3 prompt string.
+#[test]
+fn phase2d_chat_template_qwen3() {
+    let Some(path) = qwen3_path() else { return };
+    let gguf = GgufFile::open(&path).expect("open");
+    let tok = Tokenizer::from_gguf(&gguf).expect("tokenizer");
+
+    let prompt = apply_chat_template(&tok, "Hi", None);
+    // Must start with <|im_start|>system and end with <|im_start|>assistant\n.
+    assert_eq!(prompt[0], tok.im_start_id);
+    assert!(
+        prompt.iter().filter(|&&id| id == tok.im_start_id).count() == 3,
+        "expected 3 <|im_start|> in chat template, got {prompt:?}",
+    );
+    assert!(
+        prompt.iter().filter(|&&id| id == tok.im_end_id).count() == 2,
+        "expected 2 <|im_end|> in chat template",
+    );
+    let rendered = tok.decode(&prompt);
+    assert!(
+        rendered.contains("<|im_start|>system\n")
+            && rendered.contains("<|im_start|>user\nHi<|im_end|>\n")
+            && rendered.ends_with("<|im_start|>assistant\n"),
+        "chat-template renders unexpectedly:\n{rendered}",
+    );
+}
+
+/// End-to-end decode: greedy generation on "Explain what a mutex is in
+/// one sentence." must produce coherent English containing one of the
+/// expected mutex-related keywords. Catches future regressions that
+/// flip from "looks plausible" to "Garbage".
+#[test]
+fn phase2d_decode_produces_coherent_text() {
+    let Some(path) = qwen3_path() else { return };
+    let dev = VulkanDevice::new().expect("VulkanDevice::new");
+    let mut allocator = Allocator::new(&AllocatorCreateDesc {
+        instance: dev.instance.clone(),
+        device: dev.device.clone(),
+        physical_device: dev.physical_device,
+        debug_settings: gpu_allocator::AllocatorDebugSettings::default(),
+        buffer_device_address: false,
+        allocation_sizes: gpu_allocator::AllocationSizes::default(),
+    })
+    .expect("Allocator::new");
+    let (registry, _) = PipelineRegistry::new(&dev.device, None).expect("registry");
+    let cmd_ctx = CommandContext::new(&dev.device, dev.queue_family_index).expect("cmd_ctx");
+    let gguf = GgufFile::open(&path).expect("open");
+    let cfg = ModelConfig::from_gguf(&gguf).expect("config");
+    let model = LoadedModel::load(&dev, &mut allocator, &gguf).expect("load");
+    let tokenizer = Tokenizer::from_gguf(&gguf).expect("tokenizer");
+
+    let kv_cache = KvCache::new(
+        &dev.device,
+        &mut allocator,
+        KvCacheConfig {
+            n_layers: cfg.n_layers,
+            n_kv_heads: cfg.n_kv_heads,
+            head_dim: cfg.head_dim,
+            // Generous enough for a 30-token prompt + 80 generated tokens.
+            max_seq_len: 256,
+        },
+    )
+    .expect("kv_cache");
+    let mut forward =
+        Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None).expect("forward");
+
+    let result = generate(
+        &mut forward,
+        &dev,
+        &registry,
+        &cmd_ctx,
+        &model,
+        &gguf,
+        &cfg,
+        &tokenizer,
+        "Explain what a mutex is in one sentence.",
+        &GenerateConfig {
+            max_tokens: 80,
+            print_stream: false,
+        },
+    )
+    .expect("generate");
+
+    assert!(result.generated_tokens > 0, "no tokens generated");
+    let text_lower = result.generated_text.to_lowercase();
+    let keywords = ["mutex", "mutual", "lock", "thread", "synchron", "exclus"];
+    assert!(
+        keywords.iter().any(|k| text_lower.contains(k)),
+        "decoded text contains none of {keywords:?}:\n{}",
+        result.generated_text,
+    );
+
+    forward.destroy(&dev.device, &mut allocator);
+    cmd_ctx.destroy(&dev.device);
+    model.destroy(&dev.device, &mut allocator);
+    registry.destroy(&dev.device);
+    drop(allocator);
 }
 
 /// Phase-1 regression: the original 1.4 smoke test. Bit-exact output
