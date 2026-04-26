@@ -14,8 +14,9 @@ use vulkanforge::backend::vulkan::commands::CommandContext;
 use vulkanforge::backend::vulkan::device::VulkanDevice;
 use vulkanforge::backend::vulkan::pipeline::{
     init_fastdiv_values, ComputeKernel, GenericBinaryPushConstants,
-    GenericHeadPushConstants, GenericUnaryPushConstants, RopePushConstants,
-    ScalarAttnPushConstants, SoftMaxPushConstants,
+    GenericHeadPushConstants, GenericUnaryPushConstants, MmqPushConstants,
+    Q8_1QuantizePushConstants, RopePushConstants, ScalarAttnPushConstants,
+    SoftMaxPushConstants,
 };
 use vulkanforge::backend::vulkan::pipeline_registry::PipelineRegistry;
 use vulkanforge::backend::vulkan::shaders::ShaderId;
@@ -734,6 +735,230 @@ fn test_scalar_attn_single_token() {
             "scalar_attn(seq=1, K=0.1, V=1.0) max_abs from 1.0 = {max_abs:e}\n\
              gpu first 8: {:?}",
             &gpu[..8]);
+    fix.teardown();
+}
+
+// -----------------------------------------------------------------
+// Phase-3D — Q8_1 quantize roundtrip + GEMM-vs-GEMV parity tests.
+
+/// CPU dequantise one `block_q8_1_x4` (144 bytes covering 128 floats).
+/// Layout: `f16vec2 ds[4]` (16 B) followed by `int8 qs[128]` (the
+/// shader writes them as `int32_t qs[32]` = same bytes).
+/// Each of the 4 sub-blocks of 32 floats has its own f16 scale `d`
+/// (the `.x` of `ds[i]`) and was quantised as `round(val / d)` with
+/// `d = amax / 127`.
+fn dequant_q8_1_x4_block(bytes: &[u8; 144]) -> [f32; 128] {
+    let mut out = [0.0f32; 128];
+    let mut ds = [0.0f32; 4];
+    for i in 0..4 {
+        // f16vec2 = 4 bytes; .x is the scale, .y is the f16 sum*d (unused for dequant).
+        let off = i * 4;
+        let bits = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
+        ds[i] = half::f16::from_bits(bits).to_f32();
+    }
+    let qs = &bytes[16..16 + 128];
+    for sub in 0..4 {
+        let d = ds[sub];
+        for j in 0..32 {
+            let q = qs[sub * 32 + j] as i8;
+            out[sub * 32 + j] = (q as f32) * d;
+        }
+    }
+    out
+}
+
+#[test]
+fn test_q8_1_quantize_roundtrip() {
+    let mut fix = Fixture::new();
+    // 256 elements (= 2 x4 blocks). Mix of magnitudes per sub-block
+    // so each scale is non-trivial and the round-trip exercises real
+    // dequant work.
+    let n: u32 = 256;
+    let input: Vec<f32> = (0..n)
+        .map(|i| {
+            let sub = (i / 32) as f32;
+            let amp = 0.1 + 0.5 * sub;
+            ((i as f32 - 128.0) * 0.05).sin() * amp
+        })
+        .collect();
+
+    let a_h = fix.host_buffer_f32(&input, "q8_in");
+    // Output buffer: ceil(n/128) x4 blocks × 144 bytes each.
+    let blocks_x4 = ((n + 127) / 128) as usize;
+    let out_bytes = (blocks_x4 * 144) as u64;
+    let out_h = {
+        let device = fix.dev.device.clone();
+        let allocator = fix.allocator.as_mut().unwrap();
+        let buf = GpuBuffer::new(
+            &device, allocator, out_bytes,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::GpuToCpu,
+            "q8_out",
+        ).expect("alloc q8 out");
+        fix.track(buf)
+    };
+
+    let pc = Q8_1QuantizePushConstants {
+        ne: n,
+        num_blocks: blocks_x4 as u32,
+    };
+    fix.dispatch(
+        ShaderId::QuantizeQ8_1,
+        &[a_h, out_h],
+        bytemuck::bytes_of(&pc),
+        // local_size_x = GROUP_SIZE = 32; one workgroup per x4 block.
+        (blocks_x4 as u32, 1, 1),
+    );
+
+    // Pull the raw bytes back, dequantise, compare.
+    let buf = fix
+        .pending_buffers
+        .iter()
+        .find(|b| b.handle == out_h)
+        .expect("out_h tracked");
+    let raw = buf.read_bytes().expect("read q8 out");
+    let mut recovered = vec![0.0f32; n as usize];
+    for b in 0..blocks_x4 {
+        let block: &[u8; 144] = (&raw[b * 144..b * 144 + 144]).try_into().unwrap();
+        let block_out = dequant_q8_1_x4_block(block);
+        recovered[b * 128..b * 128 + 128].copy_from_slice(&block_out);
+    }
+
+    // Q8_1 round-trip error is bounded by quantisation round-off
+    // (d/2 = amax/254) plus f16 scale storage error. The empirical
+    // worst case on our test data is <1% of the per-sub-block amax
+    // — anything more would mean a layout/stride mismatch.
+    let mut max_rel = 0.0f64;
+    for sub in 0..(n as usize / 32) {
+        let amax = input[sub * 32..(sub + 1) * 32]
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0f32, f32::max);
+        let tol = (amax / 100.0).max(1e-6);
+        for j in 0..32 {
+            let i = sub * 32 + j;
+            let err = (recovered[i] - input[i]).abs();
+            assert!(
+                err <= tol,
+                "q8_1 roundtrip exceeded 1%-of-amax at i={i}: input={} recovered={} err={} tol={}",
+                input[i], recovered[i], err, tol
+            );
+            let rel = (err / amax.max(1e-9)) as f64;
+            if rel > max_rel {
+                max_rel = rel;
+            }
+        }
+    }
+    assert!(max_rel < 0.01, "max relative roundtrip error {max_rel} > 1%");
+    fix.teardown();
+}
+
+/// Phase 3D — GEMM(weights, activations_seq1) must match the existing
+/// GEMV smoke output `[256.0, 512.0]` for `build_smoke_weights()`.
+/// This is the parity gate: if the dispatch / push-constants / buffer
+/// layout aren't right, output diverges (or NaNs) and the rest of
+/// `prefill_batch` can't ship.
+///
+/// Setup mirrors `phase1_q4k_smoke_dispatch_bit_exact`:
+///   M = 2 (output rows), K = QUANT_K = 256, N = 1 (single token)
+///   Weights = `build_smoke_weights()` (Q4_K)
+///   Activations = `[1.0; K]`, quantised through `quantize_q8_1`.
+#[test]
+fn test_gemm_q4k_vs_gemv_seq1_parity() {
+    use vulkanforge::backend::vulkan::q4k;
+
+    let mut fix = Fixture::new();
+    let m: u32 = 2;
+    let k: u32 = q4k::QUANT_K as u32; // 256
+    let n: u32 = 1;
+
+    // 1. Q4_K weights (same bytes the GEMV smoke uses).
+    let weights_bytes = q4k::build_smoke_weights();
+    let w_buf = {
+        let device = fix.dev.device.clone();
+        let allocator = fix.allocator.as_mut().unwrap();
+        let mut b = GpuBuffer::new(
+            &device, allocator, weights_bytes.len() as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "gemm_weights",
+        ).expect("alloc weights");
+        b.write_bytes(&weights_bytes).expect("write weights");
+        fix.track(b)
+    };
+
+    // 2. Activations FP32 — single token of K=256 ones.
+    let act: Vec<f32> = vec![1.0; k as usize];
+    let act_buf = fix.host_buffer_f32(&act, "gemm_act_f32");
+
+    // 3. Quantise activations → Q8_1_x4 (one 128-element x4 block per
+    //    sub-row; K=256 → 2 x4 blocks).
+    let q8_blocks_x4 = ((k * n + 127) / 128) as usize;
+    let q8_buf = {
+        let device = fix.dev.device.clone();
+        let allocator = fix.allocator.as_mut().unwrap();
+        let buf = GpuBuffer::new(
+            &device, allocator, (q8_blocks_x4 * 144) as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::GpuOnly, "gemm_q8",
+        ).expect("alloc q8 act");
+        fix.track(buf)
+    };
+    let q8_pc = Q8_1QuantizePushConstants {
+        ne: k * n,
+        num_blocks: q8_blocks_x4 as u32,
+    };
+    fix.dispatch(
+        ShaderId::QuantizeQ8_1, &[act_buf, q8_buf],
+        bytemuck::bytes_of(&q8_pc),
+        (q8_blocks_x4 as u32, 1, 1),
+    );
+
+    // 4. Output buffer — M × N f32 = 2 floats.
+    let out_buf = fix.output_buffer_f32((m * n) as usize, "gemm_out");
+
+    // 5. Dispatch GEMM. Push constants per mul_mmq.comp lines 41-68
+    //    (non-MoE variant). With BM=BN=64, M=2 < BM and N=1 < BN, so
+    //    blocks_m = 1, blocks_n = 1, total dispatch = (1, 1, 1). The
+    //    shader bounds-checks before writing rows past M.
+    let pc = MmqPushConstants {
+        m, n, k,
+        stride_a: k,           // K elements per row of weights
+        stride_b: k,            // K elements per row of activations (1 row of K elements)
+        stride_d: n,            // N elements per row of D = 1
+        batch_stride_a: m * k,
+        batch_stride_b: n * k,
+        batch_stride_d: m * n,
+        base_work_group_z: 0,
+        num_batches: 1,
+        k_split: k,             // no split-K
+        ne02: 1,
+        ne12: 1,
+        broadcast2: 1,
+        broadcast3: 1,
+    };
+    fix.dispatch(
+        ShaderId::MulMmqQ4K, &[w_buf, q8_buf, out_buf],
+        bytemuck::bytes_of(&pc),
+        (1, 1, 1),
+    );
+
+    let gpu = fix.read_output(out_buf, (m * n) as usize);
+    eprintln!("GEMM seq=1 output: {:?}", gpu);
+    let nan = gpu.iter().any(|x| !x.is_finite());
+    assert!(!nan, "GEMM seq=1 produced NaN/Inf — first 8: {:?}", &gpu[..gpu.len().min(8)]);
+    // GEMV smoke produces exactly [256.0, 512.0]. GEMM should match
+    // within Q8_1 round-off (input is all 1.0 → quantises to exactly
+    // 127 with d=1/127 → dequant 1.0 exactly → matrix product matches).
+    // Q8_1 storage of activations + f16 storage of the per-block scale
+    // introduces round-off bounded by amax/127 per term. For input
+    // amax=1.0 the per-term error is ≈1/127, so the matrix-product
+    // error of K=256 ones × constant weights stays within ≈0.5% of
+    // the analytical answer. We assert <0.1 absolute which is well
+    // above the observed ≈0.02 round-off.
+    let g0_err = (gpu[0] - 256.0).abs();
+    let g1_err = (gpu[1] - 512.0).abs();
+    assert!(
+        g0_err < 0.1 && g1_err < 0.1,
+        "GEMM seq=1 ≠ GEMV: got [{}, {}], expected [256.0, 512.0] (errs {} {})",
+        gpu[0], gpu[1], g0_err, g1_err
+    );
     fix.teardown();
 }
 

@@ -177,6 +177,43 @@ pub struct ScalarAttnPushConstants {
 }
 const _: () = assert!(std::mem::size_of::<ScalarAttnPushConstants>() == 24);
 
+/// `mul_mmq.comp` push block (non-MUL_MAT_ID variant). 16 × u32 = 64 B.
+/// Field order matches the GLSL `parameter` block exactly — see
+/// `vk_shaders/mul_mmq.comp` lines 41-68.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct MmqPushConstants {
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    pub stride_a: u32,
+    pub stride_b: u32,
+    pub stride_d: u32,
+    pub batch_stride_a: u32,
+    pub batch_stride_b: u32,
+    pub batch_stride_d: u32,
+    pub base_work_group_z: u32,
+    pub num_batches: u32,
+    pub k_split: u32,
+    pub ne02: u32,
+    pub ne12: u32,
+    pub broadcast2: u32,
+    pub broadcast3: u32,
+}
+const _: () = assert!(std::mem::size_of::<MmqPushConstants>() == 64);
+
+/// `quantize_q8_1.comp` push block. 2 × u32 = 8 B.
+/// `ne` is the total f32 element count of the input. `num_blocks` is
+/// the workgroup-loop upper bound (with `QBLOCK_X4` defined that's the
+/// number of 128-element x4 blocks in the output).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Q8_1QuantizePushConstants {
+    pub ne: u32,
+    pub num_blocks: u32,
+}
+const _: () = assert!(std::mem::size_of::<Q8_1QuantizePushConstants>() == 8);
+
 /// llama.cpp's `init_fastdiv_values`. Used by [`GenericUnaryPushConstants`]
 /// to populate the `ne*_*mp/L` fields — without these, `copy`'s SPIR-V
 /// fastdiv path divides by a magic-of-zero and produces garbage indices.
