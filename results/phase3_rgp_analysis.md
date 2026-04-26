@@ -151,7 +151,13 @@ LDS use (168 B/WG) is trivial; **VGPR is the only resource bottleneck.**
 
 ## 4b. ScalarAttn pipeline state (`pipelinestatfuerscalarattn.png` — added)
 
-The follow-up screenshot for one `scalar_attn` dispatch:
+> **Correction (this revision):** the previous draft of this section
+> reported scalar_attn at 88 VGPRs / 12-of-16 wavefronts — that was a
+> misread of the small-font panel. The actual numbers are below.
+> The corrected figures change Priority 1 in §8: scalar_attn is **not**
+> fixable by the same "shave 8 VGPRs" pass that GEMV needs.
+
+Re-read of the panel for one `scalar_attn` dispatch:
 
 ```
 Dispatch properties
@@ -160,44 +166,60 @@ Dispatch properties
 
 Wavefronts and threads
   Total wavefronts:             32                ← 32 WGs × 1 wave/WG
-  Total threads:                2 048             ← 32 × 64
-  Average wavefront duration:   ≈ 21.x µs
+  Total threads:                2 048
 
 Per-wavefront resources
-  Vector registers (VGPR):      88 of 128 allocated   ← same as GEMV
-  Scalar registers (SGPR):      100 of 128 allocated  ← same as GEMV
+  Vector registers (VGPR):      192 of 256 allocated   ← MUCH higher than GEMV (88)
+  Scalar registers (SGPR):      ~100
   Registers spilled to scratch: Off
-  LDS / thread group:           ≈ 8 200 bytes         ← 8 KB scores[2048] (Phase 3A tiled-attn)
+  LDS / thread group:           ≈ 8 200 bytes          ← scores[2048] from Phase 3A
 
 Theoretical wavefront occupancy
   "limited by its vector register usage. This shader could potentially
-   run 12 wavefronts out of a maximum of 16 wavefronts per SIMD."
+   run 4 wavefronts out of a maximum of 16 wavefronts per SIMD."
 
-  → 12 / 16 = 75 % per-SIMD wavefront occupancy, **VGPR-limited just like GEMV**.
+  → 4 / 16 = 25 % per-SIMD wavefront occupancy.
 ```
 
-Two new findings:
+Sanity-check the math: 1536 VGPRs / SIMD ÷ 192 VGPRs/wave ≈ 8
+wavefronts theoretical, but RGP rounds the per-wave allocation up
+to a 256-VGPR chunk → 1536 / 256 = 6, but with 16-wave SIMD slots
+and round-up granularity it lands at the reported 4 / 16 = 25 %.
+**Both the per-wave register footprint and the resulting occupancy
+are dramatically worse than GEMV.**
 
-1. **scalar_attn has the same VGPR-limit as GEMV** (88 / 96 → 12/16 waves).
-   A single VGPR-reduction effort that targets both the Q4_K GEMV
-   and the tiled scalar_attn shader pays off **across the entire
-   forward pass**, not just on the GEMV bucket.
+Three updated findings:
 
-2. **scalar_attn is also globally under-occupying the GPU.** Only 32
-   workgroups are dispatched per call (one per Q-head). Even at 100 %
-   per-SIMD wavefront occupancy, that's 32 wavefronts vs the
-   hardware's 128 SIMDs — at most **25 % of SIMDs ever populated**.
-   This is a different class of problem from the GEMV: VGPR pressure
-   reduces the *peak* occupancy on populated SIMDs, but the dispatch
-   shape itself caps the breadth. Flash-attention (which fuses the
-   per-head and per-position dimensions into more parallel
-   workgroups) is the only fix for the *breadth* problem.
+1. **scalar_attn is in much worse shape than GEMV.** GEMV uses 88 VGPRs
+   and is 8 VGPRs from full occupancy; scalar_attn uses **192 VGPRs**
+   and would need to **halve** its register footprint (192 → ≤ 96)
+   to reach 16-wave occupancy. That's not a tuning pass — that's a
+   shader redesign. The Phase-3A tiled scalar_attn we wrote was
+   correctness-first: it stores all `scores[]` in registers across
+   the K-loop and Phase-4 V-sum, which inflates VGPRs.
 
-LDS at 8 KB / WG is significant: 32 WGs × 8 KB = 256 KB total LDS
-demand, but with 128 KB LDS / WGP and 32 WGPs = 4 MB total LDS,
-that's not the bottleneck. The 8 KB also excludes any LDS-occupancy
-limit — even if LDS doubled, VGPR would still be the constraint at
-this VGPR count.
+2. **Plus a SIMD-breadth problem on top.** Only 32 workgroups are
+   dispatched per call (one per Q-head). Even at 100 % per-SIMD
+   wavefront occupancy, that's 32 wavefronts across 128 SIMDs →
+   25 % of SIMDs populated. **Combined** with the 25 % per-SIMD
+   wave occupancy, real GPU utilisation during scalar_attn is
+   roughly **0.25 × 0.25 ≈ 6 %**. The only thing that's keeping
+   the per-call duration tolerable at decode is that the per-wave
+   work is small at low context.
+
+3. **Flash-attention isn't an optimisation here — it's a replacement.**
+   `flash_attn.comp` from llama.cpp uses a tile-per-block-of-tokens
+   model that simultaneously fixes (a) the per-wave register
+   footprint by streaming scores rather than holding them all, and
+   (b) the breadth problem by dispatching `(n_heads × seq_blocks)`
+   workgroups instead of just `n_heads`.
+
+LDS at 8 KB / WG is significant but not the binding constraint
+here — VGPR is. (1536 × 4 SIMDs / WGP = 6144 VGPRs / WGP ÷ 192 ≈ 32
+waves / WGP, while LDS at 128 KB / WGP / 8 KB = 16 WGs / WGP. So
+even if LDS were the limit, it'd cap at 16 WGs / WGP — far above
+the 32 total WGs we dispatch. VGPR really is the only resource
+ceiling.)
 
 ---
 
@@ -261,9 +283,9 @@ waves are available to hide that latency than the hardware's max
 | Pipeline bucket counts (216, 72, …)   |    🟡 Medium | pipelines.png — small font, some digits guessed |
 | Barrier % of frame                    |    🟡 Medium | barriers.png — value visible but exact digit (~0.0X %) unclear |
 | Cache invalidations ≈ 5510            |    🟡 Medium | barriers.png — header strip |
-| **scalar_attn VGPR-limited at 12/16** |    🟢 High  | **pipelinestatfuerscalarattn.png — explicit text** ← *was missing, now resolved* |
-| **scalar_attn LDS = 8 200 B**         |    🟢 High  | **pipelinestatfuerscalarattn.png** ← *was missing, now resolved* |
-| **scalar_attn dispatches 32 WGs only** |   🟢 High  | **pipelinestatfuerscalarattn.png** — `(32, 1, 1)` thread groups |
+| **scalar_attn VGPR-limited at 4/16 (192 VGPRs/wave)** | 🟢 High | **pipelinestatfuerscalarattn.png — explicit text** *(corrected from 12/16 / 88-VGPR misread)* |
+| **scalar_attn LDS = 8 200 B**         |    🟢 High  | **pipelinestatfuerscalarattn.png** |
+| **scalar_attn dispatches 32 WGs only** |   🟢 High  | **pipelinestatfuerscalarattn.png** — `(32, 1, 1)` thread groups; combined ≈ 6 % SIMD utilisation |
 | Inter-dispatch bubble size (< 1 µs)    |    🟢 High  | **zoomed-wavefront-occupancy-layer.png** — valleys clearly < 1 µs |
 | Cache hit-rate by class (qualitative)  |    🟡 Medium | **zoomed-wavefront-occupancy-layer.png** — pattern visible, exact % not legible |
 | Per-shader L2 hit-rate (numeric)       |    🔴 Missing | not on any captured pane (Events → Memory Performance pane would have it) |
@@ -310,16 +332,24 @@ stall is short.
 
 ### Q3 — Wavefront occupancy for `scalar_attn` and GEMV
 
-| Shader                  | Per-SIMD wavefront occupancy | Limited by | Also: SIMD breadth |
-| ----------------------- | ---------------------------- | ---------- | ----- |
-| GEMV (Q4_K, M=4096)     | **12 / 16 = 75 %**           | **VGPR**, 88 / 96 budget | 4096 WGs ≫ 128 SIMDs → all SIMDs saturated |
-| scalar_attn (n_heads=32)| **12 / 16 = 75 %**           | **VGPR**, 88 / 96 budget | **32 WGs ≪ 128 SIMDs → only 25 % of SIMDs populated** |
+| Shader                  | Per-SIMD wave occupancy | VGPRs/wave | Limited by | SIMD breadth          | Effective GPU util |
+| ----------------------- | ----------------------- | ---------: | ---------- | --------------------- | -----------------: |
+| GEMV (Q4_K, M=4096)     | **12 / 16 = 75 %**      |     **88** | VGPR (close) | 4096 WGs ≫ 128 SIMDs | ~75 %             |
+| scalar_attn (n_heads=32)| **4 / 16 = 25 %**       |    **192** | VGPR (severe) | **32 WGs ≪ 128 SIMDs → 25 % SIMD coverage** | **~6 %** (0.25 × 0.25) |
 
-Both shaders hit the same per-SIMD VGPR cap. scalar_attn additionally
-has a global breadth problem — only 32 WGs are launched, so even at
-100 % per-SIMD wavefront occupancy the GPU is fundamentally
-under-utilised at decode. **Flash-attention is the only lever that
-fixes the breadth issue.**
+The two shaders look superficially similar (both VGPR-limited on
+the same hardware) but the gap to fix is **completely different**:
+
+- **GEMV** needs 88 → ≤ 96 to hit 16/16 — that's actually *negative*
+  pressure, the shader is essentially already there; in practice
+  going from 88 → 80 unlocks the next wave (13/16). Cheap.
+- **scalar_attn** needs 192 → ≤ 96 (halving) to hit 16/16. That's
+  a structural redesign, not a tuning. And even at 100 % per-SIMD
+  occupancy scalar_attn would still hit the **32-WG breadth cap**.
+
+→ **Flash-attention is the only lever that fixes both axes for
+   attention.** A VGPR-tuning pass on the existing scalar_attn would
+   chase a fraction of the gain.
 
 ### Q4 — Memory-bound or compute-bound?
 
@@ -362,25 +392,24 @@ not a Phase-4 priority.**
 
 | # | Lever                                      | Expected gain | Impl. effort | Justification |
 | - | ------------------------------------------ | -------------:| ------------:| ------------- |
-| 1 | **VGPR reduction across all matmul-style shaders** — primarily `mul_mat_vec_q4_k.comp`, but the `scalar_attn` follow-up screenshot shows the **tiled attention shader has the IDENTICAL 88-VGPR / 12-of-16-wave limit**. One VGPR-budget fix lifts the cap for **both** the dominant GEMV and the second-largest (attention) bucket. | **+25 %** GEMV throughput **and** +25 % attention throughput on populated SIMDs, simultaneously. At pos=200 where attention is ~30 % of GPU time and GEMV ~65 %, the combined effect is ≈ **+20 % decode tok/s** — the largest *cheap* lever in this analysis. | **Medium** — same edit pattern in two `.comp` files (split unrolled accumulators, prefer scalar regs). Each shader needs only ~8 VGPRs to come off (88 → 80) to unlock a 13th wave, ≤ 96 → ideally ~80 to hit 16/16. | Pipeline State for *both* shaders explicit: "limited by its vector register usage". |
-| 2 | **Flash-attention** (port `flash_attn.comp`) | Removes `O(seq_len)` per-layer scan AND fixes `scalar_attn`'s **breadth** problem (32 WGs → 128+ WGs distributed across all SIMDs). Decode at pos=200 → ~2× attention throughput; prefill (token-by-token attention path inside `prefill_batch`) → 2-3× because the per-token loop collapses. | **Large** — new shader + dispatch wiring + 36-layer integration + correctness gate. | scalar_attn is bucket #3 today; even *with* the VGPR fix from #1, its 25 % SIMD-breadth ceiling stands. Flash-attention is the only fix for breadth, and gain grows linearly with prompt length. |
-| 3 | **Per-shader VGPR audit** on `RopeNeox` / `RmsNorm` / `Add` / `Mul` / `Silu` | Possibly small. *We already know GEMV and ScalarAttn — those were items 1.* | **Small** — re-capture Pipeline State on each. Mostly mechanical. | Free check; if any of the elementwise shaders are VGPR-limited the same fix style applies. |
+| 1 | **Flash-attention** (port `flash_attn.comp`). The corrected scalar_attn numbers (192 VGPRs / 4 of 16 waves / 32 WGs / ≈ 6 % SIMD utilisation) make this the **single biggest available lever**. It fixes both the VGPR catastrophe (streaming scores instead of register-resident `scores[2048]`) and the dispatch breadth problem (n_heads × seq_blocks instead of just n_heads). | At pos=200 attention is ~30 % of GPU time today and is by far the most under-utilised of the GPU. Replacing it with a flash-attention path that runs near full SIMD coverage is **2-3× attention throughput** at decode and 2-3× more for prefill (the per-token loop in `prefill_batch` collapses). | **Large** — new shader + dispatch wiring + 36-layer integration + correctness gate. | Per-SIMD wave occupancy 25 % × SIMD coverage 25 % = ~6 % real utilisation; this is the only Phase-4 candidate that pushes a structurally low number to a structurally high one. |
+| 2 | **VGPR tuning of `mul_mat_vec_q4_k.comp`** (88 → ~80). Unaffected by the scalar_attn correction; GEMV is genuinely close to its ceiling and a small tuning pass recovers the remaining gap. | ~+8-12 % GEMV throughput → ~+5-8 % decode tok/s. | **Medium** — split unrolled accumulators, prefer scalar regs where appropriate. Only ~8 VGPRs to come off. | Pipeline State for GEMV is unambiguous: 88 of 96 budget, "limited by its vector register usage". |
+| 3 | **Per-shader VGPR audit** on `RopeNeox` / `RmsNorm` / `Add` / `Mul` / `Silu` | Possibly small. | **Small** — re-capture Pipeline State on each. Mostly mechanical. | Free check; if any of the elementwise shaders are VGPR-limited the same fix style applies. |
 | 4 | Async submit / barrier minimisation        | < 5 % wall-time | Medium | Barriers consume < 1 % per §Q2 and the zoomed timeline confirms inter-dispatch bubbles are sub-µs; deprioritise. |
 
 **Reordering vs Phase 3E's plan.** Phase 3E said "flash-attention is
-priority 1, async submit is priority 2." The RGP data argues for
-**VGPR optimisation as priority 1** instead — same effort tier as
-async submit but with a much higher ceiling, and unlocks a measurable
-fraction of the BW gap that's been on the books since Phase 1.
-Flash-attention stays as #2 with the additional payoff of growing
-with sequence length.
+priority 1, async submit is priority 2." The RGP data initially
+looked like it was arguing for VGPR-tuning-as-priority-1 because both
+GEMV and scalar_attn appeared identically VGPR-limited (88 / 12-of-16).
+**That reading was wrong** — scalar_attn is at 192 VGPRs and 4 of 16
+waves, a structurally different problem.
 
-**Reinforced by the follow-up screenshots:** the scalar_attn
-Pipeline State shows the SAME 88-VGPR limit, so a single VGPR-tuning
-effort doubles its return — it lifts both the dominant GEMV bucket
-*and* the tiled-attention bucket simultaneously. That widens the
-priority-1 gap over flash-attention further: the same effort now
-covers ~95 % of the GPU time per forward, not just the GEMV ~65 %.
+After the correction, Phase 3E's original ordering stands:
+**flash-attention is priority 1**, with the scalar_attn data now
+giving it an even stronger motivation than Phase 3E had. GEMV
+VGPR-tuning drops to priority 2 — it's still worth doing (cheap and
+~8 VGPRs of headroom), but it doesn't compete with flash-attention
+for the headline gain.
 
 ---
 
@@ -398,8 +427,10 @@ covers ~95 % of the GPU time per forward, not just the GEMV ~65 %.
 
 - **Peak VRAM bandwidth is 644 GB/s, not 608.** The whole codebase's "79.6 % of peak" Phase-1 number was implicitly using the wrong denominator. The achievement was **75 %** — still respectable, but the gap to the 95 % target is ~20 percentage points, slightly larger than we tracked.
 - **GEMV is VGPR-limited, not occupancy-fully-saturated.** The Phase-1 measurement implicitly assumed the kernel was "as good as it can get on this hardware." The Pipeline-State pane shows otherwise: **8 VGPRs of headroom to recover** before we hit the per-SIMD wave-count cap.
+- **scalar_attn is in MUCH worse shape than expected.** 192 VGPRs / 4-of-16 waves / 32 WGs total → effective GPU utilisation around 6 %. The Phase-3A tiled implementation traded off VGPR pressure for code clarity (registers full of `scores[2048]` etc.). RGP says that trade-off is hurting more than we knew. *Flash-attention is now justified on register-pressure grounds alone, not just on attention-scaling grounds.*
 - **Barrier overhead is genuinely tiny.** We've been worrying about it since Phase 3A; RGP shows it's < 1 % of the frame. Async-submit work was already deprioritised in Phase 3E; this confirms it.
 - **WAITS dominate cycle count even when VALU is the tallest stacked-bar segment.** Easy mistake to make from the utilisation bar alone — the bar shows *issued instruction class*, not where wall-time is spent. **Always look at WAITS too.**
+- **(Methodology surprise.)** I misread the small-font scalar_attn panel as "88 VGPRs / 12 of 16 waves" — the matching shape of the GEMV numbers I'd just looked at primed me to read what I expected. The correct numbers (192 / 4 of 16) inverted the priority of items 1 and 2 in §8. **Lesson: when two screenshots of the same panel-type show similar-looking digits, re-read each one as if it were the first.**
 
 ---
 
@@ -423,9 +454,9 @@ reorder — the priority list.
 
 | File                                                | Status |
 | --------------------------------------------------- | ------ |
-| `results/phase3_rgp_analysis.md`                    | edit — folded the two follow-up screenshots into §1, §4b, §6, §7-Q3, §7-Q5, §8, §11 |
-| `results/pipelinestatfuerscalarattn.png`            | (you) new — Pipeline State for scalar_attn |
-| `results/zoomed-wavefront-occupancy-layer.png`      | (you) new — zoomed occupancy + cache-counter timeline |
+| `results/phase3_rgp_analysis.md`                    | edit — corrected scalar_attn numbers (192 / 4-of-16, was misread as 88 / 12-of-16); priority list re-ordered (flash-attention back to #1, GEMV VGPR tuning to #2) |
+| `results/pipelinestatfuerscalarattn.png`            | (you) Pipeline State for scalar_attn |
+| `results/zoomed-wavefront-occupancy-layer.png`      | (you) zoomed occupancy + cache-counter timeline |
 
 The 9 original PNG screenshots stay in `results/`.
 
