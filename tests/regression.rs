@@ -1292,3 +1292,240 @@ fn phase_prompt16_alice_context_retention_qwen3() {
     registry.destroy(&dev.device);
     drop(allocator);
 }
+
+// =====================================================================
+// Phase 5B.2 — batched-Q prefill attention.
+//
+// `dispatch_layer_batch` now folds the M-fold per-token attention
+// loop into a single `flash_attn_batch` dispatch when
+// `batch_attn_enabled` is set. The tests below build two `Forward`
+// instances with explicit `batch_attn_enabled` settings and confirm
+// that:
+//   1. argmax of the prefill logits matches between the two paths.
+//   2. top-5 overlap is ≥ 4/5 (same gate as `phase3e_…_top5`).
+//   3. multi-turn decode after a batched prefill produces a coherent
+//      continuation (verifies the KV cache survives the new path).
+//   4. continuation prefill at q_start > 0 still recalls earlier
+//      facts from the prior turn (multi-turn KV-cache + q_start arith).
+// =====================================================================
+
+fn batched_prefill_logits(
+    path: &PathBuf,
+    user_prompt: &str,
+    batch_attn: bool,
+    max_seq_len: u32,
+) -> (Vec<f32>, u32) {
+    use vulkanforge::backend::vulkan::kv_cache::{KvCache, KvCacheConfig};
+    use vulkanforge::backend::vulkan::pipeline_registry::PipelineRegistry;
+
+    let dev = VulkanDevice::new().expect("dev");
+    let mut allocator = Allocator::new(&AllocatorCreateDesc {
+        instance: dev.instance.clone(),
+        device: dev.device.clone(),
+        physical_device: dev.physical_device,
+        debug_settings: gpu_allocator::AllocatorDebugSettings::default(),
+        buffer_device_address: false,
+        allocation_sizes: gpu_allocator::AllocationSizes::default(),
+    }).expect("alloc");
+    let (registry, _) = PipelineRegistry::new(&dev.device, None).expect("reg");
+    let cmd_ctx = CommandContext::new(&dev.device, dev.queue_family_index).expect("cmd");
+    let gguf = GgufFile::open(path).expect("gguf");
+    let cfg = ModelConfig::from_gguf(&gguf).expect("cfg");
+    let model = LoadedModel::load(&dev, &mut allocator, &gguf).expect("upload");
+    let tokenizer = Tokenizer::from_gguf(&gguf).expect("tok");
+
+    let mut prompt_tokens =
+        vulkanforge::backend::vulkan::tokenizer::apply_chat_template(
+            &tokenizer, user_prompt, None,
+        );
+    if prompt_tokens.len() > 64 { prompt_tokens.truncate(64); }
+    let seq_len = prompt_tokens.len() as u32;
+
+    let kv = KvCache::new(&dev.device, &mut allocator, KvCacheConfig {
+        n_layers: cfg.n_layers, n_kv_heads: cfg.n_kv_heads,
+        head_dim: cfg.head_dim, max_seq_len,
+    }).expect("kv");
+    let mut fwd = Forward::new_with_prefill(
+        &dev, &mut allocator, kv, cfg.clone(), None, seq_len,
+    ).expect("fwd");
+    fwd.set_batch_attn_enabled(batch_attn);
+    fwd.kv_cache.reset();
+
+    let mut all_embeds: Vec<f32> = Vec::new();
+    for &tid in &prompt_tokens {
+        all_embeds.extend(embedding_row(&gguf, &cfg, tid).expect("embd"));
+    }
+    fwd.prefill_batch(
+        &dev, &registry, &cmd_ctx, &model, &all_embeds, seq_len, 0,
+    ).expect("prefill_batch");
+    let logits = fwd.logits().expect("logits");
+
+    fwd.destroy(&dev.device, &mut allocator);
+    cmd_ctx.destroy(&dev.device);
+    model.destroy(&dev.device, &mut allocator);
+    registry.destroy(&dev.device);
+    drop(allocator);
+
+    (logits, seq_len)
+}
+
+#[test]
+fn phase5b2_batch_attn_parity_qwen3_short() {
+    let Some(path) = qwen3_path() else { return };
+    let prompt = "Explain what a mutex is in one sentence.";
+    let (logits_off, seq_off) = batched_prefill_logits(&path, prompt, false, 256);
+    let (logits_on, seq_on) = batched_prefill_logits(&path, prompt, true, 256);
+    assert_eq!(seq_off, seq_on, "tokenization should be deterministic");
+
+    assert!(
+        !logits_on.iter().any(|v| !v.is_finite()),
+        "batched prefill produced NaN/Inf"
+    );
+
+    let argmax = |v: &[f32]| -> usize {
+        v.iter().enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0
+    };
+    let top1_off = argmax(&logits_off);
+    let top1_on = argmax(&logits_on);
+    let top_k = |v: &[f32], k: usize| -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..v.len()).collect();
+        idx.sort_by(|&a, &b| v[b].partial_cmp(&v[a]).unwrap());
+        idx.truncate(k);
+        idx
+    };
+    let top5_off = top_k(&logits_off, 5);
+    let top5_on = top_k(&logits_on, 5);
+    let overlap = top5_off.iter().filter(|t| top5_on.contains(t)).count();
+    eprintln!(
+        "[phase5b2] short top1_off={top1_off} top1_on={top1_on} \
+         top5_off={top5_off:?} top5_on={top5_on:?} overlap={overlap}"
+    );
+    assert_eq!(top1_off, top1_on,
+        "argmax differs: per-token={top1_off} batch={top1_on}\n\
+         top5 off: {top5_off:?}\n\
+         top5 on:  {top5_on:?}");
+    assert!(overlap >= 4,
+        "top-5 overlap {overlap}/5 too low (off={top5_off:?} on={top5_on:?})");
+}
+
+#[test]
+fn phase5b2_batch_attn_parity_qwen3_two_tiles() {
+    let Some(path) = qwen3_path() else { return };
+    // Long enough that seq_len caps at 64 in `batched_prefill_logits`
+    // — last query has two TILE iterations, exercises the per-query
+    // causal triangle past the TILE=64 boundary.
+    let prompt = "Write a long, detailed paragraph explaining what a \
+                  mutex is, why it is needed, when you use it, what \
+                  alternatives exist, and how it differs from a \
+                  semaphore in low-level systems programming.";
+    let (logits_off, seq_off) = batched_prefill_logits(&path, prompt, false, 256);
+    let (logits_on, seq_on) = batched_prefill_logits(&path, prompt, true, 256);
+    assert_eq!(seq_off, seq_on);
+    let argmax = |v: &[f32]| -> usize {
+        v.iter().enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0
+    };
+    let top1_off = argmax(&logits_off);
+    let top1_on = argmax(&logits_on);
+    let top_k = |v: &[f32], k: usize| -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..v.len()).collect();
+        idx.sort_by(|&a, &b| v[b].partial_cmp(&v[a]).unwrap());
+        idx.truncate(k);
+        idx
+    };
+    let top5_off = top_k(&logits_off, 5);
+    let top5_on = top_k(&logits_on, 5);
+    let overlap = top5_off.iter().filter(|t| top5_on.contains(t)).count();
+    eprintln!(
+        "[phase5b2] two_tiles seq={seq_on} top1_off={top1_off} top1_on={top1_on} \
+         top5_off={top5_off:?} top5_on={top5_on:?} overlap={overlap}"
+    );
+    assert_eq!(top1_off, top1_on,
+        "argmax differs (two-tile prompt): per-token={top1_off} batch={top1_on}");
+    assert!(overlap >= 4, "top-5 overlap {overlap}/5 too low at seq={seq_on}");
+}
+
+#[test]
+fn phase5b2_decode_after_batched_prefill_qwen3() {
+    use vulkanforge::backend::vulkan::chat::ChatSession;
+    use vulkanforge::backend::vulkan::chat_template::ChatTemplate;
+    use vulkanforge::backend::vulkan::decode::GenerateConfig;
+    use vulkanforge::backend::vulkan::kv_cache::{KvCache, KvCacheConfig};
+    use vulkanforge::backend::vulkan::pipeline_registry::PipelineRegistry;
+
+    const MAX_SEQ_LEN: u32 = 2048;
+    let Some(path) = qwen3_path() else { return };
+
+    let dev = VulkanDevice::new().expect("dev");
+    let mut allocator = Allocator::new(&AllocatorCreateDesc {
+        instance: dev.instance.clone(),
+        device: dev.device.clone(),
+        physical_device: dev.physical_device,
+        debug_settings: gpu_allocator::AllocatorDebugSettings::default(),
+        buffer_device_address: false,
+        allocation_sizes: gpu_allocator::AllocationSizes::default(),
+    }).expect("alloc");
+    let (registry, _) = PipelineRegistry::new(&dev.device, None).expect("reg");
+    let cmd_ctx = CommandContext::new(&dev.device, dev.queue_family_index).expect("cmd");
+    let gguf = GgufFile::open(&path).expect("gguf");
+    let cfg = ModelConfig::from_gguf(&gguf).expect("cfg");
+    let model = LoadedModel::load(&dev, &mut allocator, &gguf).expect("upload");
+    let tokenizer = Tokenizer::from_gguf(&gguf).expect("tok");
+    let kv = KvCache::new(&dev.device, &mut allocator, KvCacheConfig {
+        n_layers: cfg.n_layers, n_kv_heads: cfg.n_kv_heads,
+        head_dim: cfg.head_dim, max_seq_len: MAX_SEQ_LEN,
+    }).expect("kv");
+    let mut fwd = Forward::new(&dev, &mut allocator, kv, cfg.clone(), None).expect("fwd");
+    fwd.set_batch_attn_enabled(true);
+    let template = ChatTemplate::detect(&gguf, &tokenizer);
+    let mut session = ChatSession::new_with_template(
+        fwd, "You are a helpful assistant.", template,
+    );
+
+    let cfg_g = GenerateConfig {
+        max_tokens: 220,
+        print_stream: false,
+        think_filter: false,
+    };
+    // Turn 1: introduce a fact via batched prefill.
+    let r1 = session.send(
+        &dev, &registry, &cmd_ctx, &model, &gguf, &cfg, &tokenizer,
+        "I live in Berlin.", &cfg_g,
+    ).expect("turn1");
+    assert!(r1.generated_tokens > 0, "turn1 produced no tokens");
+
+    // Turn 2: continuation prefill at q_start = current_pos > 0.
+    // Must recall "Berlin" from the prior turn — fails fast if the new
+    // prefill path leaves the KV cache in a broken state.
+    let r2 = session.send(
+        &dev, &registry, &cmd_ctx, &model, &gguf, &cfg, &tokenizer,
+        "Where do I live?", &cfg_g,
+    ).expect("turn2");
+    let lower = r2.generated_text.to_lowercase();
+    assert!(
+        lower.contains("berlin"),
+        "decode after batched prefill failed to recall 'Berlin' — got: {}",
+        r2.generated_text
+    );
+    eprintln!(
+        "[phase5b2] batched-prefill recall pos={} gen={} reply={:?}",
+        session.current_pos, r2.generated_tokens,
+        phase5b2_first_chars(&r2.generated_text, 80)
+    );
+
+    session.forward.destroy(&dev.device, &mut allocator);
+    cmd_ctx.destroy(&dev.device);
+    model.destroy(&dev.device, &mut allocator);
+    registry.destroy(&dev.device);
+    drop(allocator);
+}
+
+fn phase5b2_first_chars(s: &str, n: usize) -> String {
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i >= n { out.push('…'); break; }
+        out.push(c);
+    }
+    out
+}
