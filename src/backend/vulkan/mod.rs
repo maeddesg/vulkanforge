@@ -14,5 +14,6 @@ pub mod profiler;
 pub mod q4k;
 pub mod shaders;
 pub mod spirv_reflect;
+pub mod spm;
 pub mod tokenizer;
 pub mod vram_arena;

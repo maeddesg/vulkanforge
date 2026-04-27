@@ -1,4 +1,5 @@
-//! Chat-template detection + rendering for the Phase-4D model zoo.
+//! Chat-template detection + rendering for the Phase-4D / Phase-5C
+//! model zoo.
 //!
 //! VulkanForge ships its own minimal renderer rather than running the
 //! Jinja template embedded in each GGUF — every supported model maps
@@ -10,12 +11,14 @@
 //! Auto-detection (see [`ChatTemplate::detect`]) prefers the GGUF
 //! `tokenizer.chat_template` string over the architecture name when
 //! the two disagree (DeepSeek-R1-Distill-Llama is `arch=llama` but
-//! ships the DeepSeek-R1 template).
+//! ships the DeepSeek-R1 template; Mistral and Llama-3 both share
+//! `arch=llama` but use very different layouts).
 
 use super::gguf::GgufFile;
 use super::tokenizer::{Tokenizer, TokenizerFlavour};
 
-/// One of the canonical chat-template layouts supported in Phase 4D.
+/// One of the canonical chat-template layouts supported in Phase 4D /
+/// Phase 5C.
 ///
 /// `Raw` is the no-template fallback — used when the user explicitly
 /// asks for plain-text completion or for a base model with no chat
@@ -31,6 +34,9 @@ pub enum ChatTemplate {
     /// DeepSeek-R1 thinking form (Distill-Llama variant uses
     /// `<｜begin▁of▁sentence｜>` + `<｜User｜>` / `<｜Assistant｜>`).
     DeepSeekR1,
+    /// Mistral Instruct form: `<s>[INST] {user} [/INST]`. Multi-turn
+    /// re-uses the same `[INST]…[/INST]` brackets per turn.
+    Mistral,
     /// Plain text — system + user concatenated, no role markers.
     Raw,
 }
@@ -38,8 +44,8 @@ pub enum ChatTemplate {
 impl ChatTemplate {
     /// Detect the right template for this GGUF. Order: explicit
     /// match against the embedded Jinja `tokenizer.chat_template`
-    /// string first (covers DeepSeek-on-Llama-arch), then fall back
-    /// to the architecture / tokenizer flavour.
+    /// string first (covers DeepSeek-on-Llama-arch and Mistral-on-
+    /// Llama-arch), then fall back to the tokenizer flavour.
     pub fn detect(gguf: &GgufFile, tokenizer: &Tokenizer) -> Self {
         let template_str = gguf
             .metadata
@@ -62,11 +68,22 @@ impl ChatTemplate {
         if template_str.contains("<|im_start|>") || template_str.contains("<|im_end|>") {
             return ChatTemplate::ChatML;
         }
+        // Mistral Instruct: `[INST]` + `[/INST]` brackets in the
+        // template. Mistral is the canonical SPM template, so any
+        // SPM model that doesn't match the others falls through here
+        // via the tokenizer flavour fallback below as well.
+        if template_str.contains("[INST]") {
+            return ChatTemplate::Mistral;
+        }
 
-        // Fallback: pick from the tokenizer flavour.
+        // Fallback: pick from the tokenizer flavour. SPM (Mistral,
+        // Llama-2 family) returns `None` from `flavour()` — default
+        // those to the Mistral [INST] template, which is the only
+        // SPM-style template we currently render.
         match tokenizer.flavour() {
-            TokenizerFlavour::Qwen2 => ChatTemplate::ChatML,
-            TokenizerFlavour::Llama3 => ChatTemplate::Llama3,
+            Some(TokenizerFlavour::Qwen2) => ChatTemplate::ChatML,
+            Some(TokenizerFlavour::Llama3) => ChatTemplate::Llama3,
+            None => ChatTemplate::Mistral,
         }
     }
 
@@ -83,6 +100,7 @@ impl ChatTemplate {
             ChatTemplate::ChatML => render_chatml_first(tokenizer, system, user),
             ChatTemplate::Llama3 => render_llama3_first(tokenizer, system, user),
             ChatTemplate::DeepSeekR1 => render_deepseek_first(tokenizer, system, user),
+            ChatTemplate::Mistral => render_mistral_first(tokenizer, system, user),
             ChatTemplate::Raw => render_raw_first(tokenizer, system, user),
         }
     }
@@ -95,6 +113,7 @@ impl ChatTemplate {
             ChatTemplate::ChatML => render_chatml_continuation(tokenizer, user),
             ChatTemplate::Llama3 => render_llama3_continuation(tokenizer, user),
             ChatTemplate::DeepSeekR1 => render_deepseek_continuation(tokenizer, user),
+            ChatTemplate::Mistral => render_mistral_continuation(tokenizer, user),
             ChatTemplate::Raw => render_raw_continuation(tokenizer, user),
         }
     }
@@ -252,6 +271,68 @@ fn render_deepseek_continuation(tokenizer: &Tokenizer, user: &str) -> Vec<u32> {
     tokens.extend(tokenizer.encode(user));
     tokens.push(asst_tok);
     tokens.extend(tokenizer.encode("<think>\n"));
+    tokens
+}
+
+// ---------- Mistral Instruct ([INST]...[/INST]) ----------
+// Template (Mistral-7B-Instruct-v0.3, single turn, no tools):
+//   <s>[INST] {user_content} [/INST]
+// Multi-turn (continuation):
+//   ...{prev_assistant}</s>[INST] {user_content} [/INST]
+//
+// The HF Mistral chat template ignores the system role unless wrapped
+// inside the user message. We replicate that: for the first turn, if
+// `system` is non-empty we splice it ahead of `user` separated by a
+// blank line.
+//
+// `[INST]` and `[/INST]` are real vocab entries (single ids) in the
+// Mistral GGUF — using `special_id` keeps them as literal tokens
+// rather than re-tokenizing the brackets as ASCII.
+
+fn mistral_special(tokenizer: &Tokenizer, name: &str) -> u32 {
+    tokenizer
+        .special_id(name)
+        .unwrap_or_else(|| panic!("Mistral chat template missing special token {name:?}"))
+}
+
+fn render_mistral_first(tokenizer: &Tokenizer, system: &str, user: &str) -> Vec<u32> {
+    let bos = tokenizer.bos_id.unwrap_or(1);
+    let inst_open = mistral_special(tokenizer, "[INST]");
+    let inst_close = mistral_special(tokenizer, "[/INST]");
+
+    let mut tokens = Vec::new();
+    tokens.push(bos);
+    tokens.push(inst_open);
+    // After the [INST] special token we emit a single leading space
+    // (matches HF Jinja `'[INST] '`). Use `encode_no_prefix` so the
+    // SPM normaliser doesn't add its own ▁ prefix on top — that would
+    // produce a double ▁. We deliberately do NOT emit a trailing
+    // space before `[/INST]`: the HF template's `' [/INST]'` would
+    // tokenise to a `▁` token right before the special id, which the
+    // model treats as a confusing post-content space and pushes the
+    // first generated token off-distribution.
+    let body = if system.is_empty() {
+        format!(" {}", user)
+    } else {
+        format!(" {}\n\n{}", system, user)
+    };
+    tokens.extend(tokenizer.encode_no_prefix(&body));
+    tokens.push(inst_close);
+    tokens
+}
+
+fn render_mistral_continuation(tokenizer: &Tokenizer, user: &str) -> Vec<u32> {
+    let inst_open = mistral_special(tokenizer, "[INST]");
+    let inst_close = mistral_special(tokenizer, "[/INST]");
+    // Mistral expects the previous assistant turn to end with `</s>`
+    // (the EOS we caught last turn but didn't commit). Replay it.
+    let eos = tokenizer.eos_id;
+
+    let mut tokens = Vec::new();
+    tokens.push(eos);
+    tokens.push(inst_open);
+    tokens.extend(tokenizer.encode_no_prefix(&format!(" {}", user)));
+    tokens.push(inst_close);
     tokens
 }
 

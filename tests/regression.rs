@@ -1057,3 +1057,112 @@ fn phase5a_cb_reuse_parity_qwen3() {
     registry.destroy(&dev.device);
     drop(allocator);
 }
+
+// =====================================================================
+// Phase 5C — SPM tokenizer + Mistral support.
+// =====================================================================
+
+fn mistral_path() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("VF_MISTRAL_PATH").map(PathBuf::from) {
+        return Some(p);
+    }
+    let home = std::env::var_os("HOME")?;
+    let p = PathBuf::from(home)
+        .join("models")
+        .join("Mistral-7B-Instruct-v0.3.Q4_K_M.gguf");
+    if p.exists() { Some(p) } else { None }
+}
+
+#[test]
+fn phase5c_spm_tokenizer_loads_mistral() {
+    let Some(path) = mistral_path() else { return };
+    let gguf = GgufFile::open(&path).expect("open Mistral");
+    let tok = Tokenizer::from_gguf(&gguf).expect("Mistral tokenizer");
+    assert_eq!(tok.vocab_size(), 32768, "Mistral vocab_size");
+    assert_eq!(tok.eos_id, 2, "Mistral </s>");
+    assert_eq!(tok.bos_id, Some(1), "Mistral <s>");
+    assert!(tok.flavour().is_none(), "Mistral is SPM, has no BPE flavour");
+    assert!(tok.is_spm());
+    assert!(
+        tok.special_id("[INST]").is_some(),
+        "Mistral vocab must contain [INST] as a special token"
+    );
+    assert!(
+        tok.special_id("[/INST]").is_some(),
+        "Mistral vocab must contain [/INST] as a special token"
+    );
+}
+
+#[test]
+fn phase5c_spm_encode_decode_roundtrip() {
+    let Some(path) = mistral_path() else { return };
+    let gguf = GgufFile::open(&path).expect("open Mistral");
+    let tok = Tokenizer::from_gguf(&gguf).expect("Mistral tokenizer");
+
+    // Strings the SPM tokeniser must round-trip exactly through
+    // encode→decode. Includes ASCII, multibyte, and a non-Latin script
+    // that exercises byte-fallback if those code points aren't in the
+    // 32k vocab.
+    for s in [
+        "Hello World",
+        "1+1=2",
+        "Hallo Welt!",
+        "The quick brown fox jumps over the lazy dog.",
+        "Mistral-7B-Instruct-v0.3",
+    ] {
+        let ids = tok.encode(s);
+        assert!(!ids.is_empty(), "encode {s:?} produced no tokens");
+        let back = tok.decode(&ids);
+        assert_eq!(back, s, "SPM roundtrip mismatch for {s:?}: got {back:?}");
+    }
+}
+
+#[test]
+fn phase5c_spm_byte_fallback_handles_unicode() {
+    let Some(path) = mistral_path() else { return };
+    let gguf = GgufFile::open(&path).expect("open Mistral");
+    let tok = Tokenizer::from_gguf(&gguf).expect("Mistral tokenizer");
+
+    // Japanese (likely not in the 32k Mistral vocab as whole words —
+    // exercises the <0xHH> byte-fallback path).
+    let s = "こんにちは";
+    let ids = tok.encode(s);
+    let back = tok.decode(&ids);
+    assert_eq!(back, s, "byte-fallback roundtrip mismatch: got {back:?}");
+}
+
+#[test]
+fn phase5c_mistral_chat_template_brackets() {
+    use vulkanforge::backend::vulkan::chat_template::ChatTemplate;
+    let Some(path) = mistral_path() else { return };
+    let gguf = GgufFile::open(&path).expect("open Mistral");
+    let tok = Tokenizer::from_gguf(&gguf).expect("Mistral tokenizer");
+
+    let template = ChatTemplate::detect(&gguf, &tok);
+    assert_eq!(
+        template,
+        ChatTemplate::Mistral,
+        "Mistral chat-template must auto-detect as Mistral"
+    );
+
+    let bos = tok.bos_id.expect("Mistral has BOS");
+    let inst_open = tok.special_id("[INST]").expect("[INST]");
+    let inst_close = tok.special_id("[/INST]").expect("[/INST]");
+    let prompt = template.render_first_turn(&tok, "", "What is 2+2?");
+    assert_eq!(prompt[0], bos, "Mistral first-turn starts with <s>");
+    assert_eq!(prompt[1], inst_open, "after BOS comes [INST]");
+    assert_eq!(
+        prompt.last().copied(),
+        Some(inst_close),
+        "first-turn ends with [/INST]"
+    );
+    // Exactly one of each bracket id in a single-turn prompt.
+    assert_eq!(
+        prompt.iter().filter(|&&id| id == inst_open).count(),
+        1
+    );
+    assert_eq!(
+        prompt.iter().filter(|&&id| id == inst_close).count(),
+        1
+    );
+}

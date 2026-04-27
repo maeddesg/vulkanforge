@@ -1,20 +1,22 @@
-//! Byte-level BPE tokenizer for `tokenizer.ggml.model=="gpt2"` GGUFs.
+//! Tokenizer dispatch — wraps the GPT-2 byte-level BPE (Qwen3,
+//! Llama-3 / DeepSeek family) and the SentencePiece Unigram path
+//! (Mistral, Llama-2) behind a single API. Both are selected from
+//! `tokenizer.ggml.model` at load time and surface the same
+//! `encode`/`decode`/`is_eos`/`special_id` surface so callers don't
+//! need to know which one they have.
 //!
-//! Originally Phase 2D / Schritt 2.8 for Qwen3 (`pre="qwen2"`).
-//! Phase 4D extends it to Llama-3 family (`pre="llama-bpe"`) which
-//! shares the same byte-level encoding and merge format but uses a
-//! slightly different pre-split regex (`\p{N}{1,3}` rather than
-//! `\p{N}+`) and a different special-token namespace.
-//!
-//! Pipeline (encode):
+//! BPE pipeline (encode):
 //!   text (UTF-8)
 //!     → pre-split via the architecture-specific PAT regex
 //!     → for each chunk: byte-level encode (byte → unicode char)
 //!     → BPE-merge using the merges table (lowest priority wins)
 //!     → vocab lookup → token ids
 //!
-//! Decode is the inverse: token id → vocab byte-encoded string,
-//! concatenated across the run, then byte-decoded back to UTF-8.
+//! SPM pipeline (encode):
+//!   text (UTF-8)
+//!     → SPM normalise (prepend ▁, swap ' ' for ▁)
+//!     → Viterbi best-path over the unigram vocabulary, with
+//!       byte-fallback as a competing edge per char.
 //!
 //! Special tokens are not scanned for inside `encode()`. Callers that
 //! need them (chat-template application) emit the ids directly via
@@ -27,6 +29,7 @@ use std::collections::HashMap;
 use fancy_regex::Regex;
 
 use super::gguf::GgufFile;
+use super::spm::SpmTokenizer;
 
 /// Qwen2/3 pre-tokenizer regex (matches the canonical `tokenizer.json`
 /// PAT_STR). Uses `\p{L}`, `\p{N}` for Unicode letter/number classes
@@ -63,6 +66,7 @@ pub enum TokenizerError {
     BadRegex(String),
     UnknownToken(String),
     UnmappableChar(char),
+    Malformed(String),
 }
 
 impl std::fmt::Display for TokenizerError {
@@ -77,14 +81,16 @@ impl std::fmt::Display for TokenizerError {
             TokenizerError::UnmappableChar(c) => {
                 write!(f, "decode hit non-byte-encoded char '{}' (u+{:04x})", c, *c as u32)
             }
+            TokenizerError::Malformed(s) => write!(f, "malformed tokenizer data: {s}"),
         }
     }
 }
 
 impl std::error::Error for TokenizerError {}
 
-/// Which pre-tokenizer / special-token namespace this BPE was built
-/// for. Set from `tokenizer.ggml.pre` at load time.
+/// Which pre-tokenizer / special-token namespace the GPT-2 BPE was
+/// built for. Only meaningful when [`Tokenizer::flavour`] returns
+/// `Some(_)`; SPM-flavoured models return `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenizerFlavour {
     /// Qwen2 / Qwen3 — `pre="qwen2"`. ChatML special tokens.
@@ -93,27 +99,37 @@ pub enum TokenizerFlavour {
     Llama3,
 }
 
-pub struct Tokenizer {
+/// Internal storage discriminator.
+enum TokenizerInner {
+    Bpe(BpeData),
+    Spm(SpmTokenizer),
+}
+
+/// GPT-2 byte-level BPE state.
+struct BpeData {
     vocab: Vec<String>,
     token_to_id: HashMap<String, u32>,
     /// concatenated-pair → priority (lower = applied first).
     merges: HashMap<String, u32>,
     pre_split: Regex,
     flavour: TokenizerFlavour,
-
     /// GPT-2 byte-level encoding tables. `byte_to_char[b]` is the
     /// unicode char that represents byte `b` in the vocab.
     byte_to_char: [char; 256],
     char_to_byte: HashMap<char, u8>,
+}
 
+pub struct Tokenizer {
+    inner: TokenizerInner,
     pub bos_id: Option<u32>,
     /// Primary EOS id from `tokenizer.ggml.eos_token_id` — varies per
     /// model (Qwen3=151645 `<|im_end|>`, Llama-3.1=128009 `<|eot_id|>`,
-    /// DeepSeek-R1-Distill-Llama=128001 `<|end_of_text|>`).
+    /// DeepSeek-R1-Distill-Llama=128001 `<|end_of_text|>`,
+    /// Mistral=2 `</s>`).
     pub eos_id: u32,
     /// Extra ids treated as end-of-stream by `is_eos`. For Qwen3 this
     /// holds `<|endoftext|>`; for Llama-3 it holds the alternates from
-    /// the chat-template (e.g. `<|eom_id|>`).
+    /// the chat-template (e.g. `<|eom_id|>`); empty for SPM.
     extra_eos_ids: Vec<u32>,
     /// Qwen3 ChatML ids. Populated for `Qwen2` flavour, `None`
     /// otherwise. Kept here so the ChatML chat-template code can stay
@@ -130,13 +146,14 @@ impl Tokenizer {
             .get("tokenizer.ggml.model")
             .and_then(|v| v.as_str())
             .ok_or(TokenizerError::MissingMetadata("tokenizer.ggml.model"))?;
-        if model != "gpt2" {
-            // Mistral / Llama-2 GGUFs use `model="llama"` (SentencePiece
-            // unigram) — we don't have an SPM decoder yet (Phase 4D
-            // deferred), so reject up-front with a clear message.
-            return Err(TokenizerError::BadModel(model.to_string()));
+        match model {
+            "gpt2" => Self::from_gguf_bpe(gguf),
+            "llama" => Self::from_gguf_spm(gguf),
+            other => Err(TokenizerError::BadModel(other.to_string())),
         }
+    }
 
+    fn from_gguf_bpe(gguf: &GgufFile) -> Result<Self, TokenizerError> {
         let pre = gguf
             .metadata
             .get("tokenizer.ggml.pre")
@@ -226,11 +243,7 @@ impl Tokenizer {
                 }
             }
             TokenizerFlavour::Llama3 => {
-                for name in [
-                    "<|eot_id|>",
-                    "<|end_of_text|>",
-                    "<|eom_id|>",
-                ] {
+                for name in ["<|eot_id|>", "<|end_of_text|>", "<|eom_id|>"] {
                     if let Some(&id) = token_to_id.get(name) {
                         if id != eos_id && !extra_eos_ids.contains(&id) {
                             extra_eos_ids.push(id);
@@ -245,7 +258,7 @@ impl Tokenizer {
         let pre_split = Regex::new(pre_regex)
             .map_err(|e| TokenizerError::BadRegex(format!("{e}")))?;
 
-        Ok(Self {
+        let inner = TokenizerInner::Bpe(BpeData {
             vocab,
             token_to_id,
             merges,
@@ -253,6 +266,10 @@ impl Tokenizer {
             flavour,
             byte_to_char,
             char_to_byte,
+        });
+
+        Ok(Self {
+            inner,
             bos_id,
             eos_id,
             extra_eos_ids,
@@ -262,138 +279,91 @@ impl Tokenizer {
         })
     }
 
-    pub fn flavour(&self) -> TokenizerFlavour {
-        self.flavour
+    fn from_gguf_spm(gguf: &GgufFile) -> Result<Self, TokenizerError> {
+        let spm = SpmTokenizer::from_gguf(gguf)?;
+        let bos_id = spm.bos_id;
+        let eos_id = spm.eos_id;
+        // SPM models don't carry ChatML literals; leave those empty.
+        Ok(Self {
+            inner: TokenizerInner::Spm(spm),
+            bos_id,
+            eos_id,
+            extra_eos_ids: Vec::new(),
+            im_start_id: None,
+            im_end_id: None,
+            endoftext_id: None,
+        })
+    }
+
+    /// Returns the BPE flavour, or `None` for SPM-backed tokenizers.
+    pub fn flavour(&self) -> Option<TokenizerFlavour> {
+        match &self.inner {
+            TokenizerInner::Bpe(b) => Some(b.flavour),
+            TokenizerInner::Spm(_) => None,
+        }
     }
 
     /// Look up a special-token id by its literal vocab string
-    /// (e.g. `"<|begin_of_text|>"` for Llama-3).
+    /// (e.g. `"<|begin_of_text|>"` for Llama-3, `"[INST]"` for Mistral).
     pub fn special_id(&self, name: &str) -> Option<u32> {
-        self.token_to_id.get(name).copied()
+        match &self.inner {
+            TokenizerInner::Bpe(b) => b.token_to_id.get(name).copied(),
+            TokenizerInner::Spm(s) => s.special_id(name),
+        }
     }
 
     pub fn vocab_size(&self) -> usize {
-        self.vocab.len()
+        match &self.inner {
+            TokenizerInner::Bpe(b) => b.vocab.len(),
+            TokenizerInner::Spm(s) => s.vocab_size(),
+        }
     }
 
-    /// Plain-text encode (no special-token scanning).
+    /// Plain-text encode (no special-token scanning). For SPM this
+    /// applies the ▁-prefix normalisation; chat-template code that wants
+    /// to glue text onto a special token without the leading marker
+    /// should call [`Tokenizer::encode_no_prefix`].
     pub fn encode(&self, text: &str) -> Vec<u32> {
-        let mut out = Vec::new();
-        let mut cursor = 0usize;
-        // fancy-regex returns iterator over Result<Match>.
-        for m in self.pre_split.find_iter(text) {
-            let m = match m { Ok(x) => x, Err(_) => continue };
-            // The regex covers the input contiguously when applied via
-            // find_iter (with whitespace fallback), but be defensive:
-            // skip over any unmatched gap by encoding it as bytes too.
-            if m.start() > cursor {
-                self.encode_chunk(&text[cursor..m.start()], &mut out);
-            }
-            self.encode_chunk(m.as_str(), &mut out);
-            cursor = m.end();
-        }
-        if cursor < text.len() {
-            self.encode_chunk(&text[cursor..], &mut out);
-        }
-        out
-    }
-
-    fn encode_chunk(&self, chunk: &str, out: &mut Vec<u32>) {
-        if chunk.is_empty() {
-            return;
-        }
-        // Byte-level encode each UTF-8 byte to the GPT-2 unicode char.
-        let mut byte_chars = String::with_capacity(chunk.len());
-        for b in chunk.as_bytes() {
-            byte_chars.push(self.byte_to_char[*b as usize]);
-        }
-        // BPE-merge.
-        let pieces = self.bpe(&byte_chars);
-        for p in pieces {
-            // Vocab lookup must succeed — byte-level BPE guarantees
-            // every leaf char is in vocab and the merge tree only
-            // produces vocab entries.
-            let id = *self
-                .token_to_id
-                .get(p.as_str())
-                .unwrap_or_else(|| panic!("BPE produced unknown token: {:?}", p));
-            out.push(id);
+        match &self.inner {
+            TokenizerInner::Bpe(b) => bpe_encode(b, text),
+            TokenizerInner::Spm(s) => s.encode(text),
         }
     }
 
-    /// Iteratively merge adjacent token-strings with the lowest merge
-    /// priority until no merge applies.
-    fn bpe(&self, word: &str) -> Vec<String> {
-        let mut tokens: Vec<String> = word.chars().map(|c| c.to_string()).collect();
-        if tokens.len() < 2 {
-            return tokens;
+    /// Encode without prepending the SPM `▁` space marker. Identical to
+    /// `encode` for BPE flavours (BPE has no leading-space convention),
+    /// but for SPM it skips the implicit leading space — used by chat
+    /// templates that already emit a special token whose representation
+    /// ends mid-word.
+    pub fn encode_no_prefix(&self, text: &str) -> Vec<u32> {
+        match &self.inner {
+            TokenizerInner::Bpe(b) => bpe_encode(b, text),
+            TokenizerInner::Spm(s) => s.encode_no_prefix(text),
         }
-        loop {
-            let mut best: Option<(usize, u32)> = None;
-            // Build pair concat once per (i,j) — small allocations are
-            // cheap for words of typical length 1..30.
-            for i in 0..tokens.len() - 1 {
-                let mut joined =
-                    String::with_capacity(tokens[i].len() + tokens[i + 1].len());
-                joined.push_str(&tokens[i]);
-                joined.push_str(&tokens[i + 1]);
-                if let Some(&prio) = self.merges.get(&joined) {
-                    if best.map_or(true, |(_, p)| prio < p) {
-                        best = Some((i, prio));
-                    }
-                }
-            }
-            match best {
-                None => break,
-                Some((idx, _)) => {
-                    let right = tokens.remove(idx + 1);
-                    tokens[idx].push_str(&right);
-                }
-            }
-        }
-        tokens
     }
 
     /// Decode a token-id slice. Concatenates the byte-level encoded
-    /// vocab strings, then maps each char back to its byte.
-    /// Non-mappable chars (special-token glyphs like `<|im_end|>`)
-    /// pass through verbatim — they are pure ASCII so byte-decoding
-    /// is the identity.
+    /// vocab strings, then maps each char back to its byte (BPE), or
+    /// expands `<0xHH>` byte tokens and replaces `▁` with space (SPM).
     pub fn decode(&self, ids: &[u32]) -> String {
-        let mut buf: Vec<u8> = Vec::with_capacity(ids.len() * 4);
-        for &id in ids {
-            self.decode_into(id, &mut buf);
+        match &self.inner {
+            TokenizerInner::Bpe(b) => bpe_decode(b, ids),
+            TokenizerInner::Spm(s) => s.decode(ids),
         }
-        String::from_utf8_lossy(&buf).into_owned()
     }
 
     pub fn decode_token(&self, id: u32) -> String {
-        let mut buf = Vec::with_capacity(8);
-        self.decode_into(id, &mut buf);
-        String::from_utf8_lossy(&buf).into_owned()
-    }
-
-    fn decode_into(&self, id: u32, out: &mut Vec<u8>) {
-        let s = match self.vocab.get(id as usize) {
-            Some(s) => s,
-            None => return,
-        };
-        // Special tokens like `<|im_end|>` are pure ASCII — every char
-        // round-trips through char_to_byte (since ASCII bytes >= 33
-        // map to themselves in the byte-level table). Same for `<`,
-        // `|`, etc. Falling back to UTF-8 bytes covers any leftover.
-        for c in s.chars() {
-            if let Some(&b) = self.char_to_byte.get(&c) {
-                out.push(b);
-            } else {
-                let mut tmp = [0u8; 4];
-                out.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
-            }
+        match &self.inner {
+            TokenizerInner::Bpe(b) => bpe_decode_token(b, id),
+            TokenizerInner::Spm(s) => s.decode_token(id),
         }
     }
 
     pub fn token_str(&self, id: u32) -> Option<&str> {
-        self.vocab.get(id as usize).map(|s| s.as_str())
+        match &self.inner {
+            TokenizerInner::Bpe(b) => b.vocab.get(id as usize).map(|s| s.as_str()),
+            TokenizerInner::Spm(s) => s.token_str(id),
+        }
     }
 
     /// True for the model's primary EOS plus any architecture-specific
@@ -401,6 +371,117 @@ impl Tokenizer {
     /// stops on `<|end_of_text|>` / `<|eom_id|>`).
     pub fn is_eos(&self, id: u32) -> bool {
         id == self.eos_id || self.extra_eos_ids.contains(&id)
+    }
+
+    /// True if this tokenizer is the SPM (SentencePiece Unigram) variant
+    /// — Mistral / Llama-2 style. Used by callers that need to choose
+    /// between BPE-style and SPM-style chat templating defaults.
+    pub fn is_spm(&self) -> bool {
+        matches!(self.inner, TokenizerInner::Spm(_))
+    }
+}
+
+// ---------- BPE encode/decode (free functions over `BpeData`) ----------
+
+fn bpe_encode(b: &BpeData, text: &str) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    for m in b.pre_split.find_iter(text) {
+        let m = match m {
+            Ok(x) => x,
+            Err(_) => continue,
+        };
+        if m.start() > cursor {
+            bpe_encode_chunk(b, &text[cursor..m.start()], &mut out);
+        }
+        bpe_encode_chunk(b, m.as_str(), &mut out);
+        cursor = m.end();
+    }
+    if cursor < text.len() {
+        bpe_encode_chunk(b, &text[cursor..], &mut out);
+    }
+    out
+}
+
+fn bpe_encode_chunk(b: &BpeData, chunk: &str, out: &mut Vec<u32>) {
+    if chunk.is_empty() {
+        return;
+    }
+    let mut byte_chars = String::with_capacity(chunk.len());
+    for byte in chunk.as_bytes() {
+        byte_chars.push(b.byte_to_char[*byte as usize]);
+    }
+    let pieces = bpe_merge(b, &byte_chars);
+    for p in pieces {
+        let id = *b
+            .token_to_id
+            .get(p.as_str())
+            .unwrap_or_else(|| panic!("BPE produced unknown token: {:?}", p));
+        out.push(id);
+    }
+}
+
+/// Iteratively merge adjacent token-strings with the lowest merge
+/// priority until no merge applies.
+fn bpe_merge(b: &BpeData, word: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = word.chars().map(|c| c.to_string()).collect();
+    if tokens.len() < 2 {
+        return tokens;
+    }
+    loop {
+        let mut best: Option<(usize, u32)> = None;
+        for i in 0..tokens.len() - 1 {
+            let mut joined =
+                String::with_capacity(tokens[i].len() + tokens[i + 1].len());
+            joined.push_str(&tokens[i]);
+            joined.push_str(&tokens[i + 1]);
+            if let Some(&prio) = b.merges.get(&joined) {
+                if best.map_or(true, |(_, p)| prio < p) {
+                    best = Some((i, prio));
+                }
+            }
+        }
+        match best {
+            None => break,
+            Some((idx, _)) => {
+                let right = tokens.remove(idx + 1);
+                tokens[idx].push_str(&right);
+            }
+        }
+    }
+    tokens
+}
+
+fn bpe_decode(b: &BpeData, ids: &[u32]) -> String {
+    let mut buf: Vec<u8> = Vec::with_capacity(ids.len() * 4);
+    for &id in ids {
+        bpe_decode_into(b, id, &mut buf);
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn bpe_decode_token(b: &BpeData, id: u32) -> String {
+    let mut buf = Vec::with_capacity(8);
+    bpe_decode_into(b, id, &mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn bpe_decode_into(b: &BpeData, id: u32, out: &mut Vec<u8>) {
+    let s = match b.vocab.get(id as usize) {
+        Some(s) => s,
+        None => return,
+    };
+    // Special tokens like `<|im_end|>` are pure ASCII — every char
+    // round-trips through char_to_byte (since ASCII bytes >= 33
+    // map to themselves in the byte-level table). Same for `<`,
+    // `|`, etc. Falling back to UTF-8 bytes covers any leftover.
+    for c in s.chars() {
+        if let Some(&byte) = b.char_to_byte.get(&c) {
+            out.push(byte);
+        } else {
+            let mut tmp = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+        }
     }
 }
 

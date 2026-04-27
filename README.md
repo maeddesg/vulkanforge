@@ -6,31 +6,35 @@ Compute-only — no swapchain, no graphics queues — built directly on `ash 0.3
 
 ## Status
 
-Phase 4D (Multi-Model + Polish). Single-batch greedy decode + multi-turn chat
-sessions with persistent KV cache. Supports the Qwen and Llama-3 GGUF families
-out-of-the-box.
+v0.1.1 — Phase 5C (SPM Tokenizer + Mistral). Single-batch greedy decode +
+multi-turn chat sessions with persistent KV cache. Supports the Qwen, Llama-3
+and Mistral GGUF families out-of-the-box.
 
 | Model | Arch | Tokenizer | Chat template | Status |
 |---|---|---|---|---|
 | Qwen3-8B-Q4_K_M | qwen3 | gpt2 / qwen2 | ChatML | ✅ reference |
 | Meta-Llama-3.1-8B-Instruct-Q4_K_M | llama | gpt2 / llama-bpe | Llama3 | ✅ |
 | DeepSeek-R1-Distill-Llama-8B-Q4_K_M | llama | gpt2 / llama-bpe | DeepSeek-R1 | ✅ |
-| Mistral-7B-Instruct-v0.3.Q4_K_M | llama | **llama (SPM)** | Mistral | ❌ deferred |
+| Mistral-7B-Instruct-v0.3.Q4_K_M | llama | llama (SPM) | Mistral | ✅ new in v0.1.1 |
 
-Mistral fails at tokenizer load with `BadModel("llama")` — the `llama` tokenizer
-model is SentencePiece (vocab=32768, scores array). VulkanForge only ships a
-GPT-2 byte-level BPE today; an SPM unigram decoder is planned for Phase 5.
-
-Gemma-4 is out of scope for Phase 4D (different arch, requires Gemma-specific
+Gemma-4 is out of scope for v0.1.1 (different arch, requires Gemma-specific
 tensor layout work).
 
-## Performance (RX 9070 XT, gfx1201, RDNA 4 — full 15-prompt suite)
+## Performance (RX 9070 XT, gfx1201, RDNA 4)
+
+15-prompt suite for the Phase 5A models:
 
 | Model | Decode tok/s (median) | Prefill tok/s (median) | Coherent |
 |---|---:|---:|---:|
 | Qwen3-8B-Q4_K_M | 88.5 | 404.9 | 14/15 |
 | Meta-Llama-3.1-8B-Instruct-Q4_K_M | 94.6 | 489.9 | 13/15 |
 | DeepSeek-R1-Distill-Llama-8B-Q4_K_M | 94.8 | 433.9 | 15/15 |
+
+5-prompt smoke for Mistral (added in v0.1.1):
+
+| Model | Decode tok/s (median) | Prefill tok/s (median) | Coherent |
+|---|---:|---:|---:|
+| Mistral-7B-Instruct-v0.3.Q4_K_M | 102.7 | 333.6 | 5/5 |
 
 `Coherent` is the bench's automatic ✓/✗ heuristic; the false-negatives on
 Qwen3 (1) and Llama-3.1 (2) are digits-only / emoji-only outputs that the
@@ -53,7 +57,7 @@ llama.cpp ROCm. Prefill remains a Phase 5B target.
 ```bash
 cargo build --release             # ~2-3 s after first build (SPIR-V is cached)
 cargo run --release               # Phase 0 device-init smoke
-cargo test --release --tests      # 17 + 25 = 42 tests
+cargo test --release              # 19 + 25 + 21 = 65 tests
 ```
 
 MSRV is **Rust 1.85** (edition 2024). Build dependencies require a working

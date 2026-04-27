@@ -1,5 +1,65 @@
 # Changelog
 
+## v0.1.1 — Phase 5C: SPM Tokenizer + Mistral Support (2026-04-27)
+
+### Headline
+
+Adds SentencePiece tokenizer support, unblocking the Mistral / Llama-2
+GGUF family. `Mistral-7B-Instruct-v0.3-Q4_K_M` joins Qwen3, Llama-3.1
+and DeepSeek-R1 in the supported set — four models on a shared backend.
+
+### Mistral-7B-Instruct-v0.3 — 5-prompt smoke
+
+| Metric | Value |
+|---|---:|
+| Decode median | **102.7 tok/s** |
+| Prefill median | 333.6 tok/s |
+| Coherence | 5 / 5 |
+
+Prompts: Mutex Explanation · Haiku · 2+2 · Translate-to-German · Prime
+Check (Python). All five returned coherent, on-topic outputs.
+
+### Added
+
+- `src/backend/vulkan/spm.rs` — SentencePiece tokenizer using the
+  greedy bigram-merge algorithm (mirrors llama.cpp's
+  `llm_tokenizer_spm`). Score-priority merge over a doubly-linked-list
+  of UTF-8-char symbols, byte-fallback (`<0xHH>`) and `<unk>` for
+  unmappable chars, optional `▁` (U+2581) leading-space normalisation.
+- `Tokenizer::is_spm` / `Tokenizer::encode_no_prefix` — SPM-aware
+  helpers used by the Mistral chat template.
+- `ChatTemplate::Mistral` — `<s>[INST] {body} [/INST]` rendering with
+  the `[INST]` / `[/INST]` brackets emitted as their dedicated
+  vocab ids (3 / 4) instead of being re-tokenised as ASCII. Auto-
+  detected from the GGUF Jinja template.
+- 4 new regression tests (`phase5c_*`) for the SPM tokenizer + Mistral
+  chat template on `Mistral-7B-Instruct-v0.3.Q4_K_M.gguf`.
+- 4 new lib unit tests covering byte-token parsing, UTF-8 char-length
+  arithmetic, SPM normalisation, and the bigram priority queue.
+- `examples/spm_dump.rs` — tokenizer / vocab / template diagnostic
+  driver.
+- `inference_test_prompts_mistral_5.json` — 5-prompt suite used by
+  `run_15prompt_bench` for Mistral coherence checks.
+
+### Changed
+
+- `Tokenizer` is now a dispatch struct over an internal
+  `TokenizerInner::{Bpe, Spm}` enum. Public field surface (`bos_id`,
+  `eos_id`, `im_start_id`, …) is unchanged; the `flavour()` method
+  now returns `Option<TokenizerFlavour>` and is `None` for SPM-backed
+  tokenizers (Mistral, Llama-2).
+- `ChatTemplate::detect` recognises Mistral templates by their `[INST]`
+  marker before falling back to the tokenizer flavour. SPM-flavoured
+  models with no Jinja signature default to `ChatTemplate::Mistral`.
+- `TokenizerError::Malformed(String)` added for SPM array-length
+  validation.
+
+### Notes / non-goals
+
+- No prefill optimisation in this release (Phase 5B target).
+- No Llama-2 chat support (different template even though the
+  tokenizer is the same SPM family — out of scope here).
+
 ## Phase 5A — CB-Reuse via Persistent Descriptor Sets (2026-04-26)
 
 ### Headline numbers (RX 9070 XT, gfx1201, 15-prompt suite)

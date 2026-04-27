@@ -23,6 +23,7 @@
     clippy::match_like_matches_macro,
     clippy::doc_lazy_continuation,
     clippy::collapsible_else_if,
+    clippy::large_enum_variant,
 )]
 
 pub mod backend;
