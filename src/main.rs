@@ -34,6 +34,11 @@
 //!   VF_SYSTEM            system prompt (default "You are a helpful assistant.")
 //!   VF_NO_THINK_FILTER   set to disable the think-filter
 //!   VF_PROMPT="..."     run a single turn non-interactively (CI / regression)
+//!   VF_TEMPERATURE       sampling temperature (default 0.0 = greedy)
+//!   VF_TOP_K             top-k filter (default 0 = disabled)
+//!   VF_TOP_P             top-p / nucleus cutoff (default 1.0 = disabled)
+//!   VF_REPETITION_PENALTY  >1.0 discourages repeats (default 1.0 off)
+//!   VF_SEED              xorshift64* seed for non-greedy sampling
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -44,7 +49,7 @@ use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 
 use vulkanforge::backend::vulkan::chat::{ChatError, ChatSession, TurnResult};
 use vulkanforge::backend::vulkan::commands::CommandContext;
-use vulkanforge::backend::vulkan::decode::GenerateConfig;
+use vulkanforge::backend::vulkan::decode::{GenerateConfig, Sampling};
 use vulkanforge::backend::vulkan::device::VulkanDevice;
 use vulkanforge::backend::vulkan::forward::Forward;
 use vulkanforge::backend::vulkan::gguf::{GgufFile, ModelConfig};
@@ -93,6 +98,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let system_prompt = std::env::var("VF_SYSTEM").unwrap_or_else(|_| DEFAULT_SYSTEM.to_string());
     let mut think_filter = std::env::var("VF_NO_THINK_FILTER").is_err();
 
+    // Phase 6 v0.1.2 sampling — `temperature == 0.0` (default) keeps
+    // greedy decoding, so existing benchmarks stay byte-deterministic.
+    // Set `VF_TEMPERATURE` to a positive value to enable softmax
+    // sampling; `VF_TOP_K`, `VF_TOP_P`, `VF_REPETITION_PENALTY`,
+    // `VF_SEED` tune the rest. The sampler short-circuits on T=0 and
+    // ignores the other knobs in that case.
+    let sampling = Sampling {
+        temperature: std::env::var("VF_TEMPERATURE")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(0.0),
+        top_k: std::env::var("VF_TOP_K")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(0),
+        top_p: std::env::var("VF_TOP_P")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(1.0),
+        repetition_penalty: std::env::var("VF_REPETITION_PENALTY")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(1.0),
+        seed: std::env::var("VF_SEED")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(0),
+    };
+
     let load_start = Instant::now();
     let gguf = GgufFile::open(&model_path)?;
     let cfg = ModelConfig::from_gguf(&gguf)?;
@@ -126,7 +150,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(prompt) = std::env::var("VF_PROMPT") {
         // Non-interactive: run one turn, print stats, exit.
         match send_turn(&mut session, &dev, &registry, &cmd_ctx, &model, &gguf, &cfg,
-                        &tokenizer, &prompt, max_tokens, think_filter)
+                        &tokenizer, &prompt, max_tokens, think_filter, &sampling)
         {
             Ok(r) => last_turn = Some(r),
             Err(ChatError::ContextOverflow { .. }) => {
@@ -167,7 +191,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     println!();
                     match send_turn(
                         &mut session, &dev, &registry, &cmd_ctx, &model, &gguf, &cfg,
-                        &tokenizer, trimmed, max_tokens, think_filter,
+                        &tokenizer, trimmed, max_tokens, think_filter, &sampling,
                     ) {
                         Ok(r) => {
                             print_inline_stats(&r);
@@ -186,6 +210,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+    }
+
+    // Phase 6 v0.1.2: persist the pipeline cache so the next run boots
+    // straight into the warm path instead of re-running ACO over every
+    // SPV. Errors are logged from inside `save_cache` and otherwise
+    // ignored — a cold next start is harmless, just slower.
+    let stats = registry.save_cache(&dev.device);
+    if stats.saved_bytes > 0 {
+        println!(
+            "  Pipeline cache: saved {} bytes (loaded {} bytes at start)",
+            stats.saved_bytes, pipelines_loaded
+        );
     }
 
     session.forward.destroy(&dev.device, &mut allocator);
@@ -210,11 +246,13 @@ fn send_turn(
     user_message: &str,
     max_tokens: u32,
     think_filter: bool,
+    sampling: &Sampling,
 ) -> Result<TurnResult, ChatError> {
     let cfg_g = GenerateConfig {
         max_tokens,
         print_stream: false,
         think_filter,
+        sampling: sampling.clone(),
     };
     session.send_streaming(
         dev, registry, cmd_ctx, model, gguf, cfg, tokenizer,

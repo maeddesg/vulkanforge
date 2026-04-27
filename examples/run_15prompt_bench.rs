@@ -211,7 +211,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let cfg_g = GenerateConfig {
             max_tokens: max_tok,
             print_stream: false,
-            think_filter: false,
+            think_filter: false, sampling: Default::default(),
         };
         // KV reset between every prompt — apples-to-apples with ROCmForge.
         session.reset();

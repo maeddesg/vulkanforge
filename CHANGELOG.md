@@ -1,5 +1,90 @@
 # Changelog
 
+## v0.1.2 — Phase 6 fallback work (2026-04-27)
+
+### Headline
+
+Coopmat / WMMA path was found non-viable for v0.1.x — `mul_mm_cm2.comp`
+depends end-to-end on `GL_NV_cooperative_matrix2` and RADV gfx1201
+advertises only `VK_KHR_cooperative_matrix`. A from-scratch KHR-only
+GEMM kernel was descoped to v0.2 (3-4 weeks). v0.1.2 ships the
+fallback work-list from Phase 6A's §4.3 that doesn't require a new
+kernel:
+
+- **Pipeline-cache wired through** — `save_cache()` was implemented
+  in v0.1.0 but never called. v0.1.2 calls it at REPL shutdown. Cold
+  start writes 158 KB of compiled pipelines to
+  `$HOME/.vulkanforge/pipeline_cache.bin`; the next start loads them
+  back and skips the ACO compile pass. (Steady-state perf unchanged —
+  this is purely a startup-latency win.)
+- **Sampling: temperature / top-k / top-p / repetition-penalty.** The
+  legacy greedy path is preserved as the `temperature == 0.0` short-
+  circuit, so every benchmark and regression test stays byte-
+  deterministic. Configurable via `VF_TEMPERATURE`, `VF_TOP_K`,
+  `VF_TOP_P`, `VF_REPETITION_PENALTY`, `VF_SEED` in the REPL. RNG is
+  a small xorshift64* that takes a per-run seed.
+- **Phase 6A coopmat probe + naive WMMA bench** retained as artefacts
+  (`examples/probe_coopmat.rs`, `examples/bench_coopmat.rs`).
+
+### Performance
+
+15-prompt suite, Qwen3-8B-Q4_K_M:
+
+| Metric | v0.1.1 | v0.1.2 | Δ |
+|---|---:|---:|---|
+| Decode median | 88.8 | 88.3 | run-to-run noise |
+| Prefill median | 1082.3 | 1050.2 | run-to-run noise |
+| Coherent | 14/15 | 14/15 | unchanged |
+| **Cold-start pipeline compile** | every run | every run + persisted | ~150 ms saved on warm starts |
+
+The throughput numbers are unchanged because sampling at `T=0`
+short-circuits to argmax — same code path as v0.1.1 — and the
+pipeline cache only changes ACO-compile time at process start.
+
+### Deferred
+
+- **FP16 KV-cache** (Phase 6 §3) — touches 4 attention shaders
+  (`flash_attn{_split,_reduce,_batch}.comp` + KV-cache buffer
+  layout). Marginal expected gain (~+2-3 % decode at long context,
+  ~50 MB VRAM headroom) vs non-trivial regression risk on the
+  multi-turn correctness gate. Deferred to v0.1.3.
+- **Barrier-coalescing** (Phase 6 §2) — every `compute_barrier` in
+  `dispatch_layer_batch` is RAW-required. The remaining wins would
+  need shader fusion (silu+mul, attn_norm+quantize), which is
+  v0.2-class work.
+- **Coopmat KHR-only GEMM from scratch** (Phase 6A §4.2) — v0.2 /
+  Phase 7 milestone, ~3-4 weeks. Patterns from
+  `flash_attn_cm1.comp` + `mul_mm.comp` in llama.cpp.
+
+### Tests
+
+```
+unit (lib)         24   (+5: sampling unit tests)
+correctness        33   (no change)
+regression         25   (no change)
+TOTAL              82   ALL GREEN
+cargo clippy --release --tests --examples  →  clean
+```
+
+### Files added / changed in v0.1.2
+
+```
+EDIT  Cargo.toml                              0.1.1 → 0.1.2
+EDIT  src/main.rs                             save_cache() call + sampling env vars
+EDIT  src/backend/vulkan/decode.rs            Sampling struct + sample_next_token
+                                              + 5 unit tests
+EDIT  examples/run_alice_test.rs              GenerateConfig::sampling field
+EDIT  examples/run_15prompt_bench.rs          ditto
+EDIT  examples/run_validation.rs              ditto
+EDIT  examples/sample_decode.rs               ditto
+EDIT  tests/regression.rs                     ditto (4 sites)
+EDIT  README.md                               sampling env-var doc
+EDIT  CHANGELOG.md                            this entry
+NEW   results/phase6_v012_optimizations.md    full report
+```
+
+---
+
 ## v0.1.1 — Phase 5B + 5C combined (2026-04-27)
 
 ### Headline performance (RX 9070 XT, 15-prompt suite)

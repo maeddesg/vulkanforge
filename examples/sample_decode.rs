@@ -70,7 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         forward, "You are a helpful assistant.", template,
     );
     let cfg_g = GenerateConfig {
-        max_tokens, print_stream: false, think_filter: false,
+        max_tokens, print_stream: false, think_filter: false, sampling: Default::default(),
     };
     let turn = session.send(
         &dev, &registry, &cmd_ctx, &model, &gguf, &cfg, &tokenizer,

@@ -469,7 +469,7 @@ fn phase2d_decode_produces_coherent_text() {
         &GenerateConfig {
             max_tokens: 80,
             print_stream: false,
-            think_filter: false,
+            think_filter: false, sampling: Default::default(),
         },
     )
     .expect("generate");
@@ -562,7 +562,7 @@ fn phase3b_chat_session_multi_turn_carries_and_resets() {
         // Filter <think> chatter out of the *visible* text we assert on
         // — the model frequently muses inside <think>; we want the
         // post-think answer.
-        think_filter: true,
+        think_filter: true, sampling: Default::default(),
     };
 
     // Turn 1: tell it the user's name.
@@ -793,7 +793,7 @@ fn phase3b_chat_session_context_overflow_clean_error() {
             // The chat template alone is ~25 tokens; with max_tokens=80
             // we ask for ~110, well over max_seq_len=64.
             "Tell me everything you know about distributed systems.",
-            &GenerateConfig { max_tokens: 80, print_stream: false, think_filter: false },
+            &GenerateConfig { max_tokens: 80, print_stream: false, think_filter: false, sampling: Default::default() },
         )
         .expect_err("expected ChatError::ContextOverflow");
     let msg = format!("{err}");
@@ -1252,7 +1252,7 @@ fn phase_prompt16_alice_context_retention_qwen3() {
         let cfg_g = GenerateConfig {
             max_tokens: *max_tok,
             print_stream: false,
-            think_filter: false,
+            think_filter: false, sampling: Default::default(),
         };
         let result = session.send(
             &dev, &registry, &cmd_ctx, &model, &gguf, &cfg, &tokenizer,
@@ -1486,7 +1486,7 @@ fn phase5b2_decode_after_batched_prefill_qwen3() {
     let cfg_g = GenerateConfig {
         max_tokens: 220,
         print_stream: false,
-        think_filter: false,
+        think_filter: false, sampling: Default::default(),
     };
     // Turn 1: introduce a fact via batched prefill.
     let r1 = session.send(

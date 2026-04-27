@@ -38,6 +38,11 @@ pub struct GenerateConfig {
     /// Strip `<think>...</think>` blocks from the visible output (only
     /// affects streaming; the raw token sequence is unchanged).
     pub think_filter: bool,
+    /// Phase 6 v0.1.2 sampling. `None` (or `Sampling::greedy()`) keeps
+    /// the legacy argmax-only behaviour every previous phase ran with;
+    /// the bench / regression tests pin temperature=0 so their
+    /// outputs remain deterministic and comparable to v0.1.1.
+    pub sampling: Sampling,
 }
 
 impl Default for GenerateConfig {
@@ -46,8 +51,264 @@ impl Default for GenerateConfig {
             max_tokens: 200,
             print_stream: false,
             think_filter: false,
+            sampling: Sampling::greedy(),
         }
     }
+}
+
+/// Sampling configuration for the next-token decision.
+///
+/// `temperature == 0.0` short-circuits to argmax (greedy decoding) —
+/// every benchmark and regression test in the project pins this so
+/// outputs stay byte-deterministic. Any other temperature applies the
+/// standard `softmax(logits / T)` pipeline, optionally filtered by
+/// top-k (keep the K highest-prob candidates) and top-p (smallest
+/// candidate set whose cumulative probability exceeds P), with a
+/// repetition penalty over the previously emitted tokens applied
+/// before temperature scaling.
+#[derive(Debug, Clone)]
+pub struct Sampling {
+    /// Temperature applied to logits before softmax. `0.0` ⇒ greedy.
+    pub temperature: f32,
+    /// Keep at most `top_k` highest-probability candidates after
+    /// softmax. `0` disables the filter.
+    pub top_k: u32,
+    /// Top-p (nucleus) cutoff in `(0.0, 1.0]`. `1.0` disables.
+    pub top_p: f32,
+    /// Multiplicative penalty applied to previously generated tokens'
+    /// raw logits before temperature scaling. `1.0` disables;
+    /// `>1.0` discourages repetition.
+    pub repetition_penalty: f32,
+    /// Seed for the deterministic xorshift RNG used by the sampler.
+    /// Different seeds produce different (still-valid) outputs at
+    /// `temperature > 0.0`.
+    pub seed: u64,
+}
+
+impl Sampling {
+    /// Greedy decoding — argmax of the logits, every step. The sampler
+    /// short-circuits on `temperature == 0.0` so every other field is
+    /// ignored; this is the default everywhere it isn't explicitly
+    /// overridden.
+    pub fn greedy() -> Self {
+        Self {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+            seed: 0,
+        }
+    }
+}
+
+impl Default for Sampling {
+    fn default() -> Self {
+        Self::greedy()
+    }
+}
+
+/// Pick the next token id from a logits row.
+///
+/// Greedy short-circuit on `temperature == 0.0` keeps the test suite
+/// byte-deterministic: every prior phase's regression test runs
+/// through this function with greedy sampling and produces the same
+/// argmax it did in v0.1.1.
+pub fn sample_next_token(
+    logits: &mut [f32],
+    history: &[u32],
+    sampling: &Sampling,
+    rng_state: &mut u64,
+) -> u32 {
+    if sampling.temperature == 0.0 {
+        return argmax(logits) as u32;
+    }
+    // Repetition penalty — divide by `penalty` for previously emitted
+    // tokens (positive logits become smaller, negatives become larger
+    // — that's the standard Hugging Face formulation).
+    if sampling.repetition_penalty > 1.0 {
+        for &t in history {
+            let i = t as usize;
+            if i < logits.len() {
+                let v = logits[i];
+                logits[i] = if v > 0.0 {
+                    v / sampling.repetition_penalty
+                } else {
+                    v * sampling.repetition_penalty
+                };
+            }
+        }
+    }
+    // Temperature.
+    let inv_t = 1.0 / sampling.temperature;
+    for v in logits.iter_mut() {
+        *v *= inv_t;
+    }
+    // Softmax over the (post-temperature) logits.
+    let max_v = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut probs: Vec<f32> = logits.iter().map(|&v| (v - max_v).exp()).collect();
+    let sum: f32 = probs.iter().sum();
+    if !sum.is_finite() || sum <= 0.0 {
+        return argmax(logits) as u32;
+    }
+    let inv_sum = 1.0 / sum;
+    for p in probs.iter_mut() {
+        *p *= inv_sum;
+    }
+    // Build (id, prob) pairs and sort descending by prob for top-k /
+    // top-p filtering.
+    let mut pairs: Vec<(u32, f32)> = probs.iter().enumerate().map(|(i, &p)| (i as u32, p)).collect();
+    pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    if sampling.top_k > 0 {
+        pairs.truncate(sampling.top_k as usize);
+    }
+    if sampling.top_p < 1.0 {
+        let mut cumul = 0.0f32;
+        let mut keep = pairs.len();
+        for (i, &(_, p)) in pairs.iter().enumerate() {
+            cumul += p;
+            if cumul >= sampling.top_p {
+                keep = i + 1;
+                break;
+            }
+        }
+        pairs.truncate(keep.max(1));
+    }
+    // Re-normalise the kept distribution.
+    let kept_sum: f32 = pairs.iter().map(|&(_, p)| p).sum();
+    if kept_sum <= 0.0 {
+        return pairs.first().map(|&(id, _)| id).unwrap_or(0);
+    }
+    let r = next_rand_unit(rng_state) * kept_sum;
+    let mut acc = 0.0f32;
+    for &(id, p) in &pairs {
+        acc += p;
+        if r <= acc {
+            return id;
+        }
+    }
+    pairs.last().map(|&(id, _)| id).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod sampling_tests {
+    use super::*;
+
+    fn synth_logits(values: &[(u32, f32)]) -> Vec<f32> {
+        let n = 8;
+        let mut v = vec![-10.0f32; n];
+        for &(i, x) in values {
+            v[i as usize] = x;
+        }
+        v
+    }
+
+    #[test]
+    fn greedy_matches_argmax() {
+        // Temperature=0 must short-circuit to argmax of the raw logits,
+        // ignoring every other sampling field. This is what every
+        // benchmark and regression test in the project relies on.
+        let mut logits = synth_logits(&[(0, 1.0), (3, 5.0), (7, 2.0)]);
+        let mut rng = 0u64;
+        let s = Sampling::greedy();
+        let id = sample_next_token(&mut logits, &[], &s, &mut rng);
+        assert_eq!(id, 3);
+    }
+
+    #[test]
+    fn temperature_picks_from_softmax() {
+        // With temperature=1.0 and no top-k / top-p filter, every
+        // token has a positive probability — but the highest-logit
+        // one should still dominate. Run many trials and assert the
+        // top-logit token wins the plurality.
+        let logits = synth_logits(&[(0, 0.5), (3, 4.0), (7, 0.5)]);
+        let s = Sampling { temperature: 1.0, top_k: 0, top_p: 1.0,
+            repetition_penalty: 1.0, seed: 1234 };
+        let mut counts = [0u32; 8];
+        let mut rng = s.seed;
+        for _ in 0..2000 {
+            let mut l = logits.clone();
+            let id = sample_next_token(&mut l, &[], &s, &mut rng);
+            counts[id as usize] += 1;
+        }
+        // Token 3 (logit 4.0) dominates; tokens 0 / 7 (logit 0.5) are
+        // ~equal, both far behind. The 4.0-logit-vs-0.5 odds at
+        // temperature=1 are ~exp(3.5) ≈ 33×.
+        assert!(counts[3] > counts[0] * 5);
+        assert!(counts[3] > counts[7] * 5);
+        assert!(counts.iter().filter(|&&c| c > 0).count() >= 2,
+            "expected the sampler to actually sample, got {counts:?}");
+    }
+
+    #[test]
+    fn top_k_limits_candidates() {
+        // top_k=1 must pick the highest-logit token deterministically,
+        // regardless of seed (only one candidate survives the filter).
+        let logits = synth_logits(&[(0, 1.0), (3, 4.0), (7, 2.0)]);
+        let s = Sampling { temperature: 0.7, top_k: 1, top_p: 1.0,
+            repetition_penalty: 1.0, seed: 99 };
+        for seed in 0..5u64 {
+            let mut l = logits.clone();
+            let mut rng = seed;
+            let s2 = Sampling { seed, ..s.clone() };
+            let id = sample_next_token(&mut l, &[], &s2, &mut rng);
+            assert_eq!(id, 3, "top_k=1 must always pick the argmax");
+        }
+    }
+
+    #[test]
+    fn top_p_keeps_minimal_set() {
+        // With one dominant token (probability > 0.95) and rest tiny,
+        // top_p=0.9 must keep only the dominant one.
+        let logits = synth_logits(&[(0, 0.0), (3, 6.0), (7, 0.0)]);
+        let s = Sampling { temperature: 1.0, top_k: 0, top_p: 0.9,
+            repetition_penalty: 1.0, seed: 7 };
+        let mut rng = s.seed;
+        for _ in 0..50 {
+            let mut l = logits.clone();
+            let id = sample_next_token(&mut l, &[], &s, &mut rng);
+            assert_eq!(id, 3);
+        }
+    }
+
+    #[test]
+    fn repetition_penalty_discourages_history() {
+        // Token 3 has the highest logit, but when it's already in the
+        // history the penalty should kick its logit below token 7's.
+        // Use top_k=1 to make the test deterministic — whoever has the
+        // highest *adjusted* logit wins.
+        let logits = synth_logits(&[(3, 4.0), (7, 3.0)]);
+        let history = [3u32];
+        let s = Sampling { temperature: 0.7, top_k: 1, top_p: 1.0,
+            repetition_penalty: 2.0, seed: 0 };
+        let mut l = logits.clone();
+        let mut rng = 0;
+        let id = sample_next_token(&mut l, &history, &s, &mut rng);
+        // 4.0 / 2.0 = 2.0 < 3.0  ⇒ token 7 wins.
+        assert_eq!(id, 7);
+        // Without history, token 3 wins.
+        let mut l = logits.clone();
+        let mut rng2 = 0;
+        let id2 = sample_next_token(&mut l, &[], &s, &mut rng2);
+        assert_eq!(id2, 3);
+    }
+}
+
+/// xorshift64* — small, deterministic, no dependencies. Returns a
+/// uniform `f32` in `[0, 1)` and updates the state in place.
+fn next_rand_unit(state: &mut u64) -> f32 {
+    let mut x = *state;
+    if x == 0 {
+        x = 0x9E37_79B9_7F4A_7C15; // golden-ratio splitter, avoid x=0 trap
+    }
+    x ^= x << 12;
+    x ^= x >> 25;
+    x ^= x << 27;
+    *state = x;
+    let m = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+    // Take the top 24 bits → uniform in [0, 1) at f32 precision.
+    let bits = (m >> 40) as u32; // 24 bits
+    (bits as f32) / ((1u32 << 24) as f32)
 }
 
 #[derive(Debug)]
@@ -192,9 +453,16 @@ pub fn generate_from_tokens(
     let decode_start = Instant::now();
     let mut generated: Vec<u32> = Vec::new();
     let mut stopped_on_eos = false;
+    // Phase 6 v0.1.2 sampling RNG seed. The greedy path (default,
+    // temperature=0) never reads it, so existing tests stay
+    // byte-deterministic; non-greedy callers seed via
+    // `config.sampling.seed`.
+    let mut rng_state = config.sampling.seed.wrapping_add(start_pos as u64);
 
     loop {
-        let next_id = argmax(&last_logits) as u32;
+        let next_id = sample_next_token(
+            &mut last_logits, &generated, &config.sampling, &mut rng_state,
+        );
         if tokenizer.is_eos(next_id) {
             stopped_on_eos = true;
             break;
