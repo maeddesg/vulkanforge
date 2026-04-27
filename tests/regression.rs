@@ -1166,3 +1166,129 @@ fn phase5c_mistral_chat_template_brackets() {
         1
     );
 }
+
+// =====================================================================
+// Prompt 16 — Alice multi-turn context retention.
+//
+// Six-turn `ChatSession` exchange with NO `reset()` between turns. On a
+// working KV-cache + chat-template-continuation path the model
+// recalls the user-stated facts (name, city) in later turns. The three
+// "critical" turns (3, 5, 6) MUST pass; soft turns (1, 2, 4) are not
+// asserted here (e.g. Qwen3's <think> block can hit max_tokens before
+// emitting "4" for `2+2` — that's a budgeting detail, not a KV-cache
+// bug). A failure on a critical turn means the multi-turn pipeline is
+// broken (KV-cache being reset between turns, position offset wrong,
+// chat-template continuation rendered with the wrong boundary, …).
+// =====================================================================
+
+#[test]
+fn phase_prompt16_alice_context_retention_qwen3() {
+    use vulkanforge::backend::vulkan::chat_template::ChatTemplate;
+    use vulkanforge::backend::vulkan::decode::GenerateConfig;
+    use vulkanforge::backend::vulkan::kv_cache::{KvCache, KvCacheConfig};
+    use vulkanforge::backend::vulkan::loader::LoadedModel;
+    use vulkanforge::backend::vulkan::pipeline_registry::PipelineRegistry;
+
+    const MAX_SEQ_LEN: u32 = 2048;
+    let Some(path) = qwen3_path() else { return };
+
+    let dev = VulkanDevice::new().expect("device");
+    let mut allocator = Allocator::new(&AllocatorCreateDesc {
+        instance: dev.instance.clone(),
+        device: dev.device.clone(),
+        physical_device: dev.physical_device,
+        debug_settings: gpu_allocator::AllocatorDebugSettings::default(),
+        buffer_device_address: false,
+        allocation_sizes: gpu_allocator::AllocationSizes::default(),
+    })
+    .expect("allocator");
+    let (registry, _) = PipelineRegistry::new(&dev.device, None).expect("registry");
+    let cmd_ctx = CommandContext::new(&dev.device, dev.queue_family_index).expect("cmd");
+
+    let gguf = GgufFile::open(&path).expect("open Qwen3");
+    let cfg = ModelConfig::from_gguf(&gguf).expect("cfg");
+    let model = LoadedModel::load(&dev, &mut allocator, &gguf).expect("upload");
+    let tokenizer = Tokenizer::from_gguf(&gguf).expect("tokenizer");
+    let kv_cache = KvCache::new(
+        &dev.device,
+        &mut allocator,
+        KvCacheConfig {
+            n_layers: cfg.n_layers,
+            n_kv_heads: cfg.n_kv_heads,
+            head_dim: cfg.head_dim,
+            max_seq_len: MAX_SEQ_LEN,
+        },
+    )
+    .expect("kv");
+    let forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)
+        .expect("forward");
+    let template = ChatTemplate::detect(&gguf, &tokenizer);
+    let mut session = ChatSession::new_with_template(
+        forward,
+        "You are a helpful assistant.",
+        template,
+    );
+
+    // (user_msg, expect_keyword_lowercase, max_tokens, critical)
+    // Qwen3 streams a long <think> block before the answer; bump the
+    // max-tokens cap on critical turns so the model has room to emit
+    // the recall keyword AFTER `</think>`.
+    let turns: &[(&str, &[&str], u32, bool)] = &[
+        ("My name is Alice.",                       &["alice"],            120, false),
+        ("What is 2 + 2?",                          &["4"],                120, false),
+        ("What is my name?",                        &["alice"],            220, true),
+        ("I live in Berlin.",                       &["berlin"],           120, false),
+        ("Where do I live?",                        &["berlin"],           220, true),
+        ("What is my name and where do I live?",    &["alice", "berlin"],  300, true),
+    ];
+
+    let mut critical_pass = 0usize;
+    let mut critical_total = 0usize;
+    let mut last_pos = 0u32;
+    for (i, (user, expect, max_tok, critical)) in turns.iter().enumerate() {
+        if *critical {
+            critical_total += 1;
+        }
+        let cfg_g = GenerateConfig {
+            max_tokens: *max_tok,
+            print_stream: false,
+            think_filter: false,
+        };
+        let result = session.send(
+            &dev, &registry, &cmd_ctx, &model, &gguf, &cfg, &tokenizer,
+            user, &cfg_g,
+        ).unwrap_or_else(|e| panic!("Alice turn {} failed: {e}", i + 1));
+
+        let lower = result.generated_text.to_lowercase();
+        let passed = expect.iter().all(|k| lower.contains(*k));
+        eprintln!(
+            "[alice] turn {} '{}' kw={:?} pass={} pos={} gen={}",
+            i + 1, user, expect, passed, session.current_pos, result.generated_tokens,
+        );
+        if *critical {
+            assert!(
+                passed,
+                "CRITICAL Alice turn {} failed: expected {:?} in response, got: {}",
+                i + 1, expect, &result.generated_text,
+            );
+            critical_pass += 1;
+        }
+        last_pos = session.current_pos;
+    }
+
+    assert_eq!(
+        critical_pass, critical_total,
+        "Alice critical-turn score should be {}/{}, got {}/{}",
+        critical_total, critical_total, critical_pass, critical_total,
+    );
+    assert!(
+        last_pos > 0 && last_pos < MAX_SEQ_LEN,
+        "Alice should leave the KV-cache populated within bounds (got pos={last_pos})"
+    );
+
+    session.forward.destroy(&dev.device, &mut allocator);
+    cmd_ctx.destroy(&dev.device);
+    model.destroy(&dev.device, &mut allocator);
+    registry.destroy(&dev.device);
+    drop(allocator);
+}
