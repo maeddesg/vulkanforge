@@ -162,15 +162,44 @@ impl PipelineRegistry {
                         entry(9, 32, 4),
                         entry(10, 36, 4),
                     ];
+                    // Phase 6 v0.1.2 cont. — GEMM tile-tuning.
+                    //
+                    // Phase 3C originally pinned TM=4 / TN=2 (the
+                    // default in llama.cpp's vulkan-shaders-gen for
+                    // a non-coopmat MMQ build). Bench sweep over the
+                    // 5-prompt suite on Qwen3-8B at v0.1.2:
+                    //   TM=4 TN=2  → 716 tok/s  (Phase 3C baseline)
+                    //   TM=2 TN=2  → 776 tok/s  (+8 %)
+                    //   TM=2 TN=4  → 789 tok/s  (+10 %, new default)
+                    //   TM=8 TN=1  → 669 tok/s  (-7 %)
+                    // The N-dim benefits more from per-thread tile
+                    // coverage on RDNA4 than the M-dim does — the
+                    // GEMM is K-major-loaded (Q4_K weights along
+                    // rows, Q8_1 activations along cols), so giving
+                    // each thread 4 N-cols × 2 M-rows reuses cached
+                    // weight rows better than 2 N-cols × 4 M-rows.
+                    //
+                    // Constraint: WNITER = WM*WN/(WARP*TM*TN*WMITER)
+                    // must be a positive integer. With WM=WN=32,
+                    // WARP=64, WMITER=2: TM*TN ≤ 8.
+                    //
+                    // Override via VULKANFORGE_GEMM_BLOCK_SIZE / _TM
+                    // / _TN env vars for A/B testing without rebuild.
+                    let block_size: u32 = std::env::var("VULKANFORGE_GEMM_BLOCK_SIZE")
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(128);
+                    let tm: u32 = std::env::var("VULKANFORGE_GEMM_TM")
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+                    let tn: u32 = std::env::var("VULKANFORGE_GEMM_TN")
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
                     let data: [u32; 10] = [
-                        128, // BLOCK_SIZE — 64 warp × 2 sub-warps
+                        block_size, // BLOCK_SIZE
                         64,  // BM
                         64,  // BN
                         32,  // WM
                         32,  // WN
                         2,   // WMITER
-                        4,   // TM
-                        2,   // TN
+                        tm,  // TM (default 2 — Phase 6 v0.1.2)
+                        tn,  // TN (default 4 — Phase 6 v0.1.2)
                         1,   // TK
                         64,  // WARP — RDNA Wave64
                     ];

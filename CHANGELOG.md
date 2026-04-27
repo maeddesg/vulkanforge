@@ -2,6 +2,26 @@
 
 ## v0.1.2 — Phase 6 fallback work (2026-04-27)
 
+### Performance addendum — GEMM tile-tuning (added later same day)
+
+Sweep over `mul_mmq.comp`'s spec-constants found a single new
+default — `TM=2 TN=4` (was `TM=4 TN=2`) — that lifts prefill
+median by **+3 to +6 % across all four supported models**:
+
+| Model | v0.1.1 | v0.1.2 (TM=2 TN=4) | Δ |
+|---|---:|---:|---:|
+| Qwen3-8B | 1082.3 | 1115.6 | +3.1 % |
+| Meta-Llama-3.1-8B | 1140.4 | 1207.6 | +5.9 % |
+| DeepSeek-R1-Distill | 919.0 | 963.0 | +4.8 % |
+| Mistral-7B-v0.3 | 949.0 | 1005.7 | +6.0 % |
+
+Single-line pipeline-registration change. No shader edits, no SPV
+rebuilds (the values are spec-constants, the shader's SPIR-V is
+unchanged). `VULKANFORGE_GEMM_{BLOCK_SIZE,TM,TN}` env vars added
+for future A/B testing without rebuilding.
+
+Sweep details in `results/phase6_v012_tile_tuning.md`.
+
 ### Headline
 
 Coopmat / WMMA path was found non-viable for v0.1.x — `mul_mm_cm2.comp`
