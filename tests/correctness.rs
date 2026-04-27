@@ -23,8 +23,8 @@ use vulkanforge::backend::vulkan::pipeline::{
     init_fastdiv_values, ComputeKernel, FlashAttnReducePushConstants,
     FlashAttnSplitPushConstants, GenericBinaryPushConstants,
     GenericHeadPushConstants, GenericUnaryPushConstants, MmqPushConstants,
-    Q8_1QuantizePushConstants, RopePushConstants, ScalarAttnPushConstants,
-    SoftMaxPushConstants,
+    FlashAttnBatchPushConstants, Q8_1QuantizePushConstants, RopePushConstants,
+    ScalarAttnPushConstants, SoftMaxPushConstants,
 };
 use vulkanforge::backend::vulkan::pipeline_registry::PipelineRegistry;
 use vulkanforge::backend::vulkan::shaders::ShaderId;
@@ -1411,4 +1411,382 @@ fn unary_pc_1d(n: u32) -> GenericUnaryPushConstants {
 
 fn max_abs_err(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+}
+
+// =====================================================================
+// Phase 5B.1 — batched-Q flash-attention (`flash_attn_batch.comp`).
+// One dispatch covers (n_heads, M, 1); each WG runs the same online-
+// softmax recurrence as Phase-4B `flash_attn` but with a per-query
+// causal mask `causal_len = q_start + q_idx + 1`. Tests below are
+// isolated — they don't go through the forward pass.
+// =====================================================================
+
+/// CPU reference for batched attention with causal masking. f64
+/// internally for the softmax + V-sum so the f32 GPU path can be
+/// graded against a numerically clean answer.
+fn cpu_batch_attn_reference(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    m: u32,
+    n_kv: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    q_start: u32,
+    scale: f32,
+) -> Vec<f32> {
+    let head_dim_us = head_dim as usize;
+    let pos_stride = (n_kv_heads * head_dim) as usize;
+    let group_size = n_heads / n_kv_heads;
+    let scale_d = scale as f64;
+    let mut out = vec![0.0f32; (m * n_heads * head_dim) as usize];
+    for q_idx in 0..m {
+        let causal_len = ((q_start + q_idx + 1).min(n_kv)) as usize;
+        for h in 0..n_heads {
+            let kvh = (h / group_size) as usize;
+            let q_off = ((q_idx * n_heads + h) * head_dim) as usize;
+
+            let mut scores = Vec::with_capacity(causal_len);
+            let mut max_score = f64::NEG_INFINITY;
+            for t in 0..causal_len {
+                let k_off = t * pos_stride + kvh * head_dim_us;
+                let mut dot = 0.0f64;
+                for d in 0..head_dim_us {
+                    dot += (q[q_off + d] as f64) * (k[k_off + d] as f64);
+                }
+                let s = dot * scale_d;
+                if s > max_score {
+                    max_score = s;
+                }
+                scores.push(s);
+            }
+            let mut weights: Vec<f64> = scores.iter().map(|s| (s - max_score).exp()).collect();
+            let sum: f64 = weights.iter().sum();
+            for w in weights.iter_mut() {
+                *w /= sum;
+            }
+
+            let o_off = ((q_idx * n_heads + h) * head_dim) as usize;
+            for d in 0..head_dim_us {
+                let mut acc = 0.0f64;
+                for t in 0..causal_len {
+                    let v_off = t * pos_stride + kvh * head_dim_us;
+                    acc += weights[t] * (v[v_off + d] as f64);
+                }
+                out[o_off + d] = acc as f32;
+            }
+        }
+    }
+    out
+}
+
+fn run_batch_attn(
+    m: u32,
+    q_start: u32,
+    abs_threshold: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut fix = Fixture::new();
+    let n_heads: u32 = 32;
+    let n_kv_heads: u32 = 8;
+    let head_dim: u32 = 128;
+    let n_kv = q_start + m;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    let pos_stride = (n_kv_heads * head_dim) as usize;
+    let kv_size = (n_kv as usize) * pos_stride;
+    let q_count = (m * n_heads * head_dim) as usize;
+
+    // Deterministic non-trivial inputs. Different sin/cos seeds per
+    // (q_idx, h, kvh, d) so a buggy stride or GQA group_size would
+    // produce divergent output. f32 is good enough — the f64 CPU
+    // reference absorbs the round-off envelope.
+    let mut q = vec![0.0f32; q_count];
+    for q_idx in 0..(m as usize) {
+        for h in 0..(n_heads as usize) {
+            for d in 0..(head_dim as usize) {
+                let off = (q_idx * n_heads as usize + h) * head_dim as usize + d;
+                q[off] = ((q_idx as f32) * 0.017 + (h as f32) * 0.011 + (d as f32) * 0.003).sin();
+            }
+        }
+    }
+    let mut k = vec![0.0f32; kv_size];
+    let mut v = vec![0.0f32; kv_size];
+    for t in 0..(n_kv as usize) {
+        for kvh in 0..(n_kv_heads as usize) {
+            for d in 0..(head_dim as usize) {
+                let off = t * pos_stride + kvh * (head_dim as usize) + d;
+                k[off] = ((t as f32 + 1.0) * 0.01 + (d as f32) * 0.001 + (kvh as f32) * 0.7).cos();
+                v[off] = ((t as f32) * 0.013 + (kvh as f32) * 0.5 + (d as f32) * 0.0007).sin();
+            }
+        }
+    }
+
+    let cpu = cpu_batch_attn_reference(
+        &q, &k, &v, m, n_kv, n_heads, n_kv_heads, head_dim, q_start, scale,
+    );
+
+    let q_h = fix.host_buffer_f32(&q, "batch_q");
+    let k_h = fix.host_buffer_f32(&k, "batch_k");
+    let v_h = fix.host_buffer_f32(&v, "batch_v");
+    let o_h = fix.output_buffer_f32(q_count, "batch_o");
+    let pc = FlashAttnBatchPushConstants {
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        m,
+        n_kv,
+        q_start,
+        scale,
+    };
+    fix.dispatch(
+        ShaderId::FlashAttnBatch,
+        &[q_h, k_h, v_h, o_h],
+        bytemuck::bytes_of(&pc),
+        (n_heads, m, 1),
+    );
+    let gpu = fix.read_output(o_h, q_count);
+
+    let nan = gpu.iter().any(|x| !x.is_finite());
+    assert!(
+        !nan,
+        "flash_attn_batch(m={m}, q_start={q_start}) produced NaN/Inf — first 8: {:?}",
+        &gpu[..8]
+    );
+    let max_abs = max_abs_err(&gpu, &cpu);
+    assert!(
+        max_abs < abs_threshold,
+        "flash_attn_batch(m={m}, q_start={q_start}) vs CPU max_abs_err = {max_abs:e} >= {abs_threshold:e}\n\
+         GPU first 8: {:?}\n CPU first 8: {:?}",
+        &gpu[..8],
+        &cpu[..8],
+    );
+    fix.teardown();
+    (gpu, cpu)
+}
+
+#[test]
+fn test_batch_attn_m1_vs_cpu() {
+    // M=1 with q_start=0 reduces to single-query attention over a
+    // single key — softmax([s]) = 1, output = V[0] (per kv-head). Same
+    // shape as the FlashAttn `seq=1` smoke test.
+    run_batch_attn(1, 0, 1e-4);
+}
+
+#[test]
+fn test_batch_attn_m4_vs_cpu() {
+    // Causal triangle is fully exercised: q=0 sees K[0], q=3 sees K[0..=3].
+    run_batch_attn(4, 0, 1e-3);
+}
+
+#[test]
+fn test_batch_attn_m16_vs_cpu() {
+    // M=16: 16 queries, all under the same TILE — exercises the
+    // per-query causal_len bookkeeping inside one tile.
+    run_batch_attn(16, 0, 1e-3);
+}
+
+#[test]
+fn test_batch_attn_m64_vs_cpu() {
+    // M=64 = exactly one full TILE for q_idx=63. Tile boundary
+    // transition (causal_len from 64 to 65) hits the tail-tile path
+    // for all later queries. Run with q_start=0.
+    run_batch_attn(64, 0, 1e-3);
+}
+
+#[test]
+fn test_batch_attn_m200_vs_cpu() {
+    // 3.125 × TILE — final query has 4 tiles to walk; numerical envelope
+    // a touch wider for the deepest accumulator.
+    run_batch_attn(200, 0, 5e-3);
+}
+
+#[test]
+fn test_batch_attn_q_start_offset() {
+    // q_start > 0: queries already see prior cache content. M=4 queries
+    // appended to a 60-position prefix → causal_len ranges 61..=64.
+    // Verifies the shader's q_start arithmetic and that causal_len is
+    // clamped against n_kv.
+    run_batch_attn(4, 60, 1e-3);
+}
+
+#[test]
+fn test_batch_attn_m1_matches_flash_attn() {
+    // For M=1, q_start=0, the batch shader must produce the same
+    // output as the single-query FlashAttn shader on identical Q/K/V.
+    // Tighter bound (1e-5) — both run the same online-softmax loop;
+    // any difference would be a pure ordering/accumulation artifact.
+    let n_heads: u32 = 32;
+    let n_kv_heads: u32 = 8;
+    let head_dim: u32 = 128;
+    let max_seq: u32 = 2048;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let pos_stride = (n_kv_heads * head_dim) as usize;
+    let kv_size = (max_seq as usize) * pos_stride;
+
+    let q_count = (n_heads * head_dim) as usize;
+    let mut q = vec![0.0f32; q_count];
+    for (i, x) in q.iter_mut().enumerate() {
+        *x = ((i as f32) * 0.001).sin();
+    }
+    let mut k = vec![0.0f32; kv_size];
+    let mut v = vec![0.0f32; kv_size];
+    for kvh in 0..(n_kv_heads as usize) {
+        for d in 0..(head_dim as usize) {
+            let off = kvh * (head_dim as usize) + d;
+            k[off] = (0.01 + (d as f32) * 0.001).cos();
+            v[off] = ((kvh as f32) * 0.7 + (d as f32) * 0.0007).sin();
+        }
+    }
+
+    // ---- single-query flash_attn ----
+    let mut fix_a = Fixture::new();
+    let q_a = fix_a.host_buffer_f32(&q, "fa_q");
+    let k_a = fix_a.host_buffer_f32(&k, "fa_k");
+    let v_a = fix_a.host_buffer_f32(&v, "fa_v");
+    let o_a = fix_a.output_buffer_f32(q_count, "fa_o");
+    let pc_fa = ScalarAttnPushConstants {
+        n_heads, n_kv_heads, head_dim,
+        seq_len: 1, max_seq, scale,
+    };
+    fix_a.dispatch(
+        ShaderId::FlashAttn,
+        &[q_a, k_a, v_a, o_a],
+        bytemuck::bytes_of(&pc_fa),
+        (n_heads, 1, 1),
+    );
+    let out_fa = fix_a.read_output(o_a, q_count);
+    fix_a.teardown();
+
+    // ---- batched flash_attn_batch (M=1, q_start=0) ----
+    let mut fix_b = Fixture::new();
+    let q_b = fix_b.host_buffer_f32(&q, "fab_q");
+    let k_b = fix_b.host_buffer_f32(&k, "fab_k");
+    let v_b = fix_b.host_buffer_f32(&v, "fab_v");
+    let o_b = fix_b.output_buffer_f32(q_count, "fab_o");
+    let pc_fab = FlashAttnBatchPushConstants {
+        n_heads, n_kv_heads, head_dim,
+        m: 1, n_kv: 1, q_start: 0, scale,
+    };
+    fix_b.dispatch(
+        ShaderId::FlashAttnBatch,
+        &[q_b, k_b, v_b, o_b],
+        bytemuck::bytes_of(&pc_fab),
+        (n_heads, 1, 1),
+    );
+    let out_fab = fix_b.read_output(o_b, q_count);
+    fix_b.teardown();
+
+    let max_abs = max_abs_err(&out_fa, &out_fab);
+    assert!(
+        max_abs < 1e-5,
+        "flash_attn_batch(M=1) vs flash_attn parity max_abs_err = {max_abs:e} >= 1e-5\n\
+         flash_attn first 8: {:?}\nflash_attn_batch first 8: {:?}",
+        &out_fa[..8], &out_fab[..8],
+    );
+}
+
+#[test]
+fn test_batch_attn_causal_mask_isolates_queries() {
+    // Causal correctness: if the model's first query is supposed to
+    // see only K[0], then expanding the batch to include later queries
+    // must NOT change query 0's output.
+    //
+    // We dispatch twice on the SAME Q/K/V — once with M=1 and once
+    // with M=4 — and assert that the first n_heads*head_dim outputs
+    // are identical (within f32 round-off) across the two runs.
+    let n_heads: u32 = 32;
+    let n_kv_heads: u32 = 8;
+    let head_dim: u32 = 128;
+    let head_count = (n_heads * head_dim) as usize;
+    let m_full: u32 = 4;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let pos_stride = (n_kv_heads * head_dim) as usize;
+    let kv_size = (m_full as usize) * pos_stride;
+    let q_count_full = (m_full * n_heads * head_dim) as usize;
+
+    // Same generator as run_batch_attn — Q's first query is identical
+    // to the M=1 run's Q.
+    let mut q_full = vec![0.0f32; q_count_full];
+    for q_idx in 0..(m_full as usize) {
+        for h in 0..(n_heads as usize) {
+            for d in 0..(head_dim as usize) {
+                let off = (q_idx * n_heads as usize + h) * head_dim as usize + d;
+                q_full[off] =
+                    ((q_idx as f32) * 0.017 + (h as f32) * 0.011 + (d as f32) * 0.003).sin();
+            }
+        }
+    }
+    let mut k = vec![0.0f32; kv_size];
+    let mut v = vec![0.0f32; kv_size];
+    for t in 0..(m_full as usize) {
+        for kvh in 0..(n_kv_heads as usize) {
+            for d in 0..(head_dim as usize) {
+                let off = t * pos_stride + kvh * (head_dim as usize) + d;
+                k[off] = ((t as f32 + 1.0) * 0.01 + (d as f32) * 0.001 + (kvh as f32) * 0.7).cos();
+                v[off] = ((t as f32) * 0.013 + (kvh as f32) * 0.5 + (d as f32) * 0.0007).sin();
+            }
+        }
+    }
+    let q_first = q_full[..head_count].to_vec();
+
+    // ---- run with M=1 ----
+    let mut fix_1 = Fixture::new();
+    let q1 = fix_1.host_buffer_f32(&q_first, "qm1");
+    let k1 = fix_1.host_buffer_f32(&k, "k1");
+    let v1 = fix_1.host_buffer_f32(&v, "v1");
+    let o1 = fix_1.output_buffer_f32(head_count, "o1");
+    let pc1 = FlashAttnBatchPushConstants {
+        n_heads, n_kv_heads, head_dim,
+        m: 1, n_kv: 1, q_start: 0, scale,
+    };
+    fix_1.dispatch(
+        ShaderId::FlashAttnBatch,
+        &[q1, k1, v1, o1],
+        bytemuck::bytes_of(&pc1),
+        (n_heads, 1, 1),
+    );
+    let out_m1 = fix_1.read_output(o1, head_count);
+    fix_1.teardown();
+
+    // ---- run with M=4 ----
+    let mut fix_4 = Fixture::new();
+    let q4 = fix_4.host_buffer_f32(&q_full, "qm4");
+    let k4 = fix_4.host_buffer_f32(&k, "k4");
+    let v4 = fix_4.host_buffer_f32(&v, "v4");
+    let o4 = fix_4.output_buffer_f32(q_count_full, "o4");
+    let pc4 = FlashAttnBatchPushConstants {
+        n_heads, n_kv_heads, head_dim,
+        m: m_full, n_kv: m_full, q_start: 0, scale,
+    };
+    fix_4.dispatch(
+        ShaderId::FlashAttnBatch,
+        &[q4, k4, v4, o4],
+        bytemuck::bytes_of(&pc4),
+        (n_heads, m_full, 1),
+    );
+    let out_m4 = fix_4.read_output(o4, q_count_full);
+    fix_4.teardown();
+
+    let max_abs = max_abs_err(&out_m1, &out_m4[..head_count]);
+    assert!(
+        max_abs < 1e-5,
+        "causal mask isolation: query 0 output differs between M=1 and M=4 (max_abs={max_abs:e})\n\
+         M=1 first 8: {:?}\nM=4 first 8: {:?}",
+        &out_m1[..8], &out_m4[..8],
+    );
+
+    // Sanity: query 3 (sees K[0..=3]) must NOT match query 0 (sees only K[0]).
+    let q3_off = 3 * head_count;
+    let mut diff_count = 0;
+    for i in 0..head_count {
+        if (out_m4[q3_off + i] - out_m1[i]).abs() > 1e-3 {
+            diff_count += 1;
+        }
+    }
+    assert!(
+        diff_count > head_count / 8,
+        "causal sanity: query 3 should attend to additional KV → output should differ from query 0 \
+         (only {diff_count}/{head_count} elements differ by >1e-3)"
+    );
 }

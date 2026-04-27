@@ -244,6 +244,29 @@ pub struct FlashAttnReducePushConstants {
 }
 const _: () = assert!(std::mem::size_of::<FlashAttnReducePushConstants>() == 12);
 
+/// Phase-5B.1 batched-Q flash attention (`flash_attn_batch.comp`) push
+/// block. 6 × u32 + 1 × f32 = 28 B. Layout matches the GLSL `Params`
+/// block in `vk_shaders/flash_attn_batch.comp`.
+///
+/// `m` is the number of queries in this batch, `n_kv` the total
+/// populated KV positions, `q_start` the KV position of the first
+/// query (equals `n_kv - m` whenever the batch is the most recent
+/// chunk added to the cache, but kept explicit so the shader does
+/// not have to derive it). The causal mask uses
+/// `causal_len = q_start + q_idx + 1`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct FlashAttnBatchPushConstants {
+    pub n_heads: u32,
+    pub n_kv_heads: u32,
+    pub head_dim: u32,
+    pub m: u32,
+    pub n_kv: u32,
+    pub q_start: u32,
+    pub scale: f32,
+}
+const _: () = assert!(std::mem::size_of::<FlashAttnBatchPushConstants>() == 28);
+
 /// llama.cpp's `init_fastdiv_values`. Used by [`GenericUnaryPushConstants`]
 /// to populate the `ne*_*mp/L` fields — without these, `copy`'s SPIR-V
 /// fastdiv path divides by a magic-of-zero and produces garbage indices.

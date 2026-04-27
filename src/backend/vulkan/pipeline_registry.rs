@@ -199,6 +199,15 @@ impl PipelineRegistry {
                     // workgroup geometry).
                     ComputeKernel::from_spv(device, &words, cache)
                 }
+                ShaderId::FlashAttnBatch => {
+                    // SpecId 0 = MAX_SEQ — kept for parity with FlashAttn
+                    // even though the runtime path uses push-constant
+                    // dimensions only.
+                    let data: [u32; 1] = [2048];
+                    let entries = [entry(0, 0, 4)];
+                    let bytes = bytemuck::bytes_of(&data);
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
+                }
             };
             let kernel = match result {
                 Ok(k) => k,

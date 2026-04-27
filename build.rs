@@ -153,6 +153,14 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "flash_attn_reduce.comp",
         defines: &[],
     },
+    // VulkanForge Phase-5B.1 batched-Q flash attention for prefill.
+    // Dispatched as (n_heads, M, 1); each WG handles one (head, query)
+    // and applies the causal mask via causal_len = q_start + q_idx + 1.
+    ShaderJob {
+        out_name: "flash_attn_batch_f32.spv",
+        entry_source: "flash_attn_batch.comp",
+        defines: &[],
+    },
     // Phase-3C: Q4_K integer-MMQ GEMM. Mirrors the defines
     // llama.cpp's vulkan-shaders-gen passes for a non-MoE, non-coopmat
     // Q4_K mul_mmq build. Used by Forward::prefill_batch (TBD) and

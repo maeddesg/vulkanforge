@@ -32,6 +32,10 @@ pub enum ShaderId {
     // forward.rs falls back to FlashAttn (single WG per head).
     FlashAttnSplit,
     FlashAttnReduce,
+    // Phase 5B.1 — batched-Q flash attention for prefill. One dispatch
+    // covers (n_heads, M, 1) with a causal mask, replacing the M-fold
+    // FlashAttn dispatch loop the per-token prefill currently runs.
+    FlashAttnBatch,
 }
 
 impl ShaderId {
@@ -54,6 +58,7 @@ impl ShaderId {
             ShaderId::FlashAttn => "flash_attn_f32",
             ShaderId::FlashAttnSplit => "flash_attn_split_f32",
             ShaderId::FlashAttnReduce => "flash_attn_reduce_f32",
+            ShaderId::FlashAttnBatch => "flash_attn_batch_f32",
         }
     }
 
@@ -76,6 +81,7 @@ impl ShaderId {
             ShaderId::FlashAttn => FLASH_ATTN_F32,
             ShaderId::FlashAttnSplit => FLASH_ATTN_SPLIT_F32,
             ShaderId::FlashAttnReduce => FLASH_ATTN_REDUCE_F32,
+            ShaderId::FlashAttnBatch => FLASH_ATTN_BATCH_F32,
         }
     }
 }
@@ -98,6 +104,7 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::FlashAttn,
     ShaderId::FlashAttnSplit,
     ShaderId::FlashAttnReduce,
+    ShaderId::FlashAttnBatch,
 ];
 
 pub const MUL_MAT_VEC_Q4_K_F32_F32: &[u8] =
@@ -126,6 +133,8 @@ pub const FLASH_ATTN_SPLIT_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_split_f32.spv"));
 pub const FLASH_ATTN_REDUCE_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_reduce_f32.spv"));
+pub const FLASH_ATTN_BATCH_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_batch_f32.spv"));
 
 /// Decode a SPIR-V byte blob into u32 words. Vulkan consumes SPIR-V
 /// as `&[u32]`; `include_bytes!` only gives us `&[u8]` whose alignment
