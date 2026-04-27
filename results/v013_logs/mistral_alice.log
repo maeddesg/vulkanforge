@@ -1,0 +1,52 @@
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+VulkanForge: GPU = AMD Radeon RX 9070 XT (RADV GFX1201)
+VulkanForge: Compute Queue Family = 0
+VulkanForge: validation layer ACTIVE
+VulkanForge — Alice multi-turn context-retention test
+  model    = /home/maeddes/models/Mistral-7B-Instruct-v0.3.Q4_K_M.gguf
+  arch     = llama
+  template = Mistral
+  rope     = Norm
+  qk_norm  = false
+
+─── Turn 1/6
+  USER: My name is Alice.
+  ASST: Hello Alice! It's nice to meet you. I'm here to help you with any questions or tasks you might have. How can I assist you today?
+  KW ["Alice"] → ✅ · pp=16 gen=34 · 371 tok/s prefill, 105.2 tok/s decode · pos=50
+
+─── Turn 2/6
+  USER: What is 2 + 2?
+  ASST: The sum of 2 + 2 is 4.
+  KW ["4"] → ✅ · pp=11 gen=12 · 287 tok/s prefill, 98.9 tok/s decode · pos=73
+
+─── Turn 3/6 [CRITICAL]
+  USER: What is my name?
+  ASST: Your name is Alice, as you mentioned earlier.
+  KW ["Alice"] → ✅ · pp=8 gen=10 · 204 tok/s prefill, 96.8 tok/s decode · pos=91
+
+─── Turn 4/6
+  USER: I live in Berlin.
+  ASST: That's interesting! Berlin is the capital and largest city of Germany. It's known for its rich history, vibrant culture, and numerous landmarks such as the Berlin Wall, Brandenburg Gate, and Museum Island. Is there anything specific you wou…
+  KW ["Berlin"] → ✅ · pp=8 gen=60 · 204 tok/s prefill, 99.7 tok/s decode · pos=159
+
+─── Turn 5/6 [CRITICAL]
+  USER: Where do I live?
+  ASST: You live in Berlin, as you mentioned earlier.
+  KW ["Berlin"] → ✅ · pp=8 gen=10 · 198 tok/s prefill, 97.6 tok/s decode · pos=177
+
+─── Turn 6/6 [CRITICAL]
+  USER: What is my name and where do I live?
+  ASST: Your name is Alice and you live in Berlin.
+  KW ["Alice", "Berlin"] → ✅ · pp=13 gen=10 · 314 tok/s prefill, 98.0 tok/s decode · pos=200
+
+=== Alice summary ===
+    Turn 1: ✅  ["Alice"] → Hello Alice! It's nice to meet you. I'm here to help you with any questions or t…
+    Turn 2: ✅  ["4"] → The sum of 2 + 2 is 4.
+  * Turn 3: ✅  ["Alice"] → Your name is Alice, as you mentioned earlier.
+    Turn 4: ✅  ["Berlin"] → That's interesting! Berlin is the capital and largest city of Germany. It's know…
+  * Turn 5: ✅  ["Berlin"] → You live in Berlin, as you mentioned earlier.
+  * Turn 6: ✅  ["Alice", "Berlin"] → Your name is Alice and you live in Berlin.
+
+  Critical score: 3/3  (PASS)
+  Aggregate: 64 prompt + 136 gen tokens, prefill 265 tok/s, decode 100.4 tok/s
+  Final KV pos: 200 / 2048

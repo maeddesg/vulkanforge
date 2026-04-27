@@ -1,0 +1,56 @@
+VulkanForge — 15-prompt benchmark
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+VulkanForge: GPU = AMD Radeon RX 9070 XT (RADV GFX1201)
+VulkanForge: Compute Queue Family = 0
+VulkanForge: validation layer ACTIVE
+  /home/maeddes/models/DeepSeek-R1-Distill-Llama-8B-Q4_K_M.gguf loaded in 0.5 s
+  arch=llama rope=Norm template=DeepSeekR1 qk_norm=false
+  # 1 Greeting                         pp= 13 gen=  64  prefill= 253.4 tok/s  decode= 96.7 tok/s  ✓
+  # 2 Simple Sequence                  pp= 22 gen=  64  prefill= 546.0 tok/s  decode= 95.6 tok/s  ✓
+  # 3 Prime Check (Python)             pp= 24 gen= 256  prefill= 606.7 tok/s  decode= 94.3 tok/s  ✓
+  # 4 LRU Cache (C++)                  pp= 40 gen= 512  prefill= 972.6 tok/s  decode= 94.0 tok/s  ✓
+  # 5 REST API (Go)                    pp= 55 gen=1024  prefill=1350.8 tok/s  decode= 85.6 tok/s  ✓
+  # 6 Mutex Explanation                pp= 22 gen= 128  prefill= 560.1 tok/s  decode= 95.5 tok/s  ✓
+  # 7 TCP vs UDP                       pp= 32 gen= 512  prefill= 800.1 tok/s  decode= 94.3 tok/s  ✓
+  # 8 GPU Architecture Blog Post       pp= 51 gen=1024  prefill=1261.0 tok/s  decode= 86.0 tok/s  ✓
+  # 9 Binary Search Complexity         pp= 23 gen= 256  prefill= 569.9 tok/s  decode= 94.8 tok/s  ✓
+  #10 Debug Code                       pp= 38 gen= 256  prefill= 956.0 tok/s  decode= 94.9 tok/s  ✓
+  #11 Distributed Message Queue        pp= 55 gen=1024  prefill=1354.7 tok/s  decode= 85.7 tok/s  ✓
+  #12 Long System Prompt + Question    pp=191 gen= 256  prefill=1563.6 tok/s  decode= 94.1 tok/s  ✓
+  #13 Long Output Story                pp= 59 gen= 512  prefill=1445.3 tok/s  decode= 93.9 tok/s  ✓
+  #14 Arithmetic (Q4_K Precision)      pp= 21 gen=  64  prefill= 538.1 tok/s  decode= 97.7 tok/s  ✓
+  #15 Emoji/Special Characters         pp= 36 gen= 128  prefill= 904.1 tok/s  decode= 95.4 tok/s  ✓
+
+=== Per-prompt results ===
+#   Name                       Category       PromTk GenTk    Prefill     Decode  Coh
+1   Greeting                   smoke             13    64     253.4       96.7  ✓
+2   Simple Sequence            smoke             22    64     546.0       95.6  ✓
+3   Prime Check (Python)       code_generati…    24   256     606.7       94.3  ✓
+4   LRU Cache (C++)            code_generati…    40   512     972.6       94.0  ✓
+5   REST API (Go)              code_generati…    55  1024    1350.8       85.6  ✓
+6   Mutex Explanation          prose             22   128     560.1       95.5  ✓
+7   TCP vs UDP                 prose             32   512     800.1       94.3  ✓
+8   GPU Architecture Blog Post prose             51  1024    1261.0       86.0  ✓
+9   Binary Search Complexity   reasoning         23   256     569.9       94.8  ✓
+10  Debug Code                 reasoning         38   256     956.0       94.9  ✓
+11  Distributed Message Queue  reasoning         55  1024    1354.7       85.7  ✓
+12  Long System Prompt + Ques… context_stress   191   256    1563.6       94.1  ✓
+13  Long Output Story          context_stress    59   512    1445.3       93.9  ✓
+14  Arithmetic (Q4_K Precisio… numerics          21    64     538.1       97.7  ✓
+15  Emoji/Special Characters   tokenizer_rob…    36   128     904.1       95.4  ✓
+
+=== Aggregate ===
+  Prompt tokens:  682
+  Decode tokens:  6080
+  Prefill total:  695.2 ms  →  981.0 tok/s
+  Decode total:   67642.9 ms  →  89.9 tok/s
+  MEDIAN decode:  94.3 tok/s
+  MEDIAN prefill: 904.1 tok/s
+  Coherent prompts: 15/15
+
+=== 4-System Comparison ===
+                          Decode tok/s  Prefill tok/s
+  llama.cpp Vulkan:           114.2          4314    (reference)
+  ROCmForge HIP (latest):      95.4           768.6  (~/projects/ROCmForge/results/inference_test_20260425.md)
+  llama.cpp ROCm:              87.5          3684    (reference)
+  VulkanForge Phase 3C:        89.9          981.0  ← this run

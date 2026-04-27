@@ -2,6 +2,38 @@
 
 ## v0.1.3 — Phase 7 mul_mm.comp debug + silent mul_mmq fix (2026-04-27)
 
+### Performance addendum — first corrected 16-prompt benchmark (added later same day)
+
+All v0.1.0 – v0.1.2 prefill numbers were inflated by the `BLOCK_SIZE = 128`
+bug below — half the GEMM work was silently skipped. v0.1.3 ships the
+**first accurate prefill measurements**:
+
+| Model | Decode med | Prefill med | Coh | Alice |
+|---|---:|---:|---:|---:|
+| Qwen3-8B | 88.6 | 1037.4 | 15/15 | 3/3 |
+| Meta-Llama-3.1-8B | 94.8 | 1092.7 | 12/15 | 3/3 |
+| DeepSeek-R1-Distill-Llama | 94.3 | 904.1 | 15/15 | 3/3 |
+| Mistral-7B-Instruct-v0.3 | 100.1 | 939.3 | 15/15 | 3/3 |
+
+vs the (now-invalidated) v0.1.2 numbers:
+
+| Model | Δ Decode | Δ Prefill | Note |
+|---|---:|---:|---|
+| Qwen3-8B | +0.1 | **−7.0 %** | full GEMM tile now |
+| Meta-Llama-3.1-8B | +0.2 | **−9.5 %** |  |
+| DeepSeek-R1-Distill-Llama | −1.2 | **−6.1 %** |  |
+| Mistral-7B-Instruct-v0.3 | −0.1 | **−6.6 %** |  |
+
+Decode is unchanged because the GEMV path (`mul_mat_vec_*.comp`)
+doesn't tile its output and was unaffected. Prefill is consistently
+lower because the corrected GEMM does ~2× the work per output tile.
+Llama-3.1's coherence drops 13/15 → 12/15 on short numeric prompts
+(`Simple Sequence`, `Arithmetic`) — the bench's "repeating garbage"
+heuristic trips on legitimate digit-only replies; the multi-turn
+Alice test still passes 3/3 and the regression suite's top-1 /
+top-5 parity gates are identical to v0.1.2. Per-model logs in
+`results/v013_logs/`. Full report in `results/phase7_v013_benchmark.md`.
+
 ### Headline
 
 Two bugs uncovered while bringing up the `mul_mm.comp` port from

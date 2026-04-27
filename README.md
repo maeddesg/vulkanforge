@@ -6,38 +6,47 @@ Compute-only — no swapchain, no graphics queues — built directly on `ash 0.3
 
 ## Status
 
-v0.1.1 — Phase 5C (SPM Tokenizer + Mistral). Single-batch greedy decode +
-multi-turn chat sessions with persistent KV cache. Supports the Qwen, Llama-3
-and Mistral GGUF families out-of-the-box.
+v0.1.3 — Phase 7 mul_mm.comp debug + silent mul_mmq fix.
+Single-batch greedy decode (with optional temperature / top-k / top-p
+sampling) + multi-turn chat sessions with persistent KV cache.
+Supports the Qwen, Llama-3 and Mistral GGUF families out-of-the-box.
 
 | Model | Arch | Tokenizer | Chat template | Status |
 |---|---|---|---|---|
 | Qwen3-8B-Q4_K_M | qwen3 | gpt2 / qwen2 | ChatML | ✅ reference |
 | Meta-Llama-3.1-8B-Instruct-Q4_K_M | llama | gpt2 / llama-bpe | Llama3 | ✅ |
 | DeepSeek-R1-Distill-Llama-8B-Q4_K_M | llama | gpt2 / llama-bpe | DeepSeek-R1 | ✅ |
-| Mistral-7B-Instruct-v0.3.Q4_K_M | llama | llama (SPM) | Mistral | ✅ new in v0.1.1 |
+| Mistral-7B-Instruct-v0.3.Q4_K_M | llama | llama (SPM) | Mistral | ✅ |
 
-Gemma-4 is out of scope for v0.1.1 (different arch, requires Gemma-specific
+Gemma-4 is out of scope (different arch, requires Gemma-specific
 tensor layout work).
 
 ## Performance (RX 9070 XT, gfx1201, RDNA 4)
 
+> **v0.1.3 numbers below are the first correct prefill measurements.**
+> All v0.1.0 – v0.1.2 prefill numbers were inflated by a `BLOCK_SIZE = 128`
+> bug that left columns 32–63 of every output tile unwritten — half the
+> GEMM work was silently skipped, which made prefill *appear* ~7–10 %
+> faster than it actually was. See `results/phase7_mul_mm_debug.md` for
+> the full investigation.
+
 Full 15-prompt benchmark suite + 6-turn Alice multi-turn test
-(prompt 16) for all four supported models, after Phase 5B.3
-(fully-batched prefill):
+(prompt 16) for all four supported models, on `BLOCK_SIZE = 256`:
 
 | Model | Decode tok/s (median) | Prefill tok/s (median) | Coherent | Alice |
 |---|---:|---:|---:|---:|
-| Qwen3-8B-Q4_K_M | 88.8 | 1082.3 | 14/15 | 3/3 |
-| Meta-Llama-3.1-8B-Instruct-Q4_K_M | 94.8 | 1140.4 | 13/15 | 3/3 |
-| DeepSeek-R1-Distill-Llama-8B-Q4_K_M | 95.2 | 919.0 | 15/15 | 3/3 |
-| Mistral-7B-Instruct-v0.3.Q4_K_M | 100.4 | 949.0 | 15/15 | 3/3 |
+| Qwen3-8B-Q4_K_M | 88.6 | 1037.4 | 15/15 | 3/3 |
+| Meta-Llama-3.1-8B-Instruct-Q4_K_M | 94.8 | 1092.7 | 12/15 | 3/3 |
+| DeepSeek-R1-Distill-Llama-8B-Q4_K_M | 94.3 | 904.1 | 15/15 | 3/3 |
+| Mistral-7B-Instruct-v0.3.Q4_K_M | 100.1 | 939.3 | 15/15 | 3/3 |
 
-`Coherent` is the bench's automatic ✓/✗ heuristic; the false-negatives on
-Qwen3 (1) and Llama-3.1 (2) are digits-only / emoji-only outputs that the
-heuristic flags but are actually correct. `Alice` is the multi-turn
-context-retention test (3 critical turns asking the model to recall
-"Alice" / "Berlin" — passes on all four models on every turn).
+`Coherent` is the bench's automatic ✓/✗ heuristic; the Llama-3.1
+false-negatives are digits-only / very short numeric replies that the
+heuristic's "repeating garbage" check flags but the underlying output
+is correct (the multi-turn `Alice` test passes 3/3 on every model,
+and the regression suite's `phase3e` top-1 / top-5 parity gates pass
+identically to v0.1.2). `Alice` is the multi-turn context-retention
+test asking the model to recall "Alice" / "Berlin" across 6 turns.
 
 Reference 4-system comparison on the same hardware (Qwen3-8B,
 llama.cpp Vulkan build 23b8cc4 with `-fa 1`, tg128 / pp62):
@@ -45,30 +54,27 @@ llama.cpp Vulkan build 23b8cc4 with `-fa 1`, tg128 / pp62):
 | System | Decode tok/s | Prefill tok/s | Decode ratio | Prefill ratio |
 |---|---:|---:|---:|---:|
 | llama.cpp Vulkan | 116.2 | 2274 | 1.00× | 1.00× |
-| **VulkanForge v0.1.1** | **88.8** | **1082 (med, 15-prompt)** | **0.76×** | **~0.48×*** |
+| **VulkanForge v0.1.3** | **88.6** | **1037 (med, 15-prompt)** | **0.76×** | **~0.46×*** |
 | llama.cpp ROCm | 87.5 | 3684 | 0.75× | 1.62× |
 | ROCmForge (HIP) | 95.4 | 768.6 | 0.82× | 0.34× |
 
-*Prefill ratio is hard to compare 1:1 because the 15-prompt suite has
-mixed prompt lengths (20–200 tokens) and llama.cpp's pp62 is a fixed
-synthetic batch. At pp=62 specifically VulkanForge's REST-API prompt
-hits 1458 tok/s → 64% of llama.cpp's 2274 tok/s; at pp=200 the gap
-widens (longer-prompt GEMM utilisation is the next bottleneck).
+*Prefill ratio is mixed-prompt-length on our side (20–200 tokens) vs
+the fixed pp62 batch on llama.cpp's; at pp=62 specifically the
+REST-API prompt hits 1418 tok/s → 62 % of llama.cpp's 2274 tok/s;
+at pp=200 the gap widens (longer-prompt GEMM utilisation is the
+next bottleneck).
 
-Decode is at 76% of llama.cpp Vulkan and **above** llama.cpp ROCm /
-ROCmForge HIP across all four models. Prefill jumped 2.7× over Phase
-5A (405 → 1082 tok/s median) and is now also above ROCmForge HIP for
-the first time — the Phase 5B series (batched-Q attention shader →
-integration → fully-batched prefill prep) closed most of the
-attention-dispatch overhead. Remaining gap to llama.cpp Vulkan
-prefill is GEMM-pipeline-cache + coopmat fusion.
+Decode is at 76 % of llama.cpp Vulkan and **above** llama.cpp ROCm /
+ROCmForge HIP across all four models. The v0.1.3 prefill numbers are
+~6–10 % below the (incorrect) v0.1.2 figures because the GEMM now
+covers the full BM × BN tile instead of half of it.
 
 ## Build
 
 ```bash
 cargo build --release             # ~2-3 s after first build (SPIR-V is cached)
 cargo run --release               # Phase 0 device-init smoke
-cargo test --release              # 19 + 33 + 25 = 77 tests
+cargo test --release              # 24 + 44 + 25 = 93 tests
 ```
 
 MSRV is **Rust 1.85** (edition 2024). Build dependencies require a working
