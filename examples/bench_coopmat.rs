@@ -188,19 +188,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let pipeline = pipelines[0];
 
-    println!("\n{:<10} {:<14} {:>11} {:>10} {:>10} {:>11}",
+    println!("\n{:<22} {:<14} {:>11} {:>10} {:>10} {:>11}",
         "size", "GFLOPs", "warmup_ms", "med_ms", "TFLOPS", "vs scalar*");
-    println!("{}", "─".repeat(74));
+    println!("{}", "─".repeat(86));
 
-    for &dim in &[256u32, 1024u32, 4096u32] {
+    // Phase 6A original baseline (square cubes), plus v0.2 smoke-test
+    // prefill-realistic shapes. Override via VF_BENCH_SHAPES =
+    // "m1,n1,k1;m2,n2,k2;..." to bench arbitrary triples.
+    let shapes: Vec<(u32, u32, u32)> = std::env::var("VF_BENCH_SHAPES")
+        .ok()
+        .and_then(|s| {
+            s.split(';')
+                .filter_map(|tri| {
+                    let mut p = tri.split(',');
+                    Some((
+                        p.next()?.trim().parse().ok()?,
+                        p.next()?.trim().parse().ok()?,
+                        p.next()?.trim().parse().ok()?,
+                    ))
+                })
+                .collect::<Vec<_>>()
+                .into()
+        })
+        .unwrap_or_else(|| vec![
+            // Phase 6A square cubes (kept for back-compat)
+            (256, 256, 256),
+            (1024, 1024, 1024),
+            (4096, 4096, 4096),
+            // v0.2 smoke-test prefill shapes (M = output, N = seq_len,
+            // K = input). Width 64 mirrors a 64-token prefill batch.
+            (2048,  64, 4096),    // gemm_q  @ pp=64
+            (11008, 64, 4096),    // gemm_gate / gemm_up @ pp=64
+            (4096,  64, 11008),   // gemm_down @ pp=64
+            (4096, 128, 4096),    // gemm_q  @ pp=128 (more N parallelism)
+        ]);
+
+    for &(m, n, k) in &shapes {
         let res = run_size(
             &device, &mut allocator, queue, &cmd_ctx,
             pipeline, pipeline_layout, dsl,
-            dim, dim, dim,
+            m, n, k,
         )?;
+        let label = if m == n && n == k {
+            format!("{}^3", m)
+        } else {
+            format!("{}x{}x{}", m, n, k)
+        };
         println!(
-            "{:<10} {:<14.2} {:>11.2} {:>10.3} {:>10.2} {:>10.2}×",
-            format!("{}^3", dim),
+            "{:<22} {:<14.2} {:>11.2} {:>10.3} {:>10.2} {:>10.2}×",
+            label,
             res.gflops,
             res.warmup_ms,
             res.median_ms,
