@@ -1680,6 +1680,97 @@ impl Forward {
         });
     }
 
+    /// Phase-5B.3 batched RoPE. The per-token prefill loop ran one
+    /// `run_rope_neox_with_pos_offset` dispatch per (layer, token,
+    /// Q-or-K), each carrying the position via `pos_buf_offset = t*4`.
+    /// This helper folds all M tokens into one dispatch by setting
+    /// `ne02 = m` (the shader's "samp" axis) and binding the full
+    /// `rope_pos_buf[0..m]` so the inner kernel reads
+    /// `rope_data_pos[i2]` where `i2` is the token index decoded from
+    /// the work-group id.
+    ///
+    /// The shader itself is unchanged from Phase 4D — `rope_neox.comp`
+    /// / `rope_norm.comp` already do the per-row arithmetic via
+    /// `i3 / i2 / i1` decomposition; we just feed it the right
+    /// strides.
+    #[allow(clippy::too_many_arguments)]
+    fn run_rope_batch(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        input: vk::Buffer,
+        output: vk::Buffer,
+        head_dim: u32,
+        heads_per_token: u32,
+        m: u32,
+        label: &str,
+    ) {
+        let (shader_id, rope_mode) = match self.config.rope_variant {
+            crate::backend::vulkan::gguf::RopeVariant::Neox => (ShaderId::RopeNeox, 2u32),
+            crate::backend::vulkan::gguf::RopeVariant::Norm => (ShaderId::RopeNorm, 0u32),
+        };
+        let kernel = registry.get(shader_id);
+        // Bind the whole `rope_pos_buf[0..m]` once — the shader reads
+        // `rope_data_pos[i2]` per row, where i2 is the token index.
+        let pos_size = (m as u64) * 4;
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[
+                (0, input, 0, 0),
+                (1, self.rope_pos_buf.handle, 0, pos_size),
+                (2, self.rope_ff_buf.handle, 0, 0),
+                (3, output, 0, 0),
+                (4, self.rope_idx_buf.handle, 0, 0),
+            ],
+        );
+        let nrows = heads_per_token * m;
+        let pc = RopePushConstants {
+            rope_mode,
+            nrows,
+            n_dims: head_dim,
+            freq_scale: 1.0,
+            freq_base: self.config.rope_freq_base,
+            ext_factor: 0.0,
+            attn_factor: 1.0,
+            corr_dims: [0.0, 0.0],
+            theta_scale: self.rope_theta_scale,
+            has_ff: 0,
+            sections: [0; 4],
+            is_imrope: 0,
+            is_back: 0,
+            set_rows_stride: 0,
+            ne00: head_dim,
+            ne01: heads_per_token,
+            ne02: m,
+            nb01: head_dim,
+            nb02: head_dim * heads_per_token,
+            nb03: head_dim * heads_per_token * m,
+            nb11: head_dim,
+            nb12: head_dim * heads_per_token,
+            nb13: head_dim * heads_per_token * m,
+        };
+        // The shader recovers row from `gl_GlobalInvocationID.x +
+        // 32768 * gl_GlobalInvocationID.z`, so dispatch with z
+        // multiplexing once nrows clears 32 768. For Qwen3 / Llama
+        // worst case this is m=2048 × n_heads=32 = 65 536, fits with
+        // dispatch_z = 2.
+        let dispatch_x = if nrows > 32768 { 32768 } else { nrows };
+        let dispatch_z = (nrows + 32767) / 32768;
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, dispatch_x, 1, dispatch_z);
+        });
+    }
+
     /// Phase-5B.2 batched-Q flash attention. One dispatch over
     /// `(n_heads, m, 1)` covers all M queries against the current
     /// layer's KV cache with a per-query causal mask
@@ -2249,17 +2340,20 @@ impl Forward {
         );
         compute_barrier(dev, cmd);
 
-        // ---- (d) Per-token RoPE + KV-cache write ----
-        // For each token t: copy batch row into single-token buf,
-        // run Q/K-norm + RoPE, write K/V into the cache slot. The
-        // attention itself runs AFTER this loop:
-        //   * batched (default, Phase 5B.2): one `flash_attn_batch`
-        //     dispatch over all M queries — needs the post-RoPE Q
-        //     for every token, so the loop also stages q_buf back
-        //     into `batch_q[t]` once `batch_attn_enabled` is set.
-        //   * per-token (legacy): the attention dispatch + the
-        //     attn_out → batch_attn_out copy stay inside the loop,
-        //     same code path that shipped through Phase 5A.
+        // ---- (d) Q/K-norm + RoPE + KV-cache write ----
+        //
+        // Two paths:
+        //   * Phase 5B.3 fully-batched (default, when `batch_attn_enabled`):
+        //     ONE dispatch each for Q-norm, K-norm, RoPE-Q, RoPE-K
+        //     reading directly from / writing back to batch_q /
+        //     batch_k, then ONE bulk `cmd_copy_buffer` per layer for
+        //     K and V into the KV cache. Skips the per-token loop
+        //     entirely. After this block batch_q holds post-RoPE Q
+        //     for all M tokens; the attention call below consumes it.
+        //
+        //   * Per-token legacy (when `batch_attn_enabled = false`):
+        //     One dispatch per (token, op) — same code path that
+        //     shipped through Phase 5A. Gated below.
         let qk_norm_weights: Option<(vk::Buffer, vk::Buffer)> = if cfg.has_qk_norm {
             Some((
                 layer_weight(model, layer, "attn_q_norm.weight"),
@@ -2269,6 +2363,89 @@ impl Forward {
             None
         };
         let batch_attn = self.batch_attn_enabled;
+
+        if batch_attn {
+            // ---- Phase 5B.3 fully-batched per-layer attention prep ----
+            // 1. Q/K-norm (Qwen-only): rms_norm with nrows = M *
+            //    heads_per_token. The shader broadcasts the single-
+            //    row weight across all rows automatically.
+            if let Some((wqn, wkn)) = qk_norm_weights {
+                self.run_rms_norm(
+                    dev, registry, cmd,
+                    self.batch_q.handle, wqn, self.batch_q.handle,
+                    cfg.head_dim, seq_len * cfg.n_heads,
+                    cfg.rms_norm_eps, "rms_norm_q_batch",
+                );
+                self.run_rms_norm(
+                    dev, registry, cmd,
+                    self.batch_k.handle, wkn, self.batch_k.handle,
+                    cfg.head_dim, seq_len * cfg.n_kv_heads,
+                    cfg.rms_norm_eps, "rms_norm_k_batch",
+                );
+                compute_barrier(dev, cmd);
+            }
+
+            // 2. RoPE Q + RoPE K — one dispatch each, in-place over
+            //    batch_q / batch_k. Position-buffer is pre-staged in
+            //    prefill_batch with `[base_pos, base_pos+1, …,
+            //    base_pos+M-1]` at slots 0..M.
+            self.run_rope_batch(
+                dev, registry, cmd,
+                self.batch_q.handle, self.batch_q.handle,
+                cfg.head_dim, cfg.n_heads, seq_len,
+                "rope_q_batch",
+            );
+            self.run_rope_batch(
+                dev, registry, cmd,
+                self.batch_k.handle, self.batch_k.handle,
+                cfg.head_dim, cfg.n_kv_heads, seq_len,
+                "rope_k_batch",
+            );
+            compute_barrier(dev, cmd);
+
+            // 3. Bulk KV-cache write. K and V are M contiguous rows of
+            //    `[n_kv_heads, head_dim]` in batch_k / batch_v; the
+            //    cache slot for this layer at positions
+            //    `base_pos..base_pos+M` is the same shape. One
+            //    cmd_copy_buffer per K and per V — replaces 2*M
+            //    per-token copies.
+            let kv_row_bytes = self.kv_cache.row_bytes();
+            let dst_off = self.kv_cache.pos_offset_bytes(layer, base_pos);
+            let bulk_size = (seq_len as u64) * kv_row_bytes;
+            let copy_k = vk::BufferCopy::default()
+                .src_offset(0).dst_offset(dst_off).size(bulk_size);
+            let copy_v = copy_k;
+            unsafe {
+                dev.device.cmd_copy_buffer(
+                    cmd, self.batch_k.handle, self.kv_cache.k_buffer.handle,
+                    std::slice::from_ref(&copy_k),
+                );
+                dev.device.cmd_copy_buffer(
+                    cmd, self.batch_v.handle, self.kv_cache.v_buffer.handle,
+                    std::slice::from_ref(&copy_v),
+                );
+            }
+            // Barrier: subsequent flash_attn_batch reads the KV cache
+            // (compute) which the bulk_copy just wrote (transfer).
+            let kv_bar = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            unsafe {
+                dev.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&kv_bar), &[], &[],
+                );
+            }
+        }
+
+        // Per-token loop only runs when batch_attn is OFF (legacy
+        // path). When batch_attn is ON we already handled Q/K-norm,
+        // RoPE, and the KV-cache write above; the loop body below
+        // would do that per-token, which is exactly what we replaced.
+        if !batch_attn {
         for t in 0..seq_len {
             let pos = base_pos + t;
             // RoPE position lives at slot `t` of rope_pos_buf — written
@@ -2329,20 +2506,6 @@ impl Forward {
                     std::slice::from_ref(&copy),
                 );
             }
-            // Phase 5B.2: stage post-RoPE Q back into batch_q[t] so
-            // the after-loop `flash_attn_batch` dispatch can read it.
-            // We re-use the existing q_buf → batch_q copy path (same
-            // layout: row-major `[seq_len, n_heads, head_dim]`).
-            if batch_attn {
-                let q_copy_back = vk::BufferCopy::default()
-                    .src_offset(0).dst_offset(q_off).size(q_bytes);
-                unsafe {
-                    dev.device.cmd_copy_buffer(
-                        cmd, self.q_buf.handle, self.batch_q.handle,
-                        std::slice::from_ref(&q_copy_back),
-                    );
-                }
-            }
             let kv_bar = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ);
@@ -2355,35 +2518,34 @@ impl Forward {
                     std::slice::from_ref(&kv_bar), &[], &[],
                 );
             }
-            if !batch_attn {
-                // Per-token attention path (legacy). seq_len for the
-                // attention dispatch is pos+1 (causal — only KV
-                // positions 0..=pos visible).
-                self.run_scalar_attn(dev, registry, cmd, layer, pos);
-                compute_barrier(dev, cmd);
-                // Store attn_out[t] back into batch_attn_out.
-                let copy_back = vk::BufferCopy::default()
-                    .src_offset(0).dst_offset(q_off).size(q_bytes);
-                unsafe {
-                    dev.device.cmd_copy_buffer(
-                        cmd, self.attn_out.handle, self.batch_attn_out.handle,
-                        std::slice::from_ref(&copy_back),
-                    );
-                }
-                let pst = vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ);
-                unsafe {
-                    dev.device.cmd_pipeline_barrier(
-                        cmd,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::PipelineStageFlags::COMPUTE_SHADER,
-                        vk::DependencyFlags::empty(),
-                        std::slice::from_ref(&pst), &[], &[],
-                    );
-                }
+            // Per-token attention path (legacy). seq_len for the
+            // attention dispatch is pos+1 (causal — only KV
+            // positions 0..=pos visible).
+            self.run_scalar_attn(dev, registry, cmd, layer, pos);
+            compute_barrier(dev, cmd);
+            // Store attn_out[t] back into batch_attn_out.
+            let copy_back = vk::BufferCopy::default()
+                .src_offset(0).dst_offset(q_off).size(q_bytes);
+            unsafe {
+                dev.device.cmd_copy_buffer(
+                    cmd, self.attn_out.handle, self.batch_attn_out.handle,
+                    std::slice::from_ref(&copy_back),
+                );
+            }
+            let pst = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            unsafe {
+                dev.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&pst), &[], &[],
+                );
             }
         }
+        } // end if !batch_attn
 
         // ---- (d.5) Phase 5B.2 batched attention ----
         // Replaces M attention dispatches with one. Reads post-RoPE Q
