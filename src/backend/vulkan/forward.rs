@@ -2352,9 +2352,17 @@ impl Forward {
         );
         compute_barrier(dev, cmd);
 
-        // Phase 6 v0.1.2 — mul_mm path takes FP32 activations directly,
-        // so skip the Q8_1 quantize step. mul_mmq still needs it.
-        let use_mul_mm = self.mul_mm_enabled;
+        // Phase 6/7 — mul_mm path takes FP32 activations directly, so
+        // skip the Q8_1 quantize step. mul_mmq still needs it. The
+        // aligned variant (vec4 B-loads) requires seq_len % 4 == 0;
+        // if it isn't we fall back to mul_mmq because mul_mm with
+        // scalar B-loads is ~45 % slower than mul_mmq at prefill.
+        let gemm_kind = if self.mul_mm_enabled {
+            if seq_len % 4 == 0 { GemmKind::MulMmAligned } else { GemmKind::Mmq }
+        } else {
+            GemmKind::Mmq
+        };
+        let use_mul_mm = matches!(gemm_kind, GemmKind::MulMm | GemmKind::MulMmAligned);
         let gemm_input_attn = if use_mul_mm {
             self.batch_norm.handle
         } else {
@@ -2372,9 +2380,9 @@ impl Forward {
         let wq = layer_weight(model, layer, "attn_q.weight");
         let wk = layer_weight(model, layer, "attn_k.weight");
         let wv = layer_weight(model, layer, "attn_v.weight");
-        let sq = layer_weight_shader_gemm(model, layer, "attn_q.weight", use_mul_mm);
-        let sk = layer_weight_shader_gemm(model, layer, "attn_k.weight", use_mul_mm);
-        let sv = layer_weight_shader_gemm(model, layer, "attn_v.weight", use_mul_mm);
+        let sq = layer_weight_shader_gemm(model, layer, "attn_q.weight", gemm_kind);
+        let sk = layer_weight_shader_gemm(model, layer, "attn_k.weight", gemm_kind);
+        let sv = layer_weight_shader_gemm(model, layer, "attn_v.weight", gemm_kind);
         self.run_gemm(
             dev, registry, cmd, sq, wq,
             gemm_input_attn, self.batch_q.handle,
@@ -2630,7 +2638,7 @@ impl Forward {
             self.batch_q8.handle
         };
         let wo = layer_weight(model, layer, "attn_output.weight");
-        let so = layer_weight_shader_gemm(model, layer, "attn_output.weight", use_mul_mm);
+        let so = layer_weight_shader_gemm(model, layer, "attn_output.weight", gemm_kind);
         self.run_gemm(
             dev, registry, cmd, so, wo,
             gemm_input_o, self.batch_o.handle,
@@ -2673,8 +2681,8 @@ impl Forward {
         // ---- (i) Gate + Up GEMMs. ----
         let wg = layer_weight(model, layer, "ffn_gate.weight");
         let wu = layer_weight(model, layer, "ffn_up.weight");
-        let sg = layer_weight_shader_gemm(model, layer, "ffn_gate.weight", use_mul_mm);
-        let su = layer_weight_shader_gemm(model, layer, "ffn_up.weight", use_mul_mm);
+        let sg = layer_weight_shader_gemm(model, layer, "ffn_gate.weight", gemm_kind);
+        let su = layer_weight_shader_gemm(model, layer, "ffn_up.weight", gemm_kind);
         self.run_gemm(
             dev, registry, cmd, sg, wg,
             gemm_input_ffn, self.batch_gate.handle,
@@ -2713,7 +2721,7 @@ impl Forward {
             self.batch_q8.handle
         };
         let wd = layer_weight(model, layer, "ffn_down.weight");
-        let sd = layer_weight_shader_gemm(model, layer, "ffn_down.weight", use_mul_mm);
+        let sd = layer_weight_shader_gemm(model, layer, "ffn_down.weight", gemm_kind);
         self.run_gemm(
             dev, registry, cmd, sd, wd,
             gemm_input_down, self.batch_ffn_out.handle,
@@ -2732,18 +2740,18 @@ impl Forward {
     }
 }
 
-/// Same shape as `layer_weight_shader` but returns the integer-MMQ
-/// (GEMM) variant. Used by `prefill_batch`.
-/// Phase 6 v0.1.2 — pick the right GEMM shader for a given layer
-/// weight, switching between `mul_mm.comp` (FP32 activations) and
-/// `mul_mmq.comp` (Q8_1 activations) based on `use_mul_mm`.
-/// Mixed-quant in Qwen3 (`attn_v` + `ffn_down` are Q6_K, the rest
-/// Q4_K) goes through both code paths.
+/// Phase 6/7 — pick the right GEMM shader for a given layer weight.
+///
+/// `gemm_kind` is the per-batch choice: `Mmq` (Q8_1 activations),
+/// `MulMm` (FP32 activations, scalar B-loads), or `MulMmAligned`
+/// (FP32 activations, vec4 B-loads — only safe when shader N is
+/// divisible by 4). Mixed-quant in Qwen3 (`attn_v` + `ffn_down`
+/// are Q6_K, the rest Q4_K) goes through both Q4_K and Q6_K paths.
 fn layer_weight_shader_gemm(
     model: &LoadedModel,
     layer: u32,
     suffix: &str,
-    use_mul_mm: bool,
+    gemm_kind: GemmKind,
 ) -> ShaderId {
     let key = format!("blk.{layer}.{suffix}");
     let q6 = model
@@ -2751,12 +2759,33 @@ fn layer_weight_shader_gemm(
         .unwrap_or_else(|| panic!("missing tensor '{key}'"))
         .ggml_type
         == GgmlType::Q6K;
-    match (use_mul_mm, q6) {
-        (true,  true)  => ShaderId::MulMmQ6K,
-        (true,  false) => ShaderId::MulMmQ4K,
-        (false, true)  => ShaderId::MulMmqQ6K,
-        (false, false) => ShaderId::MulMmqQ4K,
+    match (gemm_kind, q6) {
+        (GemmKind::MulMmAligned, true)  => ShaderId::MulMmQ6KAligned,
+        (GemmKind::MulMmAligned, false) => ShaderId::MulMmQ4KAligned,
+        (GemmKind::MulMm,        true)  => ShaderId::MulMmQ6K,
+        (GemmKind::MulMm,        false) => ShaderId::MulMmQ4K,
+        (GemmKind::Mmq,          true)  => ShaderId::MulMmqQ6K,
+        (GemmKind::Mmq,          false) => ShaderId::MulMmqQ4K,
     }
+}
+
+/// Per-batch GEMM dispatch kind. Decided once per `dispatch_layer_batch`
+/// call from the configured `mul_mm_enabled` flag and the runtime
+/// `seq_len % 4` alignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GemmKind {
+    /// `mul_mmq.comp`: Q8_1-quantized activations. Always valid.
+    Mmq,
+    /// `mul_mm.comp`: FP32 activations, scalar B-loads. Reachable
+    /// only via diagnostic / parity tests; production routes either
+    /// `Mmq` or `MulMmAligned`.
+    #[allow(dead_code)]
+    MulMm,
+    /// `mul_mm.comp` with `ALIGNED=1 / LOAD_VEC_B=4 / B_TYPE=vec4`.
+    /// Used when `mul_mm_enabled` and `seq_len % 4 == 0`. The
+    /// vec4 B-load path skips the unaligned bounds check, so this
+    /// is unsafe at unaligned `seq_len`.
+    MulMmAligned,
 }
 
 #[allow(dead_code)] // Kept for parity with `layer_weight_shader_gemm`; still referenced

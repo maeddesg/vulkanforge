@@ -235,7 +235,8 @@ impl PipelineRegistry {
                     // workgroup geometry).
                     ComputeKernel::from_spv(device, &words, cache)
                 }
-                ShaderId::MulMmQ4K | ShaderId::MulMmQ6K => {
+                ShaderId::MulMmQ4K | ShaderId::MulMmQ6K
+                | ShaderId::MulMmQ4KAligned | ShaderId::MulMmQ6KAligned => {
                     // Phase 6 v0.1.2 — mul_mm.comp port. Same spec-
                     // constant layout as MulMmqQ4K/Q6K but no
                     // ACC_TYPEV2 (the build defines that as `vec2` —

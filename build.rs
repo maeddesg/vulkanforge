@@ -227,6 +227,50 @@ const JOBS: &[ShaderJob] = &[
             ("LOAD_VEC_A", "2"),
         ],
     },
+    // Phase 7 (cont.) — aligned mul_mm variants. Mirror llama.cpp's
+    // vulkan-shaders-gen.cpp:583 logic: ALIGNED=1, LOAD_VEC_B=4,
+    // B_TYPE=vec4 → load_b_to_shmem takes the vec4-of-floats path
+    // at mul_mm_funcs.glsl:535. Only safe when shader N (= seq_len)
+    // is divisible by LOAD_VEC_B; runtime falls back to mul_mmq when
+    // not aligned.
+    ShaderJob {
+        out_name: "mul_mm_q4_k_f32_aligned.spv",
+        entry_source: "mul_mm.comp",
+        defines: &[
+            ("DATA_A_Q4_K", "1"),
+            ("A_TYPE", "block_q4_K"),
+            ("A_TYPE_PACKED32", "block_q4_K_packed32"),
+            ("B_TYPE", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("FLOAT_TYPEV4", "vec4"),
+            ("ACC_TYPE", "float"),
+            ("ACC_TYPEV2", "vec2"),
+            ("LOAD_VEC_A", "4"),
+            ("LOAD_VEC_B", "4"),
+            ("ALIGNED", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mm_q6_k_f32_aligned.spv",
+        entry_source: "mul_mm.comp",
+        defines: &[
+            ("DATA_A_Q6_K", "1"),
+            ("A_TYPE", "block_q6_K"),
+            ("A_TYPE_PACKED16", "block_q6_K_packed16"),
+            ("B_TYPE", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("FLOAT_TYPEV4", "vec4"),
+            ("ACC_TYPE", "float"),
+            ("ACC_TYPEV2", "vec2"),
+            ("LOAD_VEC_A", "2"),
+            ("LOAD_VEC_B", "4"),
+            ("ALIGNED", "1"),
+        ],
+    },
     // Phase-3C: Q4_K integer-MMQ GEMM. Mirrors the defines
     // llama.cpp's vulkan-shaders-gen passes for a non-MoE, non-coopmat
     // Q4_K mul_mmq build. Used by Forward::prefill_batch (TBD) and

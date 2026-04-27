@@ -42,6 +42,12 @@ pub enum ShaderId {
     // fallback.
     MulMmQ4K,
     MulMmQ6K,
+    // Phase 7 (cont.) — aligned mul_mm. Same shader, built with
+    // ALIGNED=1 / LOAD_VEC_B=4 / B_TYPE=vec4 so load_b_to_shmem takes
+    // the vec4 path. Only valid when the shader's N (= seq_len) is
+    // divisible by 4; runtime falls back to mul_mmq otherwise.
+    MulMmQ4KAligned,
+    MulMmQ6KAligned,
 }
 
 impl ShaderId {
@@ -67,6 +73,8 @@ impl ShaderId {
             ShaderId::FlashAttnBatch => "flash_attn_batch_f32",
             ShaderId::MulMmQ4K => "mul_mm_q4_k_f32",
             ShaderId::MulMmQ6K => "mul_mm_q6_k_f32",
+            ShaderId::MulMmQ4KAligned => "mul_mm_q4_k_f32_aligned",
+            ShaderId::MulMmQ6KAligned => "mul_mm_q6_k_f32_aligned",
         }
     }
 
@@ -92,6 +100,8 @@ impl ShaderId {
             ShaderId::FlashAttnBatch => FLASH_ATTN_BATCH_F32,
             ShaderId::MulMmQ4K => MUL_MM_Q4_K_F32,
             ShaderId::MulMmQ6K => MUL_MM_Q6_K_F32,
+            ShaderId::MulMmQ4KAligned => MUL_MM_Q4_K_F32_ALIGNED,
+            ShaderId::MulMmQ6KAligned => MUL_MM_Q6_K_F32_ALIGNED,
         }
     }
 }
@@ -117,6 +127,8 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::FlashAttnBatch,
     ShaderId::MulMmQ4K,
     ShaderId::MulMmQ6K,
+    ShaderId::MulMmQ4KAligned,
+    ShaderId::MulMmQ6KAligned,
 ];
 
 pub const MUL_MAT_VEC_Q4_K_F32_F32: &[u8] =
@@ -151,6 +163,10 @@ pub const MUL_MM_Q4_K_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q4_k_f32.spv"));
 pub const MUL_MM_Q6_K_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q6_k_f32.spv"));
+pub const MUL_MM_Q4_K_F32_ALIGNED: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q4_k_f32_aligned.spv"));
+pub const MUL_MM_Q6_K_F32_ALIGNED: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q6_k_f32_aligned.spv"));
 
 /// Decode a SPIR-V byte blob into u32 words. Vulkan consumes SPIR-V
 /// as `&[u32]`; `include_bytes!` only gives us `&[u8]` whose alignment

@@ -1113,6 +1113,136 @@ fn test_mul_mm_q4k_multi_m_tile_128()    { run_mul_mm_parity(128, 64, 256, "M=12
 #[test]
 fn test_mul_mm_q4k_realistic_2048x62()   { run_mul_mm_parity(2048, 62, 2048, "real prefill"); }
 
+// Phase 7 — aligned variant (LOAD_VEC_B=4, vec4 B-loads) parity. N
+// must be divisible by 4 for the aligned shader to be safe; the
+// unaligned bounds check is removed, so off-the-end reads on B
+// would otherwise be UB.
+fn run_mul_mm_aligned_parity(m: u32, n: u32, k: u32, label: &str) {
+    use vulkanforge::backend::vulkan::q4k;
+    assert_eq!(n % 4, 0, "aligned variant requires N % 4 == 0");
+    assert_eq!(k as usize % q4k::QUANT_K, 0, "K must be a multiple of QUANT_K");
+
+    let mut fix = Fixture::new();
+
+    let weights = q4k::build_random_weights(m as usize, k as usize, 0xBEEFCAFE);
+    let w_buf = {
+        let device = fix.dev.device.clone();
+        let allocator = fix.allocator.as_mut().unwrap();
+        let mut b = GpuBuffer::new(
+            &device, allocator, weights.len() as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu,
+            "aligned_w",
+        ).expect("alloc weights");
+        b.write_bytes(&weights).expect("write weights");
+        fix.track(b)
+    };
+
+    let acts: Vec<f32> = (0..(n * k))
+        .map(|i| ((i as f32) * 0.011).cos() * 0.4)
+        .collect();
+    let act_buf = fix.host_buffer_f32(&acts, "aligned_act");
+    let out_buf = fix.output_buffer_f32((m * n) as usize, "aligned_out");
+
+    let pc = MmqPushConstants {
+        m, n, k,
+        stride_a: k,
+        stride_b: k,
+        stride_d: m,
+        batch_stride_a: m * k,
+        batch_stride_b: n * k,
+        batch_stride_d: m * n,
+        base_work_group_z: 0,
+        num_batches: 1,
+        k_split: k,
+        ne02: 1, ne12: 1,
+        broadcast2: 1, broadcast3: 1,
+    };
+    let groups_x = (m + 63) / 64;
+    let groups_y = (n + 63) / 64;
+    fix.dispatch(
+        ShaderId::MulMmQ4KAligned, &[w_buf, act_buf, out_buf],
+        bytemuck::bytes_of(&pc),
+        (groups_x, groups_y, 1),
+    );
+
+    let gpu = fix.read_output(out_buf, (m * n) as usize);
+    let cpu = cpu_gemm_q4k_ref(&weights, &acts, m as usize, n as usize, k as usize);
+
+    let nan = gpu.iter().any(|x| !x.is_finite());
+    assert!(!nan, "mul_mm aligned[{label}] M={m} N={n} K={k} produced NaN/Inf");
+
+    let max_err = max_abs_err(&gpu, &cpu);
+    let max_amax = cpu.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let thresh = (max_amax * 0.01).max(0.1);
+    assert!(
+        max_err < thresh,
+        "mul_mm aligned[{label}] M={m} N={n} K={k} max_err={max_err:e} >= {thresh:e}"
+    );
+    fix.teardown();
+}
+
+#[test]
+fn test_mul_mm_aligned_q4k_64x64()       { run_mul_mm_aligned_parity(64,   64, 256, "aligned 64x64"); }
+#[test]
+fn test_mul_mm_aligned_q4k_k2048()       { run_mul_mm_aligned_parity(64,   64, 2048, "aligned K=2048"); }
+#[test]
+fn test_mul_mm_aligned_q4k_n128()        { run_mul_mm_aligned_parity(64,  128, 256, "aligned N=128"); }
+#[test]
+fn test_mul_mm_aligned_q4k_real_dims()   { run_mul_mm_aligned_parity(2048, 60, 2048, "aligned real prefill (N=60)"); }
+#[test]
+fn test_mul_mm_aligned_q4k_ffn_dims()    { run_mul_mm_aligned_parity(2048, 60, 11008, "aligned ffn_down (N=60)"); }
+// Bit-exact check vs the unaligned variant on the same inputs. This
+// is the strongest correctness gate: the aligned shader must produce
+// identical results to the unaligned one when N % 4 == 0.
+#[test]
+fn test_mul_mm_aligned_matches_unaligned_q4k() {
+    use vulkanforge::backend::vulkan::q4k;
+    let mut fix = Fixture::new();
+    let m: u32 = 128;
+    let n: u32 = 64; // % 4 == 0
+    let k: u32 = 2048;
+    let weights = q4k::build_random_weights(m as usize, k as usize, 0xDEADC0DE);
+    let acts: Vec<f32> = (0..(n * k)).map(|i| ((i as f32) * 0.017).sin() * 0.3).collect();
+    let w_buf = {
+        let device = fix.dev.device.clone();
+        let allocator = fix.allocator.as_mut().unwrap();
+        let mut b = GpuBuffer::new(
+            &device, allocator, weights.len() as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "w_match",
+        ).expect("alloc");
+        b.write_bytes(&weights).expect("write");
+        fix.track(b)
+    };
+    let act_buf = fix.host_buffer_f32(&acts, "act_match");
+    let out_unaligned = fix.output_buffer_f32((m * n) as usize, "out_un");
+    let out_aligned = fix.output_buffer_f32((m * n) as usize, "out_aligned");
+
+    let pc = MmqPushConstants {
+        m, n, k,
+        stride_a: k, stride_b: k, stride_d: m,
+        batch_stride_a: m * k, batch_stride_b: n * k, batch_stride_d: m * n,
+        base_work_group_z: 0, num_batches: 1, k_split: k,
+        ne02: 1, ne12: 1, broadcast2: 1, broadcast3: 1,
+    };
+    let groups = ((m + 63) / 64, (n + 63) / 64, 1);
+    fix.dispatch(ShaderId::MulMmQ4K, &[w_buf, act_buf, out_unaligned], bytemuck::bytes_of(&pc), groups);
+    fix.dispatch(ShaderId::MulMmQ4KAligned, &[w_buf, act_buf, out_aligned], bytemuck::bytes_of(&pc), groups);
+
+    let g_un = fix.read_output(out_unaligned, (m * n) as usize);
+    let g_al = fix.read_output(out_aligned, (m * n) as usize);
+
+    // Same shader, different load pattern → output must match within
+    // float-summation order tolerance. The accumulation order is
+    // identical (load order changes, FMA chain stays per-thread the
+    // same), so we expect bit-exactness in practice.
+    let max_err = max_abs_err(&g_un, &g_al);
+    assert!(
+        max_err < 1e-4,
+        "aligned vs unaligned diverged: max_err = {max_err:e}"
+    );
+    fix.teardown();
+}
+
 // FFN-down dims: M=hidden=2048, N=seq=62, K=ffn_dim=11008.
 // 11008 / QUANT_K = 43 BK iterations — most likely place a K-loop bug
 // would surface if it weren't visible at K=2048 (8 iterations).
