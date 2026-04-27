@@ -1,64 +1,105 @@
 # Changelog
 
-## v0.1.1 — Phase 5C: SPM Tokenizer + Mistral Support (2026-04-27)
+## v0.1.1 — Phase 5B + 5C combined (2026-04-27)
 
-### Headline
+### Headline performance (RX 9070 XT, 15-prompt suite)
 
-Adds SentencePiece tokenizer support, unblocking the Mistral / Llama-2
-GGUF family. `Mistral-7B-Instruct-v0.3-Q4_K_M` joins Qwen3, Llama-3.1
-and DeepSeek-R1 in the supported set — four models on a shared backend.
+| Model | Decode tok/s (median) | Prefill tok/s (median) | Δ vs Phase 5A |
+|---|---:|---:|---:|
+| Qwen3-8B-Q4_K_M | **88.8** | **1082.3** | prefill +167 % (was 404.9) |
+| Meta-Llama-3.1-8B-Instruct | **94.8** | **1140.4** | prefill +133 % (was 489.9) |
+| DeepSeek-R1-Distill-Llama-8B | **95.2** | **919.0** | prefill +112 % (was 433.9) |
+| Mistral-7B-Instruct-v0.3 | **100.4** | **949.0** | (new model) |
 
-### Mistral-7B-Instruct-v0.3 — 5-prompt smoke
+VulkanForge prefill is now above the **ROCmForge HIP backend** ceiling
+(~768 tok/s) for the first time and reaches ~48 % of llama.cpp Vulkan
+(2274 tok/s, build 23b8cc4 `-fa 1`). Decode unchanged from Phase 5A
+at ~76 % of llama.cpp Vulkan. Alice 6-turn multi-turn context-
+retention test: **3 / 3 critical turns on all four models**.
 
-| Metric | Value |
-|---|---:|
-| Decode median | **102.7 tok/s** |
-| Prefill median | 333.6 tok/s |
-| Coherence | 5 / 5 |
+### Phase 5B — fully-batched prefill (5B.1 + 5B.2 + 5B.3)
 
-Prompts: Mutex Explanation · Haiku · 2+2 · Translate-to-German · Prime
-Check (Python). All five returned coherent, on-topic outputs.
+- **`flash_attn_batch.comp`** (Phase 5B.1): batched-Q flash attention
+  shader. One dispatch covers (n_heads, M, 1) with a per-query causal
+  mask `causal_len = q_start + q_idx + 1`. 145 LOC, 12 816 B SPIR-V.
+  Eight isolated parity tests vs an f64 CPU reference.
+- **`Forward::prefill_batch` integration** (Phase 5B.2): replaces
+  the M-fold per-token attention dispatch loop with a single
+  `flash_attn_batch` call. `+26 %` median prefill on Qwen3.
+- **Per-token loop eliminated** (Phase 5B.3): batched RoPE (one
+  dispatch per Q/K with `ne02 = M` and `rope_pos_buf[i2]`), batched
+  Q/K-norm (`rms_norm` with `nrows = M × heads_per_token`), bulk
+  KV-cache write (one `cmd_copy_buffer` per K/V per layer). Per-
+  token sub-dispatch count `~22 860 → ~756` for `pp=62` (`~30 ×`).
+  `+69 %` median prefill on top of 5B.2.
+- Gated on `VULKANFORGE_BATCH_ATTN` (default ON; `=0` falls back to
+  the per-token attention loop, useful for parity testing).
+- No new shaders for 5B.2 / 5B.3 — all integration was host-side
+  re-binding of existing `rope_neox.comp` / `rope_norm.comp` /
+  `rms_norm.comp`.
 
-### Added
+### Phase 5C — SPM Tokenizer + Mistral Support
 
-- `src/backend/vulkan/spm.rs` — SentencePiece tokenizer using the
-  greedy bigram-merge algorithm (mirrors llama.cpp's
-  `llm_tokenizer_spm`). Score-priority merge over a doubly-linked-list
-  of UTF-8-char symbols, byte-fallback (`<0xHH>`) and `<unk>` for
-  unmappable chars, optional `▁` (U+2581) leading-space normalisation.
-- `Tokenizer::is_spm` / `Tokenizer::encode_no_prefix` — SPM-aware
-  helpers used by the Mistral chat template.
-- `ChatTemplate::Mistral` — `<s>[INST] {body} [/INST]` rendering with
-  the `[INST]` / `[/INST]` brackets emitted as their dedicated
-  vocab ids (3 / 4) instead of being re-tokenised as ASCII. Auto-
-  detected from the GGUF Jinja template.
-- 4 new regression tests (`phase5c_*`) for the SPM tokenizer + Mistral
-  chat template on `Mistral-7B-Instruct-v0.3.Q4_K_M.gguf`.
-- 4 new lib unit tests covering byte-token parsing, UTF-8 char-length
-  arithmetic, SPM normalisation, and the bigram priority queue.
-- `examples/spm_dump.rs` — tokenizer / vocab / template diagnostic
-  driver.
-- `inference_test_prompts_mistral_5.json` — 5-prompt suite used by
-  `run_15prompt_bench` for Mistral coherence checks.
-
-### Changed
-
+- SentencePiece Unigram tokenizer (greedy bigram-merge, mirrors
+  llama.cpp's `llm_tokenizer_spm`). 422 LOC.
+- Mistral-7B-Instruct-v0.3 support (`[INST] {body} [/INST]` template
+  with the brackets emitted as their dedicated vocab ids 3 / 4).
 - `Tokenizer` is now a dispatch struct over an internal
-  `TokenizerInner::{Bpe, Spm}` enum. Public field surface (`bos_id`,
-  `eos_id`, `im_start_id`, …) is unchanged; the `flavour()` method
-  now returns `Option<TokenizerFlavour>` and is `None` for SPM-backed
-  tokenizers (Mistral, Llama-2).
-- `ChatTemplate::detect` recognises Mistral templates by their `[INST]`
-  marker before falling back to the tokenizer flavour. SPM-flavoured
-  models with no Jinja signature default to `ChatTemplate::Mistral`.
-- `TokenizerError::Malformed(String)` added for SPM array-length
-  validation.
+  `TokenizerInner::{Bpe, Spm}` enum.
+- 4 new regression tests + 5 new lib unit tests for SPM + Mistral.
 
-### Notes / non-goals
+### Prompt 16 — Alice multi-turn context retention
 
-- No prefill optimisation in this release (Phase 5B target).
-- No Llama-2 chat support (different template even though the
-  tokenizer is the same SPM family — out of scope here).
+- Six-turn `ChatSession` exchange with NO `reset()` between turns.
+- Three critical turns ask the model to recall name / city / both.
+- All four supported models 3 / 3 PASS — multi-turn KV-cache
+  + chat-template-continuation is correct end-to-end.
+
+### Test infrastructure
+
+- `RUST_TEST_THREADS = 4` in `.cargo/config.toml` (the regression
+  suite now has 25 tests each loading ~5 GiB of weights into
+  the 16 GiB VRAM budget; default `num_cpus`-many threads
+  manifest as `VK_ERROR_DEVICE_LOST`).
+- 77 tests total (19 lib unit + 33 correctness + 25 regression).
+- Regression-suite wall-clock dropped 86 s → 36 s after Phase 5B.3
+  (every prefill-using test now goes through the batched path).
+
+### Files added / changed in v0.1.1
+
+```
+NEW   vk_shaders/flash_attn_batch.comp
+NEW   src/backend/vulkan/spm.rs
+NEW   examples/run_alice_test.rs
+NEW   examples/probe_batch_attn.rs
+NEW   examples/spm_dump.rs
+NEW   inference_test_prompts_16.json
+NEW   inference_test_prompts_mistral_5.json
+NEW   .cargo/config.toml
+NEW   results/phase5b_step_1_batch_attn.md
+NEW   results/phase5b_step_2_integration.md
+NEW   results/phase5b_step_3_batch_ops.md
+NEW   results/phase5b_step_4_benchmark.md
+NEW   results/phase5c_spm_tokenizer.md
+NEW   results/prompt16_alice_test.md
+
+EDIT  src/backend/vulkan/forward.rs
+EDIT  src/backend/vulkan/tokenizer.rs           (refactored to dispatch over BPE/SPM)
+EDIT  src/backend/vulkan/chat_template.rs       (+ ChatTemplate::Mistral)
+EDIT  src/backend/vulkan/pipeline.rs            (+ FlashAttnBatchPushConstants)
+EDIT  src/backend/vulkan/pipeline_registry.rs
+EDIT  src/backend/vulkan/shaders.rs             (+ ShaderId::FlashAttnBatch)
+EDIT  src/backend/vulkan/mod.rs                 (pub mod spm)
+EDIT  build.rs                                  (+ flash_attn_batch compile job)
+EDIT  src/lib.rs                                (+ clippy::large_enum_variant allow)
+EDIT  tests/regression.rs                       (+ 8 new tests)
+EDIT  tests/correctness.rs                      (+ 8 new batch-attn parity tests)
+EDIT  Cargo.toml                                (0.1.0 → 0.1.1)
+EDIT  README.md                                 (perf table refresh)
+EDIT  CHANGELOG.md                              (this entry)
+```
+
+---
 
 ## Phase 5A — CB-Reuse via Persistent Descriptor Sets (2026-04-26)
 
