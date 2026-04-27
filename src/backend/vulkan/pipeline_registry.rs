@@ -228,6 +228,53 @@ impl PipelineRegistry {
                     // workgroup geometry).
                     ComputeKernel::from_spv(device, &words, cache)
                 }
+                ShaderId::MulMmQ4K | ShaderId::MulMmQ6K => {
+                    // Phase 6 v0.1.2 — mul_mm.comp port. Same spec-
+                    // constant layout as MulMmqQ4K/Q6K but no
+                    // ACC_TYPEV2 (the build defines that as `vec2` —
+                    // we still pin via spec-constant for runtime
+                    // tunability).
+                    //
+                    // Phase 6 v0.1.2 (cont.) tile-tuning win was
+                    // TM=2 / TN=4 on mul_mmq; the same shape
+                    // applies here because the inner-loop math is
+                    // identical (FP32 accumulator, vec2-packed
+                    // shared memory).
+                    let block_size: u32 = std::env::var("VULKANFORGE_GEMM_BLOCK_SIZE")
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(128);
+                    let tm: u32 = std::env::var("VULKANFORGE_GEMM_TM")
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+                    let tn: u32 = std::env::var("VULKANFORGE_GEMM_TN")
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+                    let entries = [
+                        entry(0, 0, 4),
+                        entry(1, 4, 4),
+                        entry(2, 8, 4),
+                        entry(3, 12, 4),
+                        entry(4, 16, 4),
+                        entry(5, 20, 4),
+                        entry(6, 24, 4),
+                        entry(7, 28, 4),
+                        entry(8, 32, 4),
+                        entry(9, 36, 4),
+                        entry(10, 40, 4),
+                    ];
+                    let data: [u32; 11] = [
+                        block_size, // BLOCK_SIZE
+                        64,  // BM
+                        64,  // BN
+                        32,  // BK
+                        32,  // WM
+                        32,  // WN
+                        2,   // WMITER
+                        tm,  // TM
+                        tn,  // TN
+                        1,   // TK (no coopmat)
+                        64,  // WARP — RDNA Wave64
+                    ];
+                    let bytes = bytemuck::bytes_of(&data);
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
+                }
                 ShaderId::FlashAttnBatch => {
                     // SpecId 0 = MAX_SEQ — kept for parity with FlashAttn
                     // even though the runtime path uses push-constant

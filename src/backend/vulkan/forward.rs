@@ -192,6 +192,13 @@ pub struct Forward {
     /// from `batch_q` and writing to `batch_attn_out`.
     batch_attn_enabled: bool,
 
+    /// Phase 6 v0.1.2 toggle for the mul_mm.comp port. `true`
+    /// (default; `VULKANFORGE_USE_MUL_MM=0` opts out) routes the
+    /// 7 prefill GEMMs (Q/K/V/O/gate/up/down) through mul_mm with
+    /// FP32 activations, skipping the `quantize_q8_1` dispatch
+    /// before each. mul_mmq stays as the gated fallback.
+    mul_mm_enabled: bool,
+
     /// `forward_token` hot path. When `cache_enabled` is true (env
     /// `VULKANFORGE_CB_REUSE=1` at construction), `alloc_or_get_set`
     /// reuses sets across tokens instead of resetting the pool.
@@ -409,6 +416,20 @@ impl Forward {
             _ => true,
         };
 
+        // Phase 6 v0.1.2: mul_mm.comp port is OFF by default — the
+        // parity gate (phase3e_prefill_batch_matches_token_by_token_top5
+        // and the phase5b2_* tests) does not pass. The shader compiles
+        // and dispatches without driver errors, but produces NaN/garbage
+        // logits with `LOAD_VEC_A=4` (matching llama.cpp's setting) and
+        // wrong-but-finite logits with `LOAD_VEC_A=1`. Diagnostic path
+        // needs GPU step-through debugging. Set VULKANFORGE_USE_MUL_MM=1
+        // to opt in (e.g. for further debugging). See
+        // results/phase6_mul_mm_port.md for the full investigation.
+        let mul_mm_enabled = match std::env::var("VULKANFORGE_USE_MUL_MM") {
+            Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
+            _ => false,
+        };
+
         // Note for tests: callers that need to override the env-var
         // pick can use `set_cache_enabled` / `set_batch_attn_enabled`
         // after construction.
@@ -429,6 +450,7 @@ impl Forward {
             set_cache: HashMap::new(),
             cache_enabled,
             batch_attn_enabled,
+            mul_mm_enabled,
             profiler,
             rope_theta_scale, attn_scale,
             fa_scratch_out, fa_scratch_max, fa_scratch_sum,
@@ -1338,6 +1360,16 @@ impl Forward {
 
     pub fn batch_attn_enabled(&self) -> bool {
         self.batch_attn_enabled
+    }
+
+    /// Phase 6 v0.1.2 test escape hatch — toggle the mul_mm.comp
+    /// path independently of `VULKANFORGE_USE_MUL_MM`.
+    pub fn set_mul_mm_enabled(&mut self, enabled: bool) {
+        self.mul_mm_enabled = enabled;
+    }
+
+    pub fn mul_mm_enabled(&self) -> bool {
+        self.mul_mm_enabled
     }
 
     /// Phase 5A-2 Stage 2D: cache-aware descriptor-set fetch. When
@@ -2308,34 +2340,42 @@ impl Forward {
         );
         compute_barrier(dev, cmd);
 
-        // ---- (b) Quantize attn_norm output → Q8_1 ----
-        self.run_quantize_q8_1(
-            dev, registry, cmd,
-            self.batch_norm.handle, self.batch_q8.handle,
-            seq_len * hidden, "quantize_attn",
-        );
-        compute_barrier(dev, cmd);
+        // Phase 6 v0.1.2 — mul_mm path takes FP32 activations directly,
+        // so skip the Q8_1 quantize step. mul_mmq still needs it.
+        let use_mul_mm = self.mul_mm_enabled;
+        let gemm_input_attn = if use_mul_mm {
+            self.batch_norm.handle
+        } else {
+            // ---- (b) Quantize attn_norm output → Q8_1 (mul_mmq path) ----
+            self.run_quantize_q8_1(
+                dev, registry, cmd,
+                self.batch_norm.handle, self.batch_q8.handle,
+                seq_len * hidden, "quantize_attn",
+            );
+            compute_barrier(dev, cmd);
+            self.batch_q8.handle
+        };
 
         // ---- (c) Q/K/V GEMMs. Mixed-quant: V uses Q6_K. ----
         let wq = layer_weight(model, layer, "attn_q.weight");
         let wk = layer_weight(model, layer, "attn_k.weight");
         let wv = layer_weight(model, layer, "attn_v.weight");
-        let sq = layer_weight_shader_mmq(model, layer, "attn_q.weight");
-        let sk = layer_weight_shader_mmq(model, layer, "attn_k.weight");
-        let sv = layer_weight_shader_mmq(model, layer, "attn_v.weight");
+        let sq = layer_weight_shader_gemm(model, layer, "attn_q.weight", use_mul_mm);
+        let sk = layer_weight_shader_gemm(model, layer, "attn_k.weight", use_mul_mm);
+        let sv = layer_weight_shader_gemm(model, layer, "attn_v.weight", use_mul_mm);
         self.run_gemm(
             dev, registry, cmd, sq, wq,
-            self.batch_q8.handle, self.batch_q.handle,
+            gemm_input_attn, self.batch_q.handle,
             q_dim, seq_len, hidden, "gemm_q",
         );
         self.run_gemm(
             dev, registry, cmd, sk, wk,
-            self.batch_q8.handle, self.batch_k.handle,
+            gemm_input_attn, self.batch_k.handle,
             kv_dim, seq_len, hidden, "gemm_k",
         );
         self.run_gemm(
             dev, registry, cmd, sv, wv,
-            self.batch_q8.handle, self.batch_v.handle,
+            gemm_input_attn, self.batch_v.handle,
             kv_dim, seq_len, hidden, "gemm_v",
         );
         compute_barrier(dev, cmd);
@@ -2566,17 +2606,22 @@ impl Forward {
         }
 
         // ---- (e) Output projection: GEMM(attn_out → o_batch). ----
-        self.run_quantize_q8_1(
-            dev, registry, cmd,
-            self.batch_attn_out.handle, self.batch_q8.handle,
-            seq_len * q_dim, "quantize_attn_out",
-        );
-        compute_barrier(dev, cmd);
+        let gemm_input_o = if use_mul_mm {
+            self.batch_attn_out.handle
+        } else {
+            self.run_quantize_q8_1(
+                dev, registry, cmd,
+                self.batch_attn_out.handle, self.batch_q8.handle,
+                seq_len * q_dim, "quantize_attn_out",
+            );
+            compute_barrier(dev, cmd);
+            self.batch_q8.handle
+        };
         let wo = layer_weight(model, layer, "attn_output.weight");
-        let so = layer_weight_shader_mmq(model, layer, "attn_output.weight");
+        let so = layer_weight_shader_gemm(model, layer, "attn_output.weight", use_mul_mm);
         self.run_gemm(
             dev, registry, cmd, so, wo,
-            self.batch_q8.handle, self.batch_o.handle,
+            gemm_input_o, self.batch_o.handle,
             hidden, seq_len, q_dim, "gemm_o",
         );
         compute_barrier(dev, cmd);
@@ -2600,27 +2645,32 @@ impl Forward {
         );
         compute_barrier(dev, cmd);
 
-        // ---- (h) Quantize FFN-norm output. ----
-        self.run_quantize_q8_1(
-            dev, registry, cmd,
-            self.batch_norm.handle, self.batch_q8.handle,
-            seq_len * hidden, "quantize_ffn",
-        );
-        compute_barrier(dev, cmd);
+        // ---- (h) Quantize FFN-norm output (mul_mmq path only). ----
+        let gemm_input_ffn = if use_mul_mm {
+            self.batch_norm.handle
+        } else {
+            self.run_quantize_q8_1(
+                dev, registry, cmd,
+                self.batch_norm.handle, self.batch_q8.handle,
+                seq_len * hidden, "quantize_ffn",
+            );
+            compute_barrier(dev, cmd);
+            self.batch_q8.handle
+        };
 
         // ---- (i) Gate + Up GEMMs. ----
         let wg = layer_weight(model, layer, "ffn_gate.weight");
         let wu = layer_weight(model, layer, "ffn_up.weight");
-        let sg = layer_weight_shader_mmq(model, layer, "ffn_gate.weight");
-        let su = layer_weight_shader_mmq(model, layer, "ffn_up.weight");
+        let sg = layer_weight_shader_gemm(model, layer, "ffn_gate.weight", use_mul_mm);
+        let su = layer_weight_shader_gemm(model, layer, "ffn_up.weight", use_mul_mm);
         self.run_gemm(
             dev, registry, cmd, sg, wg,
-            self.batch_q8.handle, self.batch_gate.handle,
+            gemm_input_ffn, self.batch_gate.handle,
             ffn, seq_len, hidden, "gemm_gate",
         );
         self.run_gemm(
             dev, registry, cmd, su, wu,
-            self.batch_q8.handle, self.batch_up.handle,
+            gemm_input_ffn, self.batch_up.handle,
             ffn, seq_len, hidden, "gemm_up",
         );
         compute_barrier(dev, cmd);
@@ -2639,17 +2689,22 @@ impl Forward {
         compute_barrier(dev, cmd);
 
         // ---- (k) Quantize ffn_hidden + Down-proj GEMM (Q6_K). ----
-        self.run_quantize_q8_1(
-            dev, registry, cmd,
-            self.batch_ffn_hidden.handle, self.batch_q8.handle,
-            seq_len * ffn, "quantize_ffn_h",
-        );
-        compute_barrier(dev, cmd);
+        let gemm_input_down = if use_mul_mm {
+            self.batch_ffn_hidden.handle
+        } else {
+            self.run_quantize_q8_1(
+                dev, registry, cmd,
+                self.batch_ffn_hidden.handle, self.batch_q8.handle,
+                seq_len * ffn, "quantize_ffn_h",
+            );
+            compute_barrier(dev, cmd);
+            self.batch_q8.handle
+        };
         let wd = layer_weight(model, layer, "ffn_down.weight");
-        let sd = layer_weight_shader_mmq(model, layer, "ffn_down.weight");
+        let sd = layer_weight_shader_gemm(model, layer, "ffn_down.weight", use_mul_mm);
         self.run_gemm(
             dev, registry, cmd, sd, wd,
-            self.batch_q8.handle, self.batch_ffn_out.handle,
+            gemm_input_down, self.batch_ffn_out.handle,
             hidden, seq_len, ffn, "gemm_down",
         );
         compute_barrier(dev, cmd);
@@ -2667,6 +2722,33 @@ impl Forward {
 
 /// Same shape as `layer_weight_shader` but returns the integer-MMQ
 /// (GEMM) variant. Used by `prefill_batch`.
+/// Phase 6 v0.1.2 — pick the right GEMM shader for a given layer
+/// weight, switching between `mul_mm.comp` (FP32 activations) and
+/// `mul_mmq.comp` (Q8_1 activations) based on `use_mul_mm`.
+/// Mixed-quant in Qwen3 (`attn_v` + `ffn_down` are Q6_K, the rest
+/// Q4_K) goes through both code paths.
+fn layer_weight_shader_gemm(
+    model: &LoadedModel,
+    layer: u32,
+    suffix: &str,
+    use_mul_mm: bool,
+) -> ShaderId {
+    let key = format!("blk.{layer}.{suffix}");
+    let q6 = model
+        .tensor(&key)
+        .unwrap_or_else(|| panic!("missing tensor '{key}'"))
+        .ggml_type
+        == GgmlType::Q6K;
+    match (use_mul_mm, q6) {
+        (true,  true)  => ShaderId::MulMmQ6K,
+        (true,  false) => ShaderId::MulMmQ4K,
+        (false, true)  => ShaderId::MulMmqQ6K,
+        (false, false) => ShaderId::MulMmqQ4K,
+    }
+}
+
+#[allow(dead_code)] // Kept for parity with `layer_weight_shader_gemm`; still referenced
+                    // by the `forward_layer_debug` helper paths in older diagnostic builds.
 fn layer_weight_shader_mmq(model: &LoadedModel, layer: u32, suffix: &str) -> ShaderId {
     let key = format!("blk.{layer}.{suffix}");
     match model

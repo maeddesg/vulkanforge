@@ -36,6 +36,12 @@ pub enum ShaderId {
     // covers (n_heads, M, 1) with a causal mask, replacing the M-fold
     // FlashAttn dispatch loop the per-token prefill currently runs.
     FlashAttnBatch,
+    // Phase 6 v0.1.2 — mul_mm.comp port. Q4_K / Q6_K weights × FP32
+    // activations (no Q8_1 quantize step). Used by prefill_batch when
+    // VULKANFORGE_USE_MUL_MM is set; mul_mmq stays as the gated
+    // fallback.
+    MulMmQ4K,
+    MulMmQ6K,
 }
 
 impl ShaderId {
@@ -59,6 +65,8 @@ impl ShaderId {
             ShaderId::FlashAttnSplit => "flash_attn_split_f32",
             ShaderId::FlashAttnReduce => "flash_attn_reduce_f32",
             ShaderId::FlashAttnBatch => "flash_attn_batch_f32",
+            ShaderId::MulMmQ4K => "mul_mm_q4_k_f32",
+            ShaderId::MulMmQ6K => "mul_mm_q6_k_f32",
         }
     }
 
@@ -82,6 +90,8 @@ impl ShaderId {
             ShaderId::FlashAttnSplit => FLASH_ATTN_SPLIT_F32,
             ShaderId::FlashAttnReduce => FLASH_ATTN_REDUCE_F32,
             ShaderId::FlashAttnBatch => FLASH_ATTN_BATCH_F32,
+            ShaderId::MulMmQ4K => MUL_MM_Q4_K_F32,
+            ShaderId::MulMmQ6K => MUL_MM_Q6_K_F32,
         }
     }
 }
@@ -105,6 +115,8 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::FlashAttnSplit,
     ShaderId::FlashAttnReduce,
     ShaderId::FlashAttnBatch,
+    ShaderId::MulMmQ4K,
+    ShaderId::MulMmQ6K,
 ];
 
 pub const MUL_MAT_VEC_Q4_K_F32_F32: &[u8] =
@@ -135,6 +147,10 @@ pub const FLASH_ATTN_REDUCE_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_reduce_f32.spv"));
 pub const FLASH_ATTN_BATCH_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_batch_f32.spv"));
+pub const MUL_MM_Q4_K_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q4_k_f32.spv"));
+pub const MUL_MM_Q6_K_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q6_k_f32.spv"));
 
 /// Decode a SPIR-V byte blob into u32 words. Vulkan consumes SPIR-V
 /// as `&[u32]`; `include_bytes!` only gives us `&[u8]` whose alignment

@@ -178,6 +178,49 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "bench_coopmat_pure.comp",
         defines: &[],
     },
+    // Phase 6 v0.1.2 cont. — mul_mm.comp port from llama.cpp
+    // (MIT-licensed). Same shader runtime as mul_mmq.comp but takes
+    // FP32 activations directly (no Q8_1 quantize step in front), uses
+    // a different shared-memory layout (vec2-packed buf with +1 stride
+    // padding instead of mul_mmq's per-block buf), and hits ~2× the
+    // GEMM throughput on RDNA4 in llama.cpp's reference. Used by the
+    // Phase-6 prefill path; mul_mmq stays as the gated fallback.
+    ShaderJob {
+        out_name: "mul_mm_q4_k_f32.spv",
+        entry_source: "mul_mm.comp",
+        defines: &[
+            ("DATA_A_Q4_K", "1"),
+            ("A_TYPE", "block_q4_K"),
+            ("A_TYPE_PACKED32", "block_q4_K_packed32"),
+            ("B_TYPE", "float"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("ACC_TYPE", "float"),
+            ("ACC_TYPEV2", "vec2"),
+            // llama.cpp's vulkan-shaders-gen pins LOAD_VEC_A=4 for the
+            // Q4_K / Q6_K unaligned mul_mm builds (load_vec_quant=4 in
+            // gen.cpp:560). Without this the dequant index math
+            // de-syncs by a factor of 4 and the GEMM produces garbage.
+            ("LOAD_VEC_A", "4"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mm_q6_k_f32.spv",
+        entry_source: "mul_mm.comp",
+        defines: &[
+            ("DATA_A_Q6_K", "1"),
+            ("A_TYPE", "block_q6_K"),
+            ("A_TYPE_PACKED16", "block_q6_K_packed16"),
+            ("B_TYPE", "float"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("ACC_TYPE", "float"),
+            ("ACC_TYPEV2", "vec2"),
+            ("LOAD_VEC_A", "4"),
+        ],
+    },
     // Phase-3C: Q4_K integer-MMQ GEMM. Mirrors the defines
     // llama.cpp's vulkan-shaders-gen passes for a non-MoE, non-coopmat
     // Q4_K mul_mmq build. Used by Forward::prefill_batch (TBD) and

@@ -202,6 +202,15 @@ pub struct MmqPushConstants {
 }
 const _: () = assert!(std::mem::size_of::<MmqPushConstants>() == 64);
 
+/// `mul_mm.comp` push block — Phase 6 v0.1.2 port from llama.cpp.
+/// Same field order as `MmqPushConstants` (the two shaders share the
+/// llama.cpp non-MUL_MAT_ID parameter struct), so we re-use it
+/// directly. The two struct types stay distinct in Rust just for
+/// call-site readability — `Forward::run_mul_mm` takes
+/// `MulMmPushConstants` and `Forward::run_gemm` (mul_mmq) takes
+/// `MmqPushConstants`.
+pub type MulMmPushConstants = MmqPushConstants;
+
 /// `quantize_q8_1.comp` push block. 2 × u32 = 8 B.
 /// `ne` is the total f32 element count of the input. `num_blocks` is
 /// the workgroup-loop upper bound (with `QBLOCK_X4` defined that's the
