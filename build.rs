@@ -161,6 +161,23 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "flash_attn_batch.comp",
         defines: &[],
     },
+    // Phase-6A probe: confirms shaderc 0.8 + Mesa glslang ship a
+    // coopmat + bfloat16 toolchain that produces SPV without warnings.
+    // Output is unused at runtime — purely a build-time GO gate. See
+    // results/phase6a_coopmat_benchmark.md.
+    ShaderJob {
+        out_name: "_probe_coopmat.spv",
+        entry_source: "_probe_coopmat.comp",
+        defines: &[],
+    },
+    // Phase-6A pure-WMMA throughput benchmark (BF16 × BF16 → FP32).
+    // Used by examples/bench_coopmat. Not loaded by the runtime forward
+    // pass.
+    ShaderJob {
+        out_name: "bench_coopmat_pure_f32.spv",
+        entry_source: "bench_coopmat_pure.comp",
+        defines: &[],
+    },
     // Phase-3C: Q4_K integer-MMQ GEMM. Mirrors the defines
     // llama.cpp's vulkan-shaders-gen passes for a non-MoE, non-coopmat
     // Q4_K mul_mmq build. Used by Forward::prefill_batch (TBD) and
