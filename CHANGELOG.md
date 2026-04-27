@@ -1,5 +1,88 @@
 # Changelog
 
+## v0.1.3 — Phase 7 mul_mm.comp debug + silent mul_mmq fix (2026-04-27)
+
+### Headline
+
+Two bugs uncovered while bringing up the `mul_mm.comp` port from
+Phase 6 v0.1.2 — one of them was silently corrupting `mul_mmq` output
+in production for any prompt longer than 32 tokens. Both fixed; full
+test suite up from 82 → 93 tests, all green.
+
+### Bug 1 — `BLOCK_SIZE / NUM_WARPS` undercoverage (affected mul_mmq + mul_mm)
+
+Every workgroup must have enough warps to cover all `(BM/WM) × (BN/WN)`
+warp tiles. With `BM = BN = 64`, `WM = WN = 32`, four warp tiles per
+workgroup are needed. `BLOCK_SIZE = 128` on RDNA Wave64 produces only
+`128 / 64 = 2` warps; `warp_c = warp_i / (BM/WM)` was therefore always
+`0`, so cols `[WN, BN) = [32, 64)` of every output tile were never
+written. The bug went undetected because:
+
+- The pre-existing `test_gemm_q4k_vs_gemv_seq1_parity` test ran
+  `M = 2, N = 1` — both far inside the bounds-check, so the missing
+  warp was clipped anyway.
+- `phase3e_prefill_batch_matches_token_by_token_top5` runs the
+  "Explain what a mutex is in one sentence." chat-templated prompt,
+  which tokenises to ~29 tokens — below the 32-col threshold.
+
+Fix: bump default `BLOCK_SIZE` from 128 → 256 in
+`pipeline_registry.rs` for both `MulMmqQ4K/Q6K` and `MulMmQ4K/Q6K`
+spec-constants.
+
+A new dedicated test `test_gemm_q4k_full_tile_64x64_mul_mmq` runs
+`M = N = 64, K = 256` against a CPU reference and would have caught
+this immediately. Added.
+
+### Bug 2 — Q6_K `LOAD_VEC_A` mismatch (affected mul_mm only)
+
+The Q6_K `load_a_to_shmem` branch in `mul_mm_funcs.glsl` is
+hard-coded for **2 weights per idx**:
+
+```glsl
+const uint ib = idx / 128;          // 2 values per idx
+...
+buf_a[buf_idx] = FLOAT_TYPEV2(q.x, q.y);     // 1 vec2 = 2 weights
+```
+
+The Q4_K branch above it is **4 weights per idx** and writes two
+`vec2`s. We had compiled both with `LOAD_VEC_A = 4` (matching
+llama.cpp's `vulkan-shaders-gen.cpp:560`). On the Q6_K path that
+left `buf_a[buf_idx + 1]` uninitialised, surfacing as `NaN` logits
+once the GEMM hit a layer whose weights were Q6_K (`ffn_down`,
+`token_embd` on Qwen3-8B-Q4_K_M).
+
+Fix: pin `LOAD_VEC_A = 2` for the `mul_mm_q6_k_f32` build job.
+
+### Status of mul_mm
+
+* Bit-exact across all 11 new GEMM-parity unit tests (covering
+  `K = 256/512/2048/11008`, aligned + unaligned `N`, single + multi
+  `BM/BN` tiles, real-prefill `M=2048 N=62 K=2048`, and `ffn_down`
+  dimensions).
+* Phase-3E top-5 vs per-token GEMV: **5/5 overlap, top-1 = 151667**
+  with `VULKANFORGE_USE_MUL_MM=1`.
+* Default stays **OFF** — `mul_mmq` is ~45 % faster at prefill on
+  `Qwen3-8B-Q4_K_M` (FP32 activations into LDS take 4× the bandwidth
+  of `Q8_1`-packed activations). Opt in with
+  `VULKANFORGE_USE_MUL_MM=1` when you specifically want to validate
+  drift attributable to `Q8_1` quantisation of activations.
+
+| Prompt | mul_mmq | mul_mm | Δ |
+|---|---:|---:|---:|
+| 29 tok mutex | 545 tok/s | 309 tok/s | −43 % |
+| 55 tok essay | 980 tok/s | 538 tok/s | −45 % |
+
+(Same hardware, BLOCK_SIZE = 256 in both cases. Decode is unchanged
+because decode uses GEMV, not GEMM.)
+
+### Test suite
+
+`cargo test --release` — **93 / 93 green** (was 82). The 11 new tests
+sit under `test_mul_mm_q4k_*` and `test_gemm_q4k_full_tile_64x64_*`
+in `tests/correctness.rs`.
+
+Full investigation: `results/phase7_mul_mm_debug.md`.
+
 ## v0.1.2 — Phase 6 fallback work (2026-04-27)
 
 ### Performance addendum — GEMM tile-tuning (added later same day)

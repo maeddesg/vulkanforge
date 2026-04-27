@@ -218,7 +218,13 @@ const JOBS: &[ShaderJob] = &[
             ("FLOAT_TYPEV2", "vec2"),
             ("ACC_TYPE", "float"),
             ("ACC_TYPEV2", "vec2"),
-            ("LOAD_VEC_A", "4"),
+            // Phase 7 — Q6_K's load_a_to_shmem branch in
+            // mul_mm_funcs.glsl emits "// 2 values per idx" and writes a
+            // single FLOAT_TYPEV2 to buf_a[buf_idx] per invocation. Q4_K
+            // ("// 4 values per idx") writes two — LOAD_VEC_A=4 lines up
+            // there but leaves half of buf_a uninitialised on the Q6_K
+            // path, surfacing as NaN logits at scale. Pin Q6_K to 2.
+            ("LOAD_VEC_A", "2"),
         ],
     },
     // Phase-3C: Q4_K integer-MMQ GEMM. Mirrors the defines

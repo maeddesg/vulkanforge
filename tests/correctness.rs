@@ -970,6 +970,359 @@ fn test_gemm_q4k_vs_gemv_seq1_parity() {
     fix.teardown();
 }
 
+// Phase 7 — full 64×64 GEMM tile parity. The seq=1 test above only
+// exercises the corner of one workgroup; this hits a complete BM×BN
+// tile (M = BM = 64, N = BN = 64). If warp-tile coverage is broken
+// (NUM_WARPS too small for BM*BN/(WM*WN) tiles), half the output cols
+// will read uninitialised — this test surfaces it as a max-abs-err
+// blow-up versus the CPU reference.
+fn cpu_gemm_q4k_ref(
+    weights: &[u8],
+    acts: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Vec<f32> {
+    use vulkanforge::backend::vulkan::q4k::{BLOCK_BYTES, QUANT_K, dequant_block};
+    assert_eq!(k % QUANT_K, 0);
+    let bpr = k / QUANT_K;
+    let mut out = vec![0.0f32; m * n];
+    let mut dq_rows: Vec<f32> = vec![0.0f32; m * k];
+    for r in 0..m {
+        for b in 0..bpr {
+            let off = (r * bpr + b) * BLOCK_BYTES;
+            let block: &[u8; BLOCK_BYTES] = (&weights[off..off + BLOCK_BYTES]).try_into().unwrap();
+            let dq = dequant_block(block);
+            dq_rows[r * k + b * QUANT_K..r * k + (b + 1) * QUANT_K].copy_from_slice(&dq);
+        }
+    }
+    // Output layout per shader: data_d[col * stride_d + row], stride_d = M.
+    // out[col * m + row] = sum_e dq_rows[row, e] * acts[col, e]
+    for col in 0..n {
+        for row in 0..m {
+            let mut acc = 0.0f64;
+            for e in 0..k {
+                acc += (dq_rows[row * k + e] as f64) * (acts[col * k + e] as f64);
+            }
+            out[col * m + row] = acc as f32;
+        }
+    }
+    out
+}
+
+fn run_mul_mm_parity(m: u32, n: u32, k: u32, label: &str) {
+    use vulkanforge::backend::vulkan::q4k;
+    assert_eq!(k as usize % q4k::QUANT_K, 0, "K must be a multiple of QUANT_K");
+
+    let mut fix = Fixture::new();
+
+    let weights = q4k::build_random_weights(m as usize, k as usize, 0xC0FFEE);
+    let w_buf = {
+        let device = fix.dev.device.clone();
+        let allocator = fix.allocator.as_mut().unwrap();
+        let mut b = GpuBuffer::new(
+            &device, allocator, weights.len() as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu,
+            "mul_mm_w",
+        ).expect("alloc weights");
+        b.write_bytes(&weights).expect("write weights");
+        fix.track(b)
+    };
+
+    let acts: Vec<f32> = (0..(n * k))
+        .map(|i| ((i as f32) * 0.013).sin() * 0.5)
+        .collect();
+    let act_buf = fix.host_buffer_f32(&acts, "mul_mm_act");
+    let out_buf = fix.output_buffer_f32((m * n) as usize, "mul_mm_out");
+
+    let pc = MmqPushConstants {
+        m, n, k,
+        stride_a: k,
+        stride_b: k,
+        stride_d: m,
+        batch_stride_a: m * k,
+        batch_stride_b: n * k,
+        batch_stride_d: m * n,
+        base_work_group_z: 0,
+        num_batches: 1,
+        k_split: k,
+        ne02: 1, ne12: 1,
+        broadcast2: 1, broadcast3: 1,
+    };
+    let groups_x = (m + 63) / 64;
+    let groups_y = (n + 63) / 64;
+    fix.dispatch(
+        ShaderId::MulMmQ4K, &[w_buf, act_buf, out_buf],
+        bytemuck::bytes_of(&pc),
+        (groups_x, groups_y, 1),
+    );
+
+    let gpu = fix.read_output(out_buf, (m * n) as usize);
+    let cpu = cpu_gemm_q4k_ref(&weights, &acts, m as usize, n as usize, k as usize);
+
+    let nan = gpu.iter().any(|x| !x.is_finite());
+    assert!(!nan, "mul_mm[{label}] M={m} N={n} K={k} produced NaN/Inf");
+
+    let max_err = max_abs_err(&gpu, &cpu);
+    let max_amax = cpu.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let thresh = (max_amax * 0.01).max(0.1);
+
+    if max_err >= thresh {
+        eprintln!("FAIL [{label}] M={m} N={n} K={k} — per-col errs (first 16 + last 16):");
+        let mut col_err = vec![0.0f32; n as usize];
+        let mut col_amax = vec![0.0f32; n as usize];
+        for col in 0..n as usize {
+            for row in 0..m as usize {
+                let idx = col * m as usize + row;
+                col_err[col] = col_err[col].max((gpu[idx] - cpu[idx]).abs());
+                col_amax[col] = col_amax[col].max(cpu[idx].abs());
+            }
+        }
+        let show = |c: usize| {
+            eprintln!("  col {c:>4}: err={:.4e} cpu_amax={:.4e} ratio={:.3}",
+                col_err[c], col_amax[c], col_err[c] / col_amax[c].max(1e-9));
+        };
+        for c in 0..(n as usize).min(16) { show(c); }
+        if n as usize > 32 {
+            eprintln!("  ...");
+            for c in (n as usize - 16)..n as usize { show(c); }
+        }
+    }
+    assert!(
+        max_err < thresh,
+        "mul_mm[{label}] M={m} N={n} K={k} max_err={max_err:e} >= {thresh:e}"
+    );
+    fix.teardown();
+}
+
+#[test]
+fn test_mul_mm_q4k_k512_aligned()        { run_mul_mm_parity(64, 64, 512, "K=512"); }
+
+#[test]
+fn test_mul_mm_q4k_k2048_aligned()       { run_mul_mm_parity(64, 64, 2048, "K=2048"); }
+
+#[test]
+fn test_mul_mm_q4k_n_unaligned_62()      { run_mul_mm_parity(64, 62, 256,  "N=62"); }
+
+#[test]
+fn test_mul_mm_q4k_multi_n_tile_128()    { run_mul_mm_parity(64, 128, 256, "N=128 (2 BN tiles)"); }
+
+#[test]
+fn test_mul_mm_q4k_multi_m_tile_128()    { run_mul_mm_parity(128, 64, 256, "M=128 (2 BM tiles)"); }
+
+#[test]
+fn test_mul_mm_q4k_realistic_2048x62()   { run_mul_mm_parity(2048, 62, 2048, "real prefill"); }
+
+// FFN-down dims: M=hidden=2048, N=seq=62, K=ffn_dim=11008.
+// 11008 / QUANT_K = 43 BK iterations — most likely place a K-loop bug
+// would surface if it weren't visible at K=2048 (8 iterations).
+#[test]
+fn test_mul_mm_q4k_ffn_down_dims()       { run_mul_mm_parity(2048, 62, 11008, "ffn_down K=11008"); }
+
+// Multi-tile both axes to stress the (groups_x, groups_y) dispatch shape.
+#[test]
+fn test_mul_mm_q4k_multi_tile_both()     { run_mul_mm_parity(128, 128, 256, "multi-tile both"); }
+
+// Larger N with unaligned tail.
+#[test]
+fn test_mul_mm_q4k_n200()                { run_mul_mm_parity(64, 200, 256, "N=200"); }
+
+#[test]
+fn test_gemm_q4k_full_tile_64x64_mul_mm() {
+    use vulkanforge::backend::vulkan::q4k;
+
+    let mut fix = Fixture::new();
+    let m: u32 = 64;
+    let n: u32 = 64;
+    let k: u32 = q4k::QUANT_K as u32;
+
+    let weights = q4k::build_random_weights(m as usize, k as usize, 0xC0FFEE);
+    let w_buf = {
+        let device = fix.dev.device.clone();
+        let allocator = fix.allocator.as_mut().unwrap();
+        let mut b = GpuBuffer::new(
+            &device, allocator, weights.len() as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "w_full_tile_mm",
+        ).expect("alloc weights");
+        b.write_bytes(&weights).expect("write weights");
+        fix.track(b)
+    };
+
+    let acts: Vec<f32> = (0..(n * k))
+        .map(|i| ((i as f32) * 0.013).sin() * 0.5)
+        .collect();
+    let act_buf = fix.host_buffer_f32(&acts, "act_full_tile_mm");
+
+    let out_buf = fix.output_buffer_f32((m * n) as usize, "out_full_tile_mm");
+
+    let pc = MmqPushConstants {
+        m, n, k,
+        stride_a: k,
+        stride_b: k,
+        stride_d: m,
+        batch_stride_a: m * k,
+        batch_stride_b: n * k,
+        batch_stride_d: m * n,
+        base_work_group_z: 0,
+        num_batches: 1,
+        k_split: k,
+        ne02: 1, ne12: 1,
+        broadcast2: 1, broadcast3: 1,
+    };
+    fix.dispatch(
+        ShaderId::MulMmQ4K, &[w_buf, act_buf, out_buf],
+        bytemuck::bytes_of(&pc),
+        (1, 1, 1),
+    );
+
+    let gpu = fix.read_output(out_buf, (m * n) as usize);
+    let cpu = cpu_gemm_q4k_ref(&weights, &acts, m as usize, n as usize, k as usize);
+
+    let nan = gpu.iter().any(|x| !x.is_finite());
+    assert!(!nan, "mul_mm 64x64 produced NaN/Inf");
+
+    let mut col_errs: Vec<f32> = Vec::with_capacity(n as usize);
+    let mut col_cpu_amax: Vec<f32> = Vec::with_capacity(n as usize);
+    for col in 0..n as usize {
+        let mut e = 0.0f32;
+        let mut a = 0.0f32;
+        for row in 0..m as usize {
+            let idx = col * m as usize + row;
+            e = e.max((gpu[idx] - cpu[idx]).abs());
+            a = a.max(cpu[idx].abs());
+        }
+        col_errs.push(e);
+        col_cpu_amax.push(a);
+    }
+    let max_err = max_abs_err(&gpu, &cpu);
+    let max_amax = col_cpu_amax.iter().cloned().fold(0.0f32, f32::max);
+    // mul_mm reads B as raw FP32 (no Q8_1 round-off on B), so the only
+    // round-off is from Q4_K dequant of A. Tighter threshold than mul_mmq.
+    let thresh = (max_amax * 0.01).max(0.1);
+    if max_err >= thresh {
+        eprintln!("FAIL mul_mm — per-col max errors:");
+        for (col, (e, a)) in col_errs.iter().zip(&col_cpu_amax).enumerate() {
+            eprintln!("  col {col:>2}: err={:.4e}  cpu_amax={:.4e}  ratio={:.3}",
+                      e, a, e / a.max(1e-9));
+        }
+    }
+    assert!(
+        max_err < thresh,
+        "mul_mm 64x64 vs CPU max_err = {max_err:e} >= {thresh:e}"
+    );
+    fix.teardown();
+}
+
+#[test]
+fn test_gemm_q4k_full_tile_64x64_mul_mmq() {
+    use vulkanforge::backend::vulkan::q4k;
+
+    let mut fix = Fixture::new();
+    let m: u32 = 64; // = BM exactly
+    let n: u32 = 64; // = BN exactly — the case that exercises every warp tile
+    let k: u32 = q4k::QUANT_K as u32; // 256, one block per row
+
+    let weights = q4k::build_random_weights(m as usize, k as usize, 0xC0FFEE);
+    let w_buf = {
+        let device = fix.dev.device.clone();
+        let allocator = fix.allocator.as_mut().unwrap();
+        let mut b = GpuBuffer::new(
+            &device, allocator, weights.len() as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "w_full_tile",
+        ).expect("alloc weights");
+        b.write_bytes(&weights).expect("write weights");
+        fix.track(b)
+    };
+
+    // N tokens × K features each, deterministic non-trivial values.
+    let acts: Vec<f32> = (0..(n * k))
+        .map(|i| ((i as f32) * 0.013).sin() * 0.5)
+        .collect();
+    let act_buf = fix.host_buffer_f32(&acts, "act_full_tile");
+
+    // Q8_1 quantization for mul_mmq: ceil(N*K / 128) x4-blocks of 144 B.
+    let q8_blocks_x4 = ((n * k + 127) / 128) as usize;
+    let q8_buf = {
+        let device = fix.dev.device.clone();
+        let allocator = fix.allocator.as_mut().unwrap();
+        let buf = GpuBuffer::new(
+            &device, allocator, (q8_blocks_x4 * 144) as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::GpuOnly, "q8_full_tile",
+        ).expect("alloc q8");
+        fix.track(buf)
+    };
+    let q8_pc = Q8_1QuantizePushConstants { ne: n * k, num_blocks: q8_blocks_x4 as u32 };
+    fix.dispatch(
+        ShaderId::QuantizeQ8_1, &[act_buf, q8_buf],
+        bytemuck::bytes_of(&q8_pc),
+        (q8_blocks_x4 as u32, 1, 1),
+    );
+
+    let out_buf = fix.output_buffer_f32((m * n) as usize, "out_full_tile");
+
+    let pc = MmqPushConstants {
+        m, n, k,
+        stride_a: k,
+        stride_b: k,
+        stride_d: m,
+        batch_stride_a: m * k,
+        batch_stride_b: n * k,
+        batch_stride_d: m * n,
+        base_work_group_z: 0,
+        num_batches: 1,
+        k_split: k,
+        ne02: 1, ne12: 1,
+        broadcast2: 1, broadcast3: 1,
+    };
+    // groups = (ceil(M/BM), ceil(N/BN), 1) = (1, 1, 1).
+    fix.dispatch(
+        ShaderId::MulMmqQ4K, &[w_buf, q8_buf, out_buf],
+        bytemuck::bytes_of(&pc),
+        (1, 1, 1),
+    );
+
+    let gpu = fix.read_output(out_buf, (m * n) as usize);
+    let cpu = cpu_gemm_q4k_ref(&weights, &acts, m as usize, n as usize, k as usize);
+
+    let nan = gpu.iter().any(|x| !x.is_finite());
+    assert!(!nan, "mul_mmq 64x64 produced NaN/Inf");
+
+    // Per-column max error and a global cap. If any column is uninitialised
+    // (warp-tile-coverage bug), its max error will be ~|cpu| (i.e. huge).
+    let mut col_errs: Vec<f32> = Vec::with_capacity(n as usize);
+    let mut col_cpu_amax: Vec<f32> = Vec::with_capacity(n as usize);
+    for col in 0..n as usize {
+        let mut e = 0.0f32;
+        let mut a = 0.0f32;
+        for row in 0..m as usize {
+            let idx = col * m as usize + row;
+            e = e.max((gpu[idx] - cpu[idx]).abs());
+            a = a.max(cpu[idx].abs());
+        }
+        col_errs.push(e);
+        col_cpu_amax.push(a);
+    }
+
+    // Q8_1 round-off: per-output ≈ |a|*K / 127 for amax≈0.5, K=256 → ~1.0.
+    // Use a generous threshold; the bug we're hunting produces errors
+    // orders of magnitude larger.
+    let max_err = max_abs_err(&gpu, &cpu);
+    let max_amax = col_cpu_amax.iter().cloned().fold(0.0f32, f32::max);
+    let thresh = (max_amax * 0.05).max(0.5);
+    if max_err >= thresh {
+        eprintln!("FAIL — per-col max errors:");
+        for (col, (e, a)) in col_errs.iter().zip(&col_cpu_amax).enumerate() {
+            eprintln!("  col {col:>2}: err={:.4e}  cpu_amax={:.4e}  ratio={:.3}",
+                      e, a, e / a.max(1e-9));
+        }
+    }
+    assert!(
+        max_err < thresh,
+        "mul_mmq 64x64 vs CPU max_err = {max_err:e} >= {thresh:e}"
+    );
+    fix.teardown();
+}
+
 // -----------------------------------------------------------------
 // Phase-3A tiled attention regression — seq_len=64 (one wavefront)
 // and seq_len=200 (≈ Phase 2 baseline pos=200) compared against a

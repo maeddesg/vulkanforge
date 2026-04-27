@@ -185,8 +185,15 @@ impl PipelineRegistry {
                     //
                     // Override via VULKANFORGE_GEMM_BLOCK_SIZE / _TM
                     // / _TN env vars for A/B testing without rebuild.
+                    //
+                    // Phase 7 — BLOCK_SIZE = NUM_WARPS * WARP must cover
+                    // (BM/WM)*(BN/WN) warp tiles per workgroup.
+                    // For BM=BN=64, WM=WN=32, WARP=64 (Wave64): we need
+                    // 4 warps → BLOCK_SIZE=256. The previous default
+                    // (128 → 2 warps) silently dropped cols [WN, BN) of
+                    // every output tile because warp_c was always 0.
                     let block_size: u32 = std::env::var("VULKANFORGE_GEMM_BLOCK_SIZE")
-                        .ok().and_then(|s| s.parse().ok()).unwrap_or(128);
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(256);
                     let tm: u32 = std::env::var("VULKANFORGE_GEMM_TM")
                         .ok().and_then(|s| s.parse().ok()).unwrap_or(2);
                     let tn: u32 = std::env::var("VULKANFORGE_GEMM_TN")
@@ -240,8 +247,10 @@ impl PipelineRegistry {
                     // applies here because the inner-loop math is
                     // identical (FP32 accumulator, vec2-packed
                     // shared memory).
+                    // Phase 7 — same coverage rule as MulMmq (see comment
+                    // in that branch above): BLOCK_SIZE = 256 → 4 warps.
                     let block_size: u32 = std::env::var("VULKANFORGE_GEMM_BLOCK_SIZE")
-                        .ok().and_then(|s| s.parse().ok()).unwrap_or(128);
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(256);
                     let tm: u32 = std::env::var("VULKANFORGE_GEMM_TM")
                         .ok().and_then(|s| s.parse().ok()).unwrap_or(2);
                     let tn: u32 = std::env::var("VULKANFORGE_GEMM_TN")

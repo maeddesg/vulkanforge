@@ -417,14 +417,26 @@ impl Forward {
         };
 
         // Phase 6 v0.1.2: mul_mm.comp port is OFF by default — the
-        // parity gate (phase3e_prefill_batch_matches_token_by_token_top5
-        // and the phase5b2_* tests) does not pass. The shader compiles
-        // and dispatches without driver errors, but produces NaN/garbage
-        // logits with `LOAD_VEC_A=4` (matching llama.cpp's setting) and
-        // wrong-but-finite logits with `LOAD_VEC_A=1`. Diagnostic path
-        // needs GPU step-through debugging. Set VULKANFORGE_USE_MUL_MM=1
-        // to opt in (e.g. for further debugging). See
-        // results/phase6_mul_mm_port.md for the full investigation.
+        // Phase 7 — mul_mm.comp is now bit-exact across all 11 unit
+        // tests + the phase3e/5b2 regressions (top-5 = 5/5 vs the
+        // per-token GEMV path). Two bugs were fixed:
+        //   (1) BLOCK_SIZE 128 → 256: NUM_WARPS = BLOCK_SIZE/WARP must
+        //       cover (BM/WM)*(BN/WN) warp tiles. With WARP=64, BM=BN=64,
+        //       WM=WN=32 we need 4 warps. The previous 128 silently
+        //       dropped cols [WN, BN) of every output tile because
+        //       warp_c (= warp_i / (BM/WM)) was always 0. Also affected
+        //       mul_mmq, which was producing wrong results for prompts
+        //       > 32 tokens — undetected because regression tests use
+        //       short prompts.
+        //   (2) Q6_K LOAD_VEC_A 4 → 2: the Q6_K branch in
+        //       mul_mm_funcs.glsl emits one vec2 (2 weights) per idx
+        //       but Q4_K's branch emits two (4 weights). Compiling
+        //       Q6_K with LOAD_VEC_A=4 left half of buf_a uninitialised
+        //       → NaN logits at scale.
+        // Default stays OFF because mul_mmq is ~45 % faster at prefill
+        // (Q8_1 activations vs FP32: 4× less B-bandwidth into LDS).
+        // Opt in via VULKANFORGE_USE_MUL_MM=1 when bit-exact FP32 input
+        // matters (e.g. validating quant-induced drift).
         let mul_mm_enabled = match std::env::var("VULKANFORGE_USE_MUL_MM") {
             Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
             _ => false,
