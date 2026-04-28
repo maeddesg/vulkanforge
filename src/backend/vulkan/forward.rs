@@ -206,6 +206,13 @@ pub struct Forward {
     /// the switch.
     coopmat_q4k_enabled: bool,
 
+    /// Sprint 3C — when coopmat is on, route through the FP8-narrowed
+    /// padded variant instead of BF16. Default OFF;
+    /// `VULKANFORGE_COOPMAT_FP8=1` flips it on. The two paths emit
+    /// the same logits up to FP8 vs BF16 quantisation grid difference;
+    /// FP8 saves ~50% LDS and a 4× VALU on the convert.
+    coopmat_fp8_enabled: bool,
+
     /// `forward_token` hot path. When `cache_enabled` is true (env
     /// `VULKANFORGE_CB_REUSE=1` at construction), `alloc_or_get_set`
     /// reuses sets across tokens instead of resetting the pool.
@@ -356,7 +363,14 @@ impl Forward {
         // Allocations sized for the largest prompt we'll batch in one
         // submit. ~60 MB at the 256-token default — comfortable within
         // the ~10 GiB free after weights.
-        let max_pp = max_prefill_tokens as u64;
+        //
+        // Sprint 3C — round max_pp up to a multiple of 16 so the
+        // coopmat path's N-padding fill stays in-bounds. Without this
+        // padding, `cmd_fill_buffer` for rows seq_len..pad_to_tile(seq_len, 16)
+        // can write past the buffer end (causing subtle memory
+        // corruption that drifts the long-tail logit ranking).
+        let max_pp_raw = max_prefill_tokens as u64;
+        let max_pp = (max_pp_raw + 15) / 16 * 16;
         let pp_hidden = max_pp * (config.hidden_dim as u64) * 4;
         let pp_kv     = max_pp * (config.n_kv_heads as u64) * (config.head_dim as u64) * 4;
         let pp_q      = max_pp * (config.n_heads as u64)   * (config.head_dim as u64) * 4;
@@ -456,6 +470,13 @@ impl Forward {
             _ => false,
         };
 
+        // Sprint 3C — FP8 narrow inside the coopmat path. Default
+        // OFF; only meaningful when coopmat itself is enabled.
+        let coopmat_fp8_enabled = match std::env::var("VULKANFORGE_COOPMAT_FP8") {
+            Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
+            _ => false,
+        };
+
         // Note for tests: callers that need to override the env-var
         // pick can use `set_cache_enabled` / `set_batch_attn_enabled`
         // after construction.
@@ -478,6 +499,7 @@ impl Forward {
             batch_attn_enabled,
             mul_mm_enabled,
             coopmat_q4k_enabled,
+            coopmat_fp8_enabled,
             profiler,
             rope_theta_scale, attn_scale,
             fa_scratch_out, fa_scratch_max, fa_scratch_sum,
@@ -1412,6 +1434,10 @@ impl Forward {
         self.coopmat_q4k_enabled
     }
 
+    pub fn set_coopmat_fp8_enabled(&mut self, enabled: bool) {
+        self.coopmat_fp8_enabled = enabled;
+    }
+
     /// Phase 5A-2 Stage 2D: cache-aware descriptor-set fetch. When
     /// `cache_enabled` is true and the (layout, bindings) key matches
     /// a previously-built set, the cached handle is returned without
@@ -2185,6 +2211,60 @@ impl Forward {
         });
     }
 
+    /// Sprint 3C — round `n` up to the next multiple of `tile`. Lets
+    /// the coopmat dispatch sees a full-tile N regardless of the
+    /// real seq_len — paired with `zero_activation_tail` below this
+    /// eliminates the partial-tile-store bug that ate Sprint 3A.
+    fn pad_to_tile(n: u32, tile: u32) -> u32 {
+        (n + tile - 1) / tile * tile
+    }
+
+    /// Sprint 3C — fill the `[n, n_padded)` rows of an [N, K]
+    /// row-major activation buffer with zeros. The coopmat dispatch
+    /// sees N = n_padded; the extra rows multiply with weights to
+    /// produce zeros in the padded output rows, which downstream code
+    /// (RoPE / attention / sampler) ignores because it walks only
+    /// `seq_len = n` rows.
+    fn zero_activation_tail(
+        &self,
+        dev: &VulkanDevice,
+        cmd: vk::CommandBuffer,
+        buf: vk::Buffer,
+        n: u32,
+        n_padded: u32,
+        k: u32,
+    ) {
+        if n_padded <= n {
+            return;
+        }
+        // Diagnostic: VULKANFORGE_COOPMAT_NO_FILL skips the fill so we
+        // can isolate whether the fill or the n_padded dispatch is the
+        // cause of any logits drift.
+        if std::env::var("VULKANFORGE_COOPMAT_NO_FILL").is_ok() {
+            return;
+        }
+        let offset_bytes = (n as u64) * (k as u64) * 4;
+        let size_bytes = ((n_padded - n) as u64) * (k as u64) * 4;
+        unsafe {
+            dev.device
+                .cmd_fill_buffer(cmd, buf, offset_bytes, size_bytes, 0);
+        }
+    }
+
+    /// Sprint 3C — pick the naive padded shader (BF16 vs FP8) per
+    /// `coopmat_fp8_enabled`.
+    fn coopmat_naive_padded_shader(&self) -> ShaderId {
+        if self.coopmat_fp8_enabled {
+            ShaderId::MulCoopmatQ4KNaivePaddedFp8
+        } else if std::env::var("VULKANFORGE_COOPMAT_LEGACY_STORE").is_ok() {
+            // Diagnostic — fall back to Sprint 3B's LDS-staged store.
+            // Used by the test that bisects the top-5 drop.
+            ShaderId::MulCoopmatQ4KNaiveBf16
+        } else {
+            ShaderId::MulCoopmatQ4KNaivePaddedBf16
+        }
+    }
+
     /// Sprint 3A — dispatch the Q4_K dequant-fusion coopmat GEMM with
     /// the forward-pass-compatible memory layout. Inputs:
     ///
@@ -2484,13 +2564,23 @@ impl Forward {
         // Q8_1 depending on mul_mm_enabled). The other six GEMMs keep
         // the existing routing.
         if self.coopmat_q4k_enabled {
-            // Sprint 3B per-shape selector: naive BF16 for skinny-N
-            // (where the tiled Sprint 2B/3A kernels regressed); the
-            // tiled FP8 BN=32/64 variants stay available for big-N
-            // shapes. Each tuple is (shader, BM, BN) so the dispatch
-            // grid can pick the right output-tile geometry.
+            // Sprint 3C — naive padded for skinny-N (covers all
+            // typical Qwen3 prefill shapes). Pad seq_len up to a
+            // multiple of 16 and zero the activation tail so every
+            // output tile is full and the kernel can use a direct
+            // ColumnMajor coopMatStore. The fused FP8/BF16 mode
+            // toggles via `coopmat_fp8_enabled`.
+            let n_padded = Self::pad_to_tile(seq_len, 16);
+            self.zero_activation_tail(
+                dev, cmd, self.batch_norm.handle,
+                seq_len, n_padded, hidden,
+            );
+            // The fill-buffer is a TRANSFER op; gate the next
+            // compute-shader read with a TRANSFER → COMPUTE barrier.
+            transfer_to_compute_barrier(dev, cmd);
+
             let (qkw_shader, qkw_bm, qkw_bn) = if seq_len <= 64 {
-                (ShaderId::MulCoopmatQ4KNaiveBf16, 16u32, 16u32)
+                (self.coopmat_naive_padded_shader(), 16u32, 16u32)
             } else if seq_len <= 128 {
                 (ShaderId::MulCoopmatQ4KFwdBn32, 64u32, 32u32)
             } else {
@@ -2499,18 +2589,18 @@ impl Forward {
             self.run_gemm_coopmat_q4k(
                 dev, registry, cmd, qkw_shader, wq,
                 self.batch_norm.handle, self.batch_q.handle,
-                q_dim, seq_len, hidden, qkw_bm, qkw_bn, "gemm_q_coopmat",
+                q_dim, n_padded, hidden, qkw_bm, qkw_bn, "gemm_q_coopmat",
             );
             self.run_gemm_coopmat_q4k(
                 dev, registry, cmd, qkw_shader, wk,
                 self.batch_norm.handle, self.batch_k.handle,
-                kv_dim, seq_len, hidden, qkw_bm, qkw_bn, "gemm_k_coopmat",
+                kv_dim, n_padded, hidden, qkw_bm, qkw_bn, "gemm_k_coopmat",
             );
             // gemm_v stays on mul_mmq — Qwen3 uses Q6_K for attn_v
-            // (mixed-quant) and Sprint 3B doesn't ship a Q6_K coopmat
-            // dequant kernel yet (Sprint 3C task). Activations for
-            // gemm_v are still in batch_q8 thanks to the earlier
-            // run_quantize_q8_1 in the mul_mmq path.
+            // (mixed-quant) and we don't ship a Q6_K coopmat dequant
+            // kernel yet. Activations for gemm_v are still in batch_q8
+            // thanks to the earlier run_quantize_q8_1 in the mul_mmq
+            // path.
             self.run_gemm(
                 dev, registry, cmd, sv, wv,
                 gemm_input_attn, self.batch_v.handle,
@@ -2764,9 +2854,16 @@ impl Forward {
         let wo = layer_weight(model, layer, "attn_output.weight");
         if self.coopmat_q4k_enabled {
             // Coopmat path reads FP32 activations directly — skip the
-            // q8_1 quantize for gemm_o.
+            // q8_1 quantize for gemm_o. Pad N + zero tail.
+            let n_padded = Self::pad_to_tile(seq_len, 16);
+            self.zero_activation_tail(
+                dev, cmd, self.batch_attn_out.handle,
+                seq_len, n_padded, q_dim,
+            );
+            transfer_to_compute_barrier(dev, cmd);
+
             let (o_shader, o_bm, o_bn) = if seq_len <= 64 {
-                (ShaderId::MulCoopmatQ4KNaiveBf16, 16u32, 16u32)
+                (self.coopmat_naive_padded_shader(), 16u32, 16u32)
             } else if seq_len <= 128 {
                 (ShaderId::MulCoopmatQ4KFwdBn32, 64u32, 32u32)
             } else {
@@ -2775,7 +2872,7 @@ impl Forward {
             self.run_gemm_coopmat_q4k(
                 dev, registry, cmd, o_shader, wo,
                 self.batch_attn_out.handle, self.batch_o.handle,
-                hidden, seq_len, q_dim, o_bm, o_bn, "gemm_o_coopmat",
+                hidden, n_padded, q_dim, o_bm, o_bn, "gemm_o_coopmat",
             );
         } else {
             let gemm_input_o = if use_mul_mm {
@@ -2834,8 +2931,20 @@ impl Forward {
         let wg = layer_weight(model, layer, "ffn_gate.weight");
         let wu = layer_weight(model, layer, "ffn_up.weight");
         if self.coopmat_q4k_enabled {
+            // Both gemm_gate and gemm_up read batch_norm — already
+            // padded for the attention-block coopmat dispatches at
+            // the top of dispatch_layer_batch. The FFN-norm pass
+            // *re*-writes batch_norm at this point so we have to
+            // pad again.
+            let n_padded = Self::pad_to_tile(seq_len, 16);
+            self.zero_activation_tail(
+                dev, cmd, self.batch_norm.handle,
+                seq_len, n_padded, hidden,
+            );
+            transfer_to_compute_barrier(dev, cmd);
+
             let (gu_shader, gu_bm, gu_bn) = if seq_len <= 64 {
-                (ShaderId::MulCoopmatQ4KNaiveBf16, 16u32, 16u32)
+                (self.coopmat_naive_padded_shader(), 16u32, 16u32)
             } else if seq_len <= 128 {
                 (ShaderId::MulCoopmatQ4KFwdBn32, 64u32, 32u32)
             } else {
@@ -2844,12 +2953,12 @@ impl Forward {
             self.run_gemm_coopmat_q4k(
                 dev, registry, cmd, gu_shader, wg,
                 self.batch_norm.handle, self.batch_gate.handle,
-                ffn, seq_len, hidden, gu_bm, gu_bn, "gemm_gate_coopmat",
+                ffn, n_padded, hidden, gu_bm, gu_bn, "gemm_gate_coopmat",
             );
             self.run_gemm_coopmat_q4k(
                 dev, registry, cmd, gu_shader, wu,
                 self.batch_norm.handle, self.batch_up.handle,
-                ffn, seq_len, hidden, gu_bm, gu_bn, "gemm_up_coopmat",
+                ffn, n_padded, hidden, gu_bm, gu_bn, "gemm_up_coopmat",
             );
         } else {
             let sg = layer_weight_shader_gemm(model, layer, "ffn_gate.weight", gemm_kind);
@@ -3011,6 +3120,24 @@ fn compute_barrier(dev: &VulkanDevice, cmd: vk::CommandBuffer) {
         dev.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            std::slice::from_ref(&mb),
+            &[], &[],
+        );
+    }
+}
+
+/// Sprint 3C — sync a TRANSFER (e.g. `cmd_fill_buffer`) so its writes
+/// are visible to the next compute shader read.
+fn transfer_to_compute_barrier(dev: &VulkanDevice, cmd: vk::CommandBuffer) {
+    let mb = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::SHADER_READ);
+    unsafe {
+        dev.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
             vk::PipelineStageFlags::COMPUTE_SHADER,
             vk::DependencyFlags::empty(),
             std::slice::from_ref(&mb),

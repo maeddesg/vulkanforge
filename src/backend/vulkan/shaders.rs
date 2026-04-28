@@ -60,6 +60,14 @@ pub enum ShaderId {
     // path for skinny-N prefill (seq_len ≤ 64) when
     // VULKANFORGE_COOPMAT=1.
     MulCoopmatQ4KNaiveBf16,
+    // v0.2 Sprint 3C — N-padded variants. The runtime guarantees
+    // pc.n is a multiple of 16 and the activation tail rows are
+    // zeroed; the kernel can then use a direct ColumnMajor
+    // coopMatStore (no LDS staging). FP8 variant retests Sprint 3A's
+    // failed precision experiment now that the partial-tile-store
+    // bug is eliminated.
+    MulCoopmatQ4KNaivePaddedBf16,
+    MulCoopmatQ4KNaivePaddedFp8,
 }
 
 impl ShaderId {
@@ -91,6 +99,8 @@ impl ShaderId {
             ShaderId::MulCoopmatQ4KFwdBn32 => "mul_coopmat_q4k_fwd_bn32",
             ShaderId::MulCoopmatQ4KFwdBn16 => "mul_coopmat_q4k_fwd_bn16",
             ShaderId::MulCoopmatQ4KNaiveBf16 => "mul_coopmat_q4k_naive_bf16",
+            ShaderId::MulCoopmatQ4KNaivePaddedBf16 => "mul_coopmat_q4k_naive_padded_bf16",
+            ShaderId::MulCoopmatQ4KNaivePaddedFp8 => "mul_coopmat_q4k_naive_padded_fp8",
         }
     }
 
@@ -122,6 +132,8 @@ impl ShaderId {
             ShaderId::MulCoopmatQ4KFwdBn32 => MUL_COOPMAT_Q4K_FWD_BN32,
             ShaderId::MulCoopmatQ4KFwdBn16 => MUL_COOPMAT_Q4K_FWD_BN16,
             ShaderId::MulCoopmatQ4KNaiveBf16 => MUL_COOPMAT_Q4K_NAIVE_BF16,
+            ShaderId::MulCoopmatQ4KNaivePaddedBf16 => MUL_COOPMAT_Q4K_NAIVE_PADDED_BF16,
+            ShaderId::MulCoopmatQ4KNaivePaddedFp8 => MUL_COOPMAT_Q4K_NAIVE_PADDED_FP8,
         }
     }
 }
@@ -153,6 +165,8 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::MulCoopmatQ4KFwdBn32,
     ShaderId::MulCoopmatQ4KFwdBn16,
     ShaderId::MulCoopmatQ4KNaiveBf16,
+    ShaderId::MulCoopmatQ4KNaivePaddedBf16,
+    ShaderId::MulCoopmatQ4KNaivePaddedFp8,
 ];
 
 pub const MUL_MAT_VEC_Q4_K_F32_F32: &[u8] =
@@ -199,6 +213,10 @@ pub const MUL_COOPMAT_Q4K_FWD_BN16: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_q4k_fwd_bn16.spv"));
 pub const MUL_COOPMAT_Q4K_NAIVE_BF16: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_q4k_naive_bf16.spv"));
+pub const MUL_COOPMAT_Q4K_NAIVE_PADDED_BF16: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_q4k_naive_padded_bf16.spv"));
+pub const MUL_COOPMAT_Q4K_NAIVE_PADDED_FP8: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_q4k_naive_padded_fp8.spv"));
 
 /// Decode a SPIR-V byte blob into u32 words. Vulkan consumes SPIR-V
 /// as `&[u32]`; `include_bytes!` only gives us `&[u8]` whose alignment

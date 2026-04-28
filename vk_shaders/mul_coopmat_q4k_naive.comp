@@ -2,7 +2,6 @@
 #extension GL_KHR_cooperative_matrix : enable
 #extension GL_KHR_memory_scope_semantics : enable
 #extension GL_KHR_shader_subgroup_basic : enable
-#extension GL_EXT_bfloat16 : enable
 #extension GL_EXT_shader_explicit_arithmetic_types : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
@@ -11,6 +10,29 @@
 #extension GL_EXT_shader_8bit_storage : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_control_flow_attributes : enable
+
+// FP8_MODE flips the narrow element type from bfloat16_t (default)
+// to floate4m3_t. Sprint 3C re-tests FP8 because Sprint 3A's
+// "FP8 precision failure" was actually a partial-tile-store bug
+// (not a precision issue). With N-padding ensuring all output tiles
+// are full 16×16, FP8 should behave too.
+#ifdef FP8_MODE
+#extension GL_EXT_float_e4m3 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#define ELEM_TYPE floate4m3_t
+#else
+#extension GL_EXT_bfloat16 : enable
+#define ELEM_TYPE bfloat16_t
+#endif
+
+// PADDED_OUTPUT: the runtime guarantees that pc.n is rounded up to
+// the next multiple of TILE (=16) and the activation buffer's tail
+// rows are zeroed before the dispatch. This lets the kernel use a
+// direct ColumnMajor coopMatStore — no LDS staging, no per-thread
+// bounds-checked write. Cuts ~1088 B of LDS and one barrier per WG.
+//
+// Without PADDED_OUTPUT the kernel falls back to the Sprint-3B
+// safe path (LDS-staged store + per-thread bounds check).
 
 // v0.2 Sprint 3B — naive Q4_K dequant-fusion coopmat with BF16
 // narrowing. Two design changes vs Sprint 2B/3A:
@@ -45,16 +67,14 @@ const uint Q4K_PER_BLOCK  = 256;
 const uint A_STRIDE = TILE + 1;       // 17 bf16
 const uint B_STRIDE = TILE + 1;       // 17 bf16
 
-shared bfloat16_t buf_a[TILE * A_STRIDE];   // 16 * 17 = 272 bf16 ≈ 544 B
-shared bfloat16_t buf_b[TILE * B_STRIDE];   // 272 bf16 ≈ 544 B
+shared ELEM_TYPE buf_a[TILE * A_STRIDE];   // 16 * 17 = 272 elem
+shared ELEM_TYPE buf_b[TILE * B_STRIDE];   // 272 elem
 
-// Staging buffer for the FP32 output tile. Lets us run the
-// coopMatStore once, then per-thread write to global with a
-// per-element bounds check so partial tiles (M / N not a multiple of
-// 16) get *some* of their elements written instead of being dropped
-// entirely. +1 padding follows the same bank-conflict reasoning as
-// buf_a/buf_b.
+#ifndef PADDED_OUTPUT
+// Sprint 3B safe path — staging buffer for the FP32 output tile.
+// PADDED_OUTPUT skips this in favour of a direct coopMatStore.
 shared float buf_c[TILE * (TILE + 1)];      // 16 * 17 = 272 fp32 ≈ 1088 B
+#endif
 
 struct block_q4_K {
     f16vec2  dm;
@@ -143,7 +163,7 @@ void main() {
                 val_f32 = q4k_dequant_one(pos_base + w, d, dmin,
                                           scale_u, min_u, block_id);
             }
-            buf_a[a_row * A_STRIDE + k_idx] = bfloat16_t(val_f32);
+            buf_a[a_row * A_STRIDE + k_idx] = ELEM_TYPE(val_f32);
         }
 
         // ---- B load: FP32 → BF16 → LDS ----
@@ -158,14 +178,14 @@ void main() {
             const uint gn    = wg_n + n_idx;
             const bool ok    = gk < pc.k && gn < pc.n;
             const float vf   = ok ? b[gn * pc.stride_b + gk] : 0.0;
-            buf_b[k_idx * B_STRIDE + n_idx] = bfloat16_t(vf);
+            buf_b[k_idx * B_STRIDE + n_idx] = ELEM_TYPE(vf);
         }
 
         barrier();
 
         // ---- Compute: one 16x16 WMMA per K-step ----
-        coopmat<bfloat16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> matA;
-        coopmat<bfloat16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> matB;
+        coopmat<ELEM_TYPE, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> matA;
+        coopmat<ELEM_TYPE, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> matB;
         coopMatLoad(matA, buf_a, 0u, A_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
         coopMatLoad(matB, buf_b, 0u, B_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
         acc = coopMatMulAdd(matA, matB, acc);
@@ -173,20 +193,24 @@ void main() {
         barrier();
     }
 
-    // ---- Store: 16x16 tile → output [N, M] row-major, with per-
-    // element bounds check so partial tiles (real Qwen3 seq_len is
-    // typically 20-40, not a multiple of 16) write the in-bounds
-    // portion instead of being dropped entirely.
-    //
-    // Stage 1: coopMatStore into LDS (RowMajor in tile-natural order).
+    // ---- Store: 16x16 tile → output [N, M] row-major ----
+#ifdef PADDED_OUTPUT
+    // Sprint 3C — runtime guarantees pc.n is a multiple of TILE and
+    // M (= pc.m) is always a multiple of 16 for current models, so
+    // every output tile is full and we can write directly with a
+    // single ColumnMajor coopMatStore. Stride is M; base offset is
+    // wg_n * M + wg_m.
+    coopMatStore(acc, c, wg_n * pc.stride_c + wg_m, pc.stride_c,
+                 gl_CooperativeMatrixLayoutColumnMajor);
+#else
+    // Sprint 3B safe path — partial tiles in either axis must drop
+    // out-of-bounds elements rather than corrupt neighbouring
+    // memory. Stage the acc into LDS RowMajor, then per-thread
+    // bounds-checked write.
     const uint C_STRIDE = TILE + 1u;
     coopMatStore(acc, buf_c, 0u, C_STRIDE,
                  gl_CooperativeMatrixLayoutRowMajor);
     barrier();
-    // Stage 2: 64 threads × 4 elements = 256 = TILE × TILE.
-    // For thread tid pass w, target element is tile(m_local, n_local)
-    // = buf_c[m_local * C_STRIDE + n_local], destination is
-    // c[(wg_n + n_local) * M + (wg_m + m_local)].
     [[unroll]] for (uint w = 0; w < 4u; w++) {
         const uint fidx    = w * BLOCK_SIZE + tid;
         const uint m_local = fidx / TILE;             // 0..15
@@ -197,4 +221,5 @@ void main() {
             c[gn * pc.stride_c + gm] = buf_c[m_local * C_STRIDE + n_local];
         }
     }
+#endif
 }

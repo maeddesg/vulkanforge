@@ -305,6 +305,28 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "mul_coopmat_q4k_naive.comp",
         defines: &[],
     },
+    // v0.2 Sprint 3C — naive Q4_K coopmat with N-padding. Same
+    // shader source as the Sprint 3B BF16 variant, but compiled with
+    // -DPADDED_OUTPUT so the output store is a single ColumnMajor
+    // coopMatStore (no LDS staging, no per-thread bounds check). The
+    // runtime is responsible for rounding pc.n up to a multiple of
+    // 16 and zero-filling the activation tail rows.
+    ShaderJob {
+        out_name: "mul_coopmat_q4k_naive_padded_bf16.spv",
+        entry_source: "mul_coopmat_q4k_naive.comp",
+        defines: &[("PADDED_OUTPUT", "1")],
+    },
+    // v0.2 Sprint 3C — FP8 retry. Sprint 3A's "FP8 precision
+    // failure" was actually a partial-tile-store bug. With
+    // PADDED_OUTPUT eliminating partial tiles, FP8 should produce
+    // logits parity. ELEM_TYPE switches to floate4m3_t under
+    // -DFP8_MODE; convert is one native v_cvt_pk_fp8_f32 (vs BF16's
+    // 5-VALU-op software pack).
+    ShaderJob {
+        out_name: "mul_coopmat_q4k_naive_padded_fp8.spv",
+        entry_source: "mul_coopmat_q4k_naive.comp",
+        defines: &[("PADDED_OUTPUT", "1"), ("FP8_MODE", "1")],
+    },
     // Phase 6 v0.1.2 cont. — mul_mm.comp port from llama.cpp
     // (MIT-licensed). Same shader runtime as mul_mmq.comp but takes
     // FP32 activations directly (no Q8_1 quantize step in front), uses

@@ -302,7 +302,9 @@ impl PipelineRegistry {
                 ShaderId::MulCoopmatQ4KFwdBn64
                 | ShaderId::MulCoopmatQ4KFwdBn32
                 | ShaderId::MulCoopmatQ4KFwdBn16
-                | ShaderId::MulCoopmatQ4KNaiveBf16 => {
+                | ShaderId::MulCoopmatQ4KNaiveBf16
+                | ShaderId::MulCoopmatQ4KNaivePaddedBf16
+                | ShaderId::MulCoopmatQ4KNaivePaddedFp8 => {
                     ComputeKernel::from_spv(device, &words, cache)
                 }
             };
