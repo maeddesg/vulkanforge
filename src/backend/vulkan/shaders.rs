@@ -45,6 +45,10 @@ pub enum ShaderId {
     FlashAttnTiledBr4,
     FlashAttnTiledBr8,
     FlashAttnTiledBr16,
+    // Sprint 7.6 — Br=16 with Bc=32 (smaller K-tile → less LDS,
+    // more WG-occupancy headroom). Same dispatch shape as
+    // FlashAttnTiledBr16; only the K-tile / scores LDS sizes differ.
+    FlashAttnTiledBr16Bc32,
     // Phase 6 v0.1.2 — mul_mm.comp port. Q4_K / Q6_K weights × FP32
     // activations (no Q8_1 quantize step). Used by prefill_batch when
     // VULKANFORGE_USE_MUL_MM is set; mul_mmq stays as the gated
@@ -103,6 +107,7 @@ impl ShaderId {
             ShaderId::FlashAttnTiledBr4 => "flash_attn_tiled_br4",
             ShaderId::FlashAttnTiledBr8 => "flash_attn_tiled_br8",
             ShaderId::FlashAttnTiledBr16 => "flash_attn_tiled_br16",
+            ShaderId::FlashAttnTiledBr16Bc32 => "flash_attn_tiled_br16_bc32",
             ShaderId::MulMmQ4K => "mul_mm_q4_k_f32",
             ShaderId::MulMmQ6K => "mul_mm_q6_k_f32",
             ShaderId::MulMmQ4KAligned => "mul_mm_q4_k_f32_aligned",
@@ -139,6 +144,7 @@ impl ShaderId {
             ShaderId::FlashAttnTiledBr4 => FLASH_ATTN_TILED_BR4,
             ShaderId::FlashAttnTiledBr8 => FLASH_ATTN_TILED_BR8,
             ShaderId::FlashAttnTiledBr16 => FLASH_ATTN_TILED_BR16,
+            ShaderId::FlashAttnTiledBr16Bc32 => FLASH_ATTN_TILED_BR16_BC32,
             ShaderId::MulMmQ4K => MUL_MM_Q4_K_F32,
             ShaderId::MulMmQ6K => MUL_MM_Q6_K_F32,
             ShaderId::MulMmQ4KAligned => MUL_MM_Q4_K_F32_ALIGNED,
@@ -175,6 +181,7 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::FlashAttnTiledBr4,
     ShaderId::FlashAttnTiledBr8,
     ShaderId::FlashAttnTiledBr16,
+    ShaderId::FlashAttnTiledBr16Bc32,
     ShaderId::MulMmQ4K,
     ShaderId::MulMmQ6K,
     ShaderId::MulMmQ4KAligned,
@@ -221,6 +228,8 @@ pub const FLASH_ATTN_TILED_BR8: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_tiled_br8.spv"));
 pub const FLASH_ATTN_TILED_BR16: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_tiled_br16.spv"));
+pub const FLASH_ATTN_TILED_BR16_BC32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_tiled_br16_bc32.spv"));
 pub const MUL_MM_Q4_K_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q4_k_f32.spv"));
 pub const MUL_MM_Q6_K_F32: &[u8] =

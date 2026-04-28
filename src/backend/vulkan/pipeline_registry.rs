@@ -328,10 +328,11 @@ impl PipelineRegistry {
                 }
                 ShaderId::FlashAttnTiledBr4
                 | ShaderId::FlashAttnTiledBr8
-                | ShaderId::FlashAttnTiledBr16 => {
-                    // No spec constants — BR/TILE/HEAD_DIM are baked
-                    // in via -DBR=4|8|16 at SPIR-V build time (Sprint
-                    // 7.5).
+                | ShaderId::FlashAttnTiledBr16
+                | ShaderId::FlashAttnTiledBr16Bc32 => {
+                    // No spec constants — BR/BC/HEAD_DIM are baked in
+                    // via -DBR=N -DBC=N at SPIR-V build time
+                    // (Sprint 7.5 / 7.6).
                     ComputeKernel::from_spv(device, &words, cache)
                 }
                 // Sprint 3A — Q4_K coopmat with forward-pass layout.

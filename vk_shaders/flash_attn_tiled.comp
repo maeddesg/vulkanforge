@@ -27,13 +27,27 @@
 //   64 KB; the existing pattern of adjacent threads reading adjacent
 //   V dims is already wave-coalesced).
 
-// Sprint 7.5 — BR is set per-SPV via -DBR=4/8/16. GLSL forbids
-// shared arrays sized by spec constants, so we emit one SPV per Br.
+// Sprint 7.5 — BR is set per-SPV via -DBR=4/8/16.
+// Sprint 7.6 — BC is set per-SPV via -DBC=32/64. GLSL forbids
+// shared arrays sized by spec constants, so we emit one SPV per
+// (Br, Bc) pair.
+//
+// WGSIZE=64 (Wave64 minimum on RDNA4) is FIXED. With BC=32, only
+// threads 0..31 cover real K-positions; threads 32..63 still
+// participate in cooperative loads (threads 0..63 each fetch one
+// dim half of an LDS row) but contribute score=-inf / pscore=0
+// to the subgroup reductions and skip the scores_lds write. Net
+// effect: half the LDS for K-tile + scores at the cost of 50%
+// idle threads in the score-compute step — viable when the LDS
+// budget enables higher WG-occupancy.
 #ifndef BR
 #define BR 4
 #endif
+#ifndef BC
+#define BC 64
+#endif
 const uint WGSIZE   = 64;
-const uint TILE     = WGSIZE;   // K-tile cols == one per thread.
+const uint TILE     = BC;
 const uint HEAD_DIM = 128;       // Hardcoded: Qwen3 / Llama-3.1 / Mistral / DSR1.
 
 layout (local_size_x = WGSIZE) in;
@@ -123,8 +137,12 @@ void main() {
         // tile (= tile_base + tid). Repeat the QK dot for each query
         // qi in the Q-tile, doing the per-query online-softmax update
         // immediately. Subgroup reductions are sequential per qi.
+        // Sprint 7.6: at BC<WGSIZE, threads with tid >= BC are out
+        // of tile range and must contribute score=-inf to the
+        // subgroup reductions (and skip the LDS write).
         uint t_global = tile_base + tid;
-        bool t_in_range = t_global < causal_len_max;
+        bool tid_in_tile = tid < BC;
+        bool t_in_range = tid_in_tile && t_global < causal_len_max;
         [[unroll]] for (uint qi = 0; qi < BR; ++qi) {
             uint q_pos_qi = p.q_start + q_base + qi;
             bool valid = t_in_range
@@ -155,7 +173,10 @@ void main() {
             my_sum[qi] += tile_sum;
             my_max[qi]  = new_max;
 
-            scores_lds[qi * TILE + tid] = pscore;
+            // Only threads inside the tile own a slot in scores_lds.
+            if (tid_in_tile) {
+                scores_lds[qi * TILE + tid] = pscore;
+            }
         }
         barrier();
 

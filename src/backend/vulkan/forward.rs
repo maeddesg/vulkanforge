@@ -220,8 +220,14 @@ pub struct Forward {
     fa_tiled_enabled: bool,
     /// Sprint 7.5 — selects the BR variant when `fa_tiled_enabled` is
     /// on. Read from `VULKANFORGE_FA_BR` env var; valid values are
-    /// 4, 8, 16. Default 4 (Sprint 7's proven config).
+    /// 4, 8, 16. Default 16 (Sprint 7.5 sweep winner).
     fa_tiled_br: u32,
+    /// Sprint 7.6 — selects the BC (K-tile width) variant. Only
+    /// applies when `fa_tiled_br = 16` (the only Br for which a
+    /// Bc=32 SPV exists). Read from `VULKANFORGE_FA_BC`; valid
+    /// values are 32, 64. Default 64 (matches Sprint 7.5 baseline
+    /// until the Bc sweep proves Bc=32 is at least as good).
+    fa_tiled_bc: u32,
 
     /// `forward_token` hot path. When `cache_enabled` is true (env
     /// `VULKANFORGE_CB_REUSE=1` at construction), `alloc_or_get_set`
@@ -512,6 +518,17 @@ impl Forward {
             Some(16) => 16,
             _        => 16,
         };
+        // Sprint 7.6 — pick which Bc variant for Br=16. Default 32
+        // (Sprint 7.6 sweep winner: +1% to +11% single-shot, +15%
+        // to +19% chunked vs Bc=64). Only honoured when fa_tiled_br
+        // == 16 because that's the only Br with a Bc=32 SPV.
+        let fa_tiled_bc: u32 = match std::env::var("VULKANFORGE_FA_BC")
+            .ok().and_then(|s| s.parse::<u32>().ok())
+        {
+            Some(32) => 32,
+            Some(64) => 64,
+            _        => 32,
+        };
 
         let coopmat_fp8_enabled = match std::env::var("VULKANFORGE_COOPMAT_FP8") {
             Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
@@ -543,6 +560,7 @@ impl Forward {
             coopmat_fp8_enabled,
             fa_tiled_enabled,
             fa_tiled_br,
+            fa_tiled_bc,
             profiler,
             rope_theta_scale, attn_scale,
             fa_scratch_out, fa_scratch_max, fa_scratch_sum,
@@ -1998,10 +2016,11 @@ impl Forward {
         q_start: u32,
         n_kv: u32,
     ) {
-        let (shader_id, br) = match self.fa_tiled_br {
-            8  => (ShaderId::FlashAttnTiledBr8,  8u32),
-            16 => (ShaderId::FlashAttnTiledBr16, 16u32),
-            _  => (ShaderId::FlashAttnTiledBr4,  4u32),
+        let (shader_id, br) = match (self.fa_tiled_br, self.fa_tiled_bc) {
+            (16, 32) => (ShaderId::FlashAttnTiledBr16Bc32, 16u32),
+            (16, _)  => (ShaderId::FlashAttnTiledBr16,     16u32),
+            (8,  _)  => (ShaderId::FlashAttnTiledBr8,       8u32),
+            _        => (ShaderId::FlashAttnTiledBr4,       4u32),
         };
         let cfg = self.config.clone();
         let kernel = registry.get(shader_id);

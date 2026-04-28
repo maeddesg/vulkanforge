@@ -180,7 +180,16 @@ const JOBS: &[ShaderJob] = &[
     ShaderJob {
         out_name: "flash_attn_tiled_br16.spv",
         entry_source: "flash_attn_tiled.comp",
-        defines: &[("BR", "16")],
+        defines: &[("BR", "16"), ("BC", "64")],
+    },
+    // Sprint 7.6 — Br=16 with Bc=32 K-tile. Halves the K-LDS row
+    // count (16 KB vs 32 KB), enabling higher WG-occupancy at the
+    // cost of half-utilised score-compute threads (32 active out
+    // of 64 in the wave).
+    ShaderJob {
+        out_name: "flash_attn_tiled_br16_bc32.spv",
+        entry_source: "flash_attn_tiled.comp",
+        defines: &[("BR", "16"), ("BC", "32")],
     },
     // Phase-6A probe: confirms shaderc 0.8 + Mesa glslang ship a
     // coopmat + bfloat16 toolchain that produces SPV without warnings.
