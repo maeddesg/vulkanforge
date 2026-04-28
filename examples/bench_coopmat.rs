@@ -34,23 +34,42 @@ const SHADER_SPV_BF16: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/bench_coopmat_pure_f32.spv"));
 const SHADER_SPV_FP8: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/bench_coopmat_fp8_e4m3.spv"));
-const SHADER_SPV_TILED_BF16: &[u8] =
+const SHADER_SPV_TILED_BF16_BN64: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_bf16_f32.spv"));
+const SHADER_SPV_TILED_BF16_BN32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_bf16_bn32.spv"));
+const SHADER_SPV_TILED_BF16_BN16: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_bf16_bn16.spv"));
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum BenchMode {
     Bf16,
     Fp8E4m3,
-    TiledBf16,
+    TiledBf16Bn64,
+    TiledBf16Bn32,
+    TiledBf16Bn16,
+    /// Auto-pick BN based on N: BN=16 for N≤32, BN=32 for N≤64, BN=64 otherwise.
+    TiledBf16Auto,
 }
 
 impl BenchMode {
     fn from_env() -> Self {
+        // VF_BENCH_BN takes precedence — explicit BN selection.
+        if let Ok(s) = std::env::var("VF_BENCH_BN") {
+            return match s.as_str() {
+                "16" => BenchMode::TiledBf16Bn16,
+                "32" => BenchMode::TiledBf16Bn32,
+                "64" => BenchMode::TiledBf16Bn64,
+                "auto" => BenchMode::TiledBf16Auto,
+                other => panic!("VF_BENCH_BN must be 16/32/64/auto, got {other}"),
+            };
+        }
         if matches!(
             std::env::var("VF_BENCH_TILED").ok().as_deref(),
             Some("1") | Some("true") | Some("bf16")
         ) {
-            return BenchMode::TiledBf16;
+            // Default tiled mode = BN=64 (Sprint 1A baseline).
+            return BenchMode::TiledBf16Bn64;
         }
         match std::env::var("VF_BENCH_FP8").ok().as_deref() {
             Some("1") | Some("true") | Some("e4m3") => BenchMode::Fp8E4m3,
@@ -62,7 +81,26 @@ impl BenchMode {
         match self {
             BenchMode::Bf16 => "BF16 (naive 1 SG/tile)",
             BenchMode::Fp8E4m3 => "FP8-E4M3 (naive 1 SG/tile)",
-            BenchMode::TiledBf16 => "BF16 tiled 4SG×2x2 (64x64)",
+            BenchMode::TiledBf16Bn64 => "BF16 tiled BN=64 (4SG, 2x2 WMMAs)",
+            BenchMode::TiledBf16Bn32 => "BF16 tiled BN=32 (4SG, 1x2 WMMAs)",
+            BenchMode::TiledBf16Bn16 => "BF16 tiled BN=16 (4SG, 1x1 WMMA)",
+            BenchMode::TiledBf16Auto => "BF16 tiled BN=auto-select(N)",
+        }
+    }
+
+    /// Resolve `Auto` to a concrete variant for the given (n).
+    fn resolve(self, n: u32) -> BenchMode {
+        match self {
+            BenchMode::TiledBf16Auto => {
+                if n <= 32 {
+                    BenchMode::TiledBf16Bn16
+                } else if n <= 64 {
+                    BenchMode::TiledBf16Bn32
+                } else {
+                    BenchMode::TiledBf16Bn64
+                }
+            }
+            other => other,
         }
     }
 
@@ -70,24 +108,34 @@ impl BenchMode {
         match self {
             BenchMode::Bf16 => SHADER_SPV_BF16,
             BenchMode::Fp8E4m3 => SHADER_SPV_FP8,
-            BenchMode::TiledBf16 => SHADER_SPV_TILED_BF16,
+            BenchMode::TiledBf16Bn64 => SHADER_SPV_TILED_BF16_BN64,
+            BenchMode::TiledBf16Bn32 => SHADER_SPV_TILED_BF16_BN32,
+            BenchMode::TiledBf16Bn16 => SHADER_SPV_TILED_BF16_BN16,
+            BenchMode::TiledBf16Auto => panic!("auto mode must be resolve()d before use"),
         }
     }
 
     fn input_bytes_per_elem(self) -> u64 {
         match self {
-            BenchMode::Bf16 | BenchMode::TiledBf16 => 2,
+            BenchMode::Bf16
+            | BenchMode::TiledBf16Bn64
+            | BenchMode::TiledBf16Bn32
+            | BenchMode::TiledBf16Bn16
+            | BenchMode::TiledBf16Auto => 2,
             BenchMode::Fp8E4m3 => 1,
         }
     }
 
     /// Workgroup output-tile size, used to compute the dispatch grid.
     /// Naive bench: each WG covers a 16x16 tile (one WMMA fragment).
-    /// Tiled BF16: each WG covers a 64x64 tile (4 subgroups × 2x2 WMMAs).
+    /// Tiled BF16: each WG covers a BMxBN tile (BM always = 64).
     fn tile_mn(self) -> (u32, u32) {
         match self {
             BenchMode::Bf16 | BenchMode::Fp8E4m3 => (16, 16),
-            BenchMode::TiledBf16 => (64, 64),
+            BenchMode::TiledBf16Bn64 => (64, 64),
+            BenchMode::TiledBf16Bn32 => (64, 32),
+            BenchMode::TiledBf16Bn16 => (64, 16),
+            BenchMode::TiledBf16Auto => panic!("auto mode must be resolve()d before use"),
         }
     }
 }
@@ -219,16 +267,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     let cmd_ctx = CommandContext::new(&device, queue_family_index)?;
 
-    // ---- Pipeline / descriptor set layout from SPV ----
-    let words: Vec<u32> = mode
-        .spv()
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    let module_info = vk::ShaderModuleCreateInfo::default().code(&words);
-    let module = unsafe { device.create_shader_module(&module_info, None)? };
-
-    // 3 storage buffers (A, B, C).
+    // 3 storage buffers (A, B, C). Shared layout across all pipelines.
     let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..3u32)
         .map(|i| {
             vk::DescriptorSetLayoutBinding::default()
@@ -250,19 +289,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .push_constant_ranges(&push_range);
     let pipeline_layout = unsafe { device.create_pipeline_layout(&pl_info, None)? };
 
-    let stage = vk::PipelineShaderStageCreateInfo::default()
-        .stage(vk::ShaderStageFlags::COMPUTE)
-        .module(module)
-        .name(c"main");
-    let cp_info = vk::ComputePipelineCreateInfo::default()
-        .stage(stage)
-        .layout(pipeline_layout);
-    let pipelines = unsafe {
-        device
-            .create_compute_pipelines(vk::PipelineCache::null(), &[cp_info], None)
-            .map_err(|(_, e)| e)?
+    // Build a (module, pipeline) for each resolved mode we'll need. For
+    // a fixed mode that's just one entry; for Auto we lazily fill in
+    // up to three (BN=16/32/64) as shapes request them.
+    let mut module_cache: std::collections::HashMap<BenchMode, vk::ShaderModule> =
+        std::collections::HashMap::new();
+    let mut pipeline_cache: std::collections::HashMap<BenchMode, vk::Pipeline> =
+        std::collections::HashMap::new();
+
+    let mut get_pipeline = |m: BenchMode| -> Result<vk::Pipeline, Box<dyn std::error::Error>> {
+        if let Some(&p) = pipeline_cache.get(&m) {
+            return Ok(p);
+        }
+        let words: Vec<u32> = m
+            .spv()
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let module = unsafe {
+            device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&words),
+                None,
+            )?
+        };
+        let stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(module)
+            .name(c"main");
+        let pipelines = unsafe {
+            device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    &[vk::ComputePipelineCreateInfo::default()
+                        .stage(stage)
+                        .layout(pipeline_layout)],
+                    None,
+                )
+                .map_err(|(_, e)| e)?
+        };
+        module_cache.insert(m, module);
+        pipeline_cache.insert(m, pipelines[0]);
+        Ok(pipelines[0])
     };
-    let pipeline = pipelines[0];
 
     println!("\n{:<22} {:<14} {:>11} {:>10} {:>10} {:>11}",
         "size", "GFLOPs", "warmup_ms", "med_ms", "TFLOPS", "vs scalar*");
@@ -300,8 +368,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ]);
 
     for &(m, n, k) in &shapes {
+        let resolved = mode.resolve(n);
+        let pipeline = get_pipeline(resolved)?;
         let res = run_size(
-            mode,
+            resolved,
             &device, &mut allocator, queue, &cmd_ctx,
             pipeline, pipeline_layout, dsl,
             m, n, k,
@@ -311,14 +381,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             format!("{}x{}x{}", m, n, k)
         };
+        // Auto mode: append the resolved BN per row so the table is
+        // self-explanatory.
+        let suffix = if mode == BenchMode::TiledBf16Auto {
+            match resolved {
+                BenchMode::TiledBf16Bn16 => " [BN=16]",
+                BenchMode::TiledBf16Bn32 => " [BN=32]",
+                BenchMode::TiledBf16Bn64 => " [BN=64]",
+                _ => "",
+            }
+        } else {
+            ""
+        };
         println!(
-            "{:<22} {:<14.2} {:>11.2} {:>10.3} {:>10.2} {:>10.2}×",
+            "{:<22} {:<14.2} {:>11.2} {:>10.3} {:>10.2} {:>10.2}×{}",
             label,
             res.gflops,
             res.warmup_ms,
             res.median_ms,
             res.tflops,
             res.tflops / SCALAR_FMA_TFLOPS_BASELINE,
+            suffix,
         );
     }
 
@@ -329,10 +412,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ---- Cleanup ----
     unsafe {
-        device.destroy_pipeline(pipeline, None);
+        for (_m, p) in pipeline_cache.iter() {
+            device.destroy_pipeline(*p, None);
+        }
+        for (_m, mo) in module_cache.iter() {
+            device.destroy_shader_module(*mo, None);
+        }
         device.destroy_pipeline_layout(pipeline_layout, None);
         device.destroy_descriptor_set_layout(dsl, None);
-        device.destroy_shader_module(module, None);
     }
     cmd_ctx.destroy(&device);
     drop(allocator);
@@ -374,7 +461,11 @@ fn run_size(
     // bench, not precision — values just need to be numerically sane
     // (no NaN/Inf in inputs, no Inf in accumulator).
     let a_raw: Vec<u8> = match mode {
-        BenchMode::Bf16 | BenchMode::TiledBf16 => bytemuck::cast_slice::<u16, u8>(
+        BenchMode::Bf16
+        | BenchMode::TiledBf16Bn64
+        | BenchMode::TiledBf16Bn32
+        | BenchMode::TiledBf16Bn16
+        | BenchMode::TiledBf16Auto => bytemuck::cast_slice::<u16, u8>(
             &(0..(m * k))
                 .map(|i| f32_to_bf16(0.001 * ((i % 64) as f32 - 32.0)))
                 .collect::<Vec<u16>>()
@@ -384,7 +475,11 @@ fn run_size(
             .collect(),
     };
     let b_raw: Vec<u8> = match mode {
-        BenchMode::Bf16 | BenchMode::TiledBf16 => bytemuck::cast_slice::<u16, u8>(
+        BenchMode::Bf16
+        | BenchMode::TiledBf16Bn64
+        | BenchMode::TiledBf16Bn32
+        | BenchMode::TiledBf16Bn16
+        | BenchMode::TiledBf16Auto => bytemuck::cast_slice::<u16, u8>(
             &(0..(k * n))
                 .map(|i| f32_to_bf16(0.001 * (((i / 17) % 32) as f32)))
                 .collect::<Vec<u16>>()
@@ -528,13 +623,21 @@ fn run_size(
             let a_idx = kk;
             let b_idx = kk * stride_b;
             let a = match mode {
-                BenchMode::Bf16 | BenchMode::TiledBf16 => bf16_to_f32(u16::from_le_bytes([
+                BenchMode::Bf16
+                | BenchMode::TiledBf16Bn64
+                | BenchMode::TiledBf16Bn32
+                | BenchMode::TiledBf16Bn16
+                | BenchMode::TiledBf16Auto => bf16_to_f32(u16::from_le_bytes([
                     a_raw[2 * a_idx], a_raw[2 * a_idx + 1],
                 ])) as f64,
                 BenchMode::Fp8E4m3 => fp8_e4m3_to_f32(a_raw[a_idx]) as f64,
             };
             let b = match mode {
-                BenchMode::Bf16 | BenchMode::TiledBf16 => bf16_to_f32(u16::from_le_bytes([
+                BenchMode::Bf16
+                | BenchMode::TiledBf16Bn64
+                | BenchMode::TiledBf16Bn32
+                | BenchMode::TiledBf16Bn16
+                | BenchMode::TiledBf16Auto => bf16_to_f32(u16::from_le_bytes([
                     b_raw[2 * b_idx], b_raw[2 * b_idx + 1],
                 ])) as f64,
                 BenchMode::Fp8E4m3 => fp8_e4m3_to_f32(b_raw[b_idx]) as f64,

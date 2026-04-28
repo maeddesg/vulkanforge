@@ -186,16 +186,32 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "bench_coopmat_fp8.comp",
         defines: &[],
     },
-    // v0.2 Sprint 1A — tiled BF16 coopmat GEMM. 4 subgroups × 2x2
-    // WMMA per subgroup over a 64x64 output tile, BK=16 K-step,
-    // LDS-staged with bank-conflict padding. Used by
+    // v0.2 Sprint 1A — tiled BF16 coopmat GEMM (BN=64 default).
+    // 4 subgroups × 2x2 WMMA per subgroup over a 64x64 output tile,
+    // BK=16 K-step, LDS-staged with bank-conflict padding. Used by
     // examples/bench_coopmat when VF_BENCH_TILED=1, and by the
     // tiled-coopmat correctness suite. Not loaded by the runtime
     // forward pass yet (Sprint 3 task).
     ShaderJob {
         out_name: "mul_coopmat_bf16_f32.spv",
         entry_source: "mul_coopmat_bf16.comp",
-        defines: &[],
+        defines: &[("BN", "64")],
+    },
+    // v0.2 Sprint 1A.5 — Skinny-N variants with smaller BN. Same
+    // source, different macro: BN=32 splits the output tile across
+    // 4 subgroups in a 4x1 grid (each subgroup 16x32 = 2 WMMAs);
+    // BN=16 is the same 4x1 grid but each subgroup emits a single
+    // 16x16 WMMA. Both increase WG-count along N for short-seq
+    // prefill workloads (N == seq_len ≤ 64).
+    ShaderJob {
+        out_name: "mul_coopmat_bf16_bn32.spv",
+        entry_source: "mul_coopmat_bf16.comp",
+        defines: &[("BN", "32")],
+    },
+    ShaderJob {
+        out_name: "mul_coopmat_bf16_bn16.spv",
+        entry_source: "mul_coopmat_bf16.comp",
+        defines: &[("BN", "16")],
     },
     // Phase 6 v0.1.2 cont. — mul_mm.comp port from llama.cpp
     // (MIT-licensed). Same shader runtime as mul_mmq.comp but takes

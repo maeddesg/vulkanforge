@@ -8,44 +8,80 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
 #extension GL_EXT_control_flow_attributes : enable
 
-// v0.2 Sprint 1A — tiled BF16 cooperative-matrix GEMM kernel.
+// v0.2 Sprint 1A.5 — tiled BF16 cooperative-matrix GEMM kernel.
 //
 // Computes C = A * B with
 //   A : [M, K] bfloat16_t row-major
 //   B : [K, N] bfloat16_t row-major
 //   C : [M, N] f32        row-major
 //
-// Tile structure mirrors llama.cpp's mul_mm.comp KHR-coopmat path
-// (BLOCK_SIZE=256, BM=BN=64, BK=16, 4 subgroups in a 2x2 grid).
-// Each subgroup owns a 32x32 region of the output tile and performs
-// four 16x16x16 WMMA mul-add operations per K-step. Thread-cooperative
-// loads stage a 64x16 slab of A and a 16x64 slab of B into LDS each
-// K-step; both staged in row-major form with +1 bf16 padding per row
-// to break bank-conflict patterns.
+// BN is a build-time #define (16 / 32 / 64). The subgroup grid and the
+// per-subgroup WMMA count adapt to BN so that:
+//   * BN = 64: 2x2 subgroup grid, each subgroup runs 2x2 = 4 WMMAs
+//              (= Sprint 1A baseline geometry, bit-identical when
+//               built with -DBN=64)
+//   * BN = 32: 4x1 subgroup grid, each subgroup runs 1x2 = 2 WMMAs
+//   * BN = 16: 4x1 subgroup grid, each subgroup runs 1x1 = 1 WMMA
+//
+// At BN<64 the kernel emits more workgroups in the N direction for any
+// given (M, N), which fixes the Sprint-1A "skinny-N" regression on
+// prefill shapes (N == 64 == BN previously yielded only 1 WG per row).
 //
 // Requires M and N to be multiples of 16 (WMMA tile aligns the store
 // path); K can be arbitrary, sub-K-tile leftover is zero-padded by the
 // global-load bounds check.
 
+#ifndef BN
+#define BN 64
+#endif
+
 const uint BLOCK_SIZE = 256;     // 4 * Wave64
-const uint BM = 64;
-const uint BN = 64;
-const uint BK = 16;              // = WMMA K
-const uint TM = 16;              // WMMA M
-const uint TN = 16;              // WMMA N
-const uint TK = 16;              // WMMA K
-const uint WM = 32;              // subgroup tile M = 2 * TM
-const uint WN = 32;              // subgroup tile N = 2 * TN
+const uint BM         = 64;
+const uint BK         = 16;      // = WMMA K
+const uint TM         = 16;      // WMMA M
+const uint TN         = 16;      // WMMA N
+const uint TK         = 16;      // WMMA K
+
+// Subgroup grid: NUM_SG = BLOCK_SIZE / 64 = 4. Layout depends on BN:
+//   BN=64: 2x2 (= sprint 1A), each SG covers 32x32
+//   BN=32: 4x1, each SG covers 16x32
+//   BN=16: 4x1, each SG covers 16x16
+#if BN >= 64
+  #define SG_M_COUNT  2
+  #define SG_N_COUNT  2
+  #define WMMAS_M     2
+  #define WMMAS_N     2
+#elif BN == 32
+  #define SG_M_COUNT  4
+  #define SG_N_COUNT  1
+  #define WMMAS_M     1
+  #define WMMAS_N     2
+#elif BN == 16
+  #define SG_M_COUNT  4
+  #define SG_N_COUNT  1
+  #define WMMAS_M     1
+  #define WMMAS_N     1
+#else
+  #error "BN must be 16, 32, or 64"
+#endif
+
+const uint WM = WMMAS_M * TM;    // subgroup tile M
+const uint WN = WMMAS_N * TN;    // subgroup tile N
 
 // +1 bf16 of padding per row breaks bank-conflict patterns. With LDS
 // banks at 4 bytes wide and bf16 at 2 bytes, BK=16 maps cleanly onto 8
 // banks; +1 bf16 (= 2 bytes) shifts subsequent rows by 1 bank-half so
 // no two rows share the same bank for the same in-row column.
-const uint A_STRIDE = BK + 1;    // 17 bf16 / row
-const uint B_STRIDE = BN + 1;    // 65 bf16 / row
+const uint A_STRIDE = BK + 1;
+const uint B_STRIDE = BN + 1;
 
-shared bfloat16_t buf_a[BM * A_STRIDE];   // 64 * 17 = 1088 bf16 ≈ 2.1 KiB
-shared bfloat16_t buf_b[BK * B_STRIDE];   // 16 * 65 = 1040 bf16 ≈ 2.0 KiB
+shared bfloat16_t buf_a[BM * A_STRIDE];
+shared bfloat16_t buf_b[BK * B_STRIDE];
+
+// Global-load pass count: ceil(elems / threads). For BM*BK=1024 with
+// BLOCK_SIZE=256 → 4 passes. For BK*BN at BN=16/32/64 → 1/2/4 passes.
+const uint A_PASSES = (BM * BK + BLOCK_SIZE - 1) / BLOCK_SIZE;
+const uint B_PASSES = (BK * BN + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
 layout(local_size_x = BLOCK_SIZE) in;
 
@@ -57,9 +93,9 @@ layout(push_constant) uniform PC {
     uint m;
     uint n;
     uint k;
-    uint stride_a;   // = K (row stride of A in bf16 elements)
-    uint stride_b;   // = N
-    uint stride_c;   // = N
+    uint stride_a;
+    uint stride_b;
+    uint stride_c;
 } pc;
 
 void main() {
@@ -67,28 +103,28 @@ void main() {
     const uint wg_n = gl_WorkGroupID.y * BN;
     const uint tid  = gl_LocalInvocationID.x;
 
-    // 4 subgroups arranged 2x2 inside the 64x64 output tile.
-    const uint sg    = gl_SubgroupID;
-    const uint sg_m  = sg / 2;       // 0..1, picks WM-row
-    const uint sg_n  = sg % 2;       // 0..1, picks WN-col
+    // Subgroup → tile-grid mapping. Generic over SG_M_COUNT × SG_N_COUNT
+    // = NUM_SG. For SG_N_COUNT=1 this collapses to "all SGs along M".
+    const uint sg   = gl_SubgroupID;
+    const uint sg_m = sg / SG_N_COUNT;
+    const uint sg_n = sg % SG_N_COUNT;
 
-    // Per-subgroup 2x2 grid of 16x16 accumulators (= cms_per_row * cms_per_col).
-    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> acc00 =
-        coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
-    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> acc01 = acc00;
-    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> acc10 = acc00;
-    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> acc11 = acc00;
+    // Per-subgroup WMMAS_M × WMMAS_N grid of 16×16 FP32 accumulators,
+    // flattened to a 1D array. mul_mm.comp uses the same flattening.
+    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> acc[WMMAS_M * WMMAS_N];
+    [[unroll]] for (uint i = 0; i < WMMAS_M * WMMAS_N; i++) {
+        acc[i] = coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
+    }
 
-    // 256 threads × 4 elems/thread = 1024 BF16 per A or B tile slab.
-    // Pass-loop walks 4 strides of BLOCK_SIZE; flat-index (m, k) for A
-    // or (k, n) for B. Bounds check zero-pads the K tail (and out-of-WG
-    // M/N rows for the last WG when M or N isn't a multiple of BM/BN).
     for (uint kk = 0; kk < pc.k; kk += BK) {
-        // ---- Stage A[BM × BK] -> buf_a (row-major, A_STRIDE per row) ----
-        [[unroll]] for (uint pass = 0; pass < 4; pass++) {
-            const uint fidx  = pass * BLOCK_SIZE + tid;        // 0..1023
-            const uint m_idx = fidx / BK;                       // 0..63
-            const uint k_idx = fidx & (BK - 1);                 // 0..15
+        // ---- Stage A[BM × BK] -> buf_a ----
+        [[unroll]] for (uint pass = 0; pass < A_PASSES; pass++) {
+            const uint fidx  = pass * BLOCK_SIZE + tid;
+            // For BM*BK=1024 and BLOCK_SIZE=256, A_PASSES=4 covers all
+            // 1024 elements with no idle thread. fidx never exceeds
+            // BM*BK on the inner loop bodies that are actually unrolled.
+            const uint m_idx = fidx / BK;
+            const uint k_idx = fidx & (BK - 1);
             const uint gm    = wg_m + m_idx;
             const uint gk    = kk + k_idx;
             const bool ok    = gm < pc.m && gk < pc.k;
@@ -98,64 +134,61 @@ void main() {
             buf_a[m_idx * A_STRIDE + k_idx] = v;
         }
 
-        // ---- Stage B[BK × BN] -> buf_b (row-major, B_STRIDE per row) ----
-        [[unroll]] for (uint pass = 0; pass < 4; pass++) {
-            const uint fidx  = pass * BLOCK_SIZE + tid;
-            const uint k_idx = fidx / BN;                       // 0..15
-            const uint n_idx = fidx & (BN - 1);                 // 0..63
-            const uint gk    = kk + k_idx;
-            const uint gn    = wg_n + n_idx;
-            const bool ok    = gk < pc.k && gn < pc.n;
-            const bfloat16_t v = ok
-                ? b[gk * pc.stride_b + gn]
-                : bfloat16_t(0.0);
-            buf_b[k_idx * B_STRIDE + n_idx] = v;
+        // ---- Stage B[BK × BN] -> buf_b ----
+        [[unroll]] for (uint pass = 0; pass < B_PASSES; pass++) {
+            const uint fidx = pass * BLOCK_SIZE + tid;
+            // For BN=16 and B_PASSES=1, fidx ∈ [0, 256) and BK*BN=256 ⇒
+            // every thread loads exactly one element. For BN=32/64 the
+            // pass-loop fans out to cover all BK*BN slots.
+            if (fidx < BK * BN) {
+                const uint k_idx = fidx / BN;
+                const uint n_idx = fidx & (BN - 1);
+                const uint gk    = kk + k_idx;
+                const uint gn    = wg_n + n_idx;
+                const bool ok    = gk < pc.k && gn < pc.n;
+                const bfloat16_t v = ok
+                    ? b[gk * pc.stride_b + gn]
+                    : bfloat16_t(0.0);
+                buf_b[k_idx * B_STRIDE + n_idx] = v;
+            }
         }
 
         barrier();
 
-        // ---- 4 WMMAs per subgroup ----
-        // A-tile row-pos for this subgroup (within buf_a)
-        const uint a_row0 = (sg_m * WM + 0  * TM) * A_STRIDE;
-        const uint a_row1 = (sg_m * WM + 1  * TM) * A_STRIDE;
-        // B-tile col-pos for this subgroup (within buf_b)
-        const uint b_col0 = sg_n * WN + 0  * TN;
-        const uint b_col1 = sg_n * WN + 1  * TN;
+        // ---- Compute: WMMAS_M × WMMAS_N MulAdds per subgroup ----
+        coopmat<bfloat16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> matA[WMMAS_M];
+        coopmat<bfloat16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> matB[WMMAS_N];
 
-        coopmat<bfloat16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> matA0;
-        coopmat<bfloat16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> matA1;
-        coopmat<bfloat16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> matB0;
-        coopmat<bfloat16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> matB1;
-
-        coopMatLoad(matA0, buf_a, a_row0, A_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatLoad(matA1, buf_a, a_row1, A_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatLoad(matB0, buf_b, b_col0, B_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatLoad(matB1, buf_b, b_col1, B_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
-
-        acc00 = coopMatMulAdd(matA0, matB0, acc00);
-        acc01 = coopMatMulAdd(matA0, matB1, acc01);
-        acc10 = coopMatMulAdd(matA1, matB0, acc10);
-        acc11 = coopMatMulAdd(matA1, matB1, acc11);
+        [[unroll]] for (uint mi = 0; mi < WMMAS_M; mi++) {
+            const uint a_row = (sg_m * WM + mi * TM) * A_STRIDE;
+            coopMatLoad(matA[mi], buf_a, a_row, A_STRIDE,
+                        gl_CooperativeMatrixLayoutRowMajor);
+        }
+        [[unroll]] for (uint ni = 0; ni < WMMAS_N; ni++) {
+            const uint b_col = sg_n * WN + ni * TN;
+            coopMatLoad(matB[ni], buf_b, b_col, B_STRIDE,
+                        gl_CooperativeMatrixLayoutRowMajor);
+        }
+        [[unroll]] for (uint mi = 0; mi < WMMAS_M; mi++) {
+            [[unroll]] for (uint ni = 0; ni < WMMAS_N; ni++) {
+                acc[mi * WMMAS_N + ni] = coopMatMulAdd(
+                    matA[mi], matB[ni], acc[mi * WMMAS_N + ni]);
+            }
+        }
 
         barrier();
     }
 
-    // ---- Store: each accumulator -> 16x16 region of C -----------------------
-    const uint c_row0 = wg_m + sg_m * WM + 0 * TM;
-    const uint c_row1 = wg_m + sg_m * WM + 1 * TM;
-    const uint c_col0 = wg_n + sg_n * WN + 0 * TN;
-    const uint c_col1 = wg_n + sg_n * WN + 1 * TN;
-
-    if (c_row0 + TM <= pc.m && c_col0 + TN <= pc.n) {
-        coopMatStore(acc00, c, c_row0 * pc.stride_c + c_col0, pc.stride_c, gl_CooperativeMatrixLayoutRowMajor);
-    }
-    if (c_row0 + TM <= pc.m && c_col1 + TN <= pc.n) {
-        coopMatStore(acc01, c, c_row0 * pc.stride_c + c_col1, pc.stride_c, gl_CooperativeMatrixLayoutRowMajor);
-    }
-    if (c_row1 + TM <= pc.m && c_col0 + TN <= pc.n) {
-        coopMatStore(acc10, c, c_row1 * pc.stride_c + c_col0, pc.stride_c, gl_CooperativeMatrixLayoutRowMajor);
-    }
-    if (c_row1 + TM <= pc.m && c_col1 + TN <= pc.n) {
-        coopMatStore(acc11, c, c_row1 * pc.stride_c + c_col1, pc.stride_c, gl_CooperativeMatrixLayoutRowMajor);
+    // ---- Store accumulators -> C ----
+    [[unroll]] for (uint mi = 0; mi < WMMAS_M; mi++) {
+        [[unroll]] for (uint ni = 0; ni < WMMAS_N; ni++) {
+            const uint c_row = wg_m + sg_m * WM + mi * TM;
+            const uint c_col = wg_n + sg_n * WN + ni * TN;
+            if (c_row + TM <= pc.m && c_col + TN <= pc.n) {
+                coopMatStore(acc[mi * WMMAS_N + ni], c,
+                             c_row * pc.stride_c + c_col, pc.stride_c,
+                             gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
     }
 }

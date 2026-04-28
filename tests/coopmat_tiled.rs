@@ -25,6 +25,10 @@ use vulkanforge::backend::vulkan::commands::CommandContext;
 
 const SHADER_SPV_TILED: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_bf16_f32.spv"));
+const SHADER_SPV_TILED_BN32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_bf16_bn32.spv"));
+const SHADER_SPV_TILED_BN16: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_bf16_bn16.spv"));
 const SHADER_SPV_NAIVE: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/bench_coopmat_pure_f32.spv"));
 
@@ -238,6 +242,8 @@ fn make_pipeline(
 #[derive(Clone, Copy)]
 enum Kernel {
     Tiled,
+    TiledBn32,
+    TiledBn16,
     Naive,
 }
 
@@ -245,12 +251,16 @@ impl Kernel {
     fn spv(self) -> &'static [u8] {
         match self {
             Kernel::Tiled => SHADER_SPV_TILED,
+            Kernel::TiledBn32 => SHADER_SPV_TILED_BN32,
+            Kernel::TiledBn16 => SHADER_SPV_TILED_BN16,
             Kernel::Naive => SHADER_SPV_NAIVE,
         }
     }
     fn tile_mn(self) -> (u32, u32) {
         match self {
             Kernel::Tiled => (64, 64),
+            Kernel::TiledBn32 => (64, 32),
+            Kernel::TiledBn16 => (64, 16),
             Kernel::Naive => (16, 16),
         }
     }
@@ -547,4 +557,58 @@ fn coopmat_tiled_bf16_unaligned_n() {
     // out to BN=64 by keeping a real N=64. This validates that the
     // multi-WG layout is stable when N == BN exactly.
     check_against_cpu(128, 64, 256, 5e-2);
+}
+
+// -- Sprint 1A.5 — BN ∈ {16, 32} skinny-N variants ----------------------------
+
+fn check_kernel_against_cpu(kernel: Kernel, m: u32, n: u32, k: u32, tol: f32) {
+    let h = harness();
+    let (gpu, a, b) = run_gemm(h, kernel, m, n, k, 1, 3).expect("gpu run");
+    let cpu = cpu_ref(&a, &b, m, n, k);
+    let err = max_abs_err(&gpu, &cpu);
+    eprintln!(
+        "{:?} M={m} N={n} K={k}: max_abs_err = {err:.4e} (tol {tol:.4e})",
+        kernel as i32
+    );
+    assert!(
+        err < tol,
+        "kernel {:?} M={m} N={n} K={k}: max_abs_err {err} > tol {tol}",
+        kernel as i32
+    );
+}
+
+#[test]
+fn coopmat_tiled_bn16_m64_n16_k256() {
+    check_kernel_against_cpu(Kernel::TiledBn16, 64, 16, 256, 1e-2);
+}
+
+#[test]
+fn coopmat_tiled_bn16_prefill_2048_64_4096() {
+    check_kernel_against_cpu(Kernel::TiledBn16, 2048, 64, 4096, 1.5e-1);
+}
+
+#[test]
+fn coopmat_tiled_bn32_m64_n32_k256() {
+    check_kernel_against_cpu(Kernel::TiledBn32, 64, 32, 256, 1e-2);
+}
+
+#[test]
+fn coopmat_tiled_bn32_prefill_2048_64_4096() {
+    check_kernel_against_cpu(Kernel::TiledBn32, 2048, 64, 4096, 1.5e-1);
+}
+
+#[test]
+fn coopmat_tiled_bn16_matches_bn64() {
+    // Same shape via two different BN variants — both compute the same
+    // GEMM in FP32 with bf16-rounded operands. The reduction order
+    // along K is identical (one BK=16 step at a time, accumulator stays
+    // in FP32), so the only differences come from the per-WMMA tile
+    // partitioning. Tolerance tracks the tiled-vs-naive parity test.
+    let h = harness();
+    let (m, n, k) = (256u32, 64u32, 1024u32);
+    let (gpu_bn16, _, _) = run_gemm(h, Kernel::TiledBn16, m, n, k, 5, 7).expect("bn16");
+    let (gpu_bn64, _, _) = run_gemm(h, Kernel::Tiled, m, n, k, 5, 7).expect("bn64");
+    let err = max_abs_err(&gpu_bn16, &gpu_bn64);
+    eprintln!("BN=16 vs BN=64 parity: max_abs_err = {err:.4e}");
+    assert!(err < 1e-3, "BN=16 vs BN=64 divergence too large: {err}");
 }
