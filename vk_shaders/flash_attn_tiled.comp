@@ -27,7 +27,11 @@
 //   64 KB; the existing pattern of adjacent threads reading adjacent
 //   V dims is already wave-coalesced).
 
-const uint BR       = 4;
+// Sprint 7.5 — BR is set per-SPV via -DBR=4/8/16. GLSL forbids
+// shared arrays sized by spec constants, so we emit one SPV per Br.
+#ifndef BR
+#define BR 4
+#endif
 const uint WGSIZE   = 64;
 const uint TILE     = WGSIZE;   // K-tile cols == one per thread.
 const uint HEAD_DIM = 128;       // Hardcoded: Qwen3 / Llama-3.1 / Mistral / DSR1.

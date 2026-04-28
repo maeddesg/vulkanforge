@@ -213,11 +213,15 @@ pub struct Forward {
     /// FP8 saves ~50% LDS and a 4× VALU on the convert.
     coopmat_fp8_enabled: bool,
 
-    /// Sprint 7 — flips prefill_batch attention from `flash_attn_batch`
-    /// (Br=1) to `flash_attn_tiled` (Br=4 queries per workgroup,
-    /// sharing K-tile loads). Set via `VULKANFORGE_FA_TILED=1`. Default
-    /// OFF until perf is validated.
+    /// Sprint 7 / 7.5 — flips prefill_batch attention from
+    /// `flash_attn_batch` (Br=1) to `flash_attn_tiled_br{N}` (BR
+    /// queries per workgroup sharing K-tile loads). Set via
+    /// `VULKANFORGE_FA_TILED=1`. Default OFF.
     fa_tiled_enabled: bool,
+    /// Sprint 7.5 — selects the BR variant when `fa_tiled_enabled` is
+    /// on. Read from `VULKANFORGE_FA_BR` env var; valid values are
+    /// 4, 8, 16. Default 4 (Sprint 7's proven config).
+    fa_tiled_br: u32,
 
     /// `forward_token` hot path. When `cache_enabled` is true (env
     /// `VULKANFORGE_CB_REUSE=1` at construction), `alloc_or_get_set`
@@ -496,6 +500,18 @@ impl Forward {
             Ok(s) => s == "1",
             Err(_) => false,
         };
+        // Sprint 7.5 — pick which Br variant to dispatch when fa_tiled
+        // is on. Default 16 (Sprint-7.5 sweep winner: +138% at pp=1024
+        // vs Br=1, beats Br=4/Br=8 across every measured pp). Falls
+        // back to 16 for unknown / missing values.
+        let fa_tiled_br: u32 = match std::env::var("VULKANFORGE_FA_BR")
+            .ok().and_then(|s| s.parse::<u32>().ok())
+        {
+            Some(4)  => 4,
+            Some(8)  => 8,
+            Some(16) => 16,
+            _        => 16,
+        };
 
         let coopmat_fp8_enabled = match std::env::var("VULKANFORGE_COOPMAT_FP8") {
             Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
@@ -526,6 +542,7 @@ impl Forward {
             coopmat_q4k_enabled,
             coopmat_fp8_enabled,
             fa_tiled_enabled,
+            fa_tiled_br,
             profiler,
             rope_theta_scale, attn_scale,
             fa_scratch_out, fa_scratch_max, fa_scratch_sum,
@@ -1963,10 +1980,11 @@ impl Forward {
         });
     }
 
-    /// Sprint 7 — Br>1 tiled-Q flash attention dispatch. Identical
-    /// bind / push layout to `run_flash_attn_batch`; only differences
-    /// are the shader ID and the dispatch shape `(n_heads,
-    /// ceil(m/BR), 1)` (where BR=4 baked into the shader).
+    /// Sprint 7 / 7.5 — Br>1 tiled-Q flash attention dispatch.
+    /// Identical bind / push layout to `run_flash_attn_batch`; the
+    /// shader ID is selected per `self.fa_tiled_br` and the dispatch
+    /// shape is `(n_heads, ceil(m/BR), 1)` where BR is baked into
+    /// each SPV via `-DBR=4|8|16`.
     #[allow(clippy::too_many_arguments)]
     fn run_flash_attn_tiled(
         &mut self,
@@ -1980,9 +1998,13 @@ impl Forward {
         q_start: u32,
         n_kv: u32,
     ) {
-        const BR: u32 = 4;
+        let (shader_id, br) = match self.fa_tiled_br {
+            8  => (ShaderId::FlashAttnTiledBr8,  8u32),
+            16 => (ShaderId::FlashAttnTiledBr16, 16u32),
+            _  => (ShaderId::FlashAttnTiledBr4,  4u32),
+        };
         let cfg = self.config.clone();
-        let kernel = registry.get(ShaderId::FlashAttnTiled);
+        let kernel = registry.get(shader_id);
         let layer_off = self.kv_cache.layer_offset_bytes(layer);
         let layer_size = (self.kv_cache.config.max_seq_len as u64)
             * (cfg.n_kv_heads as u64)
@@ -2011,7 +2033,7 @@ impl Forward {
         let layout = kernel.pipeline_layout;
         let pipeline = kernel.pipeline;
         let n_heads = cfg.n_heads;
-        let q_tiles = m.div_ceil(BR);
+        let q_tiles = m.div_ceil(br);
         self.profile("fa_tiled", dev, cmd, |dev, cmd| unsafe {
             dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             dev.device.cmd_bind_descriptor_sets(

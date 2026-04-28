@@ -163,11 +163,24 @@ const JOBS: &[ShaderJob] = &[
     },
     // VulkanForge Sprint 7 — Br>1 tiled-Q flash attention. Identical
     // bindings + push-constants to flash_attn_batch; dispatched as
-    // (n_heads, ceil(M/BR), 1) with BR=4 queries sharing one K-tile.
+    // (n_heads, ceil(M/BR), 1) with BR queries sharing one K-tile.
+    // Sprint 7.5 — three SPVs for the BR sweep (4 / 8 / 16). GLSL
+    // shared arrays can't be sized by spec constants, so BR is a
+    // compile-time #define and we emit one SPV per Br.
     ShaderJob {
-        out_name: "flash_attn_tiled_f32.spv",
+        out_name: "flash_attn_tiled_br4.spv",
         entry_source: "flash_attn_tiled.comp",
-        defines: &[],
+        defines: &[("BR", "4")],
+    },
+    ShaderJob {
+        out_name: "flash_attn_tiled_br8.spv",
+        entry_source: "flash_attn_tiled.comp",
+        defines: &[("BR", "8")],
+    },
+    ShaderJob {
+        out_name: "flash_attn_tiled_br16.spv",
+        entry_source: "flash_attn_tiled.comp",
+        defines: &[("BR", "16")],
     },
     // Phase-6A probe: confirms shaderc 0.8 + Mesa glslang ship a
     // coopmat + bfloat16 toolchain that produces SPV without warnings.
