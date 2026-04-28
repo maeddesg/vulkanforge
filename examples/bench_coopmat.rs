@@ -30,8 +30,46 @@ use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 use vulkanforge::backend::vulkan::buffers::GpuBuffer;
 use vulkanforge::backend::vulkan::commands::CommandContext;
 
-const SHADER_SPV: &[u8] =
+const SHADER_SPV_BF16: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/bench_coopmat_pure_f32.spv"));
+const SHADER_SPV_FP8: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/bench_coopmat_fp8_e4m3.spv"));
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BenchMode {
+    Bf16,
+    Fp8E4m3,
+}
+
+impl BenchMode {
+    fn from_env() -> Self {
+        match std::env::var("VF_BENCH_FP8").ok().as_deref() {
+            Some("1") | Some("true") | Some("e4m3") => BenchMode::Fp8E4m3,
+            _ => BenchMode::Bf16,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            BenchMode::Bf16 => "BF16",
+            BenchMode::Fp8E4m3 => "FP8-E4M3",
+        }
+    }
+
+    fn spv(self) -> &'static [u8] {
+        match self {
+            BenchMode::Bf16 => SHADER_SPV_BF16,
+            BenchMode::Fp8E4m3 => SHADER_SPV_FP8,
+        }
+    }
+
+    fn input_bytes_per_elem(self) -> u64 {
+        match self {
+            BenchMode::Bf16 => 2,
+            BenchMode::Fp8E4m3 => 1,
+        }
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
@@ -45,6 +83,7 @@ struct PushConsts {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mode = BenchMode::from_env();
     let entry = unsafe { ash::Entry::load()? };
 
     // ---- Instance ----
@@ -67,7 +106,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let props = unsafe { instance.get_physical_device_properties(physical_device) };
     let name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) };
-    println!("Phase 6A bench_coopmat — {}", name.to_string_lossy());
+    println!(
+        "bench_coopmat — {} ({})",
+        name.to_string_lossy(),
+        mode.label()
+    );
 
     // ---- Queue family with COMPUTE ----
     let qfp = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
@@ -82,18 +125,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .queue_family_index(queue_family_index)
         .queue_priorities(&queue_priorities);
 
-    let extensions: [*const i8; 3] = [
+    // Always enable both BF16 and FP8 extensions — driver supports both
+    // and the per-feature toggles below pick which capability the
+    // pipeline actually uses.
+    let extensions: [*const i8; 4] = [
         khr::cooperative_matrix::NAME.as_ptr(),
         c"VK_KHR_shader_bfloat16".as_ptr(),
+        c"VK_EXT_shader_float8".as_ptr(),
         c"VK_KHR_shader_subgroup_uniform_control_flow".as_ptr(),
     ];
 
     // Feature chain: PhysicalDeviceFeatures2 → 1.1 (16-bit storage),
-    // 1.2 (8-bit shader int, etc.), 1.3, plus coopmat + bfloat16.
-    // ash 0.38 doesn't ship a builder for VK_KHR_shader_bfloat16 — the
-    // extension was ratified after the bundled spec rev — so we splice
-    // its feature struct into the chain manually before
-    // `create_device`.
+    // 1.2 (8-bit shader int, etc.), 1.3, plus coopmat + bfloat16 + fp8.
+    // ash 0.38 doesn't ship builders for VK_KHR_shader_bfloat16 or
+    // VK_EXT_shader_float8 — both extensions were ratified after the
+    // bundled spec rev — so we splice their feature structs into the
+    // chain manually before `create_device`.
     let mut feat_coopmat = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default()
         .cooperative_matrix(true);
     let mut feat_bf16 = PhysicalDeviceShaderBfloat16FeaturesKHR {
@@ -102,6 +149,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         shader_bfloat16_type: vk::TRUE,
         shader_bfloat16_dot_product: vk::FALSE,
         shader_bfloat16_cooperative_matrix: vk::TRUE,
+    };
+    let mut feat_fp8 = PhysicalDeviceShaderFloat8FeaturesEXT {
+        s_type: VK_STRUCT_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT,
+        p_next: std::ptr::null_mut(),
+        shader_float8: vk::TRUE,
+        shader_float8_cooperative_matrix: vk::TRUE,
     };
     let mut feat13 = vk::PhysicalDeviceVulkan13Features::default();
     let mut feat12 = vk::PhysicalDeviceVulkan12Features::default()
@@ -114,10 +167,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let core = vk::PhysicalDeviceFeatures::default().shader_int16(true);
     let mut feat2 = vk::PhysicalDeviceFeatures2::default().features(core);
 
-    // Splice the BF16 feature struct between feat_coopmat and whatever
-    // ash chained next: feat_coopmat → feat_bf16 → (rest). Done here
+    // Splice the BF16 + FP8 feature structs into feat_coopmat's p_next
+    // chain: feat_coopmat → feat_bf16 → feat_fp8 → (rest). Done here
     // before push_next swallows feat_coopmat's p_next.
-    feat_bf16.p_next = feat_coopmat.p_next;
+    feat_fp8.p_next = feat_coopmat.p_next;
+    feat_bf16.p_next = &mut feat_fp8 as *mut _ as *mut std::ffi::c_void;
     feat_coopmat.p_next = &mut feat_bf16 as *mut _ as *mut std::ffi::c_void;
 
     let device_info = vk::DeviceCreateInfo::default()
@@ -145,7 +199,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cmd_ctx = CommandContext::new(&device, queue_family_index)?;
 
     // ---- Pipeline / descriptor set layout from SPV ----
-    let words: Vec<u32> = SHADER_SPV
+    let words: Vec<u32> = mode
+        .spv()
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
@@ -225,6 +280,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for &(m, n, k) in &shapes {
         let res = run_size(
+            mode,
             &device, &mut allocator, queue, &cmd_ctx,
             pipeline, pipeline_layout, dsl,
             m, n, k,
@@ -276,6 +332,7 @@ struct RunResult {
 }
 
 fn run_size(
+    mode: BenchMode,
     device: &ash::Device,
     allocator: &mut Allocator,
     queue: vk::Queue,
@@ -287,20 +344,34 @@ fn run_size(
 ) -> Result<RunResult, Box<dyn std::error::Error>> {
     assert!(m % 16 == 0 && n % 16 == 0 && k % 16 == 0, "WMMA tile is 16×16×16");
 
-    // Inputs are BF16 — 2 bytes each.
-    let a_bytes = (m as u64) * (k as u64) * 2;
-    let b_bytes = (k as u64) * (n as u64) * 2;
+    let elem = mode.input_bytes_per_elem();
+    let a_bytes = (m as u64) * (k as u64) * elem;
+    let b_bytes = (k as u64) * (n as u64) * elem;
     let c_bytes = (m as u64) * (n as u64) * 4;
 
-    // Deterministic BF16 values via a small CPU pattern. We just need
-    // *some* numerically valid input — the benchmark grades throughput,
-    // not precision.
-    let a_data: Vec<u16> = (0..(m * k))
-        .map(|i| f32_to_bf16(0.001 * ((i % 64) as f32 - 32.0)))
-        .collect();
-    let b_data: Vec<u16> = (0..(k * n))
-        .map(|i| f32_to_bf16(0.001 * (((i / 17) % 32) as f32)))
-        .collect();
+    // Deterministic input values via a small CPU pattern. Throughput
+    // bench, not precision — values just need to be numerically sane
+    // (no NaN/Inf in inputs, no Inf in accumulator).
+    let a_raw: Vec<u8> = match mode {
+        BenchMode::Bf16 => bytemuck::cast_slice::<u16, u8>(
+            &(0..(m * k))
+                .map(|i| f32_to_bf16(0.001 * ((i % 64) as f32 - 32.0)))
+                .collect::<Vec<u16>>()
+        ).to_vec(),
+        BenchMode::Fp8E4m3 => (0..(m * k))
+            .map(|i| f32_to_fp8_e4m3(0.001 * ((i % 64) as f32 - 32.0)))
+            .collect(),
+    };
+    let b_raw: Vec<u8> = match mode {
+        BenchMode::Bf16 => bytemuck::cast_slice::<u16, u8>(
+            &(0..(k * n))
+                .map(|i| f32_to_bf16(0.001 * (((i / 17) % 32) as f32)))
+                .collect::<Vec<u16>>()
+        ).to_vec(),
+        BenchMode::Fp8E4m3 => (0..(k * n))
+            .map(|i| f32_to_fp8_e4m3(0.001 * (((i / 17) % 32) as f32)))
+            .collect(),
+    };
 
     let mut buf_a = GpuBuffer::new(
         device, allocator, a_bytes,
@@ -317,8 +388,8 @@ fn run_size(
         vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
         MemoryLocation::GpuToCpu, "bench_c",
     )?;
-    buf_a.write_bytes(bytemuck::cast_slice(&a_data))?;
-    buf_b.write_bytes(bytemuck::cast_slice(&b_data))?;
+    buf_a.write_bytes(&a_raw)?;
+    buf_b.write_bytes(&b_raw)?;
 
     // Descriptor pool + set.
     let pool_sizes = [vk::DescriptorPoolSize {
@@ -419,9 +490,46 @@ fn run_size(
     let bytes = buf_c.read_bytes()?;
     let first_val = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     if !first_val.is_finite() {
-        eprintln!("⚠ {dim}^3: C[0] = {first_val:?} (non-finite — coopmat unhappy?)",
-                  dim = m);
+        eprintln!("⚠ {label}: C[0] = {first_val:?} (non-finite — coopmat unhappy?)",
+                  label = format!("{}x{}x{}", m, n, k));
     }
+
+    // Optional correctness probe — controlled by VF_BENCH_CHECK=1. Computes
+    // a CPU f64 reference for C[0] using the same FP8/BF16 dequant as the
+    // shader, prints rel-err side-by-side. Only runs once per shape, so
+    // negligible cost for the bench.
+    let abs_err = if std::env::var("VF_BENCH_CHECK").ok().as_deref() == Some("1") {
+        let mut acc: f64 = 0.0;
+        let stride_a = k as usize;
+        let stride_b = n as usize;
+        for kk in 0..(k as usize) {
+            let a_idx = kk;
+            let b_idx = kk * stride_b;
+            let a = match mode {
+                BenchMode::Bf16 => bf16_to_f32(u16::from_le_bytes([
+                    a_raw[2 * a_idx], a_raw[2 * a_idx + 1],
+                ])) as f64,
+                BenchMode::Fp8E4m3 => fp8_e4m3_to_f32(a_raw[a_idx]) as f64,
+            };
+            let b = match mode {
+                BenchMode::Bf16 => bf16_to_f32(u16::from_le_bytes([
+                    b_raw[2 * b_idx], b_raw[2 * b_idx + 1],
+                ])) as f64,
+                BenchMode::Fp8E4m3 => fp8_e4m3_to_f32(b_raw[b_idx]) as f64,
+            };
+            acc += a * b;
+        }
+        let _ = stride_a;
+        let cpu_ref = acc as f32;
+        let err = (first_val - cpu_ref).abs();
+        eprintln!(
+            "  C[0]: gpu={first_val:>12.6} cpu_ref={cpu_ref:>12.6}  abs_err={err:.3e}"
+        );
+        Some(err)
+    } else {
+        None
+    };
+    let _ = abs_err;
 
     unsafe { device.destroy_descriptor_pool(pool, None) };
     buf_a.destroy(device, allocator);
@@ -439,7 +547,82 @@ fn f32_to_bf16(x: f32) -> u16 {
     ((bits.wrapping_add(bias)) >> 16) as u16
 }
 
-// ---- Manual struct for VK_KHR_shader_bfloat16 (ash 0.38 doesn't ship it) ----
+fn bf16_to_f32(b: u16) -> f32 {
+    f32::from_bits((b as u32) << 16)
+}
+
+fn fp8_e4m3_to_f32(b: u8) -> f32 {
+    let sign = (b >> 7) & 1;
+    let exp = ((b >> 3) & 0x0f) as i32;
+    let mant = (b & 0x07) as u32;
+    if exp == 15 && mant == 7 {
+        // E4M3 NaN.
+        return f32::NAN;
+    }
+    let s = if sign == 1 { -1.0f32 } else { 1.0f32 };
+    if exp == 0 {
+        if mant == 0 {
+            return 0.0 * s;
+        }
+        // Subnormal: 2^-6 * (mant / 8)
+        return s * (mant as f32) / 8.0 / 64.0;
+    }
+    // Normal: 2^(exp-7) * (1 + mant/8)
+    let m = 1.0 + (mant as f32) / 8.0;
+    s * m * (2.0f32).powi(exp - 7)
+}
+
+// FP8 E4M3 packing — 1 sign + 4 exponent + 3 mantissa, bias=7.
+// E4M3 has only NaN (0x7F / 0xFF), no Inf. Range ±448. We saturate
+// out-of-range to ±max_finite (0x7E / 0xFE) and return ±0 for
+// underflow rather than emitting subnormals — bench data does not need
+// subnormal precision and avoiding them keeps the conversion simple.
+fn f32_to_fp8_e4m3(x: f32) -> u8 {
+    if x == 0.0 || !x.is_finite() {
+        return 0;
+    }
+    let bits = x.to_bits();
+    let sign = ((bits >> 31) & 1) as u8;
+    let f32_exp = ((bits >> 23) & 0xff) as i32;
+    let f32_mant = bits & 0x7f_ffff;
+
+    if f32_exp == 0 {
+        return sign << 7;
+    }
+    let unbiased = f32_exp - 127;
+    let new_exp = unbiased + 7;
+    if new_exp >= 16 {
+        // Saturate to max finite ±448.0.
+        return (sign << 7) | 0x7E;
+    }
+    if new_exp <= 0 {
+        return sign << 7;
+    }
+    // Round-to-nearest-even: keep 3 mantissa bits, look at the 4th for
+    // rounding direction.
+    let round_bit = (f32_mant >> 19) & 1;
+    let sticky = f32_mant & 0x7_ffff;
+    let mut mant3 = ((f32_mant >> 20) & 0x07) as u8;
+    let mut exp4 = new_exp as u8;
+    if round_bit == 1 && (sticky != 0 || (mant3 & 1) == 1) {
+        mant3 = mant3.wrapping_add(1);
+        if mant3 == 8 {
+            mant3 = 0;
+            exp4 = exp4.wrapping_add(1);
+            if exp4 >= 16 {
+                return (sign << 7) | 0x7E;
+            }
+        }
+    }
+    // Avoid emitting NaN bit pattern (e=15, m=7) — the saturate-to-7E
+    // above means we should never reach (15, 7) here, but assert
+    // defensively in debug.
+    debug_assert!(!(exp4 == 15 && mant3 == 7), "would emit NaN");
+    (sign << 7) | ((exp4 & 0x0f) << 3) | (mant3 & 0x07)
+}
+
+// ---- Manual structs for VK_KHR_shader_bfloat16 / VK_EXT_shader_float8
+// (ash 0.38 doesn't ship builders for either) ----
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -454,3 +637,17 @@ struct PhysicalDeviceShaderBfloat16FeaturesKHR {
 
 const VK_STRUCT_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR: vk::StructureType =
     vk::StructureType::from_raw(1000141000);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(non_snake_case)]
+struct PhysicalDeviceShaderFloat8FeaturesEXT {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    shader_float8: vk::Bool32,
+    shader_float8_cooperative_matrix: vk::Bool32,
+}
+
+// VkStructureType per VK_EXT_shader_float8 spec (registry entry 567).
+const VK_STRUCT_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT: vk::StructureType =
+    vk::StructureType::from_raw(1000567000);

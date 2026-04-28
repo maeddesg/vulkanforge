@@ -178,6 +178,14 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "bench_coopmat_pure.comp",
         defines: &[],
     },
+    // v0.2 smoke-test FP8 throughput bench (E4M3 × E4M3 → FP32).
+    // Twin of bench_coopmat_pure for the FP8 path. Used by
+    // examples/bench_coopmat when VF_BENCH_FP8=1.
+    ShaderJob {
+        out_name: "bench_coopmat_fp8_e4m3.spv",
+        entry_source: "bench_coopmat_fp8.comp",
+        defines: &[],
+    },
     // Phase 6 v0.1.2 cont. — mul_mm.comp port from llama.cpp
     // (MIT-licensed). Same shader runtime as mul_mmq.comp but takes
     // FP32 activations directly (no Q8_1 quantize step in front), uses
