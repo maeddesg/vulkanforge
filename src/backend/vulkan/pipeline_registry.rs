@@ -294,6 +294,16 @@ impl PipelineRegistry {
                     let bytes = bytemuck::bytes_of(&data);
                     ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
                 }
+                // Sprint 3A — Q4_K coopmat with forward-pass layout.
+                // No spec constants: the BN tile size is already baked
+                // in at SPIR-V build time via -DBN; the rest of the
+                // kernel geometry (BLOCK_SIZE=256, BM=64, BK=16) is
+                // hard-coded `const uint` in the shader source.
+                ShaderId::MulCoopmatQ4KFwdBn64
+                | ShaderId::MulCoopmatQ4KFwdBn32
+                | ShaderId::MulCoopmatQ4KFwdBn16 => {
+                    ComputeKernel::from_spv(device, &words, cache)
+                }
             };
             let kernel = match result {
                 Ok(k) => k,

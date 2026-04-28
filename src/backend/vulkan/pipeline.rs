@@ -211,6 +211,23 @@ const _: () = assert!(std::mem::size_of::<MmqPushConstants>() == 64);
 /// `MmqPushConstants`.
 pub type MulMmPushConstants = MmqPushConstants;
 
+/// Sprint 3A — `mul_coopmat_q4k.comp` push block (24 B).
+/// Field order matches the GLSL `PC` block exactly — 6 × u32. The
+/// runtime fills in `stride_b = K` and `stride_c = M` because the
+/// Sprint 3A variant is built with `-DFORWARD_LAYOUT` (B is [N, K],
+/// C is [N, M] row-major).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct CoopmatPushConstants {
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    pub stride_a: u32,
+    pub stride_b: u32,
+    pub stride_c: u32,
+}
+const _: () = assert!(std::mem::size_of::<CoopmatPushConstants>() == 24);
+
 /// `quantize_q8_1.comp` push block. 2 × u32 = 8 B.
 /// `ne` is the total f32 element count of the input. `num_blocks` is
 /// the workgroup-loop upper bound (with `QBLOCK_X4` defined that's the

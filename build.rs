@@ -274,6 +274,27 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "mul_coopmat_q4k.comp",
         defines: &[("BN", "16")],
     },
+    // v0.2 Sprint 3A — Q4_K coopmat with forward-pass-compatible
+    // memory layout. B is read as [N, K] row-major (matches the
+    // runtime batch_norm activations) and C is written as [N, M]
+    // row-major (matches the runtime mul_mmq output convention so
+    // downstream RoPE/attention consumers stay unchanged). Three BN
+    // variants for the same per-shape selector used in Sprint 1A.5/1B.
+    ShaderJob {
+        out_name: "mul_coopmat_q4k_fwd_bn64.spv",
+        entry_source: "mul_coopmat_q4k.comp",
+        defines: &[("BN", "64"), ("FORWARD_LAYOUT", "1")],
+    },
+    ShaderJob {
+        out_name: "mul_coopmat_q4k_fwd_bn32.spv",
+        entry_source: "mul_coopmat_q4k.comp",
+        defines: &[("BN", "32"), ("FORWARD_LAYOUT", "1")],
+    },
+    ShaderJob {
+        out_name: "mul_coopmat_q4k_fwd_bn16.spv",
+        entry_source: "mul_coopmat_q4k.comp",
+        defines: &[("BN", "16"), ("FORWARD_LAYOUT", "1")],
+    },
     // Phase 6 v0.1.2 cont. — mul_mm.comp port from llama.cpp
     // (MIT-licensed). Same shader runtime as mul_mmq.comp but takes
     // FP32 activations directly (no Q8_1 quantize step in front), uses

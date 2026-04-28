@@ -40,7 +40,7 @@ use super::loader::LoadedModel;
 use super::pipeline::{
     FlashAttnBatchPushConstants, FlashAttnReducePushConstants, FlashAttnSplitPushConstants,
     GenericBinaryPushConstants, GenericHeadPushConstants, MatVecPushConstants,
-    MmqPushConstants, Q8_1QuantizePushConstants, RopePushConstants,
+    CoopmatPushConstants, MmqPushConstants, Q8_1QuantizePushConstants, RopePushConstants,
     ScalarAttnPushConstants,
 };
 use super::pipeline_registry::PipelineRegistry;
@@ -198,6 +198,13 @@ pub struct Forward {
     /// FP32 activations, skipping the `quantize_q8_1` dispatch
     /// before each. mul_mmq stays as the gated fallback.
     mul_mm_enabled: bool,
+
+    /// Sprint 3A — opt-in coopmat (Q4_K dequant-fusion → FP8 WMMA)
+    /// for `gemm_q` only. Default OFF; `VULKANFORGE_COOPMAT=1` flips
+    /// to the coopmat path. The other 6 prefill GEMMs (K/V/O/gate/
+    /// up/down) keep their mul_mmq routing in 3A — Sprint 3B widens
+    /// the switch.
+    coopmat_q4k_enabled: bool,
 
     /// `forward_token` hot path. When `cache_enabled` is true (env
     /// `VULKANFORGE_CB_REUSE=1` at construction), `alloc_or_get_set`
@@ -442,6 +449,13 @@ impl Forward {
             _ => false,
         };
 
+        // Sprint 3A — Q4_K coopmat for gemm_q only. Default OFF until
+        // logits-parity is established at scale.
+        let coopmat_q4k_enabled = match std::env::var("VULKANFORGE_COOPMAT") {
+            Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
+            _ => false,
+        };
+
         // Note for tests: callers that need to override the env-var
         // pick can use `set_cache_enabled` / `set_batch_attn_enabled`
         // after construction.
@@ -463,6 +477,7 @@ impl Forward {
             cache_enabled,
             batch_attn_enabled,
             mul_mm_enabled,
+            coopmat_q4k_enabled,
             profiler,
             rope_theta_scale, attn_scale,
             fa_scratch_out, fa_scratch_max, fa_scratch_sum,
@@ -1384,6 +1399,19 @@ impl Forward {
         self.mul_mm_enabled
     }
 
+    /// Sprint 3A escape hatch — toggle the Q4_K coopmat fusion path
+    /// for `gemm_q` independently of `VULKANFORGE_COOPMAT`. Used by
+    /// the parity test in `tests/regression.rs` to construct two
+    /// Forward instances in the same process: one with mul_mmq and
+    /// one with coopmat, then compare logits.
+    pub fn set_coopmat_q4k_enabled(&mut self, enabled: bool) {
+        self.coopmat_q4k_enabled = enabled;
+    }
+
+    pub fn coopmat_q4k_enabled(&self) -> bool {
+        self.coopmat_q4k_enabled
+    }
+
     /// Phase 5A-2 Stage 2D: cache-aware descriptor-set fetch. When
     /// `cache_enabled` is true and the (layout, bindings) key matches
     /// a previously-built set, the cached handle is returned without
@@ -2157,6 +2185,70 @@ impl Forward {
         });
     }
 
+    /// Sprint 3A — dispatch the Q4_K dequant-fusion coopmat GEMM with
+    /// the forward-pass-compatible memory layout. Inputs:
+    ///
+    /// * `weights` : Q4_K block buffer, M × K rows × cols of weights
+    ///               packed as 144 B / 256-weight blocks.
+    /// * `acts_f32`: FP32 activations, [N, K] = [seq_len, hidden]
+    ///               row-major (i.e. the runtime `batch_norm` buffer
+    ///               after RMSNorm — *not* the Q8_1 quantised one).
+    /// * `output`  : FP32 output, [N, M] = [seq_len, output_dim]
+    ///               row-major (matches the mul_mmq output convention
+    ///               so downstream RoPE / attention paths stay
+    ///               unchanged).
+    ///
+    /// `m`, `n`, `k` follow the same convention `run_gemm` uses:
+    /// `m` = output_dim, `n` = seq_len, `k` = hidden. The shader's
+    /// `stride_b = K` and `stride_c = M` reflect the [N, K] / [N, M]
+    /// row-major layout under `-DFORWARD_LAYOUT`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_gemm_coopmat_q4k(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        shader_id: ShaderId,
+        weights: vk::Buffer,
+        acts_f32: vk::Buffer,
+        output: vk::Buffer,
+        m: u32,
+        n: u32,
+        k: u32,
+        bn_tile: u32,
+        label: &'static str,
+    ) {
+        let kernel = registry.get(shader_id);
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[
+                (0, weights, 0, 0),
+                (1, acts_f32, 0, 0),
+                (2, output, 0, 0),
+            ],
+        );
+        let pc = CoopmatPushConstants {
+            m, n, k,
+            stride_a: k,   // weights stride in elements
+            stride_b: k,   // FORWARD_LAYOUT: B is [N, K], stride = K
+            stride_c: m,   // FORWARD_LAYOUT: C is [N, M], stride = M
+        };
+        let groups_x = m.div_ceil(64);
+        let groups_y = n.div_ceil(bn_tile);
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, groups_x, groups_y, 1);
+        });
+    }
+
     /// Copy one row out of an `[seq_len, dim]` batched GEMM output
     /// into a single-token buffer so the existing per-token RMSNorm
     /// / RoPE / attention helpers can run unchanged.
@@ -2383,11 +2475,33 @@ impl Forward {
         let sq = layer_weight_shader_gemm(model, layer, "attn_q.weight", gemm_kind);
         let sk = layer_weight_shader_gemm(model, layer, "attn_k.weight", gemm_kind);
         let sv = layer_weight_shader_gemm(model, layer, "attn_v.weight", gemm_kind);
-        self.run_gemm(
-            dev, registry, cmd, sq, wq,
-            gemm_input_attn, self.batch_q.handle,
-            q_dim, seq_len, hidden, "gemm_q",
-        );
+        // Sprint 3A: gemm_q can opt into the Q4_K coopmat fusion.
+        // Coopmat reads activations from `batch_norm` (FP32) regardless
+        // of the mul_mm/mul_mmq route the rest of the layer takes, so
+        // the coopmat dispatch passes `self.batch_norm.handle` directly
+        // — independent of `gemm_input_attn` (which is either FP32 or
+        // Q8_1 depending on mul_mm_enabled). The other six GEMMs keep
+        // the existing routing.
+        if self.coopmat_q4k_enabled {
+            let (q_shader, q_bn) = if seq_len <= 32 {
+                (ShaderId::MulCoopmatQ4KFwdBn16, 16u32)
+            } else if seq_len <= 64 {
+                (ShaderId::MulCoopmatQ4KFwdBn32, 32u32)
+            } else {
+                (ShaderId::MulCoopmatQ4KFwdBn64, 64u32)
+            };
+            self.run_gemm_coopmat_q4k(
+                dev, registry, cmd, q_shader, wq,
+                self.batch_norm.handle, self.batch_q.handle,
+                q_dim, seq_len, hidden, q_bn, "gemm_q_coopmat",
+            );
+        } else {
+            self.run_gemm(
+                dev, registry, cmd, sq, wq,
+                gemm_input_attn, self.batch_q.handle,
+                q_dim, seq_len, hidden, "gemm_q",
+            );
+        }
         self.run_gemm(
             dev, registry, cmd, sk, wk,
             gemm_input_attn, self.batch_k.handle,

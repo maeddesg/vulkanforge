@@ -48,6 +48,13 @@ pub enum ShaderId {
     // divisible by 4; runtime falls back to mul_mmq otherwise.
     MulMmQ4KAligned,
     MulMmQ6KAligned,
+    // v0.2 Sprint 3A — Q4_K dequant-fusion coopmat GEMM with forward-
+    // pass-compatible memory layout (B = [N, K] activations, C = [N, M]
+    // output). Three BN variants for the per-shape selector. Default
+    // OFF; gated behind `VULKANFORGE_COOPMAT=1` in `forward.rs`.
+    MulCoopmatQ4KFwdBn64,
+    MulCoopmatQ4KFwdBn32,
+    MulCoopmatQ4KFwdBn16,
 }
 
 impl ShaderId {
@@ -75,6 +82,9 @@ impl ShaderId {
             ShaderId::MulMmQ6K => "mul_mm_q6_k_f32",
             ShaderId::MulMmQ4KAligned => "mul_mm_q4_k_f32_aligned",
             ShaderId::MulMmQ6KAligned => "mul_mm_q6_k_f32_aligned",
+            ShaderId::MulCoopmatQ4KFwdBn64 => "mul_coopmat_q4k_fwd_bn64",
+            ShaderId::MulCoopmatQ4KFwdBn32 => "mul_coopmat_q4k_fwd_bn32",
+            ShaderId::MulCoopmatQ4KFwdBn16 => "mul_coopmat_q4k_fwd_bn16",
         }
     }
 
@@ -102,6 +112,9 @@ impl ShaderId {
             ShaderId::MulMmQ6K => MUL_MM_Q6_K_F32,
             ShaderId::MulMmQ4KAligned => MUL_MM_Q4_K_F32_ALIGNED,
             ShaderId::MulMmQ6KAligned => MUL_MM_Q6_K_F32_ALIGNED,
+            ShaderId::MulCoopmatQ4KFwdBn64 => MUL_COOPMAT_Q4K_FWD_BN64,
+            ShaderId::MulCoopmatQ4KFwdBn32 => MUL_COOPMAT_Q4K_FWD_BN32,
+            ShaderId::MulCoopmatQ4KFwdBn16 => MUL_COOPMAT_Q4K_FWD_BN16,
         }
     }
 }
@@ -129,6 +142,9 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::MulMmQ6K,
     ShaderId::MulMmQ4KAligned,
     ShaderId::MulMmQ6KAligned,
+    ShaderId::MulCoopmatQ4KFwdBn64,
+    ShaderId::MulCoopmatQ4KFwdBn32,
+    ShaderId::MulCoopmatQ4KFwdBn16,
 ];
 
 pub const MUL_MAT_VEC_Q4_K_F32_F32: &[u8] =
@@ -167,6 +183,12 @@ pub const MUL_MM_Q4_K_F32_ALIGNED: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q4_k_f32_aligned.spv"));
 pub const MUL_MM_Q6_K_F32_ALIGNED: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q6_k_f32_aligned.spv"));
+pub const MUL_COOPMAT_Q4K_FWD_BN64: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_q4k_fwd_bn64.spv"));
+pub const MUL_COOPMAT_Q4K_FWD_BN32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_q4k_fwd_bn32.spv"));
+pub const MUL_COOPMAT_Q4K_FWD_BN16: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_q4k_fwd_bn16.spv"));
 
 /// Decode a SPIR-V byte blob into u32 words. Vulkan consumes SPIR-V
 /// as `&[u32]`; `include_bytes!` only gives us `&[u8]` whose alignment

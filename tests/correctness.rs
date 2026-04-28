@@ -1257,6 +1257,93 @@ fn test_mul_mm_q4k_multi_tile_both()     { run_mul_mm_parity(128, 128, 256, "mul
 #[test]
 fn test_mul_mm_q4k_n200()                { run_mul_mm_parity(64, 200, 256, "N=200"); }
 
+// Sprint 3A — Q4_K coopmat (forward layout) vs CPU f64 reference. Same
+// shape pattern as `run_mul_mm_parity` but dispatches the coopmat
+// shader. Output layout is identical ([N, M] row-major), so the
+// existing CPU reference fits without modification. Tolerance is
+// looser than mul_mm because the coopmat path narrows both A and B
+// to FP8 inside the K-loop.
+fn run_coopmat_q4k_parity(m: u32, n: u32, k: u32, label: &str) {
+    use vulkanforge::backend::vulkan::pipeline::CoopmatPushConstants;
+    use vulkanforge::backend::vulkan::q4k;
+    assert_eq!(k as usize % q4k::QUANT_K, 0, "K must be a multiple of QUANT_K");
+
+    let mut fix = Fixture::new();
+    let weights = q4k::build_random_weights(m as usize, k as usize, 0xC0FFEE);
+    let w_buf = {
+        let device = fix.dev.device.clone();
+        let allocator = fix.allocator.as_mut().unwrap();
+        let mut b = GpuBuffer::new(
+            &device, allocator, weights.len() as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu,
+            "coopmat_w",
+        ).expect("alloc weights");
+        b.write_bytes(&weights).expect("write weights");
+        fix.track(b)
+    };
+
+    let acts: Vec<f32> = (0..(n * k))
+        .map(|i| ((i as f32) * 0.013).sin() * 0.5)
+        .collect();
+    let act_buf = fix.host_buffer_f32(&acts, "coopmat_act");
+    let out_buf = fix.output_buffer_f32((m * n) as usize, "coopmat_out");
+
+    // Per-shape BN selector (matches the runtime gemm_q switch).
+    let (shader, bn_tile) = if n <= 32 {
+        (ShaderId::MulCoopmatQ4KFwdBn16, 16u32)
+    } else if n <= 64 {
+        (ShaderId::MulCoopmatQ4KFwdBn32, 32u32)
+    } else {
+        (ShaderId::MulCoopmatQ4KFwdBn64, 64u32)
+    };
+
+    let pc = CoopmatPushConstants {
+        m, n, k,
+        stride_a: k,   // weights stride in elements
+        stride_b: k,   // FORWARD_LAYOUT: B is [N, K], stride = K
+        stride_c: m,   // FORWARD_LAYOUT: C is [N, M], stride = M
+    };
+    let groups_x = m.div_ceil(64);
+    let groups_y = n.div_ceil(bn_tile);
+    fix.dispatch(
+        shader, &[w_buf, act_buf, out_buf],
+        bytemuck::bytes_of(&pc),
+        (groups_x, groups_y, 1),
+    );
+
+    let gpu = fix.read_output(out_buf, (m * n) as usize);
+    let cpu = cpu_gemm_q4k_ref(&weights, &acts, m as usize, n as usize, k as usize);
+
+    let nan = gpu.iter().any(|x| !x.is_finite());
+    assert!(!nan, "coopmat[{label}] M={m} N={n} K={k} produced NaN/Inf");
+
+    let max_err = max_abs_err(&gpu, &cpu);
+    let max_amax = cpu.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    // FP8 narrowing on both A and B → ~12.5% relative grid plus
+    // sqrt(K) accumulation drift. 50% of max-magnitude is comfortable
+    // headroom; matches what the v0.2 sprint-2B tests use.
+    let thresh = (max_amax * 0.5).max(0.5);
+
+    assert!(
+        max_err < thresh,
+        "coopmat[{label}] M={m} N={n} K={k} max_err={max_err:e} >= {thresh:e} (max_amax={max_amax:e})"
+    );
+    fix.teardown();
+}
+
+#[test]
+fn test_coopmat_q4k_fwd_k512()    { run_coopmat_q4k_parity(64, 64, 512, "K=512"); }
+#[test]
+fn test_coopmat_q4k_fwd_k2048()   { run_coopmat_q4k_parity(64, 64, 2048, "K=2048"); }
+#[test]
+fn test_coopmat_q4k_fwd_n128()    { run_coopmat_q4k_parity(64, 128, 256, "N=128"); }
+#[test]
+fn test_coopmat_q4k_fwd_m128()    { run_coopmat_q4k_parity(128, 64, 256, "M=128"); }
+#[test]
+fn test_coopmat_q4k_fwd_prefill_2048_64() {
+    run_coopmat_q4k_parity(2048, 64, 4096, "prefill 2048x64x4096");
+}
+
 #[test]
 fn test_gemm_q4k_full_tile_64x64_mul_mm() {
     use vulkanforge::backend::vulkan::q4k;

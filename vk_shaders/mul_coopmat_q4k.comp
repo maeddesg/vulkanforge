@@ -19,6 +19,15 @@
 //   B : FP32 activations
 //   C : FP32 output
 //
+// Two memory-layout conventions are supported via -DFORWARD_LAYOUT:
+//   * default: B is [K, N] row-major, C is [M, N] row-major. This is
+//     the Sprint 2B test/bench convention.
+//   * FORWARD_LAYOUT: B is [N, K] row-major (matches the runtime
+//     batch_norm = [seq_len, hidden] = [N, K] activation buffer), and
+//     C is [N, M] row-major (matches the runtime mul_mmq output =
+//     [seq_len, output_dim] = [N, M]). This is the variant wired into
+//     the Sprint 3A forward-pass slot for gemm_q.
+//
 // Each K-step:
 //   1. Cooperative-load 64 rows × 16 cols of A:
 //      decode the source Q4_K block (dm + scales) once per thread,
@@ -93,8 +102,13 @@ layout(push_constant) uniform PC {
     uint n;
     uint k;             // = K, must be a multiple of Q4K_PER_BLOCK
     uint stride_a;      // = K (logical row stride of A in weights)
-    uint stride_b;      // = N
-    uint stride_c;      // = N
+#ifdef FORWARD_LAYOUT
+    uint stride_b;      // = K (B is [N, K] row-major; row stride is K)
+    uint stride_c;      // = M (C is [N, M] row-major; row stride is M)
+#else
+    uint stride_b;      // = N (B is [K, N] row-major)
+    uint stride_c;      // = N (C is [M, N] row-major)
+#endif
 } pc;
 
 // Dequant a single Q4_K weight at position `pos` in [0, 256) of the
@@ -192,7 +206,13 @@ void main() {
                 const uint gk    = kk + k_idx;
                 const uint gn    = wg_n + n_idx;
                 const bool ok    = gk < pc.k && gn < pc.n;
+#ifdef FORWARD_LAYOUT
+                // B is stored as [N, K] row-major (token-major activations).
+                // stride_b = K, so element (gk, gn) lives at b[gn * K + gk].
+                const float vf   = ok ? b[gn * pc.stride_b + gk] : 0.0;
+#else
                 const float vf   = ok ? b[gk * pc.stride_b + gn] : 0.0;
+#endif
                 buf_b[k_idx * B_STRIDE + n_idx] = floate4m3_t(vf);
             }
         }
@@ -229,9 +249,18 @@ void main() {
             const uint c_row = wg_m + sg_m * WM + mi * TM;
             const uint c_col = wg_n + sg_n * WN + ni * TN;
             if (c_row + TM <= pc.m && c_col + TN <= pc.n) {
+#ifdef FORWARD_LAYOUT
+                // C is [N, M] row-major: write the 16x16 output tile
+                // ColumnMajor with stride_c = M so element (mi, ni)
+                // lands at c[(c_col + ni) * M + (c_row + mi)].
+                coopMatStore(acc[mi * WMMAS_N + ni], c,
+                             c_col * pc.stride_c + c_row, pc.stride_c,
+                             gl_CooperativeMatrixLayoutColumnMajor);
+#else
                 coopMatStore(acc[mi * WMMAS_N + ni], c,
                              c_row * pc.stride_c + c_col, pc.stride_c,
                              gl_CooperativeMatrixLayoutRowMajor);
+#endif
             }
         }
     }
