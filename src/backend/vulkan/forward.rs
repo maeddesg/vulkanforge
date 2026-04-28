@@ -269,7 +269,18 @@ impl Forward {
         config: ModelConfig,
         profiler: Option<ShaderProfiler>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::new_with_prefill(dev, allocator, kv_cache, config, profiler, 256)
+        // Sprint 5 — bump default from 256 to 1024 to lift the
+        // pp>256 cliff (decode.rs:429 routes prefill_len >
+        // max_prefill_tokens through forward_token, collapsing
+        // throughput to ~90 tok/s = decode rate). VRAM cost at
+        // Qwen3-8B dims: ~240 MB vs ~60 MB. Override via env var
+        // VULKANFORGE_MAX_PREFILL when callers need a smaller cap
+        // (low-VRAM hosts, CI VMs).
+        let max_pp: u32 = std::env::var("VULKANFORGE_MAX_PREFILL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024);
+        Self::new_with_prefill(dev, allocator, kv_cache, config, profiler, max_pp)
     }
 
     /// Like `new` but accepts an explicit `max_prefill_tokens` cap so
