@@ -254,6 +254,26 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "dequant_q4k_debug.comp",
         defines: &[("OUT_FP8", "1")],
     },
+    // v0.2 Sprint 2B — Q4_K dequant-fusion into the tiled FP8 coopmat
+    // GEMM. A is bound as `block_q4_K[]` (144 B/256 weights), B is
+    // FP32 activations, output is FP32. Each K-step does Q4_K → FP32
+    // → FP8 in registers, then coopMatMulAdd in FP8. Three BN
+    // variants for the same per-shape Sprint-1A.5 selector.
+    ShaderJob {
+        out_name: "mul_coopmat_q4k_bn64.spv",
+        entry_source: "mul_coopmat_q4k.comp",
+        defines: &[("BN", "64")],
+    },
+    ShaderJob {
+        out_name: "mul_coopmat_q4k_bn32.spv",
+        entry_source: "mul_coopmat_q4k.comp",
+        defines: &[("BN", "32")],
+    },
+    ShaderJob {
+        out_name: "mul_coopmat_q4k_bn16.spv",
+        entry_source: "mul_coopmat_q4k.comp",
+        defines: &[("BN", "16")],
+    },
     // Phase 6 v0.1.2 cont. — mul_mm.comp port from llama.cpp
     // (MIT-licensed). Same shader runtime as mul_mmq.comp but takes
     // FP32 activations directly (no Q8_1 quantize step in front), uses
