@@ -295,6 +295,16 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "mul_coopmat_q4k.comp",
         defines: &[("BN", "16"), ("FORWARD_LAYOUT", "1")],
     },
+    // v0.2 Sprint 3B — naive Q4_K coopmat with BF16 narrowing
+    // (1 Wave64/WG, single 16x16 output tile). Targets skinny-N
+    // prefill where the tiled kernels of Sprint 2B/3A regress.
+    // BF16 (7 mantissa bits) replaces FP8 (3 bits) so the precision
+    // is sufficient for full-stack Qwen3 forward.
+    ShaderJob {
+        out_name: "mul_coopmat_q4k_naive_bf16.spv",
+        entry_source: "mul_coopmat_q4k_naive.comp",
+        defines: &[],
+    },
     // Phase 6 v0.1.2 cont. — mul_mm.comp port from llama.cpp
     // (MIT-licensed). Same shader runtime as mul_mmq.comp but takes
     // FP32 activations directly (no Q8_1 quantize step in front), uses

@@ -2215,6 +2215,7 @@ impl Forward {
         m: u32,
         n: u32,
         k: u32,
+        bm_tile: u32,
         bn_tile: u32,
         label: &'static str,
     ) {
@@ -2233,7 +2234,7 @@ impl Forward {
             stride_b: k,   // FORWARD_LAYOUT: B is [N, K], stride = K
             stride_c: m,   // FORWARD_LAYOUT: C is [N, M], stride = M
         };
-        let groups_x = m.div_ceil(64);
+        let groups_x = m.div_ceil(bm_tile);
         let groups_y = n.div_ceil(bn_tile);
         let layout = kernel.pipeline_layout;
         let pipeline = kernel.pipeline;
@@ -2483,17 +2484,37 @@ impl Forward {
         // Q8_1 depending on mul_mm_enabled). The other six GEMMs keep
         // the existing routing.
         if self.coopmat_q4k_enabled {
-            let (q_shader, q_bn) = if seq_len <= 32 {
-                (ShaderId::MulCoopmatQ4KFwdBn16, 16u32)
-            } else if seq_len <= 64 {
-                (ShaderId::MulCoopmatQ4KFwdBn32, 32u32)
+            // Sprint 3B per-shape selector: naive BF16 for skinny-N
+            // (where the tiled Sprint 2B/3A kernels regressed); the
+            // tiled FP8 BN=32/64 variants stay available for big-N
+            // shapes. Each tuple is (shader, BM, BN) so the dispatch
+            // grid can pick the right output-tile geometry.
+            let (qkw_shader, qkw_bm, qkw_bn) = if seq_len <= 64 {
+                (ShaderId::MulCoopmatQ4KNaiveBf16, 16u32, 16u32)
+            } else if seq_len <= 128 {
+                (ShaderId::MulCoopmatQ4KFwdBn32, 64u32, 32u32)
             } else {
-                (ShaderId::MulCoopmatQ4KFwdBn64, 64u32)
+                (ShaderId::MulCoopmatQ4KFwdBn64, 64u32, 64u32)
             };
             self.run_gemm_coopmat_q4k(
-                dev, registry, cmd, q_shader, wq,
+                dev, registry, cmd, qkw_shader, wq,
                 self.batch_norm.handle, self.batch_q.handle,
-                q_dim, seq_len, hidden, q_bn, "gemm_q_coopmat",
+                q_dim, seq_len, hidden, qkw_bm, qkw_bn, "gemm_q_coopmat",
+            );
+            self.run_gemm_coopmat_q4k(
+                dev, registry, cmd, qkw_shader, wk,
+                self.batch_norm.handle, self.batch_k.handle,
+                kv_dim, seq_len, hidden, qkw_bm, qkw_bn, "gemm_k_coopmat",
+            );
+            // gemm_v stays on mul_mmq — Qwen3 uses Q6_K for attn_v
+            // (mixed-quant) and Sprint 3B doesn't ship a Q6_K coopmat
+            // dequant kernel yet (Sprint 3C task). Activations for
+            // gemm_v are still in batch_q8 thanks to the earlier
+            // run_quantize_q8_1 in the mul_mmq path.
+            self.run_gemm(
+                dev, registry, cmd, sv, wv,
+                gemm_input_attn, self.batch_v.handle,
+                kv_dim, seq_len, hidden, "gemm_v",
             );
         } else {
             self.run_gemm(
@@ -2501,17 +2522,17 @@ impl Forward {
                 gemm_input_attn, self.batch_q.handle,
                 q_dim, seq_len, hidden, "gemm_q",
             );
+            self.run_gemm(
+                dev, registry, cmd, sk, wk,
+                gemm_input_attn, self.batch_k.handle,
+                kv_dim, seq_len, hidden, "gemm_k",
+            );
+            self.run_gemm(
+                dev, registry, cmd, sv, wv,
+                gemm_input_attn, self.batch_v.handle,
+                kv_dim, seq_len, hidden, "gemm_v",
+            );
         }
-        self.run_gemm(
-            dev, registry, cmd, sk, wk,
-            gemm_input_attn, self.batch_k.handle,
-            kv_dim, seq_len, hidden, "gemm_k",
-        );
-        self.run_gemm(
-            dev, registry, cmd, sv, wv,
-            gemm_input_attn, self.batch_v.handle,
-            kv_dim, seq_len, hidden, "gemm_v",
-        );
         compute_barrier(dev, cmd);
 
         // ---- (d) Q/K-norm + RoPE + KV-cache write ----
@@ -2740,24 +2761,41 @@ impl Forward {
         }
 
         // ---- (e) Output projection: GEMM(attn_out → o_batch). ----
-        let gemm_input_o = if use_mul_mm {
-            self.batch_attn_out.handle
-        } else {
-            self.run_quantize_q8_1(
-                dev, registry, cmd,
-                self.batch_attn_out.handle, self.batch_q8.handle,
-                seq_len * q_dim, "quantize_attn_out",
-            );
-            compute_barrier(dev, cmd);
-            self.batch_q8.handle
-        };
         let wo = layer_weight(model, layer, "attn_output.weight");
-        let so = layer_weight_shader_gemm(model, layer, "attn_output.weight", gemm_kind);
-        self.run_gemm(
-            dev, registry, cmd, so, wo,
-            gemm_input_o, self.batch_o.handle,
-            hidden, seq_len, q_dim, "gemm_o",
-        );
+        if self.coopmat_q4k_enabled {
+            // Coopmat path reads FP32 activations directly — skip the
+            // q8_1 quantize for gemm_o.
+            let (o_shader, o_bm, o_bn) = if seq_len <= 64 {
+                (ShaderId::MulCoopmatQ4KNaiveBf16, 16u32, 16u32)
+            } else if seq_len <= 128 {
+                (ShaderId::MulCoopmatQ4KFwdBn32, 64u32, 32u32)
+            } else {
+                (ShaderId::MulCoopmatQ4KFwdBn64, 64u32, 64u32)
+            };
+            self.run_gemm_coopmat_q4k(
+                dev, registry, cmd, o_shader, wo,
+                self.batch_attn_out.handle, self.batch_o.handle,
+                hidden, seq_len, q_dim, o_bm, o_bn, "gemm_o_coopmat",
+            );
+        } else {
+            let gemm_input_o = if use_mul_mm {
+                self.batch_attn_out.handle
+            } else {
+                self.run_quantize_q8_1(
+                    dev, registry, cmd,
+                    self.batch_attn_out.handle, self.batch_q8.handle,
+                    seq_len * q_dim, "quantize_attn_out",
+                );
+                compute_barrier(dev, cmd);
+                self.batch_q8.handle
+            };
+            let so = layer_weight_shader_gemm(model, layer, "attn_output.weight", gemm_kind);
+            self.run_gemm(
+                dev, registry, cmd, so, wo,
+                gemm_input_o, self.batch_o.handle,
+                hidden, seq_len, q_dim, "gemm_o",
+            );
+        }
         compute_barrier(dev, cmd);
 
         // ---- (f) Residual1 = batch_residual + batch_o (in-place). ----
@@ -2795,18 +2833,38 @@ impl Forward {
         // ---- (i) Gate + Up GEMMs. ----
         let wg = layer_weight(model, layer, "ffn_gate.weight");
         let wu = layer_weight(model, layer, "ffn_up.weight");
-        let sg = layer_weight_shader_gemm(model, layer, "ffn_gate.weight", gemm_kind);
-        let su = layer_weight_shader_gemm(model, layer, "ffn_up.weight", gemm_kind);
-        self.run_gemm(
-            dev, registry, cmd, sg, wg,
-            gemm_input_ffn, self.batch_gate.handle,
-            ffn, seq_len, hidden, "gemm_gate",
-        );
-        self.run_gemm(
-            dev, registry, cmd, su, wu,
-            gemm_input_ffn, self.batch_up.handle,
-            ffn, seq_len, hidden, "gemm_up",
-        );
+        if self.coopmat_q4k_enabled {
+            let (gu_shader, gu_bm, gu_bn) = if seq_len <= 64 {
+                (ShaderId::MulCoopmatQ4KNaiveBf16, 16u32, 16u32)
+            } else if seq_len <= 128 {
+                (ShaderId::MulCoopmatQ4KFwdBn32, 64u32, 32u32)
+            } else {
+                (ShaderId::MulCoopmatQ4KFwdBn64, 64u32, 64u32)
+            };
+            self.run_gemm_coopmat_q4k(
+                dev, registry, cmd, gu_shader, wg,
+                self.batch_norm.handle, self.batch_gate.handle,
+                ffn, seq_len, hidden, gu_bm, gu_bn, "gemm_gate_coopmat",
+            );
+            self.run_gemm_coopmat_q4k(
+                dev, registry, cmd, gu_shader, wu,
+                self.batch_norm.handle, self.batch_up.handle,
+                ffn, seq_len, hidden, gu_bm, gu_bn, "gemm_up_coopmat",
+            );
+        } else {
+            let sg = layer_weight_shader_gemm(model, layer, "ffn_gate.weight", gemm_kind);
+            let su = layer_weight_shader_gemm(model, layer, "ffn_up.weight", gemm_kind);
+            self.run_gemm(
+                dev, registry, cmd, sg, wg,
+                gemm_input_ffn, self.batch_gate.handle,
+                ffn, seq_len, hidden, "gemm_gate",
+            );
+            self.run_gemm(
+                dev, registry, cmd, su, wu,
+                gemm_input_ffn, self.batch_up.handle,
+                ffn, seq_len, hidden, "gemm_up",
+            );
+        }
         compute_barrier(dev, cmd);
 
         // ---- (j) silu(gate) * up → batch_ffn_hidden. ----
@@ -2822,7 +2880,13 @@ impl Forward {
         );
         compute_barrier(dev, cmd);
 
-        // ---- (k) Quantize ffn_hidden + Down-proj GEMM (Q6_K). ----
+        // ---- (k) Quantize ffn_hidden + Down-proj GEMM (Q4_K). ----
+        // NOTE: gemm_down is left on mul_mmq even when coopmat is on.
+        // The coopmat path produced NaN logits when all 6 Q4_K GEMMs
+        // were swapped — bisect localised the divergence to gemm_down
+        // (K = ffn = 11008, the longest K-chain in the model). Sprint
+        // 3C will revisit this with header-caching for the 11008/256
+        // = 43 blocks per row, and/or a per-row scaling pass.
         let gemm_input_down = if use_mul_mm {
             self.batch_ffn_hidden.handle
         } else {

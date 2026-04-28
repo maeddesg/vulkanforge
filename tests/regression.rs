@@ -841,21 +841,27 @@ fn sprint3a_coopmat_gemm_q_logits_parity() {
     sorted_b.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     let mmq_top1_rank_in_coopmat = sorted_b.iter().position(|(i, _)| *i == top1_a).unwrap_or(usize::MAX);
 
-    // Observational record. The gate that this test ENFORCES is just
-    // "no NaN/Inf in coopmat logits"; numerical accuracy across the
-    // 36-layer Qwen3 stack is recorded but not asserted. Empirical
-    // 3A run: mmq_top1 = 151667, coopmat_top1 = 13, top-5 overlap = 0,
-    // mmq's top-1 ranks ~12 000 in coopmat's logits. The integration
-    // plumbing is correct (5/5 `test_coopmat_q4k_fwd_*` tests in
-    // correctness.rs pass against the f64 CPU reference); the precision
-    // floor of Q4_K → FP8 → FP8 (3 mantissa bits both sides) is the
-    // limiter once 36 layers of drift compound. Sprint 3B will pivot
-    // to BF16 dequant-fusion to pick up the missing precision.
     eprintln!(
-        "[sprint3a-parity] top1_mmq={} top1_coopmat={} top5_mmq={:?} top5_coopmat={:?} top5_overlap={} mmq_top1_rank_in_coopmat={}",
+        "[sprint3-parity] top1_mmq={} top1_coopmat={} top5_mmq={:?} top5_coopmat={:?} top5_overlap={} mmq_top1_rank_in_coopmat={}",
         top1_a, top1_b, top5_a, top5_b, overlap5, mmq_top1_rank_in_coopmat,
     );
-    let _ = (top1_b, overlap5, mmq_top1_rank_in_coopmat);
+    // Sprint 3B gate (after the BF16 pivot + partial-tile-store fix
+    // landed): top-1 must agree, and top-5 overlap >= 3/5. Sprint 3A's
+    // FP8 attempt failed both checks; the failure trace was
+    //   top1_mmq=151667 top1_coopmat=13 overlap=0 rank=12322
+    // After Sprint 3B the same prompt yields
+    //   top1=151667/151667 overlap=4/5 rank=0
+    assert_eq!(
+        top1_a, top1_b,
+        "coopmat gemm_q changed top-1 token: mmq={} coopmat={}",
+        top1_a, top1_b,
+    );
+    assert!(
+        overlap5 >= 3,
+        "top-5 overlap {}/5 too low\n  mmq:     {:?}\n  coopmat: {:?}",
+        overlap5, top5_a, top5_b,
+    );
+    let _ = mmq_top1_rank_in_coopmat;
 
     cmd_ctx.destroy(&dev.device);
     model.destroy(&dev.device, &mut allocator);

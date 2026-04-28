@@ -301,7 +301,8 @@ impl PipelineRegistry {
                 // hard-coded `const uint` in the shader source.
                 ShaderId::MulCoopmatQ4KFwdBn64
                 | ShaderId::MulCoopmatQ4KFwdBn32
-                | ShaderId::MulCoopmatQ4KFwdBn16 => {
+                | ShaderId::MulCoopmatQ4KFwdBn16
+                | ShaderId::MulCoopmatQ4KNaiveBf16 => {
                     ComputeKernel::from_spv(device, &words, cache)
                 }
             };

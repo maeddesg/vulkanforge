@@ -1344,6 +1344,83 @@ fn test_coopmat_q4k_fwd_prefill_2048_64() {
     run_coopmat_q4k_parity(2048, 64, 4096, "prefill 2048x64x4096");
 }
 
+// Sprint 3B — naive BF16 Q4_K coopmat. Same shape pattern as
+// run_coopmat_q4k_parity but dispatches the naive shader. Parity
+// gate is FP32-noise level since BF16 (7 mantissa bits) is much
+// closer to f64 than FP8 was — tolerance scales with sqrt(K) * a
+// small fraction of max-magnitude.
+fn run_coopmat_q4k_naive_parity(m: u32, n: u32, k: u32, label: &str) {
+    use vulkanforge::backend::vulkan::pipeline::CoopmatPushConstants;
+    use vulkanforge::backend::vulkan::q4k;
+    assert_eq!(k as usize % q4k::QUANT_K, 0);
+    let mut fix = Fixture::new();
+    let weights = q4k::build_random_weights(m as usize, k as usize, 0xC0FFEE);
+    let w_buf = {
+        let device = fix.dev.device.clone();
+        let allocator = fix.allocator.as_mut().unwrap();
+        let mut b = GpuBuffer::new(
+            &device, allocator, weights.len() as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu,
+            "naive_w",
+        ).expect("alloc weights");
+        b.write_bytes(&weights).expect("write weights");
+        fix.track(b)
+    };
+    let acts: Vec<f32> = (0..(n * k))
+        .map(|i| ((i as f32) * 0.013).sin() * 0.5)
+        .collect();
+    let act_buf = fix.host_buffer_f32(&acts, "naive_act");
+    let out_buf = fix.output_buffer_f32((m * n) as usize, "naive_out");
+
+    let pc = CoopmatPushConstants {
+        m, n, k,
+        stride_a: k,
+        stride_b: k,    // FORWARD_LAYOUT: B = [N, K]
+        stride_c: m,    // FORWARD_LAYOUT: C = [N, M]
+    };
+    // Naive kernel emits 16x16 output tiles, so dispatch is
+    // (M/16, N/16) instead of (M/64, N/BN).
+    let groups_x = m.div_ceil(16);
+    let groups_y = n.div_ceil(16);
+    fix.dispatch(
+        ShaderId::MulCoopmatQ4KNaiveBf16, &[w_buf, act_buf, out_buf],
+        bytemuck::bytes_of(&pc),
+        (groups_x, groups_y, 1),
+    );
+
+    let gpu = fix.read_output(out_buf, (m * n) as usize);
+    let cpu = cpu_gemm_q4k_ref(&weights, &acts, m as usize, n as usize, k as usize);
+    let nan = gpu.iter().any(|x| !x.is_finite());
+    assert!(!nan, "naive[{label}] produced NaN/Inf");
+    let max_err = max_abs_err(&gpu, &cpu);
+    let max_amax = cpu.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    // BF16 has ~0.4% relative precision per element; tolerance scales
+    // with the worst-case product magnitude in the fixture.
+    let thresh = (max_amax * 0.05).max(0.05);
+    assert!(
+        max_err < thresh,
+        "naive[{label}] M={m} N={n} K={k} max_err={max_err:e} >= {thresh:e} (max_amax={max_amax:e})"
+    );
+    fix.teardown();
+}
+
+#[test]
+fn test_coopmat_q4k_naive_k512()       { run_coopmat_q4k_naive_parity(64, 64, 512, "K=512"); }
+#[test]
+fn test_coopmat_q4k_naive_k2048()      { run_coopmat_q4k_naive_parity(64, 64, 2048, "K=2048"); }
+#[test]
+fn test_coopmat_q4k_naive_m128()       { run_coopmat_q4k_naive_parity(128, 64, 256, "M=128"); }
+#[test]
+fn test_coopmat_q4k_naive_prefill_64() {
+    run_coopmat_q4k_naive_parity(2048, 64, 4096, "prefill 2048x64x4096");
+}
+
+#[test]
+fn test_coopmat_q4k_naive_qwen3_gemm_q() {
+    // Exact runtime gemm_q shape on Qwen3-8B: q_dim=4096, seq_len=64, hidden=4096.
+    run_coopmat_q4k_naive_parity(4096, 64, 4096, "qwen3 gemm_q 4096x64x4096");
+}
+
 #[test]
 fn test_gemm_q4k_full_tile_64x64_mul_mm() {
     use vulkanforge::backend::vulkan::q4k;

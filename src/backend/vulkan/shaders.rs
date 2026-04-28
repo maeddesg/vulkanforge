@@ -55,6 +55,11 @@ pub enum ShaderId {
     MulCoopmatQ4KFwdBn64,
     MulCoopmatQ4KFwdBn32,
     MulCoopmatQ4KFwdBn16,
+    // v0.2 Sprint 3B — naive Q4_K coopmat with BF16 narrowing.
+    // Single subgroup per WG, single 16x16 output tile. Default
+    // path for skinny-N prefill (seq_len ≤ 64) when
+    // VULKANFORGE_COOPMAT=1.
+    MulCoopmatQ4KNaiveBf16,
 }
 
 impl ShaderId {
@@ -85,6 +90,7 @@ impl ShaderId {
             ShaderId::MulCoopmatQ4KFwdBn64 => "mul_coopmat_q4k_fwd_bn64",
             ShaderId::MulCoopmatQ4KFwdBn32 => "mul_coopmat_q4k_fwd_bn32",
             ShaderId::MulCoopmatQ4KFwdBn16 => "mul_coopmat_q4k_fwd_bn16",
+            ShaderId::MulCoopmatQ4KNaiveBf16 => "mul_coopmat_q4k_naive_bf16",
         }
     }
 
@@ -115,6 +121,7 @@ impl ShaderId {
             ShaderId::MulCoopmatQ4KFwdBn64 => MUL_COOPMAT_Q4K_FWD_BN64,
             ShaderId::MulCoopmatQ4KFwdBn32 => MUL_COOPMAT_Q4K_FWD_BN32,
             ShaderId::MulCoopmatQ4KFwdBn16 => MUL_COOPMAT_Q4K_FWD_BN16,
+            ShaderId::MulCoopmatQ4KNaiveBf16 => MUL_COOPMAT_Q4K_NAIVE_BF16,
         }
     }
 }
@@ -145,6 +152,7 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::MulCoopmatQ4KFwdBn64,
     ShaderId::MulCoopmatQ4KFwdBn32,
     ShaderId::MulCoopmatQ4KFwdBn16,
+    ShaderId::MulCoopmatQ4KNaiveBf16,
 ];
 
 pub const MUL_MAT_VEC_Q4_K_F32_F32: &[u8] =
@@ -189,6 +197,8 @@ pub const MUL_COOPMAT_Q4K_FWD_BN32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_q4k_fwd_bn32.spv"));
 pub const MUL_COOPMAT_Q4K_FWD_BN16: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_q4k_fwd_bn16.spv"));
+pub const MUL_COOPMAT_Q4K_NAIVE_BF16: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_q4k_naive_bf16.spv"));
 
 /// Decode a SPIR-V byte blob into u32 words. Vulkan consumes SPIR-V
 /// as `&[u32]`; `include_bytes!` only gives us `&[u8]` whose alignment
