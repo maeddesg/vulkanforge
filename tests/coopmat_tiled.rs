@@ -31,6 +31,14 @@ const SHADER_SPV_TILED_BN16: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_bf16_bn16.spv"));
 const SHADER_SPV_NAIVE: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/bench_coopmat_pure_f32.spv"));
+const SHADER_SPV_FP8_NAIVE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/bench_coopmat_fp8_e4m3.spv"));
+const SHADER_SPV_FP8_TILED_BN64: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_fp8_bn64.spv"));
+const SHADER_SPV_FP8_TILED_BN32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_fp8_bn32.spv"));
+const SHADER_SPV_FP8_TILED_BN16: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_fp8_bn16.spv"));
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
@@ -54,6 +62,60 @@ fn bf16_to_f32(b: u16) -> f32 {
     f32::from_bits((b as u32) << 16)
 }
 
+fn f32_to_fp8_e4m3(x: f32) -> u8 {
+    if x == 0.0 || !x.is_finite() {
+        return 0;
+    }
+    let bits = x.to_bits();
+    let sign = ((bits >> 31) & 1) as u8;
+    let f32_exp = ((bits >> 23) & 0xff) as i32;
+    let f32_mant = bits & 0x7f_ffff;
+    if f32_exp == 0 {
+        return sign << 7;
+    }
+    let unbiased = f32_exp - 127;
+    let new_exp = unbiased + 7;
+    if new_exp >= 16 {
+        return (sign << 7) | 0x7E;
+    }
+    if new_exp <= 0 {
+        return sign << 7;
+    }
+    let round_bit = (f32_mant >> 19) & 1;
+    let sticky = f32_mant & 0x7_ffff;
+    let mut mant3 = ((f32_mant >> 20) & 0x07) as u8;
+    let mut exp4 = new_exp as u8;
+    if round_bit == 1 && (sticky != 0 || (mant3 & 1) == 1) {
+        mant3 = mant3.wrapping_add(1);
+        if mant3 == 8 {
+            mant3 = 0;
+            exp4 = exp4.wrapping_add(1);
+            if exp4 >= 16 {
+                return (sign << 7) | 0x7E;
+            }
+        }
+    }
+    (sign << 7) | ((exp4 & 0x0f) << 3) | (mant3 & 0x07)
+}
+
+fn fp8_e4m3_to_f32(b: u8) -> f32 {
+    let sign = (b >> 7) & 1;
+    let exp = ((b >> 3) & 0x0f) as i32;
+    let mant = (b & 0x07) as u32;
+    if exp == 15 && mant == 7 {
+        return f32::NAN;
+    }
+    let s = if sign == 1 { -1.0f32 } else { 1.0f32 };
+    if exp == 0 {
+        if mant == 0 {
+            return 0.0 * s;
+        }
+        return s * (mant as f32) / 8.0 / 64.0;
+    }
+    let m = 1.0 + (mant as f32) / 8.0;
+    s * m * (2.0f32).powi(exp - 7)
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 #[allow(non_snake_case)]
@@ -66,6 +128,18 @@ struct PhysicalDeviceShaderBfloat16FeaturesKHR {
 }
 const VK_STRUCT_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR: vk::StructureType =
     vk::StructureType::from_raw(1000141000);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(non_snake_case)]
+struct PhysicalDeviceShaderFloat8FeaturesEXT {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    shader_float8: vk::Bool32,
+    shader_float8_cooperative_matrix: vk::Bool32,
+}
+const VK_STRUCT_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT: vk::StructureType =
+    vk::StructureType::from_raw(1000567000);
 
 /// Owns the Vulkan handles for the test session. Built lazily on first
 /// test entry; destroyed only when the process exits (cargo test
@@ -120,9 +194,10 @@ fn build_harness() -> Result<Harness, Box<dyn std::error::Error>> {
         .queue_family_index(queue_family_index)
         .queue_priorities(&queue_priorities);
 
-    let extensions: [*const i8; 3] = [
+    let extensions: [*const i8; 4] = [
         khr::cooperative_matrix::NAME.as_ptr(),
         c"VK_KHR_shader_bfloat16".as_ptr(),
+        c"VK_EXT_shader_float8".as_ptr(),
         c"VK_KHR_shader_subgroup_uniform_control_flow".as_ptr(),
     ];
 
@@ -135,6 +210,12 @@ fn build_harness() -> Result<Harness, Box<dyn std::error::Error>> {
         shader_bfloat16_dot_product: vk::FALSE,
         shader_bfloat16_cooperative_matrix: vk::TRUE,
     };
+    let mut feat_fp8 = PhysicalDeviceShaderFloat8FeaturesEXT {
+        s_type: VK_STRUCT_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT,
+        p_next: std::ptr::null_mut(),
+        shader_float8: vk::TRUE,
+        shader_float8_cooperative_matrix: vk::TRUE,
+    };
     let mut feat13 = vk::PhysicalDeviceVulkan13Features::default();
     let mut feat12 = vk::PhysicalDeviceVulkan12Features::default()
         .storage_buffer8_bit_access(true)
@@ -146,7 +227,8 @@ fn build_harness() -> Result<Harness, Box<dyn std::error::Error>> {
     let core = vk::PhysicalDeviceFeatures::default().shader_int16(true);
     let mut feat2 = vk::PhysicalDeviceFeatures2::default().features(core);
 
-    feat_bf16.p_next = feat_coopmat.p_next;
+    feat_fp8.p_next = feat_coopmat.p_next;
+    feat_bf16.p_next = &mut feat_fp8 as *mut _ as *mut std::ffi::c_void;
     feat_coopmat.p_next = &mut feat_bf16 as *mut _ as *mut std::ffi::c_void;
 
     let device_info = vk::DeviceCreateInfo::default()
@@ -245,6 +327,10 @@ enum Kernel {
     TiledBn32,
     TiledBn16,
     Naive,
+    Fp8Naive,
+    Fp8TiledBn64,
+    Fp8TiledBn32,
+    Fp8TiledBn16,
 }
 
 impl Kernel {
@@ -254,15 +340,28 @@ impl Kernel {
             Kernel::TiledBn32 => SHADER_SPV_TILED_BN32,
             Kernel::TiledBn16 => SHADER_SPV_TILED_BN16,
             Kernel::Naive => SHADER_SPV_NAIVE,
+            Kernel::Fp8Naive => SHADER_SPV_FP8_NAIVE,
+            Kernel::Fp8TiledBn64 => SHADER_SPV_FP8_TILED_BN64,
+            Kernel::Fp8TiledBn32 => SHADER_SPV_FP8_TILED_BN32,
+            Kernel::Fp8TiledBn16 => SHADER_SPV_FP8_TILED_BN16,
         }
     }
     fn tile_mn(self) -> (u32, u32) {
         match self {
-            Kernel::Tiled => (64, 64),
-            Kernel::TiledBn32 => (64, 32),
-            Kernel::TiledBn16 => (64, 16),
-            Kernel::Naive => (16, 16),
+            Kernel::Tiled | Kernel::Fp8TiledBn64 => (64, 64),
+            Kernel::TiledBn32 | Kernel::Fp8TiledBn32 => (64, 32),
+            Kernel::TiledBn16 | Kernel::Fp8TiledBn16 => (64, 16),
+            Kernel::Naive | Kernel::Fp8Naive => (16, 16),
         }
+    }
+    fn is_fp8(self) -> bool {
+        matches!(
+            self,
+            Kernel::Fp8Naive
+                | Kernel::Fp8TiledBn64
+                | Kernel::Fp8TiledBn32
+                | Kernel::Fp8TiledBn16
+        )
     }
 }
 
@@ -297,23 +396,41 @@ fn run_gemm(
     let (pipeline, pipeline_layout, dsl, module) = make_pipeline(device, kernel.spv())?;
 
     // Generate A and B as small float patterns that exercise positives,
-    // negatives and zero — keeps the dot products numerically interesting
-    // without saturating BF16's range.
+    // negatives and zero. Range stays well within FP8 E4M3 (±448) and
+    // BF16's full range, so neither type saturates.
     let a_f32: Vec<f32> = (0..(m * k))
         .map(|i| 0.001 * (((i.wrapping_mul(seed_a)) % 64) as f32 - 32.0))
         .collect();
     let b_f32: Vec<f32> = (0..(k * n))
         .map(|i| 0.001 * (((i.wrapping_mul(seed_b) / 17) % 32) as f32 - 8.0))
         .collect();
-    let a_bf16: Vec<u16> = a_f32.iter().map(|&x| f32_to_bf16(x)).collect();
-    let b_bf16: Vec<u16> = b_f32.iter().map(|&x| f32_to_bf16(x)).collect();
-    // Reconstruct what the GPU actually sees (after BF16 rounding) so
-    // the CPU reference uses the same operands.
-    let a_seen: Vec<f32> = a_bf16.iter().map(|&x| bf16_to_f32(x)).collect();
-    let b_seen: Vec<f32> = b_bf16.iter().map(|&x| bf16_to_f32(x)).collect();
 
-    let a_bytes = (m as u64) * (k as u64) * 2;
-    let b_bytes = (k as u64) * (n as u64) * 2;
+    // Quantise per the kernel's input element type and reconstruct what
+    // the GPU actually sees so the CPU reference uses identical operands.
+    let (a_raw, a_seen): (Vec<u8>, Vec<f32>) = if kernel.is_fp8() {
+        let bytes: Vec<u8> = a_f32.iter().map(|&x| f32_to_fp8_e4m3(x)).collect();
+        let seen = bytes.iter().map(|&b| fp8_e4m3_to_f32(b)).collect();
+        (bytes, seen)
+    } else {
+        let words: Vec<u16> = a_f32.iter().map(|&x| f32_to_bf16(x)).collect();
+        let seen = words.iter().map(|&w| bf16_to_f32(w)).collect();
+        let bytes = bytemuck::cast_slice::<u16, u8>(&words).to_vec();
+        (bytes, seen)
+    };
+    let (b_raw, b_seen): (Vec<u8>, Vec<f32>) = if kernel.is_fp8() {
+        let bytes: Vec<u8> = b_f32.iter().map(|&x| f32_to_fp8_e4m3(x)).collect();
+        let seen = bytes.iter().map(|&b| fp8_e4m3_to_f32(b)).collect();
+        (bytes, seen)
+    } else {
+        let words: Vec<u16> = b_f32.iter().map(|&x| f32_to_bf16(x)).collect();
+        let seen = words.iter().map(|&w| bf16_to_f32(w)).collect();
+        let bytes = bytemuck::cast_slice::<u16, u8>(&words).to_vec();
+        (bytes, seen)
+    };
+
+    let elem = if kernel.is_fp8() { 1u64 } else { 2u64 };
+    let a_bytes = (m as u64) * (k as u64) * elem;
+    let b_bytes = (k as u64) * (n as u64) * elem;
     let c_bytes = (m as u64) * (n as u64) * 4;
 
     let mut buf_a = GpuBuffer::new(
@@ -340,8 +457,8 @@ fn run_gemm(
         MemoryLocation::GpuToCpu,
         "test_c",
     )?;
-    buf_a.write_bytes(bytemuck::cast_slice(&a_bf16))?;
-    buf_b.write_bytes(bytemuck::cast_slice(&b_bf16))?;
+    buf_a.write_bytes(&a_raw)?;
+    buf_b.write_bytes(&b_raw)?;
 
     let pool_sizes = [vk::DescriptorPoolSize {
         ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -611,4 +728,62 @@ fn coopmat_tiled_bn16_matches_bn64() {
     let err = max_abs_err(&gpu_bn16, &gpu_bn64);
     eprintln!("BN=16 vs BN=64 parity: max_abs_err = {err:.4e}");
     assert!(err < 1e-3, "BN=16 vs BN=64 divergence too large: {err}");
+}
+
+// -- Sprint 1B — FP8 (E4M3) tiled coopmat ------------------------------------
+
+#[test]
+fn coopmat_tiled_fp8_bn64_m64_n64_k256() {
+    // Single tile, K=256. FP8 E4M3 has 3 mantissa bits → tolerance
+    // is several orders looser than BF16, but the small K bounds the
+    // accumulation drift to roughly the FP8-quantised input scale.
+    check_kernel_against_cpu(Kernel::Fp8TiledBn64, 64, 64, 256, 5e-2);
+}
+
+#[test]
+fn coopmat_tiled_fp8_bn64_m64_n64_k4096() {
+    // Long K. With FP8 inputs and ~4000 MACs the absolute error grows
+    // roughly with sqrt(K), but FP32 accumulation keeps it bounded.
+    check_kernel_against_cpu(Kernel::Fp8TiledBn64, 64, 64, 4096, 5e-1);
+}
+
+#[test]
+fn coopmat_tiled_fp8_bn16_prefill_2048_64_4096() {
+    // Prefill Q-projection shape with the BN=16 variant (max N-parallelism).
+    check_kernel_against_cpu(Kernel::Fp8TiledBn16, 2048, 64, 4096, 5e-1);
+}
+
+#[test]
+fn coopmat_tiled_fp8_bn32_prefill_2048_64_4096() {
+    check_kernel_against_cpu(Kernel::Fp8TiledBn32, 2048, 64, 4096, 5e-1);
+}
+
+#[test]
+fn coopmat_tiled_fp8_matches_naive() {
+    // Same FP8 inputs through the naive 1-SG kernel must produce
+    // numerically equivalent output. Both accumulate in FP32 with
+    // BK=16 K-walks, just at different parallelism. Difference is
+    // FP32-rounding-noise only.
+    let h = harness();
+    let (m, n, k) = (256u32, 256u32, 1024u32);
+    let (gpu_t, _, _) = run_gemm(h, Kernel::Fp8TiledBn64, m, n, k, 5, 7).expect("tiled fp8");
+    let (gpu_n, _, _) = run_gemm(h, Kernel::Fp8Naive, m, n, k, 5, 7).expect("naive fp8");
+    let err = max_abs_err(&gpu_t, &gpu_n);
+    eprintln!("FP8 tiled-vs-naive max_abs_err = {err:.4e}");
+    assert!(err < 1e-3, "FP8 tiled vs naive divergence too large: {err}");
+}
+
+#[test]
+fn coopmat_tiled_fp8_bn16_matches_bn64() {
+    // BN=16 vs BN=64 parity for the FP8 path — same GEMM, different
+    // tile partitioning. Both should produce numerically equivalent
+    // FP32 output (per-tile reduction order matches because BK=16 is
+    // the same across BN variants).
+    let h = harness();
+    let (m, n, k) = (256u32, 64u32, 1024u32);
+    let (gpu_bn16, _, _) = run_gemm(h, Kernel::Fp8TiledBn16, m, n, k, 5, 7).expect("bn16");
+    let (gpu_bn64, _, _) = run_gemm(h, Kernel::Fp8TiledBn64, m, n, k, 5, 7).expect("bn64");
+    let err = max_abs_err(&gpu_bn16, &gpu_bn64);
+    eprintln!("FP8 BN=16 vs BN=64 parity: max_abs_err = {err:.4e}");
+    assert!(err < 1e-3, "FP8 BN=16 vs BN=64 divergence too large: {err}");
 }

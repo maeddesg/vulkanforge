@@ -213,6 +213,26 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "mul_coopmat_bf16.comp",
         defines: &[("BN", "16")],
     },
+    // v0.2 Sprint 1B — tiled FP8 (E4M3) coopmat GEMM. Lift-and-shift
+    // from the BF16 skeleton: same tile geometry and parametric BN, but
+    // input element type is `floate4m3_t`. Three SPVs for BN ∈
+    // {16, 32, 64}. Used by examples/bench_coopmat under the
+    // TiledFp8Bn{16,32,64} / TiledFp8Auto modes.
+    ShaderJob {
+        out_name: "mul_coopmat_fp8_bn64.spv",
+        entry_source: "mul_coopmat_fp8.comp",
+        defines: &[("BN", "64")],
+    },
+    ShaderJob {
+        out_name: "mul_coopmat_fp8_bn32.spv",
+        entry_source: "mul_coopmat_fp8.comp",
+        defines: &[("BN", "32")],
+    },
+    ShaderJob {
+        out_name: "mul_coopmat_fp8_bn16.spv",
+        entry_source: "mul_coopmat_fp8.comp",
+        defines: &[("BN", "16")],
+    },
     // Phase 6 v0.1.2 cont. — mul_mm.comp port from llama.cpp
     // (MIT-licensed). Same shader runtime as mul_mmq.comp but takes
     // FP32 activations directly (no Q8_1 quantize step in front), uses

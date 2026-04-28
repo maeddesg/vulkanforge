@@ -40,6 +40,12 @@ const SHADER_SPV_TILED_BF16_BN32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_bf16_bn32.spv"));
 const SHADER_SPV_TILED_BF16_BN16: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_bf16_bn16.spv"));
+const SHADER_SPV_TILED_FP8_BN64: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_fp8_bn64.spv"));
+const SHADER_SPV_TILED_FP8_BN32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_fp8_bn32.spv"));
+const SHADER_SPV_TILED_FP8_BN16: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_fp8_bn16.spv"));
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum BenchMode {
@@ -50,11 +56,24 @@ enum BenchMode {
     TiledBf16Bn16,
     /// Auto-pick BN based on N: BN=16 for N≤32, BN=32 for N≤64, BN=64 otherwise.
     TiledBf16Auto,
+    TiledFp8Bn64,
+    TiledFp8Bn32,
+    TiledFp8Bn16,
+    TiledFp8Auto,
 }
 
 impl BenchMode {
     fn from_env() -> Self {
-        // VF_BENCH_BN takes precedence — explicit BN selection.
+        // VF_BENCH_TILED_FP8 takes precedence over BF16 tiled selectors.
+        if let Ok(s) = std::env::var("VF_BENCH_TILED_FP8") {
+            return match s.as_str() {
+                "16" => BenchMode::TiledFp8Bn16,
+                "32" => BenchMode::TiledFp8Bn32,
+                "64" => BenchMode::TiledFp8Bn64,
+                "auto" | "1" => BenchMode::TiledFp8Auto,
+                other => panic!("VF_BENCH_TILED_FP8 must be 16/32/64/auto, got {other}"),
+            };
+        }
         if let Ok(s) = std::env::var("VF_BENCH_BN") {
             return match s.as_str() {
                 "16" => BenchMode::TiledBf16Bn16,
@@ -68,7 +87,6 @@ impl BenchMode {
             std::env::var("VF_BENCH_TILED").ok().as_deref(),
             Some("1") | Some("true") | Some("bf16")
         ) {
-            // Default tiled mode = BN=64 (Sprint 1A baseline).
             return BenchMode::TiledBf16Bn64;
         }
         match std::env::var("VF_BENCH_FP8").ok().as_deref() {
@@ -85,6 +103,10 @@ impl BenchMode {
             BenchMode::TiledBf16Bn32 => "BF16 tiled BN=32 (4SG, 1x2 WMMAs)",
             BenchMode::TiledBf16Bn16 => "BF16 tiled BN=16 (4SG, 1x1 WMMA)",
             BenchMode::TiledBf16Auto => "BF16 tiled BN=auto-select(N)",
+            BenchMode::TiledFp8Bn64 => "FP8-E4M3 tiled BN=64 (4SG, 2x2 WMMAs)",
+            BenchMode::TiledFp8Bn32 => "FP8-E4M3 tiled BN=32 (4SG, 1x2 WMMAs)",
+            BenchMode::TiledFp8Bn16 => "FP8-E4M3 tiled BN=16 (4SG, 1x1 WMMA)",
+            BenchMode::TiledFp8Auto => "FP8-E4M3 tiled BN=auto-select(N)",
         }
     }
 
@@ -100,6 +122,15 @@ impl BenchMode {
                     BenchMode::TiledBf16Bn64
                 }
             }
+            BenchMode::TiledFp8Auto => {
+                if n <= 32 {
+                    BenchMode::TiledFp8Bn16
+                } else if n <= 64 {
+                    BenchMode::TiledFp8Bn32
+                } else {
+                    BenchMode::TiledFp8Bn64
+                }
+            }
             other => other,
         }
     }
@@ -111,7 +142,12 @@ impl BenchMode {
             BenchMode::TiledBf16Bn64 => SHADER_SPV_TILED_BF16_BN64,
             BenchMode::TiledBf16Bn32 => SHADER_SPV_TILED_BF16_BN32,
             BenchMode::TiledBf16Bn16 => SHADER_SPV_TILED_BF16_BN16,
-            BenchMode::TiledBf16Auto => panic!("auto mode must be resolve()d before use"),
+            BenchMode::TiledFp8Bn64 => SHADER_SPV_TILED_FP8_BN64,
+            BenchMode::TiledFp8Bn32 => SHADER_SPV_TILED_FP8_BN32,
+            BenchMode::TiledFp8Bn16 => SHADER_SPV_TILED_FP8_BN16,
+            BenchMode::TiledBf16Auto | BenchMode::TiledFp8Auto => {
+                panic!("auto mode must be resolve()d before use")
+            }
         }
     }
 
@@ -122,21 +158,38 @@ impl BenchMode {
             | BenchMode::TiledBf16Bn32
             | BenchMode::TiledBf16Bn16
             | BenchMode::TiledBf16Auto => 2,
-            BenchMode::Fp8E4m3 => 1,
+            BenchMode::Fp8E4m3
+            | BenchMode::TiledFp8Bn64
+            | BenchMode::TiledFp8Bn32
+            | BenchMode::TiledFp8Bn16
+            | BenchMode::TiledFp8Auto => 1,
         }
     }
 
     /// Workgroup output-tile size, used to compute the dispatch grid.
-    /// Naive bench: each WG covers a 16x16 tile (one WMMA fragment).
-    /// Tiled BF16: each WG covers a BMxBN tile (BM always = 64).
     fn tile_mn(self) -> (u32, u32) {
         match self {
             BenchMode::Bf16 | BenchMode::Fp8E4m3 => (16, 16),
-            BenchMode::TiledBf16Bn64 => (64, 64),
-            BenchMode::TiledBf16Bn32 => (64, 32),
-            BenchMode::TiledBf16Bn16 => (64, 16),
-            BenchMode::TiledBf16Auto => panic!("auto mode must be resolve()d before use"),
+            BenchMode::TiledBf16Bn64 | BenchMode::TiledFp8Bn64 => (64, 64),
+            BenchMode::TiledBf16Bn32 | BenchMode::TiledFp8Bn32 => (64, 32),
+            BenchMode::TiledBf16Bn16 | BenchMode::TiledFp8Bn16 => (64, 16),
+            BenchMode::TiledBf16Auto | BenchMode::TiledFp8Auto => {
+                panic!("auto mode must be resolve()d before use")
+            }
         }
+    }
+
+    /// True for any FP8 variant — controls how A/B input bytes are
+    /// generated and how the C[0] CPU reference dequants its operands.
+    fn is_fp8(self) -> bool {
+        matches!(
+            self,
+            BenchMode::Fp8E4m3
+                | BenchMode::TiledFp8Bn64
+                | BenchMode::TiledFp8Bn32
+                | BenchMode::TiledFp8Bn16
+                | BenchMode::TiledFp8Auto
+        )
     }
 }
 
@@ -383,11 +436,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         // Auto mode: append the resolved BN per row so the table is
         // self-explanatory.
-        let suffix = if mode == BenchMode::TiledBf16Auto {
+        let suffix = if matches!(mode, BenchMode::TiledBf16Auto | BenchMode::TiledFp8Auto) {
             match resolved {
-                BenchMode::TiledBf16Bn16 => " [BN=16]",
-                BenchMode::TiledBf16Bn32 => " [BN=32]",
-                BenchMode::TiledBf16Bn64 => " [BN=64]",
+                BenchMode::TiledBf16Bn16 | BenchMode::TiledFp8Bn16 => " [BN=16]",
+                BenchMode::TiledBf16Bn32 | BenchMode::TiledFp8Bn32 => " [BN=32]",
+                BenchMode::TiledBf16Bn64 | BenchMode::TiledFp8Bn64 => " [BN=64]",
                 _ => "",
             }
         } else {
@@ -460,33 +513,27 @@ fn run_size(
     // Deterministic input values via a small CPU pattern. Throughput
     // bench, not precision — values just need to be numerically sane
     // (no NaN/Inf in inputs, no Inf in accumulator).
-    let a_raw: Vec<u8> = match mode {
-        BenchMode::Bf16
-        | BenchMode::TiledBf16Bn64
-        | BenchMode::TiledBf16Bn32
-        | BenchMode::TiledBf16Bn16
-        | BenchMode::TiledBf16Auto => bytemuck::cast_slice::<u16, u8>(
+    let a_raw: Vec<u8> = if mode.is_fp8() {
+        (0..(m * k))
+            .map(|i| f32_to_fp8_e4m3(0.001 * ((i % 64) as f32 - 32.0)))
+            .collect()
+    } else {
+        bytemuck::cast_slice::<u16, u8>(
             &(0..(m * k))
                 .map(|i| f32_to_bf16(0.001 * ((i % 64) as f32 - 32.0)))
                 .collect::<Vec<u16>>()
-        ).to_vec(),
-        BenchMode::Fp8E4m3 => (0..(m * k))
-            .map(|i| f32_to_fp8_e4m3(0.001 * ((i % 64) as f32 - 32.0)))
-            .collect(),
+        ).to_vec()
     };
-    let b_raw: Vec<u8> = match mode {
-        BenchMode::Bf16
-        | BenchMode::TiledBf16Bn64
-        | BenchMode::TiledBf16Bn32
-        | BenchMode::TiledBf16Bn16
-        | BenchMode::TiledBf16Auto => bytemuck::cast_slice::<u16, u8>(
+    let b_raw: Vec<u8> = if mode.is_fp8() {
+        (0..(k * n))
+            .map(|i| f32_to_fp8_e4m3(0.001 * (((i / 17) % 32) as f32)))
+            .collect()
+    } else {
+        bytemuck::cast_slice::<u16, u8>(
             &(0..(k * n))
                 .map(|i| f32_to_bf16(0.001 * (((i / 17) % 32) as f32)))
                 .collect::<Vec<u16>>()
-        ).to_vec(),
-        BenchMode::Fp8E4m3 => (0..(k * n))
-            .map(|i| f32_to_fp8_e4m3(0.001 * (((i / 17) % 32) as f32)))
-            .collect(),
+        ).to_vec()
     };
 
     let mut buf_a = GpuBuffer::new(
@@ -622,25 +669,19 @@ fn run_size(
         for kk in 0..(k as usize) {
             let a_idx = kk;
             let b_idx = kk * stride_b;
-            let a = match mode {
-                BenchMode::Bf16
-                | BenchMode::TiledBf16Bn64
-                | BenchMode::TiledBf16Bn32
-                | BenchMode::TiledBf16Bn16
-                | BenchMode::TiledBf16Auto => bf16_to_f32(u16::from_le_bytes([
+            let a = if mode.is_fp8() {
+                fp8_e4m3_to_f32(a_raw[a_idx]) as f64
+            } else {
+                bf16_to_f32(u16::from_le_bytes([
                     a_raw[2 * a_idx], a_raw[2 * a_idx + 1],
-                ])) as f64,
-                BenchMode::Fp8E4m3 => fp8_e4m3_to_f32(a_raw[a_idx]) as f64,
+                ])) as f64
             };
-            let b = match mode {
-                BenchMode::Bf16
-                | BenchMode::TiledBf16Bn64
-                | BenchMode::TiledBf16Bn32
-                | BenchMode::TiledBf16Bn16
-                | BenchMode::TiledBf16Auto => bf16_to_f32(u16::from_le_bytes([
+            let b = if mode.is_fp8() {
+                fp8_e4m3_to_f32(b_raw[b_idx]) as f64
+            } else {
+                bf16_to_f32(u16::from_le_bytes([
                     b_raw[2 * b_idx], b_raw[2 * b_idx + 1],
-                ])) as f64,
-                BenchMode::Fp8E4m3 => fp8_e4m3_to_f32(b_raw[b_idx]) as f64,
+                ])) as f64
             };
             acc += a * b;
         }
