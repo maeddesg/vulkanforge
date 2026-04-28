@@ -233,6 +233,27 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "mul_coopmat_fp8.comp",
         defines: &[("BN", "16")],
     },
+    // v0.2 Sprint 2A — isolated Q4_K dequant probe (no GEMM, no LDS
+    // tiling). Three output-type variants share the same shader source
+    // so the only difference between SPVs is the f32→{f32,bf16,fp8}
+    // narrowing convert at the store. Used by tests/dequant_q4k.rs
+    // for correctness vs CPU and by examples/bench_dequant for the
+    // throughput comparison.
+    ShaderJob {
+        out_name: "dequant_q4k_fp32.spv",
+        entry_source: "dequant_q4k_debug.comp",
+        defines: &[("OUT_FP32", "1")],
+    },
+    ShaderJob {
+        out_name: "dequant_q4k_bf16.spv",
+        entry_source: "dequant_q4k_debug.comp",
+        defines: &[("OUT_BF16", "1")],
+    },
+    ShaderJob {
+        out_name: "dequant_q4k_fp8.spv",
+        entry_source: "dequant_q4k_debug.comp",
+        defines: &[("OUT_FP8", "1")],
+    },
     // Phase 6 v0.1.2 cont. — mul_mm.comp port from llama.cpp
     // (MIT-licensed). Same shader runtime as mul_mmq.comp but takes
     // FP32 activations directly (no Q8_1 quantize step in front), uses
