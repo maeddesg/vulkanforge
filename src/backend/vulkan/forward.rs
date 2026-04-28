@@ -499,12 +499,14 @@ impl Forward {
 
         // Sprint 3C — FP8 narrow inside the coopmat path. Default
         // OFF; only meaningful when coopmat itself is enabled.
-        // Sprint 7 — opt-in Br>1 tiled-Q flash-attention. Default OFF;
-        // VULKANFORGE_FA_TILED=1 flips to the tiled path. Identical
-        // bind/PC layout, only the shader id and dispatch shape differ.
+        // Sprint 7 / 7.5 / 7.6 / 8a — Br>1 tiled-Q flash-attention is
+        // now the default path. Empirically wins on every pp ≥ 128
+        // (+11% to +164% vs Br=1) and is within mess-rauschen at
+        // pp ≤ 64 (-2 to -4%). Opt-out via VULKANFORGE_FA_TILED=0
+        // for the (rare) ultra-short-prompt latency cases.
         let fa_tiled_enabled = match std::env::var("VULKANFORGE_FA_TILED") {
-            Ok(s) => s == "1",
-            Err(_) => false,
+            Ok(s) => s != "0",
+            Err(_) => true,
         };
         // Sprint 7.5 — pick which Br variant to dispatch when fa_tiled
         // is on. Default 16 (Sprint-7.5 sweep winner: +138% at pp=1024
