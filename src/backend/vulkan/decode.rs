@@ -426,24 +426,32 @@ pub fn generate_from_tokens(
     let prefill_start = Instant::now();
     let mut pos = start_pos;
     let prefill_len = prefill_tokens.len() as u32;
-    if prefill_len > 0 && prefill_len <= forward.max_prefill_tokens {
-        // Phase 3E batched-GEMM path: build a contiguous embedding
-        // tensor and call prefill_batch in one submit.
-        let mut all_embeds: Vec<f32> =
-            Vec::with_capacity(prefill_tokens.len() * cfg.hidden_dim as usize);
-        for &tid in prefill_tokens {
-            all_embeds.extend(embedding_row(gguf, cfg, tid)?);
-        }
-        forward.prefill_batch(
-            dev, registry, cmd_ctx, model, &all_embeds, prefill_len, pos,
-        )?;
-        pos += prefill_len;
-    } else {
-        // Token-by-token fallback (long prompt or empty batch path).
-        for &tid in prefill_tokens {
-            let embd = embedding_row(gguf, cfg, tid)?;
-            forward.forward_token(dev, registry, cmd_ctx, model, &embd, pos)?;
-            pos += 1;
+    if prefill_len > 0 {
+        // Sprint 5B — chunked batched prefill. Slice the prefill into
+        // pieces of `max_prefill_tokens` and dispatch each piece
+        // through `prefill_batch` with a bumped `base_pos`. Replaces
+        // the prior token-by-token fallback that collapsed long
+        // prompts to decode rate (~90 tok/s). prefill_batch already
+        // takes `base_pos` and uses it for (a) RoPE positions, (b) KV
+        // write offsets via `pos_offset_bytes`, (c) flash_attn_batch
+        // bounds (q_start = base_pos, n_kv = base_pos + seq_len), so
+        // the second-and-later chunks see the prior chunks' KV
+        // entries automatically. The two_tiles regression test
+        // already covers the multi-tile-within-one-prefill case;
+        // chunked prefill is the same shape extended across multiple
+        // prefill_batch submits.
+        let chunk_size = forward.max_prefill_tokens.max(1) as usize;
+        for chunk in prefill_tokens.chunks(chunk_size) {
+            let chunk_len = chunk.len() as u32;
+            let mut chunk_embeds: Vec<f32> =
+                Vec::with_capacity(chunk.len() * cfg.hidden_dim as usize);
+            for &tid in chunk {
+                chunk_embeds.extend(embedding_row(gguf, cfg, tid)?);
+            }
+            forward.prefill_batch(
+                dev, registry, cmd_ctx, model, &chunk_embeds, chunk_len, pos,
+            )?;
+            pos += chunk_len;
         }
     }
     let mut last_logits = forward.logits()?;

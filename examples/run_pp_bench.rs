@@ -30,7 +30,10 @@ use vulkanforge::backend::vulkan::kv_cache::{KvCache, KvCacheConfig};
 use vulkanforge::backend::vulkan::loader::LoadedModel;
 use vulkanforge::backend::vulkan::pipeline_registry::{default_cache_path, PipelineRegistry};
 
-const MAX_SEQ_LEN: u32 = 2048;
+// Bumped from 2048 to 8192 so the chunked path can sweep pp up to
+// ~8K. KV cache scales linearly: 8192 × 8 × 128 × 4 × 2 (K+V) ×
+// 36 layers ≈ 3 GB at fp32 — comfortable in 16 GB.
+const MAX_SEQ_LEN: u32 = 8192;
 
 fn parse_env_u32(key: &str, default_val: u32) -> u32 {
     std::env::var(key)
@@ -59,9 +62,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let warmup = parse_env_u32("VF_PP_WARMUP", 1);
 
     let max_pp_needed = *pp_list.iter().max().unwrap();
-    // Make sure the max_prefill_tokens cap covers our biggest pp.
+    // Sprint 5B — explicit chunk size; bench loops `prefill_batch`
+    // calls of at most this many tokens, mirroring the production
+    // `decode.rs::generate_from_tokens` chunked path. Default: cap
+    // the batch at 1024 (Sprint-5 default), so pp > 1024 chunks.
+    // Override via env var for sweeping cap values.
+    let chunk_size: u32 = std::env::var("VULKANFORGE_MAX_PREFILL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| max_pp_needed.min(1024));
     if std::env::var("VULKANFORGE_MAX_PREFILL").is_err() {
-        unsafe { std::env::set_var("VULKANFORGE_MAX_PREFILL", max_pp_needed.to_string()); }
+        unsafe { std::env::set_var("VULKANFORGE_MAX_PREFILL", chunk_size.to_string()); }
     }
 
     let coopmat = std::env::var("VULKANFORGE_COOPMAT").map(|v| v == "1").unwrap_or(false);
@@ -137,32 +148,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  ---  -----------  -----------  --------");
 
     let mut rows: Vec<(u32, f64, f64, f64)> = Vec::new();
-    for &pp in &pp_list {
-        if pp > forward.max_prefill_tokens {
-            eprintln!(
-                "  skip pp={} (exceeds max_prefill_tokens={})",
-                pp, forward.max_prefill_tokens
-            );
-            continue;
+    let dispatch_chunked = |fwd: &mut Forward, pp: u32| -> Result<(), Box<dyn std::error::Error>> {
+        // Slice pp into chunks of at most `chunk_size` and call
+        // prefill_batch for each chunk with a bumped base_pos.
+        // Mirrors decode.rs:429.
+        fwd.kv_cache.reset();
+        let mut pos: u32 = 0;
+        let mut remaining = pp;
+        while remaining > 0 {
+            let this = remaining.min(chunk_size);
+            let mut embeds = Vec::with_capacity((this as usize) * one_embd.len());
+            for _ in 0..this {
+                embeds.extend_from_slice(&one_embd);
+            }
+            fwd.prefill_batch(&dev, &registry, &cmd_ctx, &model, &embeds, this, pos)?;
+            pos += this;
+            remaining -= this;
         }
-        // Synthesize embeddings: pp copies of the same row.
-        let mut embeds = Vec::with_capacity((pp as usize) * one_embd.len());
-        for _ in 0..pp {
-            embeds.extend_from_slice(&one_embd);
-        }
+        Ok(())
+    };
 
+    for &pp in &pp_list {
         // Warmup
         for _ in 0..warmup {
-            forward.kv_cache.reset();
-            forward.prefill_batch(&dev, &registry, &cmd_ctx, &model, &embeds, pp, 0)?;
+            dispatch_chunked(&mut forward, pp)?;
         }
 
         // Measured runs
         let mut times: Vec<Duration> = Vec::with_capacity(runs as usize);
         for _ in 0..runs {
-            forward.kv_cache.reset();
             let t0 = Instant::now();
-            forward.prefill_batch(&dev, &registry, &cmd_ctx, &model, &embeds, pp, 0)?;
+            dispatch_chunked(&mut forward, pp)?;
             times.push(t0.elapsed());
         }
         times.sort();
@@ -172,9 +188,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let mean_ms = mean.as_secs_f64() * 1000.0;
         let toks_per_sec = (pp as f64) / median.as_secs_f64();
 
+        let n_chunks = pp.div_ceil(chunk_size);
         println!(
-            "  {:>3}  {:>9.3}    {:>9.3}    {:>7.1}",
+            "  {:>4}  {:>9.3}    {:>9.3}    {:>7.1}   ({} chunk{})",
             pp, median_ms, mean_ms, toks_per_sec,
+            n_chunks, if n_chunks > 1 { "s" } else { " " },
         );
         rows.push((pp, median_ms, mean_ms, toks_per_sec));
     }

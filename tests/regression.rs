@@ -1648,3 +1648,130 @@ fn phase5b2_first_chars(s: &str, n: usize) -> String {
     }
     out
 }
+
+// =====================================================================
+// Sprint 5B — chunked-prefill parity
+// `decode.rs` now slices any prompt longer than `max_prefill_tokens`
+// into chunks and feeds them through `prefill_batch` one after the
+// other (replacing the old token-by-token fallback). The chunked path
+// must produce identical final logits to a single-shot prefill_batch
+// of the same prompt — argmax bit-equal, top-5 ≥ 4/5 overlap. If the
+// KV-cache offsets, RoPE positions, or attention bounds drift between
+// chunks this test catches it.
+// =====================================================================
+fn sprint5b_chunked_logits(
+    path: &PathBuf,
+    user_prompt: &str,
+    max_prefill_tokens: u32,
+) -> (Vec<f32>, u32) {
+    use vulkanforge::backend::vulkan::kv_cache::{KvCache, KvCacheConfig};
+    use vulkanforge::backend::vulkan::pipeline_registry::PipelineRegistry;
+
+    let dev = VulkanDevice::new().expect("dev");
+    let mut allocator = Allocator::new(&AllocatorCreateDesc {
+        instance: dev.instance.clone(),
+        device: dev.device.clone(),
+        physical_device: dev.physical_device,
+        debug_settings: gpu_allocator::AllocatorDebugSettings::default(),
+        buffer_device_address: false,
+        allocation_sizes: gpu_allocator::AllocationSizes::default(),
+    }).expect("alloc");
+    let (registry, _) = PipelineRegistry::new(&dev.device, None).expect("reg");
+    let cmd_ctx = CommandContext::new(&dev.device, dev.queue_family_index).expect("cmd");
+    let gguf = GgufFile::open(path).expect("gguf");
+    let cfg = ModelConfig::from_gguf(&gguf).expect("cfg");
+    let model = LoadedModel::load(&dev, &mut allocator, &gguf).expect("upload");
+    let tokenizer = Tokenizer::from_gguf(&gguf).expect("tok");
+
+    let mut prompt_tokens =
+        vulkanforge::backend::vulkan::tokenizer::apply_chat_template(
+            &tokenizer, user_prompt, None,
+        );
+    if prompt_tokens.len() > 120 { prompt_tokens.truncate(120); }
+    let seq_len = prompt_tokens.len() as u32;
+
+    let kv = KvCache::new(&dev.device, &mut allocator, KvCacheConfig {
+        n_layers: cfg.n_layers, n_kv_heads: cfg.n_kv_heads,
+        head_dim: cfg.head_dim, max_seq_len: 256,
+    }).expect("kv");
+    let mut fwd = Forward::new_with_prefill(
+        &dev, &mut allocator, kv, cfg.clone(), None, max_prefill_tokens,
+    ).expect("fwd");
+    fwd.set_batch_attn_enabled(true);
+    fwd.kv_cache.reset();
+
+    // Walk the same chunks the production decode.rs path walks.
+    let chunk_size = max_prefill_tokens.max(1) as usize;
+    let mut pos: u32 = 0;
+    for chunk in prompt_tokens.chunks(chunk_size) {
+        let chunk_len = chunk.len() as u32;
+        let mut chunk_embeds: Vec<f32> = Vec::with_capacity(
+            chunk.len() * cfg.hidden_dim as usize,
+        );
+        for &tid in chunk {
+            chunk_embeds.extend(embedding_row(&gguf, &cfg, tid).expect("embd"));
+        }
+        fwd.prefill_batch(
+            &dev, &registry, &cmd_ctx, &model, &chunk_embeds, chunk_len, pos,
+        ).expect("prefill_batch chunk");
+        pos += chunk_len;
+    }
+    let logits = fwd.logits().expect("logits");
+
+    fwd.destroy(&dev.device, &mut allocator);
+    cmd_ctx.destroy(&dev.device);
+    model.destroy(&dev.device, &mut allocator);
+    registry.destroy(&dev.device);
+    drop(allocator);
+
+    (logits, seq_len)
+}
+
+#[test]
+fn sprint5b_chunked_prefill_parity_qwen3() {
+    let Some(path) = qwen3_path() else { return };
+    // Long enough that the small chunk_size forces ≥3 chunks.
+    let prompt = "Write a long, detailed paragraph explaining what a \
+                  mutex is, why it is needed, when you use it, what \
+                  alternatives exist, and how it differs from a \
+                  semaphore in low-level systems programming.";
+    // Reference: single-shot prefill_batch (cap = full prompt).
+    let (logits_single, seq_single) = sprint5b_chunked_logits(&path, prompt, 120);
+    // Test: 3+ chunks of size 32 over the same 120-token prompt.
+    let (logits_chunked, seq_chunked) = sprint5b_chunked_logits(&path, prompt, 32);
+    assert_eq!(seq_single, seq_chunked, "tokenization should be deterministic");
+    assert!(
+        !logits_chunked.iter().any(|v| !v.is_finite()),
+        "chunked prefill produced NaN/Inf"
+    );
+
+    let argmax = |v: &[f32]| -> usize {
+        v.iter().enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0
+    };
+    let top1_single = argmax(&logits_single);
+    let top1_chunked = argmax(&logits_chunked);
+    let top_k = |v: &[f32], k: usize| -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..v.len()).collect();
+        idx.sort_by(|&a, &b| v[b].partial_cmp(&v[a]).unwrap());
+        idx.truncate(k);
+        idx
+    };
+    let top5_single = top_k(&logits_single, 5);
+    let top5_chunked = top_k(&logits_chunked, 5);
+    let overlap = top5_single
+        .iter()
+        .filter(|t| top5_chunked.contains(t))
+        .count();
+    eprintln!(
+        "[sprint5b] chunked_parity seq={seq_single} top1_single={top1_single} \
+         top1_chunked={top1_chunked} top5_single={top5_single:?} \
+         top5_chunked={top5_chunked:?} overlap={overlap}"
+    );
+    assert_eq!(top1_single, top1_chunked,
+        "argmax differs (chunked vs single): single={top1_single} chunked={top1_chunked}\n\
+         top5 single:  {top5_single:?}\n\
+         top5 chunked: {top5_chunked:?}");
+    assert!(overlap >= 4,
+        "top-5 overlap {overlap}/5 too low (single={top5_single:?} chunked={top5_chunked:?})");
+}
