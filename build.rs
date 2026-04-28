@@ -161,6 +161,14 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "flash_attn_batch.comp",
         defines: &[],
     },
+    // VulkanForge Sprint 7 — Br>1 tiled-Q flash attention. Identical
+    // bindings + push-constants to flash_attn_batch; dispatched as
+    // (n_heads, ceil(M/BR), 1) with BR=4 queries sharing one K-tile.
+    ShaderJob {
+        out_name: "flash_attn_tiled_f32.spv",
+        entry_source: "flash_attn_tiled.comp",
+        defines: &[],
+    },
     // Phase-6A probe: confirms shaderc 0.8 + Mesa glslang ship a
     // coopmat + bfloat16 toolchain that produces SPV without warnings.
     // Output is unused at runtime — purely a build-time GO gate. See

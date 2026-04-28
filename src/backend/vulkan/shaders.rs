@@ -36,6 +36,11 @@ pub enum ShaderId {
     // covers (n_heads, M, 1) with a causal mask, replacing the M-fold
     // FlashAttn dispatch loop the per-token prefill currently runs.
     FlashAttnBatch,
+    // Sprint 7 — Br>1 tiled-Q flash attention. Identical bindings/PC
+    // to FlashAttnBatch; dispatched as (n_heads, ceil(M/BR), 1) with
+    // BR=4 queries per WG sharing one K-tile load. Gated behind
+    // VULKANFORGE_FA_TILED=1; default OFF until perf is verified.
+    FlashAttnTiled,
     // Phase 6 v0.1.2 — mul_mm.comp port. Q4_K / Q6_K weights × FP32
     // activations (no Q8_1 quantize step). Used by prefill_batch when
     // VULKANFORGE_USE_MUL_MM is set; mul_mmq stays as the gated
@@ -91,6 +96,7 @@ impl ShaderId {
             ShaderId::FlashAttnSplit => "flash_attn_split_f32",
             ShaderId::FlashAttnReduce => "flash_attn_reduce_f32",
             ShaderId::FlashAttnBatch => "flash_attn_batch_f32",
+            ShaderId::FlashAttnTiled => "flash_attn_tiled_f32",
             ShaderId::MulMmQ4K => "mul_mm_q4_k_f32",
             ShaderId::MulMmQ6K => "mul_mm_q6_k_f32",
             ShaderId::MulMmQ4KAligned => "mul_mm_q4_k_f32_aligned",
@@ -124,6 +130,7 @@ impl ShaderId {
             ShaderId::FlashAttnSplit => FLASH_ATTN_SPLIT_F32,
             ShaderId::FlashAttnReduce => FLASH_ATTN_REDUCE_F32,
             ShaderId::FlashAttnBatch => FLASH_ATTN_BATCH_F32,
+            ShaderId::FlashAttnTiled => FLASH_ATTN_TILED_F32,
             ShaderId::MulMmQ4K => MUL_MM_Q4_K_F32,
             ShaderId::MulMmQ6K => MUL_MM_Q6_K_F32,
             ShaderId::MulMmQ4KAligned => MUL_MM_Q4_K_F32_ALIGNED,
@@ -157,6 +164,7 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::FlashAttnSplit,
     ShaderId::FlashAttnReduce,
     ShaderId::FlashAttnBatch,
+    ShaderId::FlashAttnTiled,
     ShaderId::MulMmQ4K,
     ShaderId::MulMmQ6K,
     ShaderId::MulMmQ4KAligned,
@@ -197,6 +205,8 @@ pub const FLASH_ATTN_REDUCE_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_reduce_f32.spv"));
 pub const FLASH_ATTN_BATCH_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_batch_f32.spv"));
+pub const FLASH_ATTN_TILED_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_tiled_f32.spv"));
 pub const MUL_MM_Q4_K_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q4_k_f32.spv"));
 pub const MUL_MM_Q6_K_F32: &[u8] =

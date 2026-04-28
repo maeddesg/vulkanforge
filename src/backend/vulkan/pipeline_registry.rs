@@ -326,6 +326,11 @@ impl PipelineRegistry {
                     let bytes = bytemuck::bytes_of(&data);
                     ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
                 }
+                ShaderId::FlashAttnTiled => {
+                    // No spec constants in the Sprint 7 tiled-Q kernel —
+                    // BR/TILE/HEAD_DIM are baked in at SPIR-V build time.
+                    ComputeKernel::from_spv(device, &words, cache)
+                }
                 // Sprint 3A — Q4_K coopmat with forward-pass layout.
                 // No spec constants: the BN tile size is already baked
                 // in at SPIR-V build time via -DBN; the rest of the

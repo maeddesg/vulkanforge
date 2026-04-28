@@ -213,6 +213,12 @@ pub struct Forward {
     /// FP8 saves ~50% LDS and a 4× VALU on the convert.
     coopmat_fp8_enabled: bool,
 
+    /// Sprint 7 — flips prefill_batch attention from `flash_attn_batch`
+    /// (Br=1) to `flash_attn_tiled` (Br=4 queries per workgroup,
+    /// sharing K-tile loads). Set via `VULKANFORGE_FA_TILED=1`. Default
+    /// OFF until perf is validated.
+    fa_tiled_enabled: bool,
+
     /// `forward_token` hot path. When `cache_enabled` is true (env
     /// `VULKANFORGE_CB_REUSE=1` at construction), `alloc_or_get_set`
     /// reuses sets across tokens instead of resetting the pool.
@@ -483,6 +489,14 @@ impl Forward {
 
         // Sprint 3C — FP8 narrow inside the coopmat path. Default
         // OFF; only meaningful when coopmat itself is enabled.
+        // Sprint 7 — opt-in Br>1 tiled-Q flash-attention. Default OFF;
+        // VULKANFORGE_FA_TILED=1 flips to the tiled path. Identical
+        // bind/PC layout, only the shader id and dispatch shape differ.
+        let fa_tiled_enabled = match std::env::var("VULKANFORGE_FA_TILED") {
+            Ok(s) => s == "1",
+            Err(_) => false,
+        };
+
         let coopmat_fp8_enabled = match std::env::var("VULKANFORGE_COOPMAT_FP8") {
             Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
             _ => false,
@@ -511,6 +525,7 @@ impl Forward {
             mul_mm_enabled,
             coopmat_q4k_enabled,
             coopmat_fp8_enabled,
+            fa_tiled_enabled,
             profiler,
             rope_theta_scale, attn_scale,
             fa_scratch_out, fa_scratch_max, fa_scratch_sum,
@@ -1948,6 +1963,67 @@ impl Forward {
         });
     }
 
+    /// Sprint 7 — Br>1 tiled-Q flash attention dispatch. Identical
+    /// bind / push layout to `run_flash_attn_batch`; only differences
+    /// are the shader ID and the dispatch shape `(n_heads,
+    /// ceil(m/BR), 1)` (where BR=4 baked into the shader).
+    #[allow(clippy::too_many_arguments)]
+    fn run_flash_attn_tiled(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        layer: u32,
+        q_buf: vk::Buffer,
+        o_buf: vk::Buffer,
+        m: u32,
+        q_start: u32,
+        n_kv: u32,
+    ) {
+        const BR: u32 = 4;
+        let cfg = self.config.clone();
+        let kernel = registry.get(ShaderId::FlashAttnTiled);
+        let layer_off = self.kv_cache.layer_offset_bytes(layer);
+        let layer_size = (self.kv_cache.config.max_seq_len as u64)
+            * (cfg.n_kv_heads as u64)
+            * (cfg.head_dim as u64)
+            * 4;
+        let q_bytes_total = (m as u64) * (cfg.n_heads as u64) * (cfg.head_dim as u64) * 4;
+        let set = self.alloc_or_get_set(
+            dev,
+            kernel.descriptor_set_layout,
+            &[
+                (0, q_buf, 0, q_bytes_total),
+                (1, self.kv_cache.k_buffer.handle, layer_off, layer_size),
+                (2, self.kv_cache.v_buffer.handle, layer_off, layer_size),
+                (3, o_buf, 0, q_bytes_total),
+            ],
+        );
+        let pc = FlashAttnBatchPushConstants {
+            n_heads: cfg.n_heads,
+            n_kv_heads: cfg.n_kv_heads,
+            head_dim: cfg.head_dim,
+            m,
+            n_kv,
+            q_start,
+            scale: self.attn_scale,
+        };
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        let n_heads = cfg.n_heads;
+        let q_tiles = m.div_ceil(BR);
+        self.profile("fa_tiled", dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, n_heads, q_tiles, 1);
+        });
+    }
+
     /// Phase-4C split-K attention: dispatches the per-tile worker
     /// across `(n_heads, n_tiles, 1)` workgroups, then a reducer over
     /// `(n_heads, 1, 1)` that combines the partials with online-softmax
@@ -2848,16 +2924,33 @@ impl Forward {
         // from batch_q (staged in the loop above), K/V from the layer's
         // KV-cache slice (positions 0..=base_pos+seq_len-1), and
         // writes [seq_len, n_heads, head_dim] into batch_attn_out.
+        //
+        // Sprint 7 — VULKANFORGE_FA_TILED=1 routes through the Br>1
+        // tiled-Q kernel (BR=4 queries per workgroup sharing a K-tile).
+        // Default OFF; flash_attn_batch (Br=1) remains the proven path
+        // until per-shape benches show tiled wins.
         if batch_attn {
-            self.run_flash_attn_batch(
-                dev, registry, cmd,
-                layer,
-                self.batch_q.handle,
-                self.batch_attn_out.handle,
-                seq_len,
-                base_pos,
-                base_pos + seq_len,
-            );
+            if self.fa_tiled_enabled {
+                self.run_flash_attn_tiled(
+                    dev, registry, cmd,
+                    layer,
+                    self.batch_q.handle,
+                    self.batch_attn_out.handle,
+                    seq_len,
+                    base_pos,
+                    base_pos + seq_len,
+                );
+            } else {
+                self.run_flash_attn_batch(
+                    dev, registry, cmd,
+                    layer,
+                    self.batch_q.handle,
+                    self.batch_attn_out.handle,
+                    seq_len,
+                    base_pos,
+                    base_pos + seq_len,
+                );
+            }
             compute_barrier(dev, cmd);
         }
 
