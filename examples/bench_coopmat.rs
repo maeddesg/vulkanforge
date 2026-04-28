@@ -34,15 +34,24 @@ const SHADER_SPV_BF16: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/bench_coopmat_pure_f32.spv"));
 const SHADER_SPV_FP8: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/bench_coopmat_fp8_e4m3.spv"));
+const SHADER_SPV_TILED_BF16: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_bf16_f32.spv"));
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BenchMode {
     Bf16,
     Fp8E4m3,
+    TiledBf16,
 }
 
 impl BenchMode {
     fn from_env() -> Self {
+        if matches!(
+            std::env::var("VF_BENCH_TILED").ok().as_deref(),
+            Some("1") | Some("true") | Some("bf16")
+        ) {
+            return BenchMode::TiledBf16;
+        }
         match std::env::var("VF_BENCH_FP8").ok().as_deref() {
             Some("1") | Some("true") | Some("e4m3") => BenchMode::Fp8E4m3,
             _ => BenchMode::Bf16,
@@ -51,8 +60,9 @@ impl BenchMode {
 
     fn label(self) -> &'static str {
         match self {
-            BenchMode::Bf16 => "BF16",
-            BenchMode::Fp8E4m3 => "FP8-E4M3",
+            BenchMode::Bf16 => "BF16 (naive 1 SG/tile)",
+            BenchMode::Fp8E4m3 => "FP8-E4M3 (naive 1 SG/tile)",
+            BenchMode::TiledBf16 => "BF16 tiled 4SG×2x2 (64x64)",
         }
     }
 
@@ -60,13 +70,24 @@ impl BenchMode {
         match self {
             BenchMode::Bf16 => SHADER_SPV_BF16,
             BenchMode::Fp8E4m3 => SHADER_SPV_FP8,
+            BenchMode::TiledBf16 => SHADER_SPV_TILED_BF16,
         }
     }
 
     fn input_bytes_per_elem(self) -> u64 {
         match self {
-            BenchMode::Bf16 => 2,
+            BenchMode::Bf16 | BenchMode::TiledBf16 => 2,
             BenchMode::Fp8E4m3 => 1,
+        }
+    }
+
+    /// Workgroup output-tile size, used to compute the dispatch grid.
+    /// Naive bench: each WG covers a 16x16 tile (one WMMA fragment).
+    /// Tiled BF16: each WG covers a 64x64 tile (4 subgroups × 2x2 WMMAs).
+    fn tile_mn(self) -> (u32, u32) {
+        match self {
+            BenchMode::Bf16 | BenchMode::Fp8E4m3 => (16, 16),
+            BenchMode::TiledBf16 => (64, 64),
         }
     }
 }
@@ -353,7 +374,7 @@ fn run_size(
     // bench, not precision — values just need to be numerically sane
     // (no NaN/Inf in inputs, no Inf in accumulator).
     let a_raw: Vec<u8> = match mode {
-        BenchMode::Bf16 => bytemuck::cast_slice::<u16, u8>(
+        BenchMode::Bf16 | BenchMode::TiledBf16 => bytemuck::cast_slice::<u16, u8>(
             &(0..(m * k))
                 .map(|i| f32_to_bf16(0.001 * ((i % 64) as f32 - 32.0)))
                 .collect::<Vec<u16>>()
@@ -363,7 +384,7 @@ fn run_size(
             .collect(),
     };
     let b_raw: Vec<u8> = match mode {
-        BenchMode::Bf16 => bytemuck::cast_slice::<u16, u8>(
+        BenchMode::Bf16 | BenchMode::TiledBf16 => bytemuck::cast_slice::<u16, u8>(
             &(0..(k * n))
                 .map(|i| f32_to_bf16(0.001 * (((i / 17) % 32) as f32)))
                 .collect::<Vec<u16>>()
@@ -441,8 +462,9 @@ fn run_size(
         stride_b: n,
         stride_c: n,
     };
-    let groups_x = m / 16;
-    let groups_y = n / 16;
+    let (tile_m, tile_n) = mode.tile_mn();
+    let groups_x = m.div_ceil(tile_m);
+    let groups_y = n.div_ceil(tile_n);
 
     let dispatch_once = |label: &str| -> f64 {
         let t0 = Instant::now();
@@ -506,13 +528,13 @@ fn run_size(
             let a_idx = kk;
             let b_idx = kk * stride_b;
             let a = match mode {
-                BenchMode::Bf16 => bf16_to_f32(u16::from_le_bytes([
+                BenchMode::Bf16 | BenchMode::TiledBf16 => bf16_to_f32(u16::from_le_bytes([
                     a_raw[2 * a_idx], a_raw[2 * a_idx + 1],
                 ])) as f64,
                 BenchMode::Fp8E4m3 => fp8_e4m3_to_f32(a_raw[a_idx]) as f64,
             };
             let b = match mode {
-                BenchMode::Bf16 => bf16_to_f32(u16::from_le_bytes([
+                BenchMode::Bf16 | BenchMode::TiledBf16 => bf16_to_f32(u16::from_le_bytes([
                     b_raw[2 * b_idx], b_raw[2 * b_idx + 1],
                 ])) as f64,
                 BenchMode::Fp8E4m3 => fp8_e4m3_to_f32(b_raw[b_idx]) as f64,

@@ -186,6 +186,17 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "bench_coopmat_fp8.comp",
         defines: &[],
     },
+    // v0.2 Sprint 1A — tiled BF16 coopmat GEMM. 4 subgroups × 2x2
+    // WMMA per subgroup over a 64x64 output tile, BK=16 K-step,
+    // LDS-staged with bank-conflict padding. Used by
+    // examples/bench_coopmat when VF_BENCH_TILED=1, and by the
+    // tiled-coopmat correctness suite. Not loaded by the runtime
+    // forward pass yet (Sprint 3 task).
+    ShaderJob {
+        out_name: "mul_coopmat_bf16_f32.spv",
+        entry_source: "mul_coopmat_bf16.comp",
+        defines: &[],
+    },
     // Phase 6 v0.1.2 cont. — mul_mm.comp port from llama.cpp
     // (MIT-licensed). Same shader runtime as mul_mmq.comp but takes
     // FP32 activations directly (no Q8_1 quantize step in front), uses
