@@ -189,26 +189,58 @@ impl PipelineRegistry {
                     // Phase 7 — BLOCK_SIZE = NUM_WARPS * WARP must cover
                     // (BM/WM)*(BN/WN) warp tiles per workgroup.
                     // For BM=BN=64, WM=WN=32, WARP=64 (Wave64): we need
-                    // 4 warps → BLOCK_SIZE=256. The previous default
-                    // (128 → 2 warps) silently dropped cols [WN, BN) of
-                    // every output tile because warp_c was always 0.
+                    // Sprint 4 — Grand-Audit-driven pivot was attempted
+                    // (BLOCK_SIZE 256→128, WMITER 2→1, TN 4→2 to match
+                    // llama.cpp's M variant for K-quants) and **regressed
+                    // by -19%** on the 5-prompt bench (740 → 598
+                    // tok/s). Other sweeps tested:
+                    //   BS=256 WMITER=2 TM=4 TN=2 (Audit's TM/TN swap)  → 691 tok/s (-7%)
+                    //   BS=128 WMITER=1 WM=WN=32 TM=2 TN=4              → 596 tok/s (-19%)
+                    //   BS=128 WMITER=1 WM=64 WN=32 TM=2 TN=2 (M-var)   → 618 tok/s (-16%)
+                    //   BS=64  WMITER=1 (S-var-ish)                     → 532 tok/s (-28%)
+                    //   BS=256 WMITER=2 TM=2 TN=4 (Phase-7 default)    → 740 tok/s (baseline)
+                    //
+                    // The 2.17× gap to llama.cpp is NOT in the kernel
+                    // spec constants — they're a local optimum already.
+                    // See results/v02_sprint4_spec_constants.md for the
+                    // bisection log.
+                    //
+                    // Each parameter is overridable via env var so future
+                    // sprints can sweep without rebuild. Defaults match
+                    // the Phase-7 v0.1.3 baseline.
+                    //
+                    // Constraint reminder (Phase-7 silent-corruption bug):
+                    //   NUM_WARPS = BLOCK_SIZE / WARP = 256/64 = 4
+                    //   warp tiles per WG = (BM/WM)·(BN/WN)·WMITER
+                    //                     = (64/32)·(64/32)·2 = 8
+                    //   → 4 warps cover 8 tiles via WNITER=2. ✓
                     let block_size: u32 = std::env::var("VULKANFORGE_GEMM_BLOCK_SIZE")
                         .ok().and_then(|s| s.parse().ok()).unwrap_or(256);
+                    let bm: u32 = std::env::var("VULKANFORGE_GEMM_BM")
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(64);
+                    let bn: u32 = std::env::var("VULKANFORGE_GEMM_BN")
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(64);
+                    let wm: u32 = std::env::var("VULKANFORGE_GEMM_WM")
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+                    let wn: u32 = std::env::var("VULKANFORGE_GEMM_WN")
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+                    let wmiter: u32 = std::env::var("VULKANFORGE_GEMM_WMITER")
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(2);
                     let tm: u32 = std::env::var("VULKANFORGE_GEMM_TM")
                         .ok().and_then(|s| s.parse().ok()).unwrap_or(2);
                     let tn: u32 = std::env::var("VULKANFORGE_GEMM_TN")
                         .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
                     let data: [u32; 10] = [
-                        block_size, // BLOCK_SIZE
-                        64,  // BM
-                        64,  // BN
-                        32,  // WM
-                        32,  // WN
-                        2,   // WMITER
-                        tm,  // TM (default 2 — Phase 6 v0.1.2)
-                        tn,  // TN (default 4 — Phase 6 v0.1.2)
+                        block_size,
+                        bm,
+                        bn,
+                        wm,
+                        wn,
+                        wmiter,
+                        tm,
+                        tn,
                         1,   // TK
-                        64,  // WARP — RDNA Wave64
+                        64,  // WARP — RDNA Wave64 (subgroup_size_8 = max(64,8) on gfx1201)
                     ];
                     let bytes = bytemuck::bytes_of(&data);
                     ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
