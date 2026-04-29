@@ -1,5 +1,128 @@
 # Changelog
 
+## v0.2.0 — coopmat attention + FP16 KV + kernel fusion (2026-04-29)
+
+### Headline
+
+**Prefill peak +118 %** (1037 → 2255 tok/s @ pp=512), **pp=4096 unblocked**
+(was DEVICE_LOST), **decode +2 %** (88.6 → 90.5 tok/s). Reaches **0.52×
+llama.cpp Vulkan prefill peak** and **0.79× decode** on Qwen3-8B-Q4_K_M.
+167/167 tests green across 30+ sprints in 2 days.
+
+### Performance (Qwen3-8B-Q4_K_M, RX 9070 XT, RUNS=5 median)
+
+| pp   | v0.2.0  | v0.1.3 (15-prompt med) | Δ        |
+|------|--------:|-----------------------:|---------:|
+|  64  |  1511   |                  ~600  | +152 %   |
+| 128  |  2001   |                  ~900  | +122 %   |
+| 256  |  2200   |                 ~1037  | +112 %   |
+| 512  |  2255   |                 ~1037  | +118 %   |
+| 1024 |  2204   |                  ~900  | +145 %   |
+| 2048 |  1997   |                  ~700  | +185 %   |
+| 4096 |  1659   |                 CRASH  |  unblock |
+
+(v0.1.3 didn't ship a pp-sweep; column shows the 15-prompt-bench
+medians which mix prompt lengths — directionally fair, not apples-to-
+apples. The pp-sweep numbers are what `examples/run_pp_bench` produces.)
+
+### Sprint highlights (v0.2.0 series, 2026-04-28 → 2026-04-29)
+
+- **Sprint 5–7** — tiled flash-attention `flash_attn_tiled.comp`
+  (Br=16, Bc=32) + Br/Bc sweep. Default Br=16 / Bc=32. +164 % at pp=1024
+  vs the v0.1.3 `flash_attn_batch` shader.
+- **Sprint 8a** — flash-attention default ON.
+- **Sprint 8b / 8b.1** — conditional barriers honest-negative; llama.cpp
+  barrier analysis preserved as documentation.
+- **Sprint 9d.1–9d.3** — FP16 KV-cache infrastructure → prefill hot-path
+  (+21 % @ pp=2048) → default ON. Half the cache VRAM at no parity cost.
+- **Sprint 10A** — `flash_attn_cm2.comp` deep-dive; pivoted to
+  `flash_attn_cm1.comp` (cm2 is `GL_NV_cooperative_matrix2`-only,
+  RDNA4 only advertises `VK_KHR_cooperative_matrix`).
+- **Sprint 10B** — isolated coopmat-QK microbench. **47.5× scalar FMA**
+  on Br=Bc=16 — STRONG GO for end-to-end integration.
+- **Sprint 10C** — `flash_attn_coopmat.comp` v1: KHR coopmat for QK,
+  scalar softmax + scalar PV. Drop-in for `flash_attn_tiled` with the
+  same bindings, dispatch geometry, and online-softmax state.
+  **+85.8 % at pp=2048** vs scalar tiled.
+- **Sprint 10D** — PV-coopmat with LDS-scratch hybrid. Passed 167/167
+  parity but regressed pp-sweep 1–24 %. Reverted per the brief's
+  fallback rule. Honest-negative in `results/v02_sprint10d_pv_coopmat.md`.
+- **Sprint 10E** — coopmat attention default ON (env opt-out via
+  `VULKANFORGE_COOPMAT_ATTN=0`).
+- **Sprint 10E.5** — pp=4096 TDR-crash investigation. Bisection showed
+  `COOPMAT_ATTN` is the determining factor; default-ON fixes it. No
+  code change committed — 10E was already the fix.
+- **Sprint 10F** — final bench + docs + push (this release).
+
+### Fused kernels added across the v0.2 series
+
+| Kernel             | Replaces                                  | Site                |
+|--------------------|-------------------------------------------|---------------------|
+| `swiglu`           | `silu` + `mul`                            | FFN                 |
+| `multi_add_rms`    | `add` + `add` + `rms_norm` (×2 sites)     | block in/out        |
+| `rms_norm_mul_rope`| `rms_norm` + `mul` + `rope`               | Q-norm + RoPE       |
+
+Net: **−5 dispatches per layer** (Qwen3-8B has 36 layers).
+
+### Coopmat attention details
+
+`flash_attn_coopmat.comp` is a drop-in replacement for the scalar
+`flash_attn_tiled.comp`. The QK score matrix is computed by a single
+16×16×16 coopmat MulAdd chain over `head_dim=128` (8 steps), with
+`q_lds` and `k_lds` staged in FP16 LDS (4 KB each) and `scores_lds`
+in FP32 (1 KB) — total 9 KB LDS vs 26 KB for the scalar shader. K^T
+is obtained via a `ColumnMajor` `coopMatLoad` with stride=head_dim.
+
+Softmax + PV remain scalar (per-thread `my_out0/my_out1[BR]`
+accumulators) — Sprint 10D's PV-coopmat regressed end-to-end and was
+reverted. KHR rev2 only (no NV cm2 dependencies).
+
+FP16-KV variant present and selected automatically when the cache is
+allocated FP16 (default).
+
+### TDR resolution
+
+pp=4096 used to return `DEVICE_LOST` because scalar
+`flash_attn_tiled`'s last-chunk attention (kv_len=4096) crossed RADV's
+~5 s TDR window. Coopmat brings the per-tile compute under the
+watchdog. Bisection (Sprint 10E.5) confirmed `COOPMAT_ATTN` is the
+single determining variable — `FP16_KV` is irrelevant to the crash.
+
+### Test suite
+
+```
+test result: ok. 27 + 9 + 18 + 70 + 8 + 8 + 27 = 167 passed; 0 failed
+```
+
+All green. Doc-tests: 0/0.
+
+### Files added in v0.2 series (selected)
+
+```
+NEW   vk_shaders/flash_attn_tiled.comp           (Sprints 5–7.6)
+NEW   vk_shaders/flash_attn_coopmat.comp         (Sprint 10C)
+NEW   vk_shaders/flash_attn_coopmat_fp16kv.comp  (Sprint 10C, build var)
+NEW   vk_shaders/swiglu.comp                     (kernel fusion)
+NEW   vk_shaders/multi_add_rms.comp              (kernel fusion)
+NEW   vk_shaders/rms_norm_mul_rope.comp          (kernel fusion)
+NEW   vk_shaders/bench_qk_scalar.comp            (Sprint 10B microbench)
+NEW   vk_shaders/bench_qk_coopmat.comp           (Sprint 10B microbench)
+NEW   examples/bench_qk.rs                       (Sprint 10B microbench)
+NEW   examples/run_pp_bench.rs                   (Sprint 9d.2 pp-sweep)
+NEW   results/v02_sprint{5,6,7,7.5,7.6,8a,8b,8b.1}_*.md
+NEW   results/v02_sprint9d{,.1,.2,.3}_*.md
+NEW   results/v02_sprint10{a,b,c,d,e,e5,f}_*.md
+EDIT  src/backend/vulkan/forward.rs               (coopmat selector, FP16 KV path)
+EDIT  src/backend/vulkan/kv_cache.rs              (FP16 layout)
+EDIT  src/backend/vulkan/shaders.rs               (53 → 59 ShaderId entries)
+EDIT  build.rs                                    (new SPV compile jobs)
+EDIT  Cargo.toml                                  (0.1.3 → 0.2.0)
+EDIT  README.md                                   (v0.2.0 perf table)
+EDIT  CHANGELOG.md                                (this entry)
+```
+
+---
+
 ## v0.1.3 — Phase 7 mul_mm.comp debug + silent mul_mmq fix (2026-04-27)
 
 ### Performance addendum — first corrected 16-prompt benchmark (added later same day)

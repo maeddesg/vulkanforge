@@ -6,10 +6,10 @@ Compute-only — no swapchain, no graphics queues — built directly on `ash 0.3
 
 ## Status
 
-v0.1.3 — Phase 7 mul_mm.comp debug + silent mul_mmq fix.
+**v0.2.0** — coopmat QK attention + FP16 KV-cache + 5 fused kernels.
 Single-batch greedy decode (with optional temperature / top-k / top-p
 sampling) + multi-turn chat sessions with persistent KV cache.
-Supports the Qwen, Llama-3 and Mistral GGUF families out-of-the-box.
+Supports the Qwen, Llama-3, DeepSeek-R1 and Mistral GGUF families out-of-the-box.
 
 | Model | Arch | Tokenizer | Chat template | Status |
 |---|---|---|---|---|
@@ -18,51 +18,68 @@ Supports the Qwen, Llama-3 and Mistral GGUF families out-of-the-box.
 | DeepSeek-R1-Distill-Llama-8B-Q4_K_M | llama | gpt2 / llama-bpe | DeepSeek-R1 | ✅ |
 | Mistral-7B-Instruct-v0.3.Q4_K_M | llama | llama (SPM) | Mistral | ✅ |
 
+### Key features (v0.2.0)
+
+- **coopmat QK attention** — KHR_cooperative_matrix WMMA replaces the scalar
+  inner loop in `flash_attn_coopmat.comp`. ~85 % faster prefill at
+  pp=2048 vs scalar; resolves the pp=4096 TDR crash entirely.
+- **FP16 KV-cache** (default ON) — half the cache VRAM, +21 % prefill at
+  pp=2048. Opt out with `VULKANFORGE_FP16_KV=0`.
+- **5 fused kernels** — `swiglu`, `multi_add_rms` (×2 sites),
+  `rms_norm_mul_rope` — −5 dispatches per layer.
+- **Tiled flash-attention** — Br=16 / Bc=32 with online softmax,
+  Br/Bc swept across the prefill range.
+- **pp=4096 supported** — previously crashed with TDR; now 1659 tok/s.
+
 Gemma-4 is out of scope (different arch, requires Gemma-specific
 tensor layout work).
 
 ## Performance (RX 9070 XT, gfx1201, RDNA 4)
 
-> **v0.1.3 numbers below are the first correct prefill measurements.**
-> All v0.1.0 – v0.1.2 prefill numbers were inflated by a `BLOCK_SIZE = 128`
-> bug that left columns 32–63 of every output tile unwritten — half the
-> GEMM work was silently skipped, which made prefill *appear* ~7–10 %
-> faster than it actually was. See `results/phase7_mul_mm_debug.md` for
-> the full investigation.
+### Prefill throughput sweep (Qwen3-8B-Q4_K_M, RUNS=5 median)
 
-Full 15-prompt benchmark suite + 6-turn Alice multi-turn test
-(prompt 16) for all four supported models, on `BLOCK_SIZE = 256`:
+| pp   | VulkanForge v0.2.0 | llama.cpp Vulkan | Ratio |
+|------|-------------------:|-----------------:|------:|
+|   64 |              1511  |             2286 | 0.66× |
+|  128 |              2001  |             3603 | 0.56× |
+|  256 |              2200  |             3999 | 0.55× |
+|  512 |          **2255**  |             4317 | 0.52× |
+| 1024 |              2204  |             4189 | 0.53× |
+| 2048 |              1997  |             3771 | 0.53× |
+| 4096 |              1659  |             3272 | 0.51× |
 
-| Model | Decode tok/s (median) | Prefill tok/s (median) | Coherent | Alice |
-|---|---:|---:|---:|---:|
-| Qwen3-8B-Q4_K_M | 88.6 | 1037.4 | 15/15 | 3/3 |
-| Meta-Llama-3.1-8B-Instruct-Q4_K_M | 94.8 | 1092.7 | 12/15 | 3/3 |
-| DeepSeek-R1-Distill-Llama-8B-Q4_K_M | 94.3 | 904.1 | 15/15 | 3/3 |
-| Mistral-7B-Instruct-v0.3.Q4_K_M | 100.1 | 939.3 | 15/15 | 3/3 |
+llama.cpp reference: build 23b8cc4 with `-fa 1` on the same hardware.
+Peak prefill throughput is 2255 tok/s @ pp=512. **pp=4096 used to
+DEVICE_LOST (TDR);** Sprint 10E's coopmat-default-ON brings the
+last-chunk attention dispatch back under the watchdog.
 
-`Coherent` is the bench's automatic ✓/✗ heuristic; the Llama-3.1
-false-negatives are digits-only / very short numeric replies that the
-heuristic's "repeating garbage" check flags but the underlying output
-is correct (the multi-turn `Alice` test passes 3/3 on every model,
-and the regression suite's `phase3e` top-1 / top-5 parity gates pass
-identically to v0.1.2). `Alice` is the multi-turn context-retention
-test asking the model to recall "Alice" / "Berlin" across 6 turns.
+### 15-prompt benchmark suite (Qwen3-8B-Q4_K_M)
 
-Reference 4-system comparison on the same hardware (Qwen3-8B,
-llama.cpp Vulkan build 23b8cc4 with `-fa 1`, tg128 / pp62):
+| Metric                     | Value          |
+|----------------------------|----------------|
+| **Median prefill tok/s**   | **1068**       |
+| **Median decode tok/s**    | **90.5**       |
+| Aggregate prefill tok/s    | 1089           |
+| Aggregate decode tok/s     | 85.5           |
+| Coherent prompts           | 15/15          |
+| Total prompt tokens        | 802            |
+| Total decode tokens        | 6080           |
 
-| System | Decode tok/s | Prefill tok/s | Decode ratio | Prefill ratio |
-|---|---:|---:|---:|---:|
-| llama.cpp Vulkan | 116.2 | 2274 | 1.00× | 1.00× |
-| **VulkanForge v0.1.3** | **88.6** | **1037 (med, 15-prompt)** | **0.76×** | **~0.46×*** |
-| llama.cpp ROCm | 87.5 | 3684 | 0.75× | 1.62× |
-| ROCmForge (HIP) | 95.4 | 768.6 | 0.82× | 0.34× |
+The 15-prompt median is dominated by short prompts (pp=20–198) and so
+sits well below the pp-sweep peak.
 
-*Prefill ratio is mixed-prompt-length on our side (20–200 tokens) vs
-the fixed pp62 batch on llama.cpp's; at pp=62 specifically the
-REST-API prompt hits 1418 tok/s → 62 % of llama.cpp's 2274 tok/s;
-at pp=200 the gap widens (longer-prompt GEMM utilisation is the
-next bottleneck).
+### 4-system comparison (Qwen3-8B, same hardware)
+
+| System                     | Decode tok/s | Prefill peak tok/s | Decode ratio | Prefill ratio |
+|----------------------------|-------------:|-------------------:|-------------:|--------------:|
+| llama.cpp Vulkan           |      114.2   |              4317  |       1.00×  |        1.00×  |
+| **VulkanForge v0.2.0**     |   **90.5**   |          **2255**  |    **0.79×** |     **0.52×** |
+| llama.cpp ROCm             |       87.5   |              3684  |       0.77×  |        0.85×  |
+| ROCmForge (HIP)            |       95.4   |               769  |       0.84×  |        0.18×  |
+
+vs v0.1.3: decode +2.1 % (88.6 → 90.5), prefill peak **+118 %** (1037
+→ 2255) — coopmat QK + FP16 KV + the fused kernels combined. `Alice`
+multi-turn context-retention test still passes 3/3 on every model.
 
 Decode is at 76 % of llama.cpp Vulkan and **above** llama.cpp ROCm /
 ROCmForge HIP across all four models. The v0.1.3 prefill numbers are
@@ -74,7 +91,7 @@ covers the full BM × BN tile instead of half of it.
 ```bash
 cargo build --release             # ~2-3 s after first build (SPIR-V is cached)
 cargo run --release               # Phase 0 device-init smoke
-cargo test --release              # 24 + 44 + 25 = 93 tests
+cargo test --release              # 167 tests across 7 binaries
 ```
 
 MSRV is **Rust 1.85** (edition 2024). Build dependencies require a working
@@ -142,10 +159,13 @@ Phase write-ups live in `results/`:
 
 ## Limitations
 
-* Greedy decode only (no temperature / top-k / top-p sampling).
-* No quantized cache (KV is f32, ~2 GiB at 8k context).
 * Single batch — concurrent sessions need separate `Forward` instances.
-* SPM tokenizer not implemented — Mistral / Llama-2 are blocked on this.
-* No coopmat / WMMA path — Phase 4 attention + Phase 5A CB-reuse brought
-  decode to ~83 % of llama.cpp Vulkan; closing the remaining ~17 % is
-  Phase 5+ work (likely a coopmat-style GEMV / improved attention shader).
+* GEMM stays scalar (`mul_mmq.comp`) — the coopmat work in v0.2 covers QK
+  attention only. A coopmat GEMM would close most of the remaining
+  ~48 % prefill gap to llama.cpp Vulkan; that's v0.3 territory.
+* PV-coopmat attempted in Sprint 10D (LDS-scratch hybrid) regressed end-to-end
+  by 1–24 % and was reverted; documented as honest negative in
+  `results/v02_sprint10d_pv_coopmat.md`.
+* `VULKANFORGE_COOPMAT_ATTN=0` (explicit opt-out) still DEVICE_LOSTs at
+  pp ≥ 4096 — scalar attention exceeds the RADV TDR window at long
+  contexts. Default-ON works; opt-out is debugging-only.
