@@ -62,13 +62,21 @@ impl KvDtype {
 }
 
 /// Read `VULKANFORGE_FP16_KV` and return the resulting dtype.
-/// Default (env unset or any value other than "1") is `F32` — Sprint
-/// 9d.1 stays behavior-neutral. The opt-in is loud-only-on-construct
-/// (see [`KvCache::new`]).
+///
+/// Sprint 9d.3 — flipped to **default ON** after the full FP16 KV
+/// path (prefill + decode) was verified to keep all 167 regression
+/// tests green, including the strict argmax-parity end-to-end tests
+/// (`phase3e_prefill_batch_matches_token_by_token_top5`,
+/// `phase5b2_decode_after_batched_prefill_qwen3`,
+/// `phase_prompt16_alice_context_retention_qwen3`, etc.).
+///
+/// FP16 KV is now the default to match llama.cpp's Qwen3 behavior
+/// and to give every run the 50% VRAM saving that enables longer
+/// contexts. Opt-out: `VULKANFORGE_FP16_KV=0` for bit-exact FP32 KV.
 fn kv_dtype_from_env() -> KvDtype {
     match std::env::var("VULKANFORGE_FP16_KV") {
-        Ok(s) if s == "1" => KvDtype::F16,
-        _ => KvDtype::F32,
+        Ok(s) if s == "0" => KvDtype::F32, // explicit opt-out
+        _ => KvDtype::F16,                 // default ON
     }
 }
 
@@ -104,19 +112,10 @@ impl KvCache {
             * (config.head_dim as u64)
             * elem_size;
 
-        // Loud warning if FP16 is selected: the read/write side of
-        // the KV path is still FP32-only as of Sprint 9d.1, so the
-        // model output will be garbage. Don't ship inferences on a
-        // run that has this enabled.
-        if kv_dtype == KvDtype::F16 {
-            eprintln!(
-                "VulkanForge: WARNING — VULKANFORGE_FP16_KV=1 allocates the \
-                 KV cache as FP16 (Sprint 9d.1 infrastructure), but the \
-                 attention shaders and KV-write copies are still FP32. \
-                 Outputs WILL BE INCORRECT until Sprint 9d.2/9d.3 ship the \
-                 conversion shader and FP16-aware attention SPVs."
-            );
-        }
+        // Sprint 9d.3 — the WARN log from 9d.1 is gone; FP16 KV is
+        // now end-to-end functional and the regression suite passes
+        // with default ON. The startup config log below is the only
+        // place we mention the dtype.
 
         let mb_total = bytes * 2 / (1024 * 1024);
         eprintln!(

@@ -259,10 +259,13 @@ impl PipelineRegistry {
                     let bytes = bytemuck::bytes_of(&data);
                     ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
                 }
-                ShaderId::FlashAttn => {
+                ShaderId::FlashAttn | ShaderId::FlashAttnFp16Kv => {
                     // SpecId 0 = MAX_SEQ — same convention as scalar_attn.
                     // 2048 covers the Phase-2 contexts; bump in Phase 4 if
                     // we go past 2048 tokens of context.
+                    // Sprint 9d.3 — FlashAttnFp16Kv shares the same
+                    // spec layout (FP16_KV is a build-time #define,
+                    // not a spec const).
                     let data: [u32; 1] = [2048];
                     let entries = [entry(0, 0, 4)];
                     let bytes = bytemuck::bytes_of(&data);
@@ -339,6 +342,7 @@ impl PipelineRegistry {
                 | ShaderId::FlashAttnTiledBr16Bc32
                 | ShaderId::FlashAttnTiledBr16Bc32Fp16Kv
                 | ShaderId::FlashAttnBatchFp16Kv
+                | ShaderId::FlashAttnSplitFp16Kv
                 | ShaderId::KvCopyFp16 => {
                     // No spec constants — BR/BC/HEAD_DIM/FP16_KV are
                     // baked in via -DBR=N -DBC=N (-DFP16_KV=1) at

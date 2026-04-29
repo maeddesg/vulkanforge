@@ -46,6 +46,14 @@ pub enum ShaderId {
     /// v0.2 Sprint 9d.2 — FP16 KV-aware variant of FlashAttnBatch
     /// (Br=1 fallback). Same source SPV, `FP16_KV=1` build define.
     FlashAttnBatchFp16Kv,
+    /// v0.2 Sprint 9d.3 — FP16 KV-aware variant of FlashAttn
+    /// (single-WG decode attention, seq_len ≤ 64). Same source
+    /// SPV, `FP16_KV=1` build define.
+    FlashAttnFp16Kv,
+    /// v0.2 Sprint 9d.3 — FP16 KV-aware variant of FlashAttnSplit
+    /// (multi-WG split-K decode worker, seq_len > 64). Same source
+    /// SPV, `FP16_KV=1` build define.
+    FlashAttnSplitFp16Kv,
     SoftMax,
     Copy,
     ScalarAttn,
@@ -129,6 +137,8 @@ impl ShaderId {
             ShaderId::KvCopyFp16 => "kv_copy_fp16",
             ShaderId::FlashAttnTiledBr16Bc32Fp16Kv => "flash_attn_tiled_br16_bc32_fp16kv",
             ShaderId::FlashAttnBatchFp16Kv => "flash_attn_batch_fp16kv",
+            ShaderId::FlashAttnFp16Kv => "flash_attn_fp16kv",
+            ShaderId::FlashAttnSplitFp16Kv => "flash_attn_split_fp16kv",
             ShaderId::SoftMax => "soft_max_f32",
             ShaderId::Copy => "copy_f32_f32",
             ShaderId::ScalarAttn => "scalar_attn_f32",
@@ -172,6 +182,8 @@ impl ShaderId {
             ShaderId::KvCopyFp16 => KV_COPY_FP16,
             ShaderId::FlashAttnTiledBr16Bc32Fp16Kv => FLASH_ATTN_TILED_BR16_BC32_FP16KV,
             ShaderId::FlashAttnBatchFp16Kv => FLASH_ATTN_BATCH_FP16KV,
+            ShaderId::FlashAttnFp16Kv => FLASH_ATTN_FP16KV,
+            ShaderId::FlashAttnSplitFp16Kv => FLASH_ATTN_SPLIT_FP16KV,
             ShaderId::SoftMax => SOFT_MAX_F32,
             ShaderId::Copy => COPY_F32_F32,
             ShaderId::ScalarAttn => SCALAR_ATTN_F32,
@@ -215,6 +227,8 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::KvCopyFp16,
     ShaderId::FlashAttnTiledBr16Bc32Fp16Kv,
     ShaderId::FlashAttnBatchFp16Kv,
+    ShaderId::FlashAttnFp16Kv,
+    ShaderId::FlashAttnSplitFp16Kv,
     ShaderId::SoftMax,
     ShaderId::Copy,
     ShaderId::ScalarAttn,
@@ -262,6 +276,10 @@ pub const FLASH_ATTN_TILED_BR16_BC32_FP16KV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_tiled_br16_bc32_fp16kv.spv"));
 pub const FLASH_ATTN_BATCH_FP16KV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_batch_fp16kv.spv"));
+pub const FLASH_ATTN_FP16KV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_fp16kv.spv"));
+pub const FLASH_ATTN_SPLIT_FP16KV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_split_fp16kv.spv"));
 pub const SOFT_MAX_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/soft_max_f32.spv"));
 pub const COPY_F32_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/copy_f32_f32.spv"));
 pub const SCALAR_ATTN_F32: &[u8] =

@@ -250,6 +250,20 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "flash_attn_batch.comp",
         defines: &[("FP16_KV", "1")],
     },
+    // v0.2 Sprint 9d.3 — FP16 KV variants for the decode-side
+    // attention shaders. flash_attn (single-WG) covers seq_len ≤ 64,
+    // flash_attn_split (multi-WG split-K) covers > 64. Same source
+    // SPVs as the FP32 builds, just with FP16_KV=1.
+    ShaderJob {
+        out_name: "flash_attn_fp16kv.spv",
+        entry_source: "flash_attn.comp",
+        defines: &[("FP16_KV", "1")],
+    },
+    ShaderJob {
+        out_name: "flash_attn_split_fp16kv.spv",
+        entry_source: "flash_attn_split.comp",
+        defines: &[("FP16_KV", "1")],
+    },
     // Phase-6A probe: confirms shaderc 0.8 + Mesa glslang ship a
     // coopmat + bfloat16 toolchain that produces SPV without warnings.
     // Output is unused at runtime — purely a build-time GO gate. See

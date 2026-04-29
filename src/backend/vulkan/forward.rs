@@ -1046,26 +1046,41 @@ impl Forward {
         }
         compute_barrier(dev, cmd);
 
-        // KV write
+        // KV write — Sprint 9d.3: dispatch the FP32→FP16 conversion
+        // compute shader when the cache is FP16-allocated, otherwise
+        // keep the cheap vkCmdCopyBuffer transfer.
         let row_bytes = self.kv_cache.row_bytes();
         let dst_off = self.kv_cache.pos_offset_bytes(layer, position);
-        let copy = vk::BufferCopy::default()
-            .src_offset(0).dst_offset(dst_off).size(row_bytes);
         let k_src = self.k_buf.handle;
         let v_src = self.v_buf.handle;
         let k_dst = self.kv_cache.k_buffer.handle;
         let v_dst = self.kv_cache.v_buffer.handle;
-        unsafe {
-            dev.device.cmd_copy_buffer(cmd, k_src, k_dst, std::slice::from_ref(&copy));
-            dev.device.cmd_copy_buffer(cmd, v_src, v_dst, std::slice::from_ref(&copy));
+        if self.kv_cache.is_fp16() {
+            let kv_elements = cfg.n_kv_heads * cfg.head_dim;
+            self.run_kv_copy_fp16(
+                dev, registry, cmd, k_src, k_dst, kv_elements, dst_off,
+                "kv_copy_fp16_k_d",
+            );
+            self.run_kv_copy_fp16(
+                dev, registry, cmd, v_src, v_dst, kv_elements, dst_off,
+                "kv_copy_fp16_v_d",
+            );
+        } else {
+            let copy = vk::BufferCopy::default()
+                .src_offset(0).dst_offset(dst_off).size(row_bytes);
+            unsafe {
+                dev.device.cmd_copy_buffer(cmd, k_src, k_dst, std::slice::from_ref(&copy));
+                dev.device.cmd_copy_buffer(cmd, v_src, v_dst, std::slice::from_ref(&copy));
+            }
         }
+        // Barrier covers either upstream (transfer or compute write).
         let kv_bar = vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)
             .dst_access_mask(vk::AccessFlags::SHADER_READ);
         unsafe {
             dev.device.cmd_pipeline_barrier(
                 cmd,
-                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
                 std::slice::from_ref(&kv_bar), &[], &[],
@@ -1311,18 +1326,31 @@ impl Forward {
         compute_barrier(dev, cmd);
 
         // (e) KV-cache write — pos-major.
+        // Sprint 9d.3: when the cache is FP16-allocated, dispatch the
+        // FP32 → packed-FP16 conversion compute shader. Otherwise the
+        // cheap vkCmdCopyBuffer transfer (FP32 → FP32) wins.
         let row_bytes = self.kv_cache.row_bytes();
         let dst_off = self.kv_cache.pos_offset_bytes(layer, position);
-        let copy = vk::BufferCopy::default()
-            .src_offset(0).dst_offset(dst_off).size(row_bytes);
         let k_src = self.k_buf.handle;
         let v_src = self.v_buf.handle;
         let k_dst = self.kv_cache.k_buffer.handle;
         let v_dst = self.kv_cache.v_buffer.handle;
-        self.profile("kv_write", dev, cmd, |dev, cmd| unsafe {
-            dev.device.cmd_copy_buffer(cmd, k_src, k_dst, std::slice::from_ref(&copy));
-            dev.device.cmd_copy_buffer(cmd, v_src, v_dst, std::slice::from_ref(&copy));
-        });
+        if self.kv_cache.is_fp16() {
+            let kv_elements = cfg.n_kv_heads * cfg.head_dim;
+            self.run_kv_copy_fp16(
+                dev, registry, cmd, k_src, k_dst, kv_elements, dst_off, "kv_copy_fp16_k",
+            );
+            self.run_kv_copy_fp16(
+                dev, registry, cmd, v_src, v_dst, kv_elements, dst_off, "kv_copy_fp16_v",
+            );
+        } else {
+            let copy = vk::BufferCopy::default()
+                .src_offset(0).dst_offset(dst_off).size(row_bytes);
+            self.profile("kv_write", dev, cmd, |dev, cmd| unsafe {
+                dev.device.cmd_copy_buffer(cmd, k_src, k_dst, std::slice::from_ref(&copy));
+                dev.device.cmd_copy_buffer(cmd, v_src, v_dst, std::slice::from_ref(&copy));
+            });
+        }
         let kv_bar = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)
             .dst_access_mask(vk::AccessFlags::SHADER_READ);
@@ -1805,7 +1833,13 @@ impl Forward {
         }
         // Phase 4B: forward path now dispatches the online-softmax
         // flash_attn shader instead of the Phase-3A tiled scalar_attn.
-        let kernel = registry.get(ShaderId::FlashAttn);
+        // Sprint 9d.3 — FP16 KV-aware variant when the cache is
+        // FP16-allocated.
+        let kernel = registry.get(if self.kv_cache.is_fp16() {
+            ShaderId::FlashAttnFp16Kv
+        } else {
+            ShaderId::FlashAttn
+        });
         let layer_off = self.kv_cache.layer_offset_bytes(layer);
         // v0.2 Sprint 9d.1 — KvCache::layer_size_bytes scales by
         // the configured KV element size (FP32 = 4 B by default).
@@ -2110,7 +2144,14 @@ impl Forward {
         let layer_size = self.kv_cache.layer_size_bytes();
 
         // ---- Split-K worker ----
-        let split_kernel = registry.get(ShaderId::FlashAttnSplit);
+        // Sprint 9d.3 — FP16 KV-aware variant of the split-K worker.
+        // The reducer (FlashAttnReduce) doesn't read KV (only partials),
+        // so it stays on the FP32 SPV.
+        let split_kernel = registry.get(if self.kv_cache.is_fp16() {
+            ShaderId::FlashAttnSplitFp16Kv
+        } else {
+            ShaderId::FlashAttnSplit
+        });
         let split_set = self.alloc_or_get_set(
             dev, split_kernel.descriptor_set_layout,
             &[
@@ -3205,20 +3246,38 @@ impl Forward {
                 cfg.head_dim, cfg.n_kv_heads, pos, rope_pos_offset, "rope_k_b",
             );
             compute_barrier(dev, cmd);
-            // KV-cache write at this token's position.
+            // KV-cache write at this token's position. Sprint 9d.3 —
+            // FP16 KV path. This per-token legacy branch fires when
+            // batch_attn_enabled=false (the
+            // `phase5b2_batch_attn_parity_qwen3_*` regression tests
+            // exercise this exact code path).
             let row_bytes = self.kv_cache.row_bytes();
             let dst_off = self.kv_cache.pos_offset_bytes(layer, pos);
-            let copy = vk::BufferCopy::default()
-                .src_offset(0).dst_offset(dst_off).size(row_bytes);
-            unsafe {
-                dev.device.cmd_copy_buffer(
-                    cmd, self.k_buf.handle, self.kv_cache.k_buffer.handle,
-                    std::slice::from_ref(&copy),
+            if self.kv_cache.is_fp16() {
+                let kv_elements = cfg.n_kv_heads * cfg.head_dim;
+                self.run_kv_copy_fp16(
+                    dev, registry, cmd,
+                    self.k_buf.handle, self.kv_cache.k_buffer.handle,
+                    kv_elements, dst_off, "kv_copy_fp16_k_t",
                 );
-                dev.device.cmd_copy_buffer(
-                    cmd, self.v_buf.handle, self.kv_cache.v_buffer.handle,
-                    std::slice::from_ref(&copy),
+                self.run_kv_copy_fp16(
+                    dev, registry, cmd,
+                    self.v_buf.handle, self.kv_cache.v_buffer.handle,
+                    kv_elements, dst_off, "kv_copy_fp16_v_t",
                 );
+            } else {
+                let copy = vk::BufferCopy::default()
+                    .src_offset(0).dst_offset(dst_off).size(row_bytes);
+                unsafe {
+                    dev.device.cmd_copy_buffer(
+                        cmd, self.k_buf.handle, self.kv_cache.k_buffer.handle,
+                        std::slice::from_ref(&copy),
+                    );
+                    dev.device.cmd_copy_buffer(
+                        cmd, self.v_buf.handle, self.kv_cache.v_buffer.handle,
+                        std::slice::from_ref(&copy),
+                    );
+                }
             }
             let kv_bar = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)

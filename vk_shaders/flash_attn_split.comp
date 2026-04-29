@@ -25,8 +25,22 @@ const uint TILE = WGSIZE;
 layout (local_size_x = WGSIZE) in;
 
 layout (binding = 0) readonly  buffer Q          { float q[]; };
+// v0.2 Sprint 9d.3 — see flash_attn_tiled.comp for rationale.
+#if FP16_KV
+layout (binding = 1) readonly  buffer K          { uint k_packed[]; };
+layout (binding = 2) readonly  buffer V          { uint v_packed[]; };
+float load_k(uint idx) {
+    return unpackHalf2x16(k_packed[idx >> 1])[idx & 1u];
+}
+float load_v(uint idx) {
+    return unpackHalf2x16(v_packed[idx >> 1])[idx & 1u];
+}
+#else
 layout (binding = 1) readonly  buffer K          { float k[]; };
 layout (binding = 2) readonly  buffer V          { float v[]; };
+float load_k(uint idx) { return k[idx]; }
+float load_v(uint idx) { return v[idx]; }
+#endif
 layout (binding = 3) writeonly buffer ScratchOut { float scratch_out[]; };
 layout (binding = 4) writeonly buffer ScratchMax { float scratch_max[]; };
 layout (binding = 5) writeonly buffer ScratchSum { float scratch_sum[]; };
@@ -68,7 +82,7 @@ void main() {
         uint k_pos_off = t * pos_stride + head_off;
         float s = 0.0;
         for (uint d = 0; d < p.head_dim; ++d) {
-            s += q[q_off + d] * k[k_pos_off + d];
+            s += q[q_off + d] * load_k(k_pos_off + d);
         }
         score = s * p.scale;
     }
@@ -93,9 +107,9 @@ void main() {
         uint global_t  = tile_base + i;
         uint v_pos_off = global_t * pos_stride + head_off;
         float pi = scores_lds[i];
-        my_out0 += pi * v[v_pos_off + tid];
+        my_out0 += pi * load_v(v_pos_off + tid);
         if (d1_valid) {
-            my_out1 += pi * v[v_pos_off + tid + 64];
+            my_out1 += pi * load_v(v_pos_off + tid + 64);
         }
     }
 
