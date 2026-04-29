@@ -206,6 +206,12 @@ pub struct Forward {
     /// up/down) keep their mul_mmq routing in 3A — Sprint 3B widens
     /// the switch.
     coopmat_q4k_enabled: bool,
+    /// Sprint 11E — when ON, Q4_K mul_mm dispatches use the
+    /// `mul_mm.comp + COOPMAT` SPV (KHR coopmat 16x16x16). Forces
+    /// `mul_mm_enabled=true` because COOPMAT mul_mm reads FP32
+    /// activations. Q6_K stays on scalar mul_mm (no COOPMAT SPV
+    /// for Q6_K shipped). Opt-in via `VULKANFORGE_USE_MM_COOPMAT=1`.
+    mul_mm_coopmat_enabled: bool,
 
     /// Sprint 3C — when coopmat is on, route through the FP8-narrowed
     /// padded variant instead of BF16. Default OFF;
@@ -498,7 +504,14 @@ impl Forward {
         // (Q8_1 activations vs FP32: 4× less B-bandwidth into LDS).
         // Opt in via VULKANFORGE_USE_MUL_MM=1 when bit-exact FP32 input
         // matters (e.g. validating quant-induced drift).
-        let mul_mm_enabled = match std::env::var("VULKANFORGE_USE_MUL_MM") {
+        // Sprint 11E — VULKANFORGE_USE_MM_COOPMAT implies VULKANFORGE_USE_MUL_MM
+        // because the COOPMAT path lives in mul_mm.comp (FP32 activations),
+        // not mul_mmq.comp.
+        let mul_mm_coopmat_enabled = match std::env::var("VULKANFORGE_USE_MM_COOPMAT") {
+            Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
+            _ => false,
+        };
+        let mul_mm_enabled = mul_mm_coopmat_enabled || match std::env::var("VULKANFORGE_USE_MUL_MM") {
             Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
             _ => false,
         };
@@ -589,6 +602,7 @@ impl Forward {
             batch_attn_enabled,
             mul_mm_enabled,
             coopmat_q4k_enabled,
+            mul_mm_coopmat_enabled,
             coopmat_fp8_enabled,
             fa_tiled_enabled,
             fa_tiled_br,
@@ -2651,10 +2665,10 @@ impl Forward {
         };
         // BM/BN come from the pipeline's spec-constants. S-tile
         // (MulMm*Q{4,6}K, MulMmqQ{4,6}K) → 64×64. L-tile
-        // (MulMmqQ{4,6}KL) → 128×128. Matches the
+        // (MulMmqQ{4,6}KL, MulMmQ4KCoopmat) → 128×128. Matches the
         // pipeline_registry.rs spec-constant block.
         let (bm, bn): (u32, u32) = match shader_id {
-            ShaderId::MulMmqQ4KL | ShaderId::MulMmqQ6KL => (128, 128),
+            ShaderId::MulMmqQ4KL | ShaderId::MulMmqQ6KL | ShaderId::MulMmQ4KCoopmat => (128, 128),
             _ => (64, 64),
         };
         let groups_x = (m + bm - 1) / bm;
@@ -3024,7 +3038,12 @@ impl Forward {
         // aligned variant (vec4 B-loads) requires seq_len % 4 == 0;
         // if it isn't we fall back to mul_mmq because mul_mm with
         // scalar B-loads is ~45 % slower than mul_mmq at prefill.
-        let gemm_kind = if self.mul_mm_enabled {
+        // Sprint 11E — when COOPMAT mul_mm is on, force the unaligned MulMm
+        // path (we don't ship a COOPMAT-aligned SPV). Otherwise the existing
+        // MulMmAligned fallback path stays.
+        let gemm_kind = if self.mul_mm_coopmat_enabled {
+            GemmKind::MulMm
+        } else if self.mul_mm_enabled {
             if seq_len % 4 == 0 { GemmKind::MulMmAligned } else { GemmKind::Mmq }
         } else {
             GemmKind::Mmq
@@ -3047,9 +3066,10 @@ impl Forward {
         let wq = layer_weight(model, layer, "attn_q.weight");
         let wk = layer_weight(model, layer, "attn_k.weight");
         let wv = layer_weight(model, layer, "attn_v.weight");
-        let sq = layer_weight_shader_gemm(model, layer, "attn_q.weight", gemm_kind, q_dim, seq_len);
-        let sk = layer_weight_shader_gemm(model, layer, "attn_k.weight", gemm_kind, kv_dim, seq_len);
-        let sv = layer_weight_shader_gemm(model, layer, "attn_v.weight", gemm_kind, kv_dim, seq_len);
+        let cm_mm = self.mul_mm_coopmat_enabled;
+        let sq = layer_weight_shader_gemm(model, layer, "attn_q.weight", gemm_kind, q_dim, seq_len, cm_mm);
+        let sk = layer_weight_shader_gemm(model, layer, "attn_k.weight", gemm_kind, kv_dim, seq_len, cm_mm);
+        let sv = layer_weight_shader_gemm(model, layer, "attn_v.weight", gemm_kind, kv_dim, seq_len, cm_mm);
         // Sprint 3A: gemm_q can opt into the Q4_K coopmat fusion.
         // Coopmat reads activations from `batch_norm` (FP32) regardless
         // of the mul_mm/mul_mmq route the rest of the layer takes, so
@@ -3438,7 +3458,7 @@ impl Forward {
                 compute_barrier(dev, cmd);
                 self.batch_q8.handle
             };
-            let so = layer_weight_shader_gemm(model, layer, "attn_output.weight", gemm_kind, hidden, seq_len);
+            let so = layer_weight_shader_gemm(model, layer, "attn_output.weight", gemm_kind, hidden, seq_len, self.mul_mm_coopmat_enabled);
             self.run_gemm(
                 dev, registry, cmd, so, wo,
                 gemm_input_o, self.batch_o.handle,
@@ -3509,8 +3529,8 @@ impl Forward {
                 ffn, n_padded, hidden, gu_bm, gu_bn, "gemm_up_coopmat",
             );
         } else {
-            let sg = layer_weight_shader_gemm(model, layer, "ffn_gate.weight", gemm_kind, ffn, seq_len);
-            let su = layer_weight_shader_gemm(model, layer, "ffn_up.weight", gemm_kind, ffn, seq_len);
+            let sg = layer_weight_shader_gemm(model, layer, "ffn_gate.weight", gemm_kind, ffn, seq_len, self.mul_mm_coopmat_enabled);
+            let su = layer_weight_shader_gemm(model, layer, "ffn_up.weight", gemm_kind, ffn, seq_len, self.mul_mm_coopmat_enabled);
             self.run_gemm(
                 dev, registry, cmd, sg, wg,
                 gemm_input_ffn, self.batch_gate.handle,
@@ -3553,7 +3573,7 @@ impl Forward {
             self.batch_q8.handle
         };
         let wd = layer_weight(model, layer, "ffn_down.weight");
-        let sd = layer_weight_shader_gemm(model, layer, "ffn_down.weight", gemm_kind, hidden, seq_len);
+        let sd = layer_weight_shader_gemm(model, layer, "ffn_down.weight", gemm_kind, hidden, seq_len, self.mul_mm_coopmat_enabled);
         self.run_gemm(
             dev, registry, cmd, sd, wd,
             gemm_input_down, self.batch_ffn_out.handle,
@@ -3624,6 +3644,7 @@ fn layer_weight_shader_gemm(
     gemm_kind: GemmKind,
     m: u32,
     n: u32,
+    coopmat_q4k_mm: bool,
 ) -> ShaderId {
     let key = format!("blk.{layer}.{suffix}");
     let q6 = model
@@ -3638,7 +3659,7 @@ fn layer_weight_shader_gemm(
         (GemmKind::MulMmAligned, true)  => ShaderId::MulMmQ6KAligned,
         (GemmKind::MulMmAligned, false) => ShaderId::MulMmQ4KAligned,
         (GemmKind::MulMm,        true)  => ShaderId::MulMmQ6K,
-        (GemmKind::MulMm,        false) => ShaderId::MulMmQ4K,
+        (GemmKind::MulMm,        false) => if coopmat_q4k_mm { ShaderId::MulMmQ4KCoopmat } else { ShaderId::MulMmQ4K },
         (GemmKind::Mmq,          true)  => if prefer_l { ShaderId::MulMmqQ6KL } else { ShaderId::MulMmqQ6K },
         (GemmKind::Mmq,          false) => if prefer_l { ShaderId::MulMmqQ4KL } else { ShaderId::MulMmqQ4K },
     }

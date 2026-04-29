@@ -591,6 +591,37 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "quantize_q8_1.comp",
         defines: &[("QBLOCK_X4", "1")],
     },
+    // Sprint 11E — mul_mm.comp with -DCOOPMAT enables the
+    // GL_KHR_cooperative_matrix path for prefill GEMM. The shader's
+    // `#ifdef COOPMAT` swap (line 17-19) brings in the KHR coopmat
+    // extension and replaces the scalar inner loop with
+    // coopMatMulAdd over 16x16x16 fragments. FP16 LDS / FP32
+    // accumulator. B (activations) stays FP32 in the storage buffer
+    // and gets converted to FP16 in load_b_to_shmem via TO_FLOAT_TYPE.
+    //
+    // Compile probe — if this fails to compile the whole COOPMAT GEMM
+    // path is unworkable on RDNA4 with our toolchain.
+    ShaderJob {
+        out_name: "mul_mm_q4_k_f32_coopmat.spv",
+        entry_source: "mul_mm.comp",
+        defines: &[
+            ("DATA_A_Q4_K", "1"),
+            ("A_TYPE", "block_q4_K"),
+            ("A_TYPE_PACKED32", "block_q4_K_packed32"),
+            ("B_TYPE", "float"),
+            ("D_TYPE", "float"),
+            // FLOAT16=1 enables GL_EXT_shader_explicit_arithmetic_types_float16
+            // (mul_mm.comp:6-8) which the COOPMAT path needs for FP16 LDS.
+            ("FLOAT16", "1"),
+            ("FLOAT_TYPE", "float16_t"),
+            ("FLOAT_TYPEV2", "f16vec2"),
+            ("FLOAT_TYPEV4", "f16vec4"),
+            ("ACC_TYPE", "float"),
+            ("ACC_TYPEV2", "vec2"),
+            ("LOAD_VEC_A", "4"),
+            ("COOPMAT", "1"),
+        ],
+    },
 ];
 
 fn main() {

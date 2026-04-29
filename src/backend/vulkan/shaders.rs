@@ -83,6 +83,12 @@ pub enum ShaderId {
     // l_warptile_mmq_int_k AMD-coopmat-override at gfx1201).
     MulMmqQ4KL,
     MulMmqQ6KL,
+    // Sprint 11E — KHR coopmat mul_mm path (mul_mm.comp + COOPMAT=1).
+    // Uses 16x16x16 FP16xFP16->FP32 fragments via coopMatMulAdd.
+    // FP32 activations (skips Q8_1 quantize), FP16 LDS, FP32 accumulator.
+    // Spec-constants from llama.cpp's warptile_mmq AMD-coopmat-override
+    // (ggml-vulkan.cpp:3367) at gfx1201.
+    MulMmQ4KCoopmat,
     QuantizeQ8_1,
     // Phase 4B — online-softmax decode attention; drop-in for ScalarAttn.
     FlashAttn,
@@ -170,6 +176,7 @@ impl ShaderId {
             ShaderId::ScalarAttn => "scalar_attn_f32",
             ShaderId::MulMmqQ4K | ShaderId::MulMmqQ4KL => "mul_mmq_q4_k_f32",
             ShaderId::MulMmqQ6K | ShaderId::MulMmqQ6KL => "mul_mmq_q6_k_f32",
+            ShaderId::MulMmQ4KCoopmat => "mul_mm_q4_k_f32_coopmat",
             ShaderId::QuantizeQ8_1 => "quantize_q8_1_f32",
             ShaderId::FlashAttn => "flash_attn_f32",
             ShaderId::FlashAttnSplit => "flash_attn_split_f32",
@@ -232,6 +239,7 @@ impl ShaderId {
             ShaderId::MulMmQ6K => MUL_MM_Q6_K_F32,
             ShaderId::MulMmQ4KAligned => MUL_MM_Q4_K_F32_ALIGNED,
             ShaderId::MulMmQ6KAligned => MUL_MM_Q6_K_F32_ALIGNED,
+            ShaderId::MulMmQ4KCoopmat => MUL_MM_Q4_K_F32_COOPMAT,
             ShaderId::MulCoopmatQ4KFwdBn64 => MUL_COOPMAT_Q4K_FWD_BN64,
             ShaderId::MulCoopmatQ4KFwdBn32 => MUL_COOPMAT_Q4K_FWD_BN32,
             ShaderId::MulCoopmatQ4KFwdBn16 => MUL_COOPMAT_Q4K_FWD_BN16,
@@ -270,6 +278,7 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::MulMmqQ6K,
     ShaderId::MulMmqQ4KL,
     ShaderId::MulMmqQ6KL,
+    ShaderId::MulMmQ4KCoopmat,
     ShaderId::QuantizeQ8_1,
     ShaderId::FlashAttn,
     ShaderId::FlashAttnSplit,
@@ -358,6 +367,8 @@ pub const MUL_MM_Q4_K_F32_ALIGNED: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q4_k_f32_aligned.spv"));
 pub const MUL_MM_Q6_K_F32_ALIGNED: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q6_k_f32_aligned.spv"));
+pub const MUL_MM_Q4_K_F32_COOPMAT: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q4_k_f32_coopmat.spv"));
 pub const MUL_COOPMAT_Q4K_FWD_BN64: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_q4k_fwd_bn64.spv"));
 pub const MUL_COOPMAT_Q4K_FWD_BN32: &[u8] =

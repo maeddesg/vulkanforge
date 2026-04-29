@@ -358,6 +358,52 @@ impl PipelineRegistry {
                     let bytes = bytemuck::bytes_of(&data);
                     ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
                 }
+                ShaderId::MulMmQ4KCoopmat => {
+                    // Sprint 11E — mul_mm.comp + COOPMAT, KHR coopmat
+                    // 16x16x16 FP16xFP16->FP32 fragments. Spec-constants
+                    // pinned from llama.cpp's warptile_mmq AMD-coopmat-
+                    // override (ggml-vulkan.cpp:3367) at gfx1201:
+                    //   { 256, 128, 128, 32, 64, 64, 2, 16, 16, 16, 64 }
+                    //
+                    // WNITER = WM·WN/(WARP·TM·TN·WMITER) is non-integer
+                    // here (64·64/(64·16·16·2) = 0.125) — but the COOPMAT
+                    // path of mul_mm.comp uses cms_per_row = WM/TM = 4
+                    // and cms_per_col = WN/TN = 4 in the inner loop
+                    // (line 178-179) instead of WNITER, so the 0
+                    // truncation in the unused scalar fallback is
+                    // benign.
+                    //
+                    // NUM_WARPS = BLOCK_SIZE/WARP = 4 = (BM/WM)·(BN/WN)
+                    //                                = 2·2 ✓
+                    let entries = [
+                        entry(0, 0, 4),
+                        entry(1, 4, 4),
+                        entry(2, 8, 4),
+                        entry(3, 12, 4),
+                        entry(4, 16, 4),
+                        entry(5, 20, 4),
+                        entry(6, 24, 4),
+                        entry(7, 28, 4),
+                        entry(8, 32, 4),
+                        entry(9, 36, 4),
+                        entry(10, 40, 4),
+                    ];
+                    let data: [u32; 11] = [
+                        256, // BLOCK_SIZE
+                        128, // BM
+                        128, // BN
+                        32,  // BK (Q4_K → 32, per shader comment)
+                        64,  // WM
+                        64,  // WN
+                        2,   // WMITER
+                        16,  // TM (coopmat_m)
+                        16,  // TN (coopmat_n)
+                        16,  // TK (coopmat_k)
+                        64,  // WARP — RDNA Wave64
+                    ];
+                    let bytes = bytemuck::bytes_of(&data);
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
+                }
                 ShaderId::FlashAttnTiledBr4
                 | ShaderId::FlashAttnTiledBr8
                 | ShaderId::FlashAttnTiledBr16
