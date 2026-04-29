@@ -100,10 +100,11 @@ impl PipelineRegistry {
                     let bytes = bytemuck::bytes_of(&MMV_SPEC_DATA);
                     ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
                 }
-                ShaderId::RmsNorm => {
+                ShaderId::RmsNorm | ShaderId::RmsNormMulRope => {
                     // SpecId 0 = norepeat (false → broadcast-safe), 1 =
                     // do_multiply (true → norm-with-gamma, which is the
-                    // standard transformer use case).
+                    // standard transformer use case). Sprint 9c.5 reuses
+                    // the same spec for the RMS_NORM_ROPE_FUSION SPV.
                     let data: [u32; 2] = [0, 1];
                     let entries = [entry(0, 0, 4), entry(1, 4, 4)];
                     let bytes = bytemuck::bytes_of(&data);

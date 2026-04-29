@@ -41,7 +41,7 @@ use super::pipeline::{
     FlashAttnBatchPushConstants, FlashAttnReducePushConstants, FlashAttnSplitPushConstants,
     GenericBinaryPushConstants, MatVecPushConstants,
     CoopmatPushConstants, MmqPushConstants, MultiAddRmsPushConstants,
-    Q8_1QuantizePushConstants, RopePushConstants,
+    Q8_1QuantizePushConstants, RmsNormMulRopePushConstants, RopePushConstants,
     ScalarAttnPushConstants, SwigluPushConstants,
 };
 use super::pipeline_registry::PipelineRegistry;
@@ -2254,6 +2254,126 @@ impl Forward {
         });
     }
 
+    /// v0.2 Sprint 9c.5 — fused rms_norm+mul+RoPE-NeoX dispatch for
+    /// Q/K-norm. One dispatch covers what previously took two
+    /// (`run_rms_norm` + `run_rope_batch`) per Q or K projection.
+    ///
+    /// Buffer layout in `qk` is `[m, heads_per_token, head_dim]`
+    /// (token-major, head_dim contiguous). Each WG normalizes one row
+    /// of `head_dim` elements (one (token, head) pair), multiplies by
+    /// the per-dim `weight[head_dim]`, then applies RoPE-NeoX in-place
+    /// using the position from `rope_pos_buf[i2]` (i2 = token index).
+    /// Output `qk_out` may alias `qk` for in-place rotation (the
+    /// production callers do this).
+    #[allow(clippy::too_many_arguments)]
+    fn run_rms_norm_mul_rope(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        qk: vk::Buffer,
+        weight: vk::Buffer,
+        qk_out: vk::Buffer,
+        head_dim: u32,
+        heads_per_token: u32,
+        m: u32,
+        eps: f32,
+        label: &'static str,
+    ) {
+        let kernel = registry.get(ShaderId::RmsNormMulRope);
+        // Binding map matches rms_norm.comp's RMS_NORM_ROPE_FUSION
+        // path: 0=A, 1=B(weight), 3=pos, 4=ff, 5=output, 6=set_rows_idx.
+        // Binding 2 is intentionally unused by the shader; we omit it.
+        let pos_size = (m as u64) * 4;
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[
+                (0, qk, 0, 0),
+                (1, weight, 0, 0),
+                (3, self.rope_pos_buf.handle, 0, pos_size),
+                (4, self.rope_ff_buf.handle, 0, 0),
+                (5, qk_out, 0, 0),
+                (6, self.rope_idx_buf.handle, 0, 0),
+            ],
+        );
+
+        let rope_mode: u32 = match self.config.rope_variant {
+            crate::backend::vulkan::gguf::RopeVariant::Neox => 2,
+            crate::backend::vulkan::gguf::RopeVariant::Norm => 0,
+        };
+
+        // CRITICAL dispatch geometry: the fused shader maps
+        // gl_WorkGroupID.x → row (head_idx), gl_WorkGroupID.y → channel
+        // (token_idx). The rope step then reads `rope_data_pos[channel]`,
+        // so the y-dim *must* be the token dimension; otherwise every
+        // token would rotate using pos=0. Use (heads_per_token, m, 1).
+        let pc = RmsNormMulRopePushConstants {
+            // GenericBinary header — describes the rms_norm input/output.
+            // ne00 = ncols (head_dim), ne01 = head_count along X workgroups,
+            // ne02 = token_count along Y workgroups. nb01/nb02 give the
+            // strides in elements that the shader applies to row/channel.
+            ne: head_dim * heads_per_token * m,
+            ne00: head_dim, ne01: heads_per_token, ne02: m, ne03: 1,
+            nb00: 1, nb01: head_dim, nb02: head_dim * heads_per_token,
+            nb03: head_dim * heads_per_token * m,
+            // Weight (data_b) is the single per-dim gamma vector; broadcast
+            // identical across all rows/channels.
+            ne10: head_dim, ne11: 1, ne12: 1, ne13: 1,
+            nb10: 1, nb11: head_dim, nb12: head_dim, nb13: head_dim,
+            // Output stride matches input (in-place rotation).
+            ne20: head_dim, ne21: heads_per_token, ne22: m, ne23: 1,
+            nb20: 1, nb21: head_dim, nb22: head_dim * heads_per_token,
+            nb23: head_dim * heads_per_token * m,
+            misalign_offsets: 0,
+            param1: eps,
+            param2: 0.0,
+            param3: 0,
+            // rope_params — mirror what `run_rope_batch` writes for the
+            // stand-alone RoPE pass so the rotation is bit-equivalent.
+            // ne01/ne02 here are *element-shape* (heads × tokens), not
+            // workgroup counts (which the shader derives from
+            // gl_NumWorkGroups). Strides are in elements.
+            rope: RopePushConstants {
+                rope_mode,
+                nrows: heads_per_token * m,
+                n_dims: head_dim,
+                freq_scale: 1.0,
+                freq_base: self.config.rope_freq_base,
+                ext_factor: 0.0,
+                attn_factor: 1.0,
+                corr_dims: [0.0, 0.0],
+                theta_scale: self.rope_theta_scale,
+                has_ff: 0,
+                sections: [0; 4],
+                is_imrope: 0,
+                is_back: 0,
+                set_rows_stride: 0,
+                ne00: head_dim,
+                ne01: heads_per_token,
+                ne02: m,
+                nb01: head_dim,
+                nb02: head_dim * heads_per_token,
+                nb03: head_dim * heads_per_token * m,
+                nb11: head_dim,
+                nb12: head_dim * heads_per_token,
+                nb13: head_dim * heads_per_token * m,
+            },
+        };
+
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, heads_per_token, m, 1);
+        });
+    }
+
     /// v0.2 Sprint 9a — fused SwiGLU dispatch.
     /// `out[i] = silu(gate[i]) * up[i]` over `n` FP32 elements.
     /// Replaces `run_silu(g→g) + barrier + run_binary(Mul, g, u, o)`
@@ -2867,41 +2987,44 @@ impl Forward {
 
         if batch_attn {
             // ---- Phase 5B.3 fully-batched per-layer attention prep ----
-            // 1. Q/K-norm (Qwen-only): rms_norm with nrows = M *
-            //    heads_per_token. The shader broadcasts the single-
-            //    row weight across all rows automatically.
+            // Sprint 9c.5 — Q/K-norm + RoPE fused into a single
+            // dispatch each (was: 4 dispatches + 2 barriers; now: 2
+            // dispatches + 1 barrier per layer). Position-buffer is
+            // pre-staged in prefill_batch with [base_pos, base_pos+1,
+            // …, base_pos+M-1] at slots 0..M.
+            //
+            // The fused path requires a Q/K-norm weight to drive the
+            // do_multiply branch. If the model has no qk_norm
+            // (non-Qwen archs), fall back to the old separate
+            // run_rope_batch dispatches with no rms_norm.
             if let Some((wqn, wkn)) = qk_norm_weights {
-                self.run_rms_norm(
+                self.run_rms_norm_mul_rope(
                     dev, registry, cmd,
                     self.batch_q.handle, wqn, self.batch_q.handle,
-                    cfg.head_dim, seq_len * cfg.n_heads,
-                    cfg.rms_norm_eps, "rms_norm_q_batch",
+                    cfg.head_dim, cfg.n_heads, seq_len,
+                    cfg.rms_norm_eps, "rms_norm_mul_rope_q_b",
                 );
-                self.run_rms_norm(
+                self.run_rms_norm_mul_rope(
                     dev, registry, cmd,
                     self.batch_k.handle, wkn, self.batch_k.handle,
-                    cfg.head_dim, seq_len * cfg.n_kv_heads,
-                    cfg.rms_norm_eps, "rms_norm_k_batch",
+                    cfg.head_dim, cfg.n_kv_heads, seq_len,
+                    cfg.rms_norm_eps, "rms_norm_mul_rope_k_b",
                 );
-                compute_barrier(dev, cmd);
+            } else {
+                // No qk_norm: keep the legacy stand-alone RoPE dispatches.
+                self.run_rope_batch(
+                    dev, registry, cmd,
+                    self.batch_q.handle, self.batch_q.handle,
+                    cfg.head_dim, cfg.n_heads, seq_len,
+                    "rope_q_batch",
+                );
+                self.run_rope_batch(
+                    dev, registry, cmd,
+                    self.batch_k.handle, self.batch_k.handle,
+                    cfg.head_dim, cfg.n_kv_heads, seq_len,
+                    "rope_k_batch",
+                );
             }
-
-            // 2. RoPE Q + RoPE K — one dispatch each, in-place over
-            //    batch_q / batch_k. Position-buffer is pre-staged in
-            //    prefill_batch with `[base_pos, base_pos+1, …,
-            //    base_pos+M-1]` at slots 0..M.
-            self.run_rope_batch(
-                dev, registry, cmd,
-                self.batch_q.handle, self.batch_q.handle,
-                cfg.head_dim, cfg.n_heads, seq_len,
-                "rope_q_batch",
-            );
-            self.run_rope_batch(
-                dev, registry, cmd,
-                self.batch_k.handle, self.batch_k.handle,
-                cfg.head_dim, cfg.n_kv_heads, seq_len,
-                "rope_k_batch",
-            );
             compute_barrier(dev, cmd);
 
             // 3. Bulk KV-cache write. K and V are M contiguous rows of

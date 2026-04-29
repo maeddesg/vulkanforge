@@ -65,6 +65,24 @@ const JOBS: &[ShaderJob] = &[
             ("FLOAT_TYPE", "float"),
         ],
     },
+    // v0.2 Sprint 9c.5 — fused rms_norm+mul+RoPE. Same shader source
+    // as rms_norm.comp, but built with RMS_NORM_ROPE_FUSION=1 so the
+    // rope_neox/rope_norm path runs after the rms_norm+mul step
+    // (sharing the normalized intermediate via `rope_data_a` LDS).
+    // 7 SSBO bindings (A, B, [skip 2], pos, ff, output, set_rows_idx).
+    // Mirrors llama.cpp's `rms_norm_mul_rope_f32_f32` SPV.
+    ShaderJob {
+        out_name: "rms_norm_mul_rope_f32.spv",
+        entry_source: "rms_norm.comp",
+        defines: &[
+            ("A_TYPE", "float"),
+            ("B_TYPE", "float"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("ROPE_D_TYPE", "float"),
+            ("RMS_NORM_ROPE_FUSION", "1"),
+        ],
+    },
     // RoPE (rotated position embedding) — Llama-style "norm" variant.
     // rope_head.glsl: 5 SSBOs (data, pos, ff, output, indices).
     ShaderJob {

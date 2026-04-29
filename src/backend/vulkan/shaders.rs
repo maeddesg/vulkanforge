@@ -27,6 +27,13 @@ pub enum ShaderId {
     /// weight → norm_out) into a single dispatch. Saves one dispatch
     /// and one compute barrier per layer at the attn→ffn transition.
     MultiAddRms,
+    /// v0.2 Sprint 9c.5 — fused rms_norm+mul+RoPE for Q/K-norm. Built
+    /// from rms_norm.comp with RMS_NORM_ROPE_FUSION=1 so the
+    /// normalized+gamma-multiplied intermediate is staged in LDS and
+    /// then rotated by the rope_neox path in the same dispatch.
+    /// Replaces the Q/K-norm + RoPE pair (4 dispatches + 2 barriers
+    /// per layer) with 2 dispatches + 1 barrier.
+    RmsNormMulRope,
     SoftMax,
     Copy,
     ScalarAttn,
@@ -106,6 +113,7 @@ impl ShaderId {
             ShaderId::Silu => "silu_f32",
             ShaderId::SwiGLU => "swiglu_f32",
             ShaderId::MultiAddRms => "multi_add_rms_f32",
+            ShaderId::RmsNormMulRope => "rms_norm_mul_rope_f32",
             ShaderId::SoftMax => "soft_max_f32",
             ShaderId::Copy => "copy_f32_f32",
             ShaderId::ScalarAttn => "scalar_attn_f32",
@@ -145,6 +153,7 @@ impl ShaderId {
             ShaderId::Silu => SILU_F32,
             ShaderId::SwiGLU => SWIGLU_F32,
             ShaderId::MultiAddRms => MULTI_ADD_RMS_F32,
+            ShaderId::RmsNormMulRope => RMS_NORM_MUL_ROPE_F32,
             ShaderId::SoftMax => SOFT_MAX_F32,
             ShaderId::Copy => COPY_F32_F32,
             ShaderId::ScalarAttn => SCALAR_ATTN_F32,
@@ -184,6 +193,7 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::Silu,
     ShaderId::SwiGLU,
     ShaderId::MultiAddRms,
+    ShaderId::RmsNormMulRope,
     ShaderId::SoftMax,
     ShaderId::Copy,
     ShaderId::ScalarAttn,
@@ -223,6 +233,8 @@ pub const SILU_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silu_f32.s
 pub const SWIGLU_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/swiglu_f32.spv"));
 pub const MULTI_ADD_RMS_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/multi_add_rms_f32.spv"));
+pub const RMS_NORM_MUL_ROPE_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm_mul_rope_f32.spv"));
 pub const SOFT_MAX_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/soft_max_f32.spv"));
 pub const COPY_F32_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/copy_f32_f32.spv"));
 pub const SCALAR_ATTN_F32: &[u8] =

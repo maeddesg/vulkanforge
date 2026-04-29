@@ -107,6 +107,34 @@ pub struct MultiAddRmsPushConstants {
 }
 const _: () = assert!(std::mem::size_of::<MultiAddRmsPushConstants>() == 12);
 
+/// v0.2 Sprint 9c.5 — fused rms_norm+mul+RoPE push block.
+/// Layout matches `generic_binary_head.glsl` (with `RMS_NORM_ROPE_FUSION`
+/// branch active): the regular GenericBinary header (116 B) followed
+/// by an embedded `rope_params` struct (108 B). Total: 224 B — well
+/// within RDNA4's 256 B push-constant budget.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct RmsNormMulRopePushConstants {
+    // GenericBinary header (116 B), same field order as
+    // GenericBinaryPushConstants.
+    pub ne: u32,
+    pub ne00: u32, pub ne01: u32, pub ne02: u32, pub ne03: u32,
+    pub nb00: u32, pub nb01: u32, pub nb02: u32, pub nb03: u32,
+    pub ne10: u32, pub ne11: u32, pub ne12: u32, pub ne13: u32,
+    pub nb10: u32, pub nb11: u32, pub nb12: u32, pub nb13: u32,
+    pub ne20: u32, pub ne21: u32, pub ne22: u32, pub ne23: u32,
+    pub nb20: u32, pub nb21: u32, pub nb22: u32, pub nb23: u32,
+    pub misalign_offsets: u32,
+    pub param1: f32,
+    pub param2: f32,
+    pub param3: i32,
+    // rope_params (108 B). Embedded by value — the Rust struct's
+    // field order matches the GLSL `rope_params` struct in
+    // `rope_params.glsl` byte-for-byte.
+    pub rope: RopePushConstants,
+}
+const _: () = assert!(std::mem::size_of::<RmsNormMulRopePushConstants>() == 116 + 108);
+
 /// `generic_unary_head.glsl` push block — used by `copy`. 32 × 4 = 128 B.
 /// The trailing six `ne0_*mp/L` and `ne1_*mp/L` fields are fastdiv
 /// constants (see [`init_fastdiv_values`]) — set them, do not leave
