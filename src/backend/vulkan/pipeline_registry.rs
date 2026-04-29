@@ -143,7 +143,8 @@ impl PipelineRegistry {
                     let bytes = bytemuck::bytes_of(&data);
                     ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
                 }
-                ShaderId::MulMmqQ4K | ShaderId::MulMmqQ6K => {
+                ShaderId::MulMmqQ4K | ShaderId::MulMmqQ6K
+                | ShaderId::MulMmqQ4KL | ShaderId::MulMmqQ6KL => {
                     // Phase-3C compile probe — pin the 11 spec
                     // constants llama.cpp's vulkan-shaders-gen pins
                     // for a non-coopmat MMQ build. Layout:
@@ -221,22 +222,43 @@ impl PipelineRegistry {
                     //   warp tiles per WG = (BM/WM)·(BN/WN)·WMITER
                     //                     = (64/32)·(64/32)·2 = 8
                     //   → 4 warps cover 8 tiles via WNITER=2. ✓
-                    let block_size: u32 = std::env::var("VULKANFORGE_GEMM_BLOCK_SIZE")
-                        .ok().and_then(|s| s.parse().ok()).unwrap_or(256);
-                    let bm: u32 = std::env::var("VULKANFORGE_GEMM_BM")
-                        .ok().and_then(|s| s.parse().ok()).unwrap_or(64);
-                    let bn: u32 = std::env::var("VULKANFORGE_GEMM_BN")
-                        .ok().and_then(|s| s.parse().ok()).unwrap_or(64);
-                    let wm: u32 = std::env::var("VULKANFORGE_GEMM_WM")
-                        .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
-                    let wn: u32 = std::env::var("VULKANFORGE_GEMM_WN")
-                        .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
-                    let wmiter: u32 = std::env::var("VULKANFORGE_GEMM_WMITER")
-                        .ok().and_then(|s| s.parse().ok()).unwrap_or(2);
-                    let tm: u32 = std::env::var("VULKANFORGE_GEMM_TM")
-                        .ok().and_then(|s| s.parse().ok()).unwrap_or(2);
-                    let tn: u32 = std::env::var("VULKANFORGE_GEMM_TN")
-                        .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+                    // Sprint 11C — L-tile pinned from llama.cpp's
+                    // l_warptile_mmq_int_k AMD-coopmat-override
+                    // (ggml-vulkan.cpp:3368, gfx1201 path):
+                    //   { 256, 128, 128, 32, 64, 64, 1, 4, 2, 1, 64 }
+                    // Constraints satisfied:
+                    //   WNITER    = WM·WN/(WARP·TM·TN·WMITER)
+                    //             = 64·64/(64·4·2·1) = 8 ✓ ganzzahlig
+                    //   NUM_WARPS = BLOCK_SIZE/WARP = 256/64 = 4
+                    //             = (BM/WM)·(BN/WN) = 2·2 = 4 ✓ Phase-7-coverage
+                    // The L-tile is hard-pinned (no env override) — its
+                    // values come from llama.cpp upstream production
+                    // tuning and the constraint chain breaks if any of
+                    // BM/BN/WM/WN/WMITER/TM/TN move independently. The
+                    // S-tile keeps the env-var override surface for the
+                    // existing v0.1.x debugging workflow.
+                    let is_l = matches!(id, ShaderId::MulMmqQ4KL | ShaderId::MulMmqQ6KL);
+                    let (block_size, bm, bn, wm, wn, wmiter, tm, tn) = if is_l {
+                        (256, 128, 128, 64, 64, 1, 4, 2)
+                    } else {
+                        let block_size: u32 = std::env::var("VULKANFORGE_GEMM_BLOCK_SIZE")
+                            .ok().and_then(|s| s.parse().ok()).unwrap_or(256);
+                        let bm: u32 = std::env::var("VULKANFORGE_GEMM_BM")
+                            .ok().and_then(|s| s.parse().ok()).unwrap_or(64);
+                        let bn: u32 = std::env::var("VULKANFORGE_GEMM_BN")
+                            .ok().and_then(|s| s.parse().ok()).unwrap_or(64);
+                        let wm: u32 = std::env::var("VULKANFORGE_GEMM_WM")
+                            .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+                        let wn: u32 = std::env::var("VULKANFORGE_GEMM_WN")
+                            .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+                        let wmiter: u32 = std::env::var("VULKANFORGE_GEMM_WMITER")
+                            .ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+                        let tm: u32 = std::env::var("VULKANFORGE_GEMM_TM")
+                            .ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+                        let tn: u32 = std::env::var("VULKANFORGE_GEMM_TN")
+                            .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+                        (block_size, bm, bn, wm, wn, wmiter, tm, tn)
+                    };
                     let data: [u32; 10] = [
                         block_size,
                         bm,

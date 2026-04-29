@@ -1969,6 +1969,181 @@ fn test_gemm_q4k_full_tile_64x64_mul_mmq() {
     fix.teardown();
 }
 
+/// Sprint 11C — L-tile (BM=BN=128) end-to-end parity at the
+/// dispatch shape that exercises every warp tile in the WG. With
+/// `(BM/WM) * (BN/WN) = (128/64)*(128/64) = 4` warp tiles per WG
+/// and `WMITER=1`, this is the same coverage check Phase 7 added
+/// for the S tile but at the doubled-tile geometry. Verifies that
+/// `l_warptile_mmq_int_k`'s spec constants (BLOCK_SIZE=256, BM=128,
+/// BN=128, WM=64, WN=64, WMITER=1, TM=4, TN=2, WARP=64) produce
+/// identical arithmetic to the S tile.
+#[test]
+fn test_gemm_q4k_full_tile_128x128_mul_mmq_l() {
+    use vulkanforge::backend::vulkan::q4k;
+
+    let mut fix = Fixture::new();
+    let m: u32 = 128; // = BM_L exactly
+    let n: u32 = 128; // = BN_L exactly
+    let k: u32 = q4k::QUANT_K as u32; // 256
+
+    let weights = q4k::build_random_weights(m as usize, k as usize, 0xDEADC0DE);
+    let w_buf = {
+        let device = fix.dev.device.clone();
+        let allocator = fix.allocator.as_mut().unwrap();
+        let mut b = GpuBuffer::new(
+            &device, allocator, weights.len() as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "w_l_tile",
+        ).expect("alloc weights");
+        b.write_bytes(&weights).expect("write weights");
+        fix.track(b)
+    };
+
+    let acts: Vec<f32> = (0..(n * k))
+        .map(|i| ((i as f32) * 0.011).cos() * 0.4)
+        .collect();
+    let act_buf = fix.host_buffer_f32(&acts, "act_l_tile");
+
+    let q8_blocks_x4 = ((n * k + 127) / 128) as usize;
+    let q8_buf = {
+        let device = fix.dev.device.clone();
+        let allocator = fix.allocator.as_mut().unwrap();
+        let buf = GpuBuffer::new(
+            &device, allocator, (q8_blocks_x4 * 144) as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::GpuOnly, "q8_l_tile",
+        ).expect("alloc q8");
+        fix.track(buf)
+    };
+    let q8_pc = Q8_1QuantizePushConstants { ne: n * k, num_blocks: q8_blocks_x4 as u32 };
+    fix.dispatch(
+        ShaderId::QuantizeQ8_1, &[act_buf, q8_buf],
+        bytemuck::bytes_of(&q8_pc),
+        (q8_blocks_x4 as u32, 1, 1),
+    );
+
+    let out_buf = fix.output_buffer_f32((m * n) as usize, "out_l_tile");
+    let pc = MmqPushConstants {
+        m, n, k,
+        stride_a: k,
+        stride_b: k,
+        stride_d: m,
+        batch_stride_a: m * k,
+        batch_stride_b: n * k,
+        batch_stride_d: m * n,
+        base_work_group_z: 0,
+        num_batches: 1,
+        k_split: k,
+        ne02: 1, ne12: 1,
+        broadcast2: 1, broadcast3: 1,
+    };
+    // groups = (ceil(M/BM_L), ceil(N/BN_L), 1) = (1, 1, 1) at exactly 128x128.
+    fix.dispatch(
+        ShaderId::MulMmqQ4KL, &[w_buf, q8_buf, out_buf],
+        bytemuck::bytes_of(&pc),
+        (1, 1, 1),
+    );
+
+    let gpu = fix.read_output(out_buf, (m * n) as usize);
+    let cpu = cpu_gemm_q4k_ref(&weights, &acts, m as usize, n as usize, k as usize);
+
+    assert!(gpu.iter().all(|x| x.is_finite()), "mul_mmq L-tile produced NaN/Inf");
+
+    let max_err = max_abs_err(&gpu, &cpu);
+    let max_amax = cpu.iter().cloned().fold(0.0f32, |acc, v| acc.max(v.abs()));
+    let thresh = (max_amax * 0.05).max(0.5);
+    assert!(
+        max_err < thresh,
+        "mul_mmq L-tile 128x128 vs CPU max_err = {max_err:e} >= {thresh:e}"
+    );
+    fix.teardown();
+}
+
+/// Sprint 11C — L-tile parity at the *production-Qwen3 prefill shape*
+/// `(M=512, K=4096, N=512)` for the Q-projection at pp=512. Catches
+/// drift between the warp-tile recurrence at small (full-tile) and
+/// large (multi-WG) dispatch shapes — a single buggy warp would only
+/// show up in one column out of 64 here. Reuses the existing CPU
+/// reference for cross-shape parity. Threshold is the same Q8_1
+/// round-off cap (`5 % * |amax|`).
+#[test]
+fn test_gemm_q4k_l_tile_qwen3_qproj_parity() {
+    use vulkanforge::backend::vulkan::q4k;
+
+    let mut fix = Fixture::new();
+    let m: u32 = 512;
+    let n: u32 = 512;
+    let k: u32 = 4 * q4k::QUANT_K as u32; // 1024 — fits the test budget while still > 1 BK_STEP
+
+    let weights = q4k::build_random_weights(m as usize, k as usize, 0xC0DEFEED);
+    let w_buf = {
+        let device = fix.dev.device.clone();
+        let allocator = fix.allocator.as_mut().unwrap();
+        let mut b = GpuBuffer::new(
+            &device, allocator, weights.len() as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "w_qproj",
+        ).expect("alloc weights");
+        b.write_bytes(&weights).expect("write weights");
+        fix.track(b)
+    };
+
+    let acts: Vec<f32> = (0..(n * k))
+        .map(|i| (((i as f32) * 0.0073).sin() + ((i as f32) * 0.013).cos()) * 0.25)
+        .collect();
+    let act_buf = fix.host_buffer_f32(&acts, "act_qproj");
+
+    let q8_blocks_x4 = ((n * k + 127) / 128) as usize;
+    let q8_buf = {
+        let device = fix.dev.device.clone();
+        let allocator = fix.allocator.as_mut().unwrap();
+        let buf = GpuBuffer::new(
+            &device, allocator, (q8_blocks_x4 * 144) as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::GpuOnly, "q8_qproj",
+        ).expect("alloc q8");
+        fix.track(buf)
+    };
+    let q8_pc = Q8_1QuantizePushConstants { ne: n * k, num_blocks: q8_blocks_x4 as u32 };
+    fix.dispatch(
+        ShaderId::QuantizeQ8_1, &[act_buf, q8_buf],
+        bytemuck::bytes_of(&q8_pc),
+        (q8_blocks_x4 as u32, 1, 1),
+    );
+
+    let out_buf = fix.output_buffer_f32((m * n) as usize, "out_qproj");
+    let pc = MmqPushConstants {
+        m, n, k,
+        stride_a: k,
+        stride_b: k,
+        stride_d: m,
+        batch_stride_a: m * k,
+        batch_stride_b: n * k,
+        batch_stride_d: m * n,
+        base_work_group_z: 0,
+        num_batches: 1,
+        k_split: k,
+        ne02: 1, ne12: 1,
+        broadcast2: 1, broadcast3: 1,
+    };
+    // BM=BN=128 → groups = (4, 4, 1) — 16 WGs total at this shape.
+    fix.dispatch(
+        ShaderId::MulMmqQ4KL, &[w_buf, q8_buf, out_buf],
+        bytemuck::bytes_of(&pc),
+        ((m + 127) / 128, (n + 127) / 128, 1),
+    );
+
+    let gpu = fix.read_output(out_buf, (m * n) as usize);
+    let cpu = cpu_gemm_q4k_ref(&weights, &acts, m as usize, n as usize, k as usize);
+
+    assert!(gpu.iter().all(|x| x.is_finite()), "mul_mmq L-tile Qproj produced NaN/Inf");
+
+    let max_err = max_abs_err(&gpu, &cpu);
+    let max_amax = cpu.iter().cloned().fold(0.0f32, |acc, v| acc.max(v.abs()));
+    let thresh = (max_amax * 0.05).max(0.5);
+    assert!(
+        max_err < thresh,
+        "mul_mmq L-tile Qproj 512x512x{k} max_err = {max_err:e} >= {thresh:e}"
+    );
+    fix.teardown();
+}
+
 // -----------------------------------------------------------------
 // Phase-3A tiled attention regression — seq_len=64 (one wavefront)
 // and seq_len=200 (≈ Phase 2 baseline pos=200) compared against a

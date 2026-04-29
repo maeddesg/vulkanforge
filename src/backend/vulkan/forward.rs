@@ -2649,9 +2649,16 @@ impl Forward {
             broadcast2: 1,
             broadcast3: 1,
         };
-        // BM = BN = 64 (matches the spec-constants pinned in PipelineRegistry).
-        let groups_x = (m + 63) / 64;
-        let groups_y = (n + 63) / 64;
+        // BM/BN come from the pipeline's spec-constants. S-tile
+        // (MulMm*Q{4,6}K, MulMmqQ{4,6}K) → 64×64. L-tile
+        // (MulMmqQ{4,6}KL) → 128×128. Matches the
+        // pipeline_registry.rs spec-constant block.
+        let (bm, bn): (u32, u32) = match shader_id {
+            ShaderId::MulMmqQ4KL | ShaderId::MulMmqQ6KL => (128, 128),
+            _ => (64, 64),
+        };
+        let groups_x = (m + bm - 1) / bm;
+        let groups_y = (n + bn - 1) / bn;
         let layout = kernel.pipeline_layout;
         let pipeline = kernel.pipeline;
         self.profile(label, dev, cmd, |dev, cmd| unsafe {
@@ -3040,9 +3047,9 @@ impl Forward {
         let wq = layer_weight(model, layer, "attn_q.weight");
         let wk = layer_weight(model, layer, "attn_k.weight");
         let wv = layer_weight(model, layer, "attn_v.weight");
-        let sq = layer_weight_shader_gemm(model, layer, "attn_q.weight", gemm_kind);
-        let sk = layer_weight_shader_gemm(model, layer, "attn_k.weight", gemm_kind);
-        let sv = layer_weight_shader_gemm(model, layer, "attn_v.weight", gemm_kind);
+        let sq = layer_weight_shader_gemm(model, layer, "attn_q.weight", gemm_kind, q_dim, seq_len);
+        let sk = layer_weight_shader_gemm(model, layer, "attn_k.weight", gemm_kind, kv_dim, seq_len);
+        let sv = layer_weight_shader_gemm(model, layer, "attn_v.weight", gemm_kind, kv_dim, seq_len);
         // Sprint 3A: gemm_q can opt into the Q4_K coopmat fusion.
         // Coopmat reads activations from `batch_norm` (FP32) regardless
         // of the mul_mm/mul_mmq route the rest of the layer takes, so
@@ -3431,7 +3438,7 @@ impl Forward {
                 compute_barrier(dev, cmd);
                 self.batch_q8.handle
             };
-            let so = layer_weight_shader_gemm(model, layer, "attn_output.weight", gemm_kind);
+            let so = layer_weight_shader_gemm(model, layer, "attn_output.weight", gemm_kind, hidden, seq_len);
             self.run_gemm(
                 dev, registry, cmd, so, wo,
                 gemm_input_o, self.batch_o.handle,
@@ -3502,8 +3509,8 @@ impl Forward {
                 ffn, n_padded, hidden, gu_bm, gu_bn, "gemm_up_coopmat",
             );
         } else {
-            let sg = layer_weight_shader_gemm(model, layer, "ffn_gate.weight", gemm_kind);
-            let su = layer_weight_shader_gemm(model, layer, "ffn_up.weight", gemm_kind);
+            let sg = layer_weight_shader_gemm(model, layer, "ffn_gate.weight", gemm_kind, ffn, seq_len);
+            let su = layer_weight_shader_gemm(model, layer, "ffn_up.weight", gemm_kind, ffn, seq_len);
             self.run_gemm(
                 dev, registry, cmd, sg, wg,
                 gemm_input_ffn, self.batch_gate.handle,
@@ -3546,7 +3553,7 @@ impl Forward {
             self.batch_q8.handle
         };
         let wd = layer_weight(model, layer, "ffn_down.weight");
-        let sd = layer_weight_shader_gemm(model, layer, "ffn_down.weight", gemm_kind);
+        let sd = layer_weight_shader_gemm(model, layer, "ffn_down.weight", gemm_kind, hidden, seq_len);
         self.run_gemm(
             dev, registry, cmd, sd, wd,
             gemm_input_down, self.batch_ffn_out.handle,
@@ -3591,11 +3598,32 @@ impl Forward {
 /// (FP32 activations, vec4 B-loads — only safe when shader N is
 /// divisible by 4). Mixed-quant in Qwen3 (`attn_v` + `ffn_down`
 /// are Q6_K, the rest Q4_K) goes through both Q4_K and Q6_K paths.
+///
+/// Sprint 11C — when `gemm_kind == Mmq` and the dispatch shape would
+/// fill the GPU at L-tile granularity, the L-tile pipeline (BM=BN=128)
+/// is preferred over the default S-tile (BM=BN=64).
+///
+/// Empirical RDNA4 (RX 9070 XT, 64 CUs):
+///   pp=128 (n=128, groups_y=1)  L-tile starved →  −27 % vs S
+///   pp=256 (n=256, groups_y=2)  L-tile marginal →  −4 % vs S
+///   pp=512 (n=512, groups_y=4)  L-tile fills    →  +4 %
+///   pp≥1024                     L-tile dominates →  +4–5 %
+///
+/// Threshold pragmatically pinned at `m > 128 && n > 256`: L-tile
+/// only when the dispatch produces ≥64 workgroups, matching the CU
+/// count. At smaller shapes the S-tile keeps its dispatch density
+/// advantage. (llama.cpp picks at `m<=64 || n<=64`; we're stricter
+/// because we don't ship an M-tile fallback yet — Sprint 11D may add
+/// one.)
+///
+/// `VULKANFORGE_DISABLE_L_TILE=1` forces every dispatch back to S.
 fn layer_weight_shader_gemm(
     model: &LoadedModel,
     layer: u32,
     suffix: &str,
     gemm_kind: GemmKind,
+    m: u32,
+    n: u32,
 ) -> ShaderId {
     let key = format!("blk.{layer}.{suffix}");
     let q6 = model
@@ -3603,13 +3631,16 @@ fn layer_weight_shader_gemm(
         .unwrap_or_else(|| panic!("missing tensor '{key}'"))
         .ggml_type
         == GgmlType::Q6K;
+    let prefer_l = m > 128 && n > 256
+        && std::env::var("VULKANFORGE_DISABLE_L_TILE")
+            .map(|s| s != "1").unwrap_or(true);
     match (gemm_kind, q6) {
         (GemmKind::MulMmAligned, true)  => ShaderId::MulMmQ6KAligned,
         (GemmKind::MulMmAligned, false) => ShaderId::MulMmQ4KAligned,
         (GemmKind::MulMm,        true)  => ShaderId::MulMmQ6K,
         (GemmKind::MulMm,        false) => ShaderId::MulMmQ4K,
-        (GemmKind::Mmq,          true)  => ShaderId::MulMmqQ6K,
-        (GemmKind::Mmq,          false) => ShaderId::MulMmqQ4K,
+        (GemmKind::Mmq,          true)  => if prefer_l { ShaderId::MulMmqQ6KL } else { ShaderId::MulMmqQ6K },
+        (GemmKind::Mmq,          false) => if prefer_l { ShaderId::MulMmqQ4KL } else { ShaderId::MulMmqQ4K },
     }
 }
 

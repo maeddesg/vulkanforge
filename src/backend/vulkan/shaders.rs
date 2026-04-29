@@ -77,6 +77,12 @@ pub enum ShaderId {
     // dispatch wiring lands in Phase 3D).
     MulMmqQ4K,
     MulMmqQ6K,
+    // Sprint 11C — large-tile (BM=128 BN=128) mul_mmq variants for
+    // prefill at m>64 && n>64. Same SPV as MulMmqQ{4,6}K, only the
+    // spec-constants differ (warptile values from llama.cpp's
+    // l_warptile_mmq_int_k AMD-coopmat-override at gfx1201).
+    MulMmqQ4KL,
+    MulMmqQ6KL,
     QuantizeQ8_1,
     // Phase 4B — online-softmax decode attention; drop-in for ScalarAttn.
     FlashAttn,
@@ -162,8 +168,8 @@ impl ShaderId {
             ShaderId::SoftMax => "soft_max_f32",
             ShaderId::Copy => "copy_f32_f32",
             ShaderId::ScalarAttn => "scalar_attn_f32",
-            ShaderId::MulMmqQ4K => "mul_mmq_q4_k_f32",
-            ShaderId::MulMmqQ6K => "mul_mmq_q6_k_f32",
+            ShaderId::MulMmqQ4K | ShaderId::MulMmqQ4KL => "mul_mmq_q4_k_f32",
+            ShaderId::MulMmqQ6K | ShaderId::MulMmqQ6KL => "mul_mmq_q6_k_f32",
             ShaderId::QuantizeQ8_1 => "quantize_q8_1_f32",
             ShaderId::FlashAttn => "flash_attn_f32",
             ShaderId::FlashAttnSplit => "flash_attn_split_f32",
@@ -211,8 +217,8 @@ impl ShaderId {
             ShaderId::SoftMax => SOFT_MAX_F32,
             ShaderId::Copy => COPY_F32_F32,
             ShaderId::ScalarAttn => SCALAR_ATTN_F32,
-            ShaderId::MulMmqQ4K => MUL_MMQ_Q4_K_F32,
-            ShaderId::MulMmqQ6K => MUL_MMQ_Q6_K_F32,
+            ShaderId::MulMmqQ4K | ShaderId::MulMmqQ4KL => MUL_MMQ_Q4_K_F32,
+            ShaderId::MulMmqQ6K | ShaderId::MulMmqQ6KL => MUL_MMQ_Q6_K_F32,
             ShaderId::QuantizeQ8_1 => QUANTIZE_Q8_1_F32,
             ShaderId::FlashAttn => FLASH_ATTN_F32,
             ShaderId::FlashAttnSplit => FLASH_ATTN_SPLIT_F32,
@@ -262,6 +268,8 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::ScalarAttn,
     ShaderId::MulMmqQ4K,
     ShaderId::MulMmqQ6K,
+    ShaderId::MulMmqQ4KL,
+    ShaderId::MulMmqQ6KL,
     ShaderId::QuantizeQ8_1,
     ShaderId::FlashAttn,
     ShaderId::FlashAttnSplit,
