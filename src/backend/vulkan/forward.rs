@@ -233,8 +233,13 @@ pub struct Forward {
     /// `run_flash_attn_tiled`'s shader selector replaces the scalar
     /// FlashAttnTiledBr16Bc32 SPV with FlashAttnCoopmat (QK via
     /// VK_KHR_cooperative_matrix WMMA, softmax + PV stay scalar).
-    /// Default OFF; opt-in via `VULKANFORGE_COOPMAT_ATTN=1`. Forces
-    /// Br=16/Bc=16 (the only shape the coopmat SPV ships).
+    /// Forces Br=16/Bc=16 (the only shape the coopmat SPV ships).
+    ///
+    /// v0.2 Sprint 10E — flipped to default ON. Opt-out:
+    /// `VULKANFORGE_COOPMAT_ATTN=0` for the original scalar
+    /// flash_attn_tiled path (Sprint 7.6/8a default). Pairs with the
+    /// FP16 KV default (Sprint 9d.3): when both are ON, the selector
+    /// picks `FlashAttnCoopmatFp16Kv`.
     coopmat_attn_enabled: bool,
 
     /// `forward_token` hot path. When `cache_enabled` is true (env
@@ -545,14 +550,21 @@ impl Forward {
             _ => false,
         };
 
-        // v0.2 Sprint 10C — opt-in coopmat flash-attention v1
-        // (QK coopmat, softmax + PV scalar). Forces fa_tiled_br=16 +
-        // fa_tiled_bc=16 because that's the only shape the coopmat
-        // SPV ships. Default OFF until Sprint 10D PV-coopmat lands
-        // and a clean perf bench is collected without Citrix.
+        // v0.2 Sprint 10C — coopmat flash-attention v1 (QK coopmat,
+        // softmax + PV scalar). Forces fa_tiled_br=16 + fa_tiled_bc=16
+        // because that's the only shape the coopmat SPV ships.
+        //
+        // v0.2 Sprint 10E — flipped to **default ON** after the
+        // QK-only coopmat path showed a +7-86% pp-sweep win across
+        // pp ∈ [128, 2048] under COOPMAT_ATTN=1 (Sprint 10C bench).
+        // Sprint 10D's PV-coopmat extension was reverted as a
+        // negative result; the production path stays at QK-only
+        // coopmat which we now flip default. Opt-out: set
+        // VULKANFORGE_COOPMAT_ATTN=0 for the original scalar
+        // flash_attn_tiled path.
         let coopmat_attn_enabled = match std::env::var("VULKANFORGE_COOPMAT_ATTN") {
-            Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
-            _ => false,
+            Ok(s) if s == "0" => false, // explicit opt-out
+            _ => true,                  // default ON
         };
 
         // Note for tests: callers that need to override the env-var
