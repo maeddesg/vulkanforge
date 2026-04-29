@@ -54,6 +54,13 @@ pub enum ShaderId {
     /// (multi-WG split-K decode worker, seq_len > 64). Same source
     /// SPV, `FP16_KV=1` build define.
     FlashAttnSplitFp16Kv,
+    /// v0.2 Sprint 10B — scalar QK micro-benchmark. Computes Score =
+    /// Q × K^T over Br=Bc=16, head_dim=128 in plain FP32 FMA. Used
+    /// by examples/bench_qk to size up the coopmat win.
+    BenchQkScalar,
+    /// v0.2 Sprint 10B — coopmat QK micro-benchmark. Same shape,
+    /// 16×16×16 FP16→FP32 WMMA fragments via VK_KHR_cooperative_matrix.
+    BenchQkCoopmat,
     SoftMax,
     Copy,
     ScalarAttn,
@@ -139,6 +146,8 @@ impl ShaderId {
             ShaderId::FlashAttnBatchFp16Kv => "flash_attn_batch_fp16kv",
             ShaderId::FlashAttnFp16Kv => "flash_attn_fp16kv",
             ShaderId::FlashAttnSplitFp16Kv => "flash_attn_split_fp16kv",
+            ShaderId::BenchQkScalar => "bench_qk_scalar",
+            ShaderId::BenchQkCoopmat => "bench_qk_coopmat",
             ShaderId::SoftMax => "soft_max_f32",
             ShaderId::Copy => "copy_f32_f32",
             ShaderId::ScalarAttn => "scalar_attn_f32",
@@ -184,6 +193,8 @@ impl ShaderId {
             ShaderId::FlashAttnBatchFp16Kv => FLASH_ATTN_BATCH_FP16KV,
             ShaderId::FlashAttnFp16Kv => FLASH_ATTN_FP16KV,
             ShaderId::FlashAttnSplitFp16Kv => FLASH_ATTN_SPLIT_FP16KV,
+            ShaderId::BenchQkScalar => BENCH_QK_SCALAR,
+            ShaderId::BenchQkCoopmat => BENCH_QK_COOPMAT,
             ShaderId::SoftMax => SOFT_MAX_F32,
             ShaderId::Copy => COPY_F32_F32,
             ShaderId::ScalarAttn => SCALAR_ATTN_F32,
@@ -229,6 +240,8 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::FlashAttnBatchFp16Kv,
     ShaderId::FlashAttnFp16Kv,
     ShaderId::FlashAttnSplitFp16Kv,
+    ShaderId::BenchQkScalar,
+    ShaderId::BenchQkCoopmat,
     ShaderId::SoftMax,
     ShaderId::Copy,
     ShaderId::ScalarAttn,
@@ -280,6 +293,10 @@ pub const FLASH_ATTN_FP16KV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_fp16kv.spv"));
 pub const FLASH_ATTN_SPLIT_FP16KV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_split_fp16kv.spv"));
+pub const BENCH_QK_SCALAR: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/bench_qk_scalar.spv"));
+pub const BENCH_QK_COOPMAT: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/bench_qk_coopmat.spv"));
 pub const SOFT_MAX_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/soft_max_f32.spv"));
 pub const COPY_F32_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/copy_f32_f32.spv"));
 pub const SCALAR_ATTN_F32: &[u8] =

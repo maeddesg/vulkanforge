@@ -107,6 +107,18 @@ pub struct MultiAddRmsPushConstants {
 }
 const _: () = assert!(std::mem::size_of::<MultiAddRmsPushConstants>() == 12);
 
+/// v0.2 Sprint 10B — push block for the QK micro-benchmark shaders
+/// (scalar + coopmat). 4 × u32 = 16 B.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BenchQkPushConstants {
+    pub br: u32,
+    pub bc: u32,
+    pub head_dim: u32,
+    pub n_tiles: u32,
+}
+const _: () = assert!(std::mem::size_of::<BenchQkPushConstants>() == 16);
+
 /// v0.2 Sprint 9d.2 — push block for `kv_copy_fp16.comp`. 3 × u32 = 12 B.
 /// `n_elements` is the FP32 element count to convert; `dst_uint_offset`
 /// and `src_float_offset` give the start positions within the bound

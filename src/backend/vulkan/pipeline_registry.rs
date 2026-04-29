@@ -343,7 +343,9 @@ impl PipelineRegistry {
                 | ShaderId::FlashAttnTiledBr16Bc32Fp16Kv
                 | ShaderId::FlashAttnBatchFp16Kv
                 | ShaderId::FlashAttnSplitFp16Kv
-                | ShaderId::KvCopyFp16 => {
+                | ShaderId::KvCopyFp16
+                | ShaderId::BenchQkScalar
+                | ShaderId::BenchQkCoopmat => {
                     // No spec constants — BR/BC/HEAD_DIM/FP16_KV are
                     // baked in via -DBR=N -DBC=N (-DFP16_KV=1) at
                     // SPIR-V build time. KvCopyFp16 has no spec

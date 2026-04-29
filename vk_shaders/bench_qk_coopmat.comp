@@ -1,0 +1,96 @@
+#version 460
+
+// v0.2 Sprint 10B — coopmat QK micro-benchmark.
+//
+// Computes Score[Br, Bc] = Q[Br, head_dim] · K^T[head_dim, Bc] using
+// VK_KHR_cooperative_matrix WMMA (16×16×16 FP16→FP32 fragments).
+// Same shape and bench-loop structure as bench_qk_scalar.comp so a
+// direct µs/TFLOPS comparison answers the GO/NO-GO question for
+// Sprint 10C+.
+//
+// Pattern follows bench_coopmat_pure.comp (Phase-6A, BF16) but
+// adapted to FP16 to match Sprint 9d.2's KV-cache path. Q and K are
+// loaded as FP32 from global, converted to FP16 in LDS, then read
+// into coopmat A/B fragments via coopMatLoad. K^T is obtained
+// implicitly via gl_CooperativeMatrixLayoutColumnMajor on the K
+// buffer (RowMajor [Bc, head_dim] read with ColMajor + stride=head_dim
+// is exactly K^T).
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 64) in;
+
+layout(set=0, binding=0) readonly buffer BufQ { float data_q[]; };
+layout(set=0, binding=1) readonly buffer BufK { float data_k[]; };
+layout(set=0, binding=2)          buffer BufS { float data_s[]; };
+
+layout(push_constant) uniform PC {
+    uint Br;        // 16 (== TILE_BR)
+    uint Bc;        // 16 (== TILE_BC)
+    uint head_dim;  // 128
+    uint n_tiles;   // bench iteration count
+} pc;
+
+const uint TILE_BR = 16;
+const uint TILE_BC = 16;
+const uint TILE_K  = 16;
+const uint HEAD_DIM = 128;
+
+// LDS staging in FP16 — coopmat A/B fragments are float16_t. Total
+// 8 KB (Br=16, head_dim=128) + 8 KB (Bc=16, head_dim=128) = 16 KB.
+// (Actually 4 KB + 4 KB = 8 KB because float16_t is 2 B.)
+shared float16_t q_lds[TILE_BR * HEAD_DIM];
+shared float16_t k_lds[TILE_BC * HEAD_DIM];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+    // Cooperative load + FP32→FP16 convert.
+    for (uint i = tid; i < TILE_BR * HEAD_DIM; i += 64) {
+        q_lds[i] = float16_t(data_q[i]);
+    }
+    for (uint i = tid; i < TILE_BC * HEAD_DIM; i += 64) {
+        k_lds[i] = float16_t(data_k[i]);
+    }
+    barrier();
+
+    // Per-WG accumulator across all bench iterations — keeps every
+    // rep's compute alive (else the compiler may elide).
+    coopmat<float, gl_ScopeSubgroup, TILE_BR, TILE_BC, gl_MatrixUseAccumulator> total =
+        coopmat<float, gl_ScopeSubgroup, TILE_BR, TILE_BC, gl_MatrixUseAccumulator>(0.0);
+
+    for (uint rep = 0; rep < pc.n_tiles; ++rep) {
+        coopmat<float, gl_ScopeSubgroup, TILE_BR, TILE_BC, gl_MatrixUseAccumulator> C_frag =
+            coopmat<float, gl_ScopeSubgroup, TILE_BR, TILE_BC, gl_MatrixUseAccumulator>(0.0);
+
+        // K-walk: head_dim/16 = 8 coopMatMulAdd steps.
+        for (uint d = 0; d < HEAD_DIM; d += TILE_K) {
+            coopmat<float16_t, gl_ScopeSubgroup, TILE_BR, TILE_K, gl_MatrixUseA> A_frag;
+            coopmat<float16_t, gl_ScopeSubgroup, TILE_K, TILE_BC, gl_MatrixUseB> B_frag;
+
+            // A = Q[0..Br, d..d+16] from q_lds (stride = HEAD_DIM, RowMajor).
+            coopMatLoad(A_frag, q_lds, d, HEAD_DIM, gl_CooperativeMatrixLayoutRowMajor);
+
+            // B = K^T[d..d+16, 0..Bc]. K is stored as [Bc, head_dim]
+            // RowMajor, so reading it with ColumnMajor + stride=head_dim
+            // gives us the transposed view starting at column d.
+            // ColumnMajor: B[m, n] = mem[base + n * stride + m]
+            //            = k[base + n * head_dim + m]
+            //            = k[n][base + m]
+            //            = K^T[base + m, n]   ✓ with base=d.
+            coopMatLoad(B_frag, k_lds, d, HEAD_DIM, gl_CooperativeMatrixLayoutColumnMajor);
+
+            C_frag = coopMatMulAdd(A_frag, B_frag, C_frag);
+        }
+
+        // Component-wise accumulate. KHR_coopmat supports + on
+        // accumulator fragments of equal shape/scope.
+        total += C_frag;
+    }
+
+    // Write the accumulated score back. data_s must be at least
+    // Br*Bc = 256 elements.
+    coopMatStore(total, data_s, 0, TILE_BC, gl_CooperativeMatrixLayoutRowMajor);
+}

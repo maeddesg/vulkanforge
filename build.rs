@@ -281,6 +281,20 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "bench_coopmat_pure.comp",
         defines: &[],
     },
+    // v0.2 Sprint 10B — isolated QK micro-benchmarks for coopmat
+    // GO/NO-GO gate. Both shaders compute Score = Q × K^T over the
+    // same Br=Bc=16, head_dim=128 shape; only the inner FMA path
+    // differs. Used by examples/bench_qk.
+    ShaderJob {
+        out_name: "bench_qk_scalar.spv",
+        entry_source: "bench_qk_scalar.comp",
+        defines: &[],
+    },
+    ShaderJob {
+        out_name: "bench_qk_coopmat.spv",
+        entry_source: "bench_qk_coopmat.comp",
+        defines: &[],
+    },
     // v0.2 smoke-test FP8 throughput bench (E4M3 × E4M3 → FP32).
     // Twin of bench_coopmat_pure for the FP8 path. Used by
     // examples/bench_coopmat when VF_BENCH_FP8=1.
