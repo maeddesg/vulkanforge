@@ -1807,10 +1807,9 @@ impl Forward {
         // flash_attn shader instead of the Phase-3A tiled scalar_attn.
         let kernel = registry.get(ShaderId::FlashAttn);
         let layer_off = self.kv_cache.layer_offset_bytes(layer);
-        let layer_size = (self.kv_cache.config.max_seq_len as u64)
-            * (cfg.n_kv_heads as u64)
-            * (cfg.head_dim as u64)
-            * 4;
+        // v0.2 Sprint 9d.1 — KvCache::layer_size_bytes scales by
+        // the configured KV element size (FP32 = 4 B by default).
+        let layer_size = self.kv_cache.layer_size_bytes();
         let set = self.alloc_or_get_set(
             dev, kernel.descriptor_set_layout,
             &[
@@ -1962,10 +1961,9 @@ impl Forward {
         let cfg = self.config.clone();
         let kernel = registry.get(ShaderId::FlashAttnBatch);
         let layer_off = self.kv_cache.layer_offset_bytes(layer);
-        let layer_size = (self.kv_cache.config.max_seq_len as u64)
-            * (cfg.n_kv_heads as u64)
-            * (cfg.head_dim as u64)
-            * 4;
+        // v0.2 Sprint 9d.1 — KvCache::layer_size_bytes scales by
+        // the configured KV element size (FP32 = 4 B by default).
+        let layer_size = self.kv_cache.layer_size_bytes();
         let q_bytes_total = (m as u64) * (cfg.n_heads as u64) * (cfg.head_dim as u64) * 4;
         let set = self.alloc_or_get_set(
             dev,
@@ -2028,10 +2026,9 @@ impl Forward {
         let cfg = self.config.clone();
         let kernel = registry.get(shader_id);
         let layer_off = self.kv_cache.layer_offset_bytes(layer);
-        let layer_size = (self.kv_cache.config.max_seq_len as u64)
-            * (cfg.n_kv_heads as u64)
-            * (cfg.head_dim as u64)
-            * 4;
+        // v0.2 Sprint 9d.1 — KvCache::layer_size_bytes scales by
+        // the configured KV element size (FP32 = 4 B by default).
+        let layer_size = self.kv_cache.layer_size_bytes();
         let q_bytes_total = (m as u64) * (cfg.n_heads as u64) * (cfg.head_dim as u64) * 4;
         let set = self.alloc_or_get_set(
             dev,
@@ -2085,10 +2082,9 @@ impl Forward {
     ) {
         let cfg = self.config.clone();
         let layer_off = self.kv_cache.layer_offset_bytes(layer);
-        let layer_size = (self.kv_cache.config.max_seq_len as u64)
-            * (cfg.n_kv_heads as u64)
-            * (cfg.head_dim as u64)
-            * 4;
+        // v0.2 Sprint 9d.1 — KvCache::layer_size_bytes scales by
+        // the configured KV element size (FP32 = 4 B by default).
+        let layer_size = self.kv_cache.layer_size_bytes();
 
         // ---- Split-K worker ----
         let split_kernel = registry.get(ShaderId::FlashAttnSplit);

@@ -27,6 +27,51 @@ use gpu_allocator::vulkan::Allocator;
 
 use super::buffers::GpuBuffer;
 
+/// v0.2 Sprint 9d.1 — KV-cache element type. Selected at allocation
+/// time and immutable afterwards.
+///
+/// `F32` is the default and matches the current shader pipeline
+/// (every attention shader and every KV-write `vkCmdCopyBuffer`
+/// reads/writes plain `float`). `F16` halves the cache footprint
+/// (4 B → 2 B per element) but is **not yet functional**: Sprint
+/// 9d.1 only wires up the buffer-sizing math; the FP32 → FP16
+/// conversion compute shader and FP16-aware attention SPVs land in
+/// Sprint 9d.2 / 9d.3. Allocating `F16` today + reading it with
+/// the existing FP32 shaders produces garbage, so the env-var that
+/// selects it is opt-in and `KvCache::new` emits a loud warning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvDtype {
+    F32,
+    F16,
+}
+
+impl KvDtype {
+    pub fn element_size(self) -> u64 {
+        match self {
+            KvDtype::F32 => 4,
+            KvDtype::F16 => 2,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            KvDtype::F32 => "FP32",
+            KvDtype::F16 => "FP16",
+        }
+    }
+}
+
+/// Read `VULKANFORGE_FP16_KV` and return the resulting dtype.
+/// Default (env unset or any value other than "1") is `F32` — Sprint
+/// 9d.1 stays behavior-neutral. The opt-in is loud-only-on-construct
+/// (see [`KvCache::new`]).
+fn kv_dtype_from_env() -> KvDtype {
+    match std::env::var("VULKANFORGE_FP16_KV") {
+        Ok(s) if s == "1" => KvDtype::F16,
+        _ => KvDtype::F32,
+    }
+}
+
 pub struct KvCacheConfig {
     pub n_layers: u32,
     pub n_kv_heads: u32,
@@ -39,6 +84,9 @@ pub struct KvCache {
     pub v_buffer: GpuBuffer,
     pub config: KvCacheConfig,
     pub current_seq_len: u32,
+    /// v0.2 Sprint 9d.1 — element type chosen at allocation time.
+    /// Defaults to `F32`; `VULKANFORGE_FP16_KV=1` flips to `F16`.
+    pub kv_dtype: KvDtype,
 }
 
 impl KvCache {
@@ -47,11 +95,41 @@ impl KvCache {
         allocator: &mut Allocator,
         config: KvCacheConfig,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Sprint 9d.1 — runtime-selectable dtype (default F32).
+        let kv_dtype = kv_dtype_from_env();
+        let elem_size = kv_dtype.element_size();
         let bytes = (config.n_layers as u64)
             * (config.n_kv_heads as u64)
             * (config.max_seq_len as u64)
             * (config.head_dim as u64)
-            * (std::mem::size_of::<f32>() as u64);
+            * elem_size;
+
+        // Loud warning if FP16 is selected: the read/write side of
+        // the KV path is still FP32-only as of Sprint 9d.1, so the
+        // model output will be garbage. Don't ship inferences on a
+        // run that has this enabled.
+        if kv_dtype == KvDtype::F16 {
+            eprintln!(
+                "VulkanForge: WARNING — VULKANFORGE_FP16_KV=1 allocates the \
+                 KV cache as FP16 (Sprint 9d.1 infrastructure), but the \
+                 attention shaders and KV-write copies are still FP32. \
+                 Outputs WILL BE INCORRECT until Sprint 9d.2/9d.3 ship the \
+                 conversion shader and FP16-aware attention SPVs."
+            );
+        }
+
+        let mb_total = bytes * 2 / (1024 * 1024);
+        eprintln!(
+            "VulkanForge: KV cache {} ({}B/elem) × 2 buffers = {} MB \
+             ({} layers × {} kv_heads × {} max_seq × {} head_dim)",
+            kv_dtype.label(),
+            elem_size,
+            mb_total,
+            config.n_layers,
+            config.n_kv_heads,
+            config.max_seq_len,
+            config.head_dim,
+        );
 
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
         let k_buffer = GpuBuffer::new(
@@ -75,6 +153,7 @@ impl KvCache {
             v_buffer,
             config,
             current_seq_len: 0,
+            kv_dtype,
         })
     }
 
@@ -99,7 +178,7 @@ impl KvCache {
     pub fn pos_offset_bytes(&self, layer: u32, pos: u32) -> u64 {
         let elems = self.layer_offset_elems(layer)
             + (pos as u64) * (self.config.n_kv_heads as u64) * (self.config.head_dim as u64);
-        elems * (std::mem::size_of::<f32>() as u64)
+        elems * self.kv_dtype.element_size()
     }
 
     /// Bytes per (kv_head × head_dim) — one token's full K-row /
@@ -107,14 +186,26 @@ impl KvCache {
     pub fn row_bytes(&self) -> u64 {
         (self.config.n_kv_heads as u64)
             * (self.config.head_dim as u64)
-            * (std::mem::size_of::<f32>() as u64)
+            * self.kv_dtype.element_size()
     }
 
     /// Byte offset for K[layer, pos=0, kv_head=0, dim=0] — pass to
     /// the attention shader so its `t * pos_stride` indexing is
     /// rooted at the right layer.
     pub fn layer_offset_bytes(&self, layer: u32) -> u64 {
-        self.layer_offset_elems(layer) * (std::mem::size_of::<f32>() as u64)
+        self.layer_offset_elems(layer) * self.kv_dtype.element_size()
+    }
+
+    /// Total bytes for one layer's K (or V) slice in the cache —
+    /// `max_seq_len × n_kv_heads × head_dim × element_size`. Used as
+    /// the `range` argument when binding the KV cache to attention
+    /// descriptors. Sprint 9d.1: replaces hardcoded `* 4`
+    /// computations at the call sites.
+    pub fn layer_size_bytes(&self) -> u64 {
+        (self.config.max_seq_len as u64)
+            * (self.config.n_kv_heads as u64)
+            * (self.config.head_dim as u64)
+            * self.kv_dtype.element_size()
     }
 
     pub fn reset(&mut self) {
@@ -124,5 +215,55 @@ impl KvCache {
     pub fn destroy(self, device: &ash::Device, allocator: &mut Allocator) {
         self.k_buffer.destroy(device, allocator);
         self.v_buffer.destroy(device, allocator);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kv_dtype_element_size() {
+        assert_eq!(KvDtype::F32.element_size(), 4);
+        assert_eq!(KvDtype::F16.element_size(), 2);
+    }
+
+    #[test]
+    fn kv_dtype_label() {
+        assert_eq!(KvDtype::F32.label(), "FP32");
+        assert_eq!(KvDtype::F16.label(), "FP16");
+    }
+
+    /// Sprint 9d.1 — verify the element-size scaling cascades through
+    /// the byte-offset accessors. This is a pure-arithmetic test (no
+    /// Vulkan device, no allocation) — it directly constructs a
+    /// `KvCache` value with synthetic GpuBuffer placeholders... well,
+    /// actually GpuBuffer carries vk handles so we can't fabricate
+    /// one. We test the offset math on `KvDtype` and the
+    /// configuration arithmetic instead.
+    #[test]
+    fn layer_size_scales_with_dtype() {
+        // Qwen3-8B realistic config.
+        let n_layers: u64 = 36;
+        let n_kv_heads: u64 = 8;
+        let head_dim: u64 = 128;
+        let max_seq: u64 = 2048;
+
+        let f32_layer_bytes =
+            max_seq * n_kv_heads * head_dim * KvDtype::F32.element_size();
+        let f16_layer_bytes =
+            max_seq * n_kv_heads * head_dim * KvDtype::F16.element_size();
+
+        // FP16 must be exactly half of FP32 for the same shape.
+        assert_eq!(f32_layer_bytes, 2 * f16_layer_bytes);
+
+        // FP32 total (K + V across all layers): 36 × 2 × 8 × 128 ×
+        // 2048 × 4 = 603 979 776 B = 576 MB.
+        let f32_total = 2 * f32_layer_bytes * n_layers;
+        assert_eq!(f32_total, 576 * 1024 * 1024);
+
+        // FP16: 288 MB.
+        let f16_total = 2 * f16_layer_bytes * n_layers;
+        assert_eq!(f16_total, 288 * 1024 * 1024);
     }
 }
