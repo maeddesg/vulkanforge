@@ -601,6 +601,15 @@ const JOBS: &[ShaderJob] = &[
     //
     // Compile probe — if this fails to compile the whole COOPMAT GEMM
     // path is unworkable on RDNA4 with our toolchain.
+    // Sprint 11F — Int8 coopmat runtime probe. 16x16x16 INT8×INT8→INT32
+    // smoke shader that A=B=ones; expect C[i][j]=16. Verifies that
+    // RDNA4's advertised "I8 × I8 → I32" coopmat config (entry 14 on
+    // gfx1201) is dispatchable through Vulkan/RADV.
+    ShaderJob {
+        out_name: "probe_int8_coopmat.spv",
+        entry_source: "probe_int8_coopmat.comp",
+        defines: &[],
+    },
     ShaderJob {
         out_name: "mul_mm_q4_k_f32_coopmat.spv",
         entry_source: "mul_mm.comp",

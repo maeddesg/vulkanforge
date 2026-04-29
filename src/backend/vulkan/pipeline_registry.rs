@@ -358,6 +358,11 @@ impl PipelineRegistry {
                     let bytes = bytemuck::bytes_of(&data);
                     ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
                 }
+                ShaderId::ProbeInt8Coopmat => {
+                    // Sprint 11F — pure runtime probe, no spec-constants.
+                    // local_size_x=64 hardcoded; layout = (3 SSBOs).
+                    ComputeKernel::from_spv(device, &words, cache)
+                }
                 ShaderId::MulMmQ4KCoopmat => {
                     // Sprint 11E — mul_mm.comp + COOPMAT, KHR coopmat
                     // 16x16x16 FP16xFP16->FP32 fragments. Spec-constants

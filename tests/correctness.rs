@@ -1969,6 +1969,71 @@ fn test_gemm_q4k_full_tile_64x64_mul_mmq() {
     fix.teardown();
 }
 
+/// Sprint 11F — Int8 coopmat runtime smoke. Dispatches the
+/// `probe_int8_coopmat` shader: A=B=ones (16x16 INT8 each), expects
+/// every cell of C (16x16 INT32) to equal 16. Verifies that the
+/// I8×I8→I32 KHR coopmat config (entry 14 advertised on RDNA4 gfx1201)
+/// is dispatchable through Vulkan/RADV, not just enumerable.
+#[test]
+fn test_int8_coopmat_runtime_smoke() {
+    let mut fix = Fixture::new();
+
+    let a_bytes: Vec<i8> = vec![1i8; 16 * 16];
+    let b_bytes: Vec<i8> = vec![1i8; 16 * 16];
+    let a_buf = {
+        let device = fix.dev.device.clone();
+        let allocator = fix.allocator.as_mut().unwrap();
+        let mut b = GpuBuffer::new(
+            &device, allocator, a_bytes.len() as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "a_int8_smoke",
+        ).expect("alloc a");
+        b.write_bytes(bytemuck::cast_slice(&a_bytes)).expect("write a");
+        fix.track(b)
+    };
+    let b_buf = {
+        let device = fix.dev.device.clone();
+        let allocator = fix.allocator.as_mut().unwrap();
+        let mut b = GpuBuffer::new(
+            &device, allocator, b_bytes.len() as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "b_int8_smoke",
+        ).expect("alloc b");
+        b.write_bytes(bytemuck::cast_slice(&b_bytes)).expect("write b");
+        fix.track(b)
+    };
+    let c_buf = {
+        let device = fix.dev.device.clone();
+        let allocator = fix.allocator.as_mut().unwrap();
+        let buf = GpuBuffer::new(
+            &device, allocator, (16 * 16 * 4) as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::GpuToCpu, "c_int32_smoke",
+        ).expect("alloc c");
+        fix.track(buf)
+    };
+
+    fix.dispatch(
+        ShaderId::ProbeInt8Coopmat, &[a_buf, b_buf, c_buf],
+        &[],
+        (1, 1, 1),
+    );
+
+    // Read back as f32 then reinterpret bytes as i32 (Fixture only
+    // exposes read_output as Vec<f32>; we just need the raw 4-byte
+    // cells since INT32 and FLOAT32 are both 4 bytes wide).
+    let raw_f32 = fix.read_output(c_buf, 16 * 16);
+    let c: Vec<i32> = raw_f32.iter().map(|f| f.to_bits() as i32).collect();
+    let expected = 16i32; // sum_k(1·1) over k=0..15
+
+    let mismatches: Vec<(usize, i32)> = c.iter().copied().enumerate()
+        .filter(|(_, v)| *v != expected)
+        .take(5)
+        .collect();
+    assert!(
+        mismatches.is_empty(),
+        "Int8 coopmat dispatch produced wrong output. Expected {expected}, got mismatches: {mismatches:?}"
+    );
+    fix.teardown();
+}
+
 /// Sprint 11E — COOPMAT mul_mm Q4_K parity at the L-tile shape.
 /// Dispatches `MulMmQ4KCoopmat` (BM=BN=128, KHR coopmat 16x16x16
 /// FP16xFP16->FP32) over the production-Qwen3 Q-projection shape
