@@ -229,6 +229,13 @@ pub struct Forward {
     /// values are 32, 64. Default 64 (matches Sprint 7.5 baseline
     /// until the Bc sweep proves Bc=32 is at least as good).
     fa_tiled_bc: u32,
+    /// v0.2 Sprint 10C — coopmat flash-attention v1. When set,
+    /// `run_flash_attn_tiled`'s shader selector replaces the scalar
+    /// FlashAttnTiledBr16Bc32 SPV with FlashAttnCoopmat (QK via
+    /// VK_KHR_cooperative_matrix WMMA, softmax + PV stay scalar).
+    /// Default OFF; opt-in via `VULKANFORGE_COOPMAT_ATTN=1`. Forces
+    /// Br=16/Bc=16 (the only shape the coopmat SPV ships).
+    coopmat_attn_enabled: bool,
 
     /// `forward_token` hot path. When `cache_enabled` is true (env
     /// `VULKANFORGE_CB_REUSE=1` at construction), `alloc_or_get_set`
@@ -538,6 +545,16 @@ impl Forward {
             _ => false,
         };
 
+        // v0.2 Sprint 10C — opt-in coopmat flash-attention v1
+        // (QK coopmat, softmax + PV scalar). Forces fa_tiled_br=16 +
+        // fa_tiled_bc=16 because that's the only shape the coopmat
+        // SPV ships. Default OFF until Sprint 10D PV-coopmat lands
+        // and a clean perf bench is collected without Citrix.
+        let coopmat_attn_enabled = match std::env::var("VULKANFORGE_COOPMAT_ATTN") {
+            Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
+            _ => false,
+        };
+
         // Note for tests: callers that need to override the env-var
         // pick can use `set_cache_enabled` / `set_batch_attn_enabled`
         // after construction.
@@ -564,6 +581,7 @@ impl Forward {
             fa_tiled_enabled,
             fa_tiled_br,
             fa_tiled_bc,
+            coopmat_attn_enabled,
             profiler,
             rope_theta_scale, attn_scale,
             fa_scratch_out, fa_scratch_max, fa_scratch_sum,
@@ -2057,12 +2075,22 @@ impl Forward {
         q_start: u32,
         n_kv: u32,
     ) {
-        // v0.2 Sprint 9d.2 — FP16 KV variant lives only for the
-        // (16, 32) shape today. The other Br/Bc combos always read
-        // FP32 KV; if the cache is FP16-allocated and the user
-        // selected a non-default Br/Bc, panic loudly — the SPV would
-        // misinterpret packed-FP16 data as FP32.
-        let (shader_id, br) = if self.kv_cache.is_fp16() {
+        // v0.2 Sprint 10C — coopmat shader takes priority when
+        // VULKANFORGE_COOPMAT_ATTN=1 is set. Forces Br=16 (the only
+        // shape the coopmat SPV ships); Bc=16 is implicit in the
+        // coopmat SPV's own #defines.
+        let (shader_id, br) = if self.coopmat_attn_enabled {
+            if self.kv_cache.is_fp16() {
+                (ShaderId::FlashAttnCoopmatFp16Kv, 16u32)
+            } else {
+                (ShaderId::FlashAttnCoopmat, 16u32)
+            }
+        } else if self.kv_cache.is_fp16() {
+            // v0.2 Sprint 9d.2 — FP16 KV variant lives only for the
+            // (16, 32) shape today. The other Br/Bc combos always read
+            // FP32 KV; if the cache is FP16-allocated and the user
+            // selected a non-default Br/Bc, panic loudly — the SPV would
+            // misinterpret packed-FP16 data as FP32.
             match (self.fa_tiled_br, self.fa_tiled_bc) {
                 (16, 32) => (ShaderId::FlashAttnTiledBr16Bc32Fp16Kv, 16u32),
                 _ => panic!(

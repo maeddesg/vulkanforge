@@ -295,6 +295,21 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "bench_qk_coopmat.comp",
         defines: &[],
     },
+    // v0.2 Sprint 10C — coopmat flash-attention v1 (QK coopmat,
+    // softmax + PV scalar). Drop-in replacement for
+    // flash_attn_tiled_br16_bc32 with the same bindings + push
+    // constants; runtime selects via VULKANFORGE_COOPMAT_ATTN.
+    // Two SPV variants: FP32 KV + FP16 KV (matches Sprint 9d.2/9d.3).
+    ShaderJob {
+        out_name: "flash_attn_coopmat.spv",
+        entry_source: "flash_attn_coopmat.comp",
+        defines: &[],
+    },
+    ShaderJob {
+        out_name: "flash_attn_coopmat_fp16kv.spv",
+        entry_source: "flash_attn_coopmat.comp",
+        defines: &[("FP16_KV", "1")],
+    },
     // v0.2 smoke-test FP8 throughput bench (E4M3 × E4M3 → FP32).
     // Twin of bench_coopmat_pure for the FP8 path. Used by
     // examples/bench_coopmat when VF_BENCH_FP8=1.
