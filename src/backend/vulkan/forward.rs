@@ -2624,9 +2624,31 @@ impl Forward {
                 );
             }
 
+            // Sprint 9b.2 — seed `batch_norm` for layer 0. Subsequent
+            // layers inherit `batch_norm` from the previous layer's
+            // end-of-layer cross-layer fusion (multi_add_rms with
+            // `next_attn_norm_weight = Some(...)`).
+            let w_attn_norm_0 = layer_weight(model, 0, "attn_norm.weight");
+            self.run_rms_norm(
+                dev, registry, cmd,
+                self.batch_residual.handle, w_attn_norm_0, self.batch_norm.handle,
+                hidden, seq_len, cfg.rms_norm_eps, "rms_norm_attn_b_seed",
+            );
+            compute_barrier(dev, cmd);
+
             for layer in 0..cfg.n_layers {
+                // Pass the *next* layer's attn_norm weight so the
+                // end-of-layer fusion can pre-populate batch_norm for
+                // the next iteration. None on the final layer falls
+                // back to a plain add_res2.
+                let next_w = if layer + 1 < cfg.n_layers {
+                    Some(layer_weight(model, layer + 1, "attn_norm.weight"))
+                } else {
+                    None
+                };
                 self.dispatch_layer_batch(
                     dev, registry, cmd, model, layer, seq_len, base_pos,
+                    next_w,
                 );
             }
 
@@ -2679,6 +2701,19 @@ impl Forward {
 
     /// One layer's worth of batched dispatches, recorded into `cmd`.
     /// Reads from `batch_residual`, writes back to `batch_residual`.
+    ///
+    /// Sprint 9b.2 — cross-layer fusion contract:
+    /// * `batch_norm` MUST already contain `rms_norm(batch_residual) *
+    ///   layer N's attn_norm.weight` on entry. The caller is responsible
+    ///   for seeding it (separate `run_rms_norm` before the layer-0 call;
+    ///   subsequent layers inherit it from the previous layer's
+    ///   end-of-layer fusion).
+    /// * `next_attn_norm_weight = Some(w)` activates the end-of-layer
+    ///   `multi_add_rms(batch_residual, batch_ffn_out, w)` fusion that
+    ///   simultaneously updates `batch_residual` AND populates
+    ///   `batch_norm` with `rms_norm(...) * w` for the *next* layer.
+    /// * `next_attn_norm_weight = None` (last layer) emits a plain
+    ///   `add_res2_b` and leaves `batch_norm` untouched.
     #[allow(clippy::too_many_arguments)]
     fn dispatch_layer_batch(
         &mut self,
@@ -2689,6 +2724,7 @@ impl Forward {
         layer: u32,
         seq_len: u32,
         base_pos: u32,
+        next_attn_norm_weight: Option<vk::Buffer>,
     ) {
         let cfg = self.config.clone();
         let hidden = cfg.hidden_dim;
@@ -2700,14 +2736,10 @@ impl Forward {
         let ffn_bytes = (ffn as u64) * 4;
 
         // ---- (a) attn_norm: per-token RMSNorm into batch_norm. ----
-        let w_attn_norm = layer_weight(model, layer, "attn_norm.weight");
-        // RMSNorm shader supports rows>1 via ne01 — dispatch all tokens at once.
-        self.run_rms_norm(
-            dev, registry, cmd,
-            self.batch_residual.handle, w_attn_norm, self.batch_norm.handle,
-            hidden, seq_len, cfg.rms_norm_eps, "rms_norm_attn_b",
-        );
-        compute_barrier(dev, cmd);
+        // Sprint 9b.2 — this used to dispatch run_rms_norm(batch_residual,
+        // attn_norm.weight → batch_norm). Now `batch_norm` is pre-seeded
+        // by either prefill_batch (for layer 0) or by the previous
+        // layer's cross-layer fusion (Sprint 9b.2). Nothing to do here.
 
         // Phase 6/7 — mul_mm path takes FP32 activations directly, so
         // skip the Q8_1 quantize step. mul_mmq still needs it. The
@@ -3210,12 +3242,31 @@ impl Forward {
         );
         compute_barrier(dev, cmd);
 
-        // ---- (l) Residual2 = residual + ffn_out (in-place). ----
-        self.run_binary(
-            dev, registry, cmd, ShaderId::Add,
-            self.batch_residual.handle, self.batch_ffn_out.handle, self.batch_residual.handle,
-            seq_len * hidden, "add_res2_b",
-        );
+        // ---- (l) Residual2 = residual + ffn_out + (cross-layer fuse). ----
+        // Sprint 9b.2 — when there's a next layer, the residual update
+        // is fused with that layer's `attn_norm` rms_norm-mul, putting
+        // the next layer's pre-attn norm into batch_norm in the same
+        // dispatch (and saving 1 dispatch + 1 barrier per layer
+        // boundary). For the final layer, fall back to a plain add.
+        match next_attn_norm_weight {
+            Some(w_next) => {
+                self.run_multi_add_rms(
+                    dev, registry, cmd,
+                    self.batch_residual.handle, self.batch_ffn_out.handle, w_next,
+                    /* sum_out  = */ self.batch_residual.handle,
+                    /* norm_out = */ self.batch_norm.handle,
+                    hidden, seq_len, cfg.rms_norm_eps, "add_rms_attn_next_b",
+                );
+            }
+            None => {
+                self.run_binary(
+                    dev, registry, cmd, ShaderId::Add,
+                    self.batch_residual.handle, self.batch_ffn_out.handle,
+                    self.batch_residual.handle,
+                    seq_len * hidden, "add_res2_b",
+                );
+            }
+        }
         compute_barrier(dev, cmd);
         let _ = (kv_bytes, ffn_bytes); // some bytes locals only used by debug paths
     }
