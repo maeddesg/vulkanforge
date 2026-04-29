@@ -116,6 +116,15 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "swiglu.comp",
         defines: &[],
     },
+    // v0.2 Sprint 9b — fused residual-add + RMSNorm-mul. 5 SSBOs
+    // (a, b, weight, sum, norm_out); 1 WG per row, BLOCK_SIZE=512.
+    // Replaces (add → barrier → rms_norm) at Stelle 1 (add_res1 +
+    // rms_norm_ffn). -1 dispatch, -1 barrier per layer.
+    ShaderJob {
+        out_name: "multi_add_rms_f32.spv",
+        entry_source: "multi_add_rms.comp",
+        defines: &[],
+    },
     // Softmax (attention scores). Own header, ~3 SSBOs.
     ShaderJob {
         out_name: "soft_max_f32.spv",

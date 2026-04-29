@@ -95,6 +95,18 @@ pub struct SwigluPushConstants {
 }
 const _: () = assert!(std::mem::size_of::<SwigluPushConstants>() == 4);
 
+/// v0.2 Sprint 9b — fused residual-add + RMSNorm-mul push block.
+/// 2 × u32 + 1 × f32 = 12 B. Field order matches `multi_add_rms.comp`'s
+/// `parameter` block exactly.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct MultiAddRmsPushConstants {
+    pub ne00: u32,
+    pub n_rows: u32,
+    pub eps: f32,
+}
+const _: () = assert!(std::mem::size_of::<MultiAddRmsPushConstants>() == 12);
+
 /// `generic_unary_head.glsl` push block — used by `copy`. 32 × 4 = 128 B.
 /// The trailing six `ne0_*mp/L` and `ne1_*mp/L` fields are fastdiv
 /// constants (see [`init_fastdiv_values`]) — set them, do not leave

@@ -40,7 +40,8 @@ use super::loader::LoadedModel;
 use super::pipeline::{
     FlashAttnBatchPushConstants, FlashAttnReducePushConstants, FlashAttnSplitPushConstants,
     GenericBinaryPushConstants, MatVecPushConstants,
-    CoopmatPushConstants, MmqPushConstants, Q8_1QuantizePushConstants, RopePushConstants,
+    CoopmatPushConstants, MmqPushConstants, MultiAddRmsPushConstants,
+    Q8_1QuantizePushConstants, RopePushConstants,
     ScalarAttnPushConstants, SwigluPushConstants,
 };
 use super::pipeline_registry::PipelineRegistry;
@@ -1347,17 +1348,18 @@ impl Forward {
                       cfg.n_heads * cfg.head_dim, cfg.hidden_dim, "gemv_o");
         compute_barrier(dev, cmd);
 
-        // (h) Residual1 = input + o_buf
-        self.run_binary(dev, registry, cmd, ShaderId::Add,
-                        input, self.o_buf.handle, self.res1.handle,
-                        cfg.hidden_dim, "add_res1");
-        compute_barrier(dev, cmd);
-
-        // (i) ffn_norm
+        // (h+i) Fused add_res1 + ffn_norm. v0.2 Sprint 9b folds
+        //   res1 = input + o_buf
+        //   hidden_norm = rms_norm(res1) * ffn_norm.weight
+        // into one dispatch.
         let w = layer_weight(model, layer, "ffn_norm.weight");
-        self.run_rms_norm(dev, registry, cmd,
-                         self.res1.handle, w, self.hidden_norm.handle,
-                         cfg.hidden_dim, 1, cfg.rms_norm_eps, "rms_norm_ffn");
+        self.run_multi_add_rms(
+            dev, registry, cmd,
+            input, self.o_buf.handle, w,
+            /* sum_out  = */ self.res1.handle,
+            /* norm_out = */ self.hidden_norm.handle,
+            cfg.hidden_dim, 1, cfg.rms_norm_eps, "add_rms_ffn",
+        );
         compute_barrier(dev, cmd);
 
         // (j) gate / up
@@ -2204,6 +2206,54 @@ impl Forward {
         });
     }
 
+    /// v0.2 Sprint 9b — fused residual-add + RMSNorm-mul dispatch.
+    /// Computes `sum = a + b`, `norm_out = rms_norm(sum) * weight`
+    /// in one pass. `sum` may alias `a` for in-place residual updates
+    /// (the batched dispatch passes `batch_residual` for both).
+    /// Replaces a separate `add` + barrier + `rms_norm` pair, saving
+    /// one dispatch and one compute barrier per layer.
+    #[allow(clippy::too_many_arguments)]
+    fn run_multi_add_rms(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        a: vk::Buffer,
+        b: vk::Buffer,
+        weight: vk::Buffer,
+        sum_out: vk::Buffer,
+        norm_out: vk::Buffer,
+        cols: u32,
+        rows: u32,
+        eps: f32,
+        label: &'static str,
+    ) {
+        let kernel = registry.get(ShaderId::MultiAddRms);
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[
+                (0, a, 0, 0),
+                (1, b, 0, 0),
+                (2, weight, 0, 0),
+                (3, sum_out, 0, 0),
+                (4, norm_out, 0, 0),
+            ],
+        );
+        let pc = MultiAddRmsPushConstants { ne00: cols, n_rows: rows, eps };
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, rows, 1, 1);
+        });
+    }
+
     /// v0.2 Sprint 9a — fused SwiGLU dispatch.
     /// `out[i] = silu(gate[i]) * up[i]` over `n` FP32 elements.
     /// Replaces `run_silu(g→g) + barrier + run_binary(Mul, g, u, o)`
@@ -3046,22 +3096,18 @@ impl Forward {
         }
         compute_barrier(dev, cmd);
 
-        // ---- (f) Residual1 = batch_residual + batch_o (in-place). ----
-        // run_binary uses GenericBinary which iterates over `ne` elems
-        // — with seq_len*hidden it covers the full batch.
-        self.run_binary(
-            dev, registry, cmd, ShaderId::Add,
-            self.batch_residual.handle, self.batch_o.handle, self.batch_residual.handle,
-            seq_len * hidden, "add_res1_b",
-        );
-        compute_barrier(dev, cmd);
-
-        // ---- (g) FFN norm. ----
+        // ---- (f+g) Fused residual-add + ffn_norm. v0.2 Sprint 9b
+        // folds add_res1_b (batch_residual += batch_o, in-place) with
+        // rms_norm_ffn_b (batch_norm = rms_norm(batch_residual) *
+        // ffn_norm.weight) into one dispatch. `sum_out` aliases `a`
+        // (both = batch_residual) for the in-place residual update.
         let w_ffn_norm = layer_weight(model, layer, "ffn_norm.weight");
-        self.run_rms_norm(
+        self.run_multi_add_rms(
             dev, registry, cmd,
-            self.batch_residual.handle, w_ffn_norm, self.batch_norm.handle,
-            hidden, seq_len, cfg.rms_norm_eps, "rms_norm_ffn_b",
+            self.batch_residual.handle, self.batch_o.handle, w_ffn_norm,
+            /* sum_out  = */ self.batch_residual.handle,
+            /* norm_out = */ self.batch_norm.handle,
+            hidden, seq_len, cfg.rms_norm_eps, "add_rms_ffn_b",
         );
         compute_barrier(dev, cmd);
 
