@@ -123,8 +123,12 @@ impl PipelineRegistry {
                     let bytes = bytemuck::bytes_of(&data);
                     ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
                 }
-                // silu, copy, rope_norm, rope_neox: no spec consts.
-                ShaderId::Silu | ShaderId::Copy | ShaderId::RopeNorm | ShaderId::RopeNeox => {
+                // silu, swiglu, copy, rope_norm, rope_neox: no spec consts.
+                ShaderId::Silu
+                | ShaderId::SwiGLU
+                | ShaderId::Copy
+                | ShaderId::RopeNorm
+                | ShaderId::RopeNeox => {
                     ComputeKernel::from_spv(device, &words, cache)
                 }
                 ShaderId::ScalarAttn => {

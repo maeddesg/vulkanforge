@@ -85,6 +85,16 @@ pub struct GenericHeadPushConstants {
 }
 const _: () = assert!(std::mem::size_of::<GenericHeadPushConstants>() == 24);
 
+/// v0.2 Sprint 9a — fused SwiGLU push block. Single u32 element-count.
+/// SPIR-V reflection rounds the layout up to 4 B already, so no
+/// trailing padding is needed.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SwigluPushConstants {
+    pub n: u32,
+}
+const _: () = assert!(std::mem::size_of::<SwigluPushConstants>() == 4);
+
 /// `generic_unary_head.glsl` push block — used by `copy`. 32 × 4 = 128 B.
 /// The trailing six `ne0_*mp/L` and `ne1_*mp/L` fields are fastdiv
 /// constants (see [`init_fastdiv_values`]) — set them, do not leave

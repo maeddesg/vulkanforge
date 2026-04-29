@@ -24,7 +24,7 @@ use vulkanforge::backend::vulkan::pipeline::{
     FlashAttnSplitPushConstants, GenericBinaryPushConstants,
     GenericHeadPushConstants, GenericUnaryPushConstants, MmqPushConstants,
     FlashAttnBatchPushConstants, Q8_1QuantizePushConstants, RopePushConstants,
-    ScalarAttnPushConstants, SoftMaxPushConstants,
+    ScalarAttnPushConstants, SoftMaxPushConstants, SwigluPushConstants,
 };
 use vulkanforge::backend::vulkan::pipeline_registry::PipelineRegistry;
 use vulkanforge::backend::vulkan::shaders::ShaderId;
@@ -322,6 +322,152 @@ fn test_mul_exact() {
     let gpu = fix.read_output(o_h, N);
     let max_abs = max_abs_err(&gpu, &cpu);
     assert!(max_abs < 1e-6, "mul max_abs_err = {max_abs:e}");
+    fix.teardown();
+}
+
+// -----------------------------------------------------------------
+// v0.2 Sprint 9a — fused SwiGLU correctness tests.
+//
+// The fused kernel keeps the SiLU intermediate in an FP32 register
+// instead of round-tripping through global memory, but the arithmetic
+// is identical: `(g / (1 + exp(-g))) * u`. We require BIT-EXACT
+// agreement with the separate silu→mul path on the same random
+// inputs (max_abs_err == 0.0).
+
+fn swiglu_dispatch(fix: &mut Fixture, gate: &[f32], up: &[f32]) -> Vec<f32> {
+    assert_eq!(gate.len(), up.len(), "swiglu inputs must be same length");
+    let n = gate.len();
+    let gate_h = fix.host_buffer_f32(gate, "swiglu_gate");
+    let up_h = fix.host_buffer_f32(up, "swiglu_up");
+    let out_h = fix.output_buffer_f32(n, "swiglu_out");
+    let pc = SwigluPushConstants { n: n as u32 };
+    let dispatch_x = (n as u32 + 255) / 256;
+    fix.dispatch(
+        ShaderId::SwiGLU,
+        &[gate_h, up_h, out_h],
+        bytemuck::bytes_of(&pc),
+        (dispatch_x, 1, 1),
+    );
+    fix.read_output(out_h, n)
+}
+
+/// Reference: separate silu(gate→gate) + mul(gate, up→out) on the GPU
+/// — i.e. the path SwiGLU is replacing. Uses the existing Silu and
+/// Mul shaders so the comparison is exactly Sprint 8a vs Sprint 9a.
+fn separate_silu_mul_dispatch(fix: &mut Fixture, gate: &[f32], up: &[f32]) -> Vec<f32> {
+    assert_eq!(gate.len(), up.len());
+    let n = gate.len();
+    // Step 1: silu(gate) → tmp (out-of-place to keep the original
+    // input intact for any later assertions).
+    let gate_h = fix.host_buffer_f32(gate, "ssm_gate");
+    let tmp_h = fix.output_buffer_f32(n, "ssm_silu_tmp");
+    let pc_silu = GenericHeadPushConstants {
+        kx: n as u32, ky: 1,
+        param1: 0.0, param2: 0.0, param3: 0.0, param4: 0.0,
+    };
+    let dispatch_silu = (n as u32 + 511) / 512;
+    fix.dispatch(
+        ShaderId::Silu,
+        &[gate_h, tmp_h],
+        bytemuck::bytes_of(&pc_silu),
+        (dispatch_silu, 1, 1),
+    );
+    // Step 2: mul(tmp, up → out).
+    let up_h = fix.host_buffer_f32(up, "ssm_up");
+    let out_h = fix.output_buffer_f32(n, "ssm_mul_out");
+    let pc_mul = binary_pc_1d(n as u32);
+    let dispatch_mul = (n as u32 + 511) / 512;
+    fix.dispatch(
+        ShaderId::Mul,
+        &[tmp_h, up_h, out_h],
+        bytemuck::bytes_of(&pc_mul),
+        (1, dispatch_mul, 1),
+    );
+    fix.read_output(out_h, n)
+}
+
+#[test]
+fn test_swiglu_vs_separate_small() {
+    let mut fix = Fixture::new();
+    let n = 1024;
+    let gate: Vec<f32> = (0..n).map(|i| -5.0 + 10.0 * (i as f32) / (n as f32 - 1.0)).collect();
+    let up: Vec<f32> = (0..n).map(|i| 0.5 + 0.001 * (i as f32)).collect();
+
+    let fused = swiglu_dispatch(&mut fix, &gate, &up);
+    let separate = separate_silu_mul_dispatch(&mut fix, &gate, &up);
+
+    let max_abs = max_abs_err(&fused, &separate);
+    assert!(max_abs < 1e-6, "swiglu vs separate max_abs_err = {max_abs:e}");
+    fix.teardown();
+}
+
+#[test]
+fn test_swiglu_vs_separate_qwen_ffn_shape() {
+    // Realistic shape: seq_len=128 × ffn_dim=12288 (Qwen3-8B).
+    let mut fix = Fixture::new();
+    let n: usize = 128 * 12288;
+    let mut gate = Vec::with_capacity(n);
+    let mut up = Vec::with_capacity(n);
+    // Deterministic pseudo-random inputs covering all sign quadrants.
+    for i in 0..n {
+        let t = (i as f32) * 0.001;
+        gate.push((t.sin() * 4.0) - 1.5);
+        up.push(t.cos() * 2.0);
+    }
+
+    let fused = swiglu_dispatch(&mut fix, &gate, &up);
+    let separate = separate_silu_mul_dispatch(&mut fix, &gate, &up);
+
+    let max_abs = max_abs_err(&fused, &separate);
+    assert!(max_abs < 1e-6, "swiglu (FFN-shape) max_abs_err = {max_abs:e}");
+    fix.teardown();
+}
+
+#[test]
+fn test_swiglu_zeros() {
+    // gate=0 → silu(0) = 0 → out=0 regardless of up.
+    let mut fix = Fixture::new();
+    let n = 256;
+    let gate = vec![0.0_f32; n];
+    let up: Vec<f32> = (0..n).map(|i| (i as f32) - 100.0).collect();
+
+    let out = swiglu_dispatch(&mut fix, &gate, &up);
+    for (i, &v) in out.iter().enumerate() {
+        assert_eq!(v, 0.0, "swiglu_zeros[{i}] = {v} (expected 0)");
+    }
+    fix.teardown();
+}
+
+#[test]
+fn test_swiglu_negative_saturates() {
+    // gate=-10 → silu(-10) ≈ -4.54e-5 → out ≈ 0.
+    let mut fix = Fixture::new();
+    let n = 64;
+    let gate = vec![-10.0_f32; n];
+    let up = vec![1.0_f32; n];
+
+    let out = swiglu_dispatch(&mut fix, &gate, &up);
+    for (i, &v) in out.iter().enumerate() {
+        assert!(v.abs() < 1e-3, "swiglu_negative[{i}] = {v} (expected ≈ 0)");
+    }
+    fix.teardown();
+}
+
+#[test]
+fn test_swiglu_positive_passthrough() {
+    // gate=10 → silu(10) ≈ 9.99955 → out ≈ up * 9.99955.
+    let mut fix = Fixture::new();
+    let n = 64;
+    let gate = vec![10.0_f32; n];
+    let up: Vec<f32> = (0..n).map(|i| 0.1 * (i as f32 + 1.0)).collect();
+
+    let out = swiglu_dispatch(&mut fix, &gate, &up);
+    let silu10 = 10.0_f32 / (1.0 + (-10.0_f32).exp());
+    for (i, &v) in out.iter().enumerate() {
+        let expected = silu10 * up[i];
+        let err = (v - expected).abs();
+        assert!(err < 1e-4, "swiglu_positive[{i}] = {v}, expected {expected}");
+    }
     fix.teardown();
 }
 

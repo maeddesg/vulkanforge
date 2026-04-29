@@ -17,6 +17,11 @@ pub enum ShaderId {
     Add,
     Mul,
     Silu,
+    /// v0.2 Sprint 9a — fused SwiGLU: out[i] = silu(gate[i]) * up[i].
+    /// Drop-in replacement for the separate Silu + Mul dispatch pair
+    /// inside the FFN block. Saves one dispatch and one compute
+    /// barrier per layer.
+    SwiGLU,
     SoftMax,
     Copy,
     ScalarAttn,
@@ -94,6 +99,7 @@ impl ShaderId {
             ShaderId::Add => "add_f32",
             ShaderId::Mul => "mul_f32",
             ShaderId::Silu => "silu_f32",
+            ShaderId::SwiGLU => "swiglu_f32",
             ShaderId::SoftMax => "soft_max_f32",
             ShaderId::Copy => "copy_f32_f32",
             ShaderId::ScalarAttn => "scalar_attn_f32",
@@ -131,6 +137,7 @@ impl ShaderId {
             ShaderId::Add => ADD_F32,
             ShaderId::Mul => MUL_F32,
             ShaderId::Silu => SILU_F32,
+            ShaderId::SwiGLU => SWIGLU_F32,
             ShaderId::SoftMax => SOFT_MAX_F32,
             ShaderId::Copy => COPY_F32_F32,
             ShaderId::ScalarAttn => SCALAR_ATTN_F32,
@@ -168,6 +175,7 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::Add,
     ShaderId::Mul,
     ShaderId::Silu,
+    ShaderId::SwiGLU,
     ShaderId::SoftMax,
     ShaderId::Copy,
     ShaderId::ScalarAttn,
@@ -204,6 +212,7 @@ pub const ROPE_NEOX_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope_
 pub const ADD_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/add_f32.spv"));
 pub const MUL_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_f32.spv"));
 pub const SILU_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silu_f32.spv"));
+pub const SWIGLU_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/swiglu_f32.spv"));
 pub const SOFT_MAX_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/soft_max_f32.spv"));
 pub const COPY_F32_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/copy_f32_f32.spv"));
 pub const SCALAR_ATTN_F32: &[u8] =

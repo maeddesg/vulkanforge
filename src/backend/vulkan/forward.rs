@@ -39,9 +39,9 @@ use super::kv_cache::KvCache;
 use super::loader::LoadedModel;
 use super::pipeline::{
     FlashAttnBatchPushConstants, FlashAttnReducePushConstants, FlashAttnSplitPushConstants,
-    GenericBinaryPushConstants, GenericHeadPushConstants, MatVecPushConstants,
+    GenericBinaryPushConstants, MatVecPushConstants,
     CoopmatPushConstants, MmqPushConstants, Q8_1QuantizePushConstants, RopePushConstants,
-    ScalarAttnPushConstants,
+    ScalarAttnPushConstants, SwigluPushConstants,
 };
 use super::pipeline_registry::PipelineRegistry;
 use super::profiler::{ShaderProfiler, TimingSample};
@@ -1373,15 +1373,14 @@ impl Forward {
                       cfg.hidden_dim, cfg.ffn_dim, "gemv_up");
         compute_barrier(dev, cmd);
 
-        // (k) silu(gate) → gate_buf in place
-        self.run_silu(dev, registry, cmd, self.gate_buf.handle, self.gate_buf.handle,
-                      cfg.ffn_dim, "silu_gate");
-        compute_barrier(dev, cmd);
-
-        // (l) ffn_hidden = gate × up
-        self.run_binary(dev, registry, cmd, ShaderId::Mul,
-                        self.gate_buf.handle, self.up_buf.handle, self.ffn_hidden.handle,
-                        cfg.ffn_dim, "mul_gate_up");
+        // (k+l) Fused SwiGLU: ffn_hidden = silu(gate) * up. v0.2
+        // Sprint 9a folds the previous silu(gate→gate) + barrier +
+        // mul(gate, up→ffn_hidden) into one dispatch.
+        self.run_swiglu(
+            dev, registry, cmd,
+            self.gate_buf.handle, self.up_buf.handle, self.ffn_hidden.handle,
+            cfg.ffn_dim, "swiglu",
+        );
         compute_barrier(dev, cmd);
 
         // (m) FFN down — Q6_K in Q4_K_M, Q4_K otherwise.
@@ -2205,26 +2204,31 @@ impl Forward {
         });
     }
 
-    fn run_silu(
+    /// v0.2 Sprint 9a — fused SwiGLU dispatch.
+    /// `out[i] = silu(gate[i]) * up[i]` over `n` FP32 elements.
+    /// Replaces `run_silu(g→g) + barrier + run_binary(Mul, g, u, o)`
+    /// with a single dispatch that keeps the SiLU intermediate in
+    /// registers (no global-memory round-trip).
+    #[allow(clippy::too_many_arguments)]
+    fn run_swiglu(
         &mut self,
         dev: &VulkanDevice,
         registry: &PipelineRegistry,
         cmd: vk::CommandBuffer,
-        input: vk::Buffer,
-        output: vk::Buffer,
+        gate: vk::Buffer,
+        up: vk::Buffer,
+        out: vk::Buffer,
         n: u32,
         label: &str,
     ) {
-        let kernel = registry.get(ShaderId::Silu);
+        let kernel = registry.get(ShaderId::SwiGLU);
         let set = self.alloc_or_get_set(
             dev, kernel.descriptor_set_layout,
-            &[(0, input, 0, 0), (1, output, 0, 0)],
+            &[(0, gate, 0, 0), (1, up, 0, 0), (2, out, 0, 0)],
         );
-        let pc = GenericHeadPushConstants {
-            kx: n, ky: 1,
-            param1: 0.0, param2: 0.0, param3: 0.0, param4: 0.0,
-        };
-        let dispatch_x = (n + 511) / 512;
+        let pc = SwigluPushConstants { n };
+        // local_size_x = 256 in swiglu.comp, 1 element per thread.
+        let dispatch_x = (n + 255) / 256;
         let layout = kernel.pipeline_layout;
         let pipeline = kernel.pipeline;
         self.profile(label, dev, cmd, |dev, cmd| unsafe {
@@ -3123,16 +3127,13 @@ impl Forward {
         }
         compute_barrier(dev, cmd);
 
-        // ---- (j) silu(gate) * up → batch_ffn_hidden. ----
-        self.run_silu(
-            dev, registry, cmd, self.batch_gate.handle, self.batch_gate.handle,
-            seq_len * ffn, "silu_b",
-        );
-        compute_barrier(dev, cmd);
-        self.run_binary(
-            dev, registry, cmd, ShaderId::Mul,
+        // ---- (j) Fused SwiGLU: batch_ffn_hidden = silu(gate) * up. ----
+        // v0.2 Sprint 9a — replaces the silu(gate→gate) + barrier +
+        // mul(gate, up→ffn_hidden) pair with a single dispatch.
+        self.run_swiglu(
+            dev, registry, cmd,
             self.batch_gate.handle, self.batch_up.handle, self.batch_ffn_hidden.handle,
-            seq_len * ffn, "mul_gate_up_b",
+            seq_len * ffn, "swiglu_b",
         );
         compute_barrier(dev, cmd);
 

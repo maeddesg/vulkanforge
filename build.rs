@@ -108,6 +108,14 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "silu.comp",
         defines: &[("A_TYPE", "float"), ("D_TYPE", "float")],
     },
+    // v0.2 Sprint 9a — fused SwiGLU (silu(gate) * up → out). 3 SSBOs,
+    // single u32 push-constant `n`. Replaces the separate silu+mul
+    // pair in the FFN block; -1 dispatch, -1 barrier per layer.
+    ShaderJob {
+        out_name: "swiglu_f32.spv",
+        entry_source: "swiglu.comp",
+        defines: &[],
+    },
     // Softmax (attention scores). Own header, ~3 SSBOs.
     ShaderJob {
         out_name: "soft_max_f32.spv",
