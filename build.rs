@@ -143,6 +143,15 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "multi_add_rms.comp",
         defines: &[],
     },
+    // v0.2 Sprint 9d.2 — FP32 → packed-FP16 conversion compute shader.
+    // Replaces vkCmdCopyBuffer for prefill KV-cache writes when
+    // VULKANFORGE_FP16_KV=1 is enabled. Each thread converts 2
+    // FP32 elements into 1 packed uint via packHalf2x16.
+    ShaderJob {
+        out_name: "kv_copy_fp16.spv",
+        entry_source: "kv_copy_fp16.comp",
+        defines: &[],
+    },
     // Softmax (attention scores). Own header, ~3 SSBOs.
     ShaderJob {
         out_name: "soft_max_f32.spv",
@@ -225,6 +234,21 @@ const JOBS: &[ShaderJob] = &[
         out_name: "flash_attn_tiled_br16_bc32.spv",
         entry_source: "flash_attn_tiled.comp",
         defines: &[("BR", "16"), ("BC", "32")],
+    },
+    // v0.2 Sprint 9d.2 — FP16 KV-cache reader variants. Same source
+    // as the FP32 build but compiled with -DFP16_KV=1 so K/V binding
+    // switch to `uint[]` and the load_k/load_v helpers decode via
+    // unpackHalf2x16. Used when VULKANFORGE_FP16_KV=1 routes the
+    // prefill attention through these SPVs.
+    ShaderJob {
+        out_name: "flash_attn_tiled_br16_bc32_fp16kv.spv",
+        entry_source: "flash_attn_tiled.comp",
+        defines: &[("BR", "16"), ("BC", "32"), ("FP16_KV", "1")],
+    },
+    ShaderJob {
+        out_name: "flash_attn_batch_fp16kv.spv",
+        entry_source: "flash_attn_batch.comp",
+        defines: &[("FP16_KV", "1")],
     },
     // Phase-6A probe: confirms shaderc 0.8 + Mesa glslang ship a
     // coopmat + bfloat16 toolchain that produces SPV without warnings.

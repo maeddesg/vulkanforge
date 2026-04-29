@@ -1,0 +1,51 @@
+#version 450
+
+// v0.2 Sprint 9d.2 — FP32 → packed-FP16 conversion for KV-cache writes.
+//
+// Replaces the `vkCmdCopyBuffer` transfer that previously copied
+// FP32 K / V into the cache. Each thread converts a *pair* of FP32
+// values into one packed uint (= two FP16 values via packHalf2x16).
+// The output buffer is declared as `uint[]` so we don't need any
+// 16-bit-storage extension — `packHalf2x16` is core GLSL 4.20.
+//
+// Storage layout:
+//   src (binding 0): FP32 element-array; index unit = float (4 B).
+//   dst (binding 1): uint  element-array; index unit = uint  (4 B).
+//                    Each uint holds 2 FP16 values; total bytes for
+//                    `n_elements` of FP16 = `2 * n_elements`, written
+//                    as `n_elements / 2` uints.
+//
+// The push-constant `dst_uint_offset` is the destination start in
+// uint units (= byte_offset / 4). The caller computes it from
+// `KvCache::pos_offset_bytes(layer, pos) / 4`. `src_float_offset`
+// is the source start in float units (typically 0 — the caller binds
+// the source GEMM-output buffer at element 0).
+//
+// Dispatch: ceil(n_elements / 2 / 256) workgroups, each thread
+// handling one uint = two FP16 values.
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256) in;
+
+layout (binding = 0) readonly  buffer Src { float data_in[]; };
+layout (binding = 1) writeonly buffer Dst { uint  data_out[]; };
+
+layout (push_constant) uniform parameter {
+    uint n_elements;        // total FP32 elements to convert (= 2 * uints)
+    uint dst_uint_offset;   // start offset in dst (uint units)
+    uint src_float_offset;  // start offset in src (float units)
+} p;
+
+void main() {
+    const uint pair_idx = gl_GlobalInvocationID.x;
+    const uint elem_idx = pair_idx * 2u;
+    if (elem_idx >= p.n_elements) {
+        return;
+    }
+    const float a = data_in[p.src_float_offset + elem_idx];
+    const float b = (elem_idx + 1u < p.n_elements)
+                  ? data_in[p.src_float_offset + elem_idx + 1u]
+                  : 0.0;
+    data_out[p.dst_uint_offset + pair_idx] = packHalf2x16(vec2(a, b));
+}

@@ -39,7 +39,7 @@ use super::kv_cache::KvCache;
 use super::loader::LoadedModel;
 use super::pipeline::{
     FlashAttnBatchPushConstants, FlashAttnReducePushConstants, FlashAttnSplitPushConstants,
-    GenericBinaryPushConstants, MatVecPushConstants,
+    GenericBinaryPushConstants, KvCopyFp16PushConstants, MatVecPushConstants,
     CoopmatPushConstants, MmqPushConstants, MultiAddRmsPushConstants,
     Q8_1QuantizePushConstants, RmsNormMulRopePushConstants, RopePushConstants,
     ScalarAttnPushConstants, SwigluPushConstants,
@@ -1959,7 +1959,13 @@ impl Forward {
         n_kv: u32,
     ) {
         let cfg = self.config.clone();
-        let kernel = registry.get(ShaderId::FlashAttnBatch);
+        // v0.2 Sprint 9d.2 — pick the FP16-KV-aware variant when the
+        // cache is allocated as FP16; otherwise the original FP32 SPV.
+        let kernel = registry.get(if self.kv_cache.is_fp16() {
+            ShaderId::FlashAttnBatchFp16Kv
+        } else {
+            ShaderId::FlashAttnBatch
+        });
         let layer_off = self.kv_cache.layer_offset_bytes(layer);
         // v0.2 Sprint 9d.1 — KvCache::layer_size_bytes scales by
         // the configured KV element size (FP32 = 4 B by default).
@@ -2017,11 +2023,28 @@ impl Forward {
         q_start: u32,
         n_kv: u32,
     ) {
-        let (shader_id, br) = match (self.fa_tiled_br, self.fa_tiled_bc) {
-            (16, 32) => (ShaderId::FlashAttnTiledBr16Bc32, 16u32),
-            (16, _)  => (ShaderId::FlashAttnTiledBr16,     16u32),
-            (8,  _)  => (ShaderId::FlashAttnTiledBr8,       8u32),
-            _        => (ShaderId::FlashAttnTiledBr4,       4u32),
+        // v0.2 Sprint 9d.2 — FP16 KV variant lives only for the
+        // (16, 32) shape today. The other Br/Bc combos always read
+        // FP32 KV; if the cache is FP16-allocated and the user
+        // selected a non-default Br/Bc, panic loudly — the SPV would
+        // misinterpret packed-FP16 data as FP32.
+        let (shader_id, br) = if self.kv_cache.is_fp16() {
+            match (self.fa_tiled_br, self.fa_tiled_bc) {
+                (16, 32) => (ShaderId::FlashAttnTiledBr16Bc32Fp16Kv, 16u32),
+                _ => panic!(
+                    "VULKANFORGE_FP16_KV=1 requires the default Br=16/Bc=32 \
+                     tiled flash-attn variant; got Br={}/Bc={}. \
+                     Sprint 9d.2 only ships FP16 SPVs for the default shape.",
+                    self.fa_tiled_br, self.fa_tiled_bc,
+                ),
+            }
+        } else {
+            match (self.fa_tiled_br, self.fa_tiled_bc) {
+                (16, 32) => (ShaderId::FlashAttnTiledBr16Bc32, 16u32),
+                (16, _)  => (ShaderId::FlashAttnTiledBr16,     16u32),
+                (8,  _)  => (ShaderId::FlashAttnTiledBr8,       8u32),
+                _        => (ShaderId::FlashAttnTiledBr4,       4u32),
+            }
         };
         let cfg = self.config.clone();
         let kernel = registry.get(shader_id);
@@ -2247,6 +2270,57 @@ impl Forward {
                 cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
             );
             dev.device.cmd_dispatch(cmd, rows, 1, 1);
+        });
+    }
+
+    /// v0.2 Sprint 9d.2 — FP32 → packed-FP16 KV-cache write.
+    /// Replaces `vkCmdCopyBuffer` for prefill K/V uploads when
+    /// `KvCache::is_fp16()`. Each thread converts one (a, b) pair to
+    /// one packed `uint`, so dispatch_x = ceil(n_elements / 2 / 256).
+    /// `dst_byte_offset` is the destination offset in **bytes** (as
+    /// returned by `KvCache::pos_offset_bytes`); the helper converts
+    /// to uint units (= bytes / 4) for the shader.
+    #[allow(clippy::too_many_arguments)]
+    fn run_kv_copy_fp16(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        src: vk::Buffer,
+        dst: vk::Buffer,
+        n_elements: u32,
+        dst_byte_offset: u64,
+        label: &'static str,
+    ) {
+        debug_assert_eq!(
+            dst_byte_offset % 4,
+            0,
+            "kv_copy_fp16: dst_byte_offset must be uint-aligned (got {dst_byte_offset})"
+        );
+        let dst_uint_offset = (dst_byte_offset / 4) as u32;
+        let kernel = registry.get(ShaderId::KvCopyFp16);
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[(0, src, 0, 0), (1, dst, 0, 0)],
+        );
+        let pc = KvCopyFp16PushConstants {
+            n_elements,
+            dst_uint_offset,
+            src_float_offset: 0,
+        };
+        // 256 threads/WG, 2 elements/thread → 512 elements/WG.
+        let dispatch_x = (n_elements + 511) / 512;
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
         });
     }
 
@@ -3026,27 +3100,47 @@ impl Forward {
             // 3. Bulk KV-cache write. K and V are M contiguous rows of
             //    `[n_kv_heads, head_dim]` in batch_k / batch_v; the
             //    cache slot for this layer at positions
-            //    `base_pos..base_pos+M` is the same shape. One
-            //    cmd_copy_buffer per K and per V — replaces 2*M
-            //    per-token copies.
-            let kv_row_bytes = self.kv_cache.row_bytes();
+            //    `base_pos..base_pos+M` is the same shape.
+            //
+            // Sprint 9d.2 — when the cache is FP16-allocated, the
+            // raw byte copy can't be used (it would copy FP32 bytes
+            // into a half-size FP16 slot). We dispatch the
+            // `kv_copy_fp16` compute shader instead, which converts
+            // FP32 → packed-FP16 element-wise. FP32 cache stays on
+            // the cheap vkCmdCopyBuffer path.
             let dst_off = self.kv_cache.pos_offset_bytes(layer, base_pos);
-            let bulk_size = (seq_len as u64) * kv_row_bytes;
-            let copy_k = vk::BufferCopy::default()
-                .src_offset(0).dst_offset(dst_off).size(bulk_size);
-            let copy_v = copy_k;
-            unsafe {
-                dev.device.cmd_copy_buffer(
-                    cmd, self.batch_k.handle, self.kv_cache.k_buffer.handle,
-                    std::slice::from_ref(&copy_k),
+            let kv_elements = (seq_len as u32) * cfg.n_kv_heads * cfg.head_dim;
+            if self.kv_cache.is_fp16() {
+                self.run_kv_copy_fp16(
+                    dev, registry, cmd,
+                    self.batch_k.handle, self.kv_cache.k_buffer.handle,
+                    kv_elements, dst_off, "kv_copy_fp16_k_b",
                 );
-                dev.device.cmd_copy_buffer(
-                    cmd, self.batch_v.handle, self.kv_cache.v_buffer.handle,
-                    std::slice::from_ref(&copy_v),
+                self.run_kv_copy_fp16(
+                    dev, registry, cmd,
+                    self.batch_v.handle, self.kv_cache.v_buffer.handle,
+                    kv_elements, dst_off, "kv_copy_fp16_v_b",
                 );
+            } else {
+                let kv_row_bytes = self.kv_cache.row_bytes();
+                let bulk_size = (seq_len as u64) * kv_row_bytes;
+                let copy_k = vk::BufferCopy::default()
+                    .src_offset(0).dst_offset(dst_off).size(bulk_size);
+                let copy_v = copy_k;
+                unsafe {
+                    dev.device.cmd_copy_buffer(
+                        cmd, self.batch_k.handle, self.kv_cache.k_buffer.handle,
+                        std::slice::from_ref(&copy_k),
+                    );
+                    dev.device.cmd_copy_buffer(
+                        cmd, self.batch_v.handle, self.kv_cache.v_buffer.handle,
+                        std::slice::from_ref(&copy_v),
+                    );
+                }
             }
-            // Barrier: subsequent flash_attn_batch reads the KV cache
-            // (compute) which the bulk_copy just wrote (transfer).
+            // Barrier: subsequent attention reads KV (compute). The
+            // upstream write was either a transfer (FP32 path) or a
+            // compute dispatch (FP16 path) — cover both stages.
             let kv_bar = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ);

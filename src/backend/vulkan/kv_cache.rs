@@ -196,6 +196,10 @@ impl KvCache {
         self.layer_offset_elems(layer) * self.kv_dtype.element_size()
     }
 
+    pub fn is_fp16(&self) -> bool {
+        self.kv_dtype == KvDtype::F16
+    }
+
     /// Total bytes for one layer's K (or V) slice in the cache —
     /// `max_seq_len × n_kv_heads × head_dim × element_size`. Used as
     /// the `range` argument when binding the KV cache to attention

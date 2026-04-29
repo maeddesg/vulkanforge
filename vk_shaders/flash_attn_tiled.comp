@@ -53,8 +53,27 @@ const uint HEAD_DIM = 128;       // Hardcoded: Qwen3 / Llama-3.1 / Mistral / DSR
 layout (local_size_x = WGSIZE) in;
 
 layout (binding = 0) readonly  buffer Q { float q[]; };   // [m, n_heads, head_dim]
+// v0.2 Sprint 9d.2 — K/V bindings switch to packed-FP16 (2 FP16 per
+// uint, decoded with unpackHalf2x16) when this SPV is built with
+// -DFP16_KV=1. The element layout is unchanged from the caller's
+// perspective: index `idx` still names the same element, but the
+// underlying buffer has half the byte size and we read it through
+// the `load_k` / `load_v` helpers.
+#if FP16_KV
+layout (binding = 1) readonly  buffer K { uint k_packed[]; };
+layout (binding = 2) readonly  buffer V { uint v_packed[]; };
+float load_k(uint idx) {
+    return unpackHalf2x16(k_packed[idx >> 1])[idx & 1u];
+}
+float load_v(uint idx) {
+    return unpackHalf2x16(v_packed[idx >> 1])[idx & 1u];
+}
+#else
 layout (binding = 1) readonly  buffer K { float k[]; };   // [n_kv, n_kv_heads, head_dim]
 layout (binding = 2) readonly  buffer V { float v[]; };   // [n_kv, n_kv_heads, head_dim]
+float load_k(uint idx) { return k[idx]; }
+float load_v(uint idx) { return v[idx]; }
+#endif
 layout (binding = 3) writeonly buffer O { float o[]; };   // [m, n_heads, head_dim]
 
 // 28 B push block — same as flash_attn_batch.
@@ -127,8 +146,8 @@ void main() {
             uint global_t = tile_base + local_pos;
             if (global_t < causal_len_max) {
                 uint kv_off = global_t * pos_stride + head_off;
-                k_lds[local_pos * HEAD_DIM + tid]      = k[kv_off + tid];
-                k_lds[local_pos * HEAD_DIM + tid + 64] = k[kv_off + tid + 64];
+                k_lds[local_pos * HEAD_DIM + tid]      = load_k(kv_off + tid);
+                k_lds[local_pos * HEAD_DIM + tid + 64] = load_k(kv_off + tid + 64);
             }
         }
         barrier();
@@ -186,8 +205,8 @@ void main() {
             uint global_t = tile_base + i;
             if (global_t >= causal_len_max) break;
             uint v_off = global_t * pos_stride + head_off;
-            float v_d0 = v[v_off + tid];
-            float v_d1 = v[v_off + tid + 64];
+            float v_d0 = load_v(v_off + tid);
+            float v_d1 = load_v(v_off + tid + 64);
             [[unroll]] for (uint qi = 0; qi < BR; ++qi) {
                 float pi = scores_lds[qi * TILE + i];
                 my_out0[qi] += pi * v_d0;

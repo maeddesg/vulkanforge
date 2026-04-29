@@ -107,6 +107,19 @@ pub struct MultiAddRmsPushConstants {
 }
 const _: () = assert!(std::mem::size_of::<MultiAddRmsPushConstants>() == 12);
 
+/// v0.2 Sprint 9d.2 — push block for `kv_copy_fp16.comp`. 3 × u32 = 12 B.
+/// `n_elements` is the FP32 element count to convert; `dst_uint_offset`
+/// and `src_float_offset` give the start positions within the bound
+/// destination (uint units) and source (float units) buffers.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct KvCopyFp16PushConstants {
+    pub n_elements: u32,
+    pub dst_uint_offset: u32,
+    pub src_float_offset: u32,
+}
+const _: () = assert!(std::mem::size_of::<KvCopyFp16PushConstants>() == 12);
+
 /// v0.2 Sprint 9c.5 — fused rms_norm+mul+RoPE push block.
 /// Layout matches `generic_binary_head.glsl` (with `RMS_NORM_ROPE_FUSION`
 /// branch active): the regular GenericBinary header (116 B) followed
