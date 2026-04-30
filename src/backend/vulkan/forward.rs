@@ -520,9 +520,18 @@ impl Forward {
         // Sprint 11E — VULKANFORGE_USE_MM_COOPMAT implies VULKANFORGE_USE_MUL_MM
         // because the COOPMAT path lives in mul_mm.comp (FP32 activations),
         // not mul_mmq.comp.
-        let mul_mm_coopmat_enabled = match std::env::var("VULKANFORGE_USE_MM_COOPMAT") {
-            Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
-            _ => false,
+        // Sprint 12M — coopmat is now DEFAULT-ON for prefill. The path
+        // wins +11-64 % over mul_mmq across pp=64..2048 after Sprint 12K
+        // (Q6_K coopmat) + 12L (LOAD_VEC_B=8 mat2x4 aligned) + 12M
+        // (M-tile selector). Opt-out: VULKANFORGE_DISABLE_MM_COOPMAT=1
+        // (or the legacy VULKANFORGE_USE_MM_COOPMAT=0 still disables).
+        let mul_mm_coopmat_enabled = match (
+            std::env::var("VULKANFORGE_DISABLE_MM_COOPMAT"),
+            std::env::var("VULKANFORGE_USE_MM_COOPMAT"),
+        ) {
+            (Ok(v), _) if v == "1" || v.eq_ignore_ascii_case("true") => false,
+            (_, Ok(v)) if v == "0" || v.eq_ignore_ascii_case("false") => false,
+            _ => true, // default-on
         };
         let mul_mm_enabled = mul_mm_coopmat_enabled || match std::env::var("VULKANFORGE_USE_MUL_MM") {
             Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
@@ -2820,6 +2829,10 @@ impl Forward {
             ShaderId::MulMmqQ4KL | ShaderId::MulMmqQ6KL
             | ShaderId::MulMmQ4KCoopmat | ShaderId::MulMmQ6KCoopmat
             | ShaderId::MulMmQ4KAlignedCoopmat | ShaderId::MulMmQ6KAlignedCoopmat => (128, 128),
+            // Sprint 12M — M-tile coopmat: BM=BN=64, same shape as the
+            // S-tile mul_mmq variants. Used when seq_len ≤ 64.
+            ShaderId::MulMmQ4KCoopmatM | ShaderId::MulMmQ6KCoopmatM
+            | ShaderId::MulMmQ4KAlignedCoopmatM | ShaderId::MulMmQ6KAlignedCoopmatM => (64, 64),
             _ => (64, 64),
         };
         let groups_x = (m + bm - 1) / bm;
@@ -3811,6 +3824,13 @@ fn layer_weight_shader_gemm(
     // by 8. Mirrors llama.cpp's f32_aligned_cm1 selection. Misaligned
     // shapes fall back to the unaligned coopmat (LOAD_VEC_B=2).
     let coopmat_aligned = coopmat_q4k_mm && n % 8 == 0;
+    // Sprint 12M — pick M-tile (BM=64, BN=64) when seq_len is small.
+    // Port of llama.cpp ggml_vk_guess_matmul_pipeline:7141 reduced to
+    // the dimension that varies with prompt size (m = output rows is
+    // always >> 64 for our model: q_dim=4096, hidden=4096, ffn=12288).
+    // pp=64 with N=12288 + L-tile = 1.5 WG/CU → severe starvation;
+    // M-tile gives 3 WG/CU (still not great, but unblocks default-on).
+    let coopmat_m_tile = coopmat_q4k_mm && n <= 64;
     match (gemm_kind, q6) {
         (GemmKind::MulMmAligned, true)  => ShaderId::MulMmQ6KAligned,
         (GemmKind::MulMmAligned, false) => ShaderId::MulMmQ4KAligned,
@@ -3819,15 +3839,20 @@ fn layer_weight_shader_gemm(
         // mul_mm FP32 (which was the slowest GEMM we have, gemm_down
         // 61ms→89ms regression in 12J).
         // Sprint 12L — pick the aligned coopmat variant when shape allows.
-        (GemmKind::MulMm,        true)  => match (coopmat_q4k_mm, coopmat_aligned) {
-            (false, _)    => ShaderId::MulMmQ6K,
-            (true,  false) => ShaderId::MulMmQ6KCoopmat,
-            (true,  true)  => ShaderId::MulMmQ6KAlignedCoopmat,
+        // Sprint 12M — pick the M-tile coopmat variant when seq_len ≤ 64.
+        (GemmKind::MulMm,        true)  => match (coopmat_q4k_mm, coopmat_aligned, coopmat_m_tile) {
+            (false, _,     _    ) => ShaderId::MulMmQ6K,
+            (true,  false, false) => ShaderId::MulMmQ6KCoopmat,
+            (true,  true,  false) => ShaderId::MulMmQ6KAlignedCoopmat,
+            (true,  false, true ) => ShaderId::MulMmQ6KCoopmatM,
+            (true,  true,  true ) => ShaderId::MulMmQ6KAlignedCoopmatM,
         },
-        (GemmKind::MulMm,        false) => match (coopmat_q4k_mm, coopmat_aligned) {
-            (false, _)    => ShaderId::MulMmQ4K,
-            (true,  false) => ShaderId::MulMmQ4KCoopmat,
-            (true,  true)  => ShaderId::MulMmQ4KAlignedCoopmat,
+        (GemmKind::MulMm,        false) => match (coopmat_q4k_mm, coopmat_aligned, coopmat_m_tile) {
+            (false, _,     _    ) => ShaderId::MulMmQ4K,
+            (true,  false, false) => ShaderId::MulMmQ4KCoopmat,
+            (true,  true,  false) => ShaderId::MulMmQ4KAlignedCoopmat,
+            (true,  false, true ) => ShaderId::MulMmQ4KCoopmatM,
+            (true,  true,  true ) => ShaderId::MulMmQ4KAlignedCoopmatM,
         },
         (GemmKind::Mmq,          true)  => if prefer_l { ShaderId::MulMmqQ6KL } else { ShaderId::MulMmqQ6K },
         (GemmKind::Mmq,          false) => if prefer_l { ShaderId::MulMmqQ4KL } else { ShaderId::MulMmqQ4K },

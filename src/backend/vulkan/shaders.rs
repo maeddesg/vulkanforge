@@ -102,6 +102,16 @@ pub enum ShaderId {
     // seq_len % 8 == 0; misaligned shapes fall back to MulMm{Q4K,Q6K}Coopmat.
     MulMmQ4KAlignedCoopmat,
     MulMmQ6KAlignedCoopmat,
+    // Sprint 12M — M-tile (BM=64, BN=64) coopmat variants for small
+    // seq_len. Reuse the same SPV bytes as the L-tile variants above —
+    // BM/BN/BK are spec-constants in mul_mm.comp:103-118, so the only
+    // difference is the spec-constant block in pipeline_registry.rs.
+    // Selector: n <= 64 → M-tile; else → L-tile (port of llama.cpp
+    // ggml_vk_guess_matmul_pipeline:7141).
+    MulMmQ4KCoopmatM,
+    MulMmQ6KCoopmatM,
+    MulMmQ4KAlignedCoopmatM,
+    MulMmQ6KAlignedCoopmatM,
     // Sprint 11F — Int8 coopmat runtime probe (16x16x16 I8xI8->I32).
     // Single-WG smoke shader; not used in production.
     ProbeInt8Coopmat,
@@ -215,6 +225,10 @@ impl ShaderId {
             ShaderId::MulMmQ6KCoopmat => "mul_mm_q6_k_f32_coopmat",
             ShaderId::MulMmQ4KAlignedCoopmat => "mul_mm_q4_k_f32_aligned_coopmat",
             ShaderId::MulMmQ6KAlignedCoopmat => "mul_mm_q6_k_f32_aligned_coopmat",
+            ShaderId::MulMmQ4KCoopmatM => "mul_mm_q4_k_f32_coopmat_m",
+            ShaderId::MulMmQ6KCoopmatM => "mul_mm_q6_k_f32_coopmat_m",
+            ShaderId::MulMmQ4KAlignedCoopmatM => "mul_mm_q4_k_f32_aligned_coopmat_m",
+            ShaderId::MulMmQ6KAlignedCoopmatM => "mul_mm_q6_k_f32_aligned_coopmat_m",
             ShaderId::ProbeInt8Coopmat => "probe_int8_coopmat",
             ShaderId::BenchInt8CmGemm => "bench_int8cm_gemm",
             ShaderId::BenchScalarGemm => "bench_scalar_gemm",
@@ -286,6 +300,13 @@ impl ShaderId {
             ShaderId::MulMmQ6KCoopmat => MUL_MM_Q6_K_F32_COOPMAT,
             ShaderId::MulMmQ4KAlignedCoopmat => MUL_MM_Q4_K_F32_ALIGNED_COOPMAT,
             ShaderId::MulMmQ6KAlignedCoopmat => MUL_MM_Q6_K_F32_ALIGNED_COOPMAT,
+            // Sprint 12M — M-tile variants reuse the same SPVs as the
+            // L-tile variants above. Tile differentiation is via
+            // spec-constants in pipeline_registry.rs, not via the SPV.
+            ShaderId::MulMmQ4KCoopmatM => MUL_MM_Q4_K_F32_COOPMAT,
+            ShaderId::MulMmQ6KCoopmatM => MUL_MM_Q6_K_F32_COOPMAT,
+            ShaderId::MulMmQ4KAlignedCoopmatM => MUL_MM_Q4_K_F32_ALIGNED_COOPMAT,
+            ShaderId::MulMmQ6KAlignedCoopmatM => MUL_MM_Q6_K_F32_ALIGNED_COOPMAT,
             ShaderId::ProbeInt8Coopmat => PROBE_INT8_COOPMAT,
             ShaderId::BenchInt8CmGemm => BENCH_INT8CM_GEMM,
             ShaderId::BenchScalarGemm => BENCH_SCALAR_GEMM,
@@ -333,6 +354,10 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::MulMmQ6KCoopmat,
     ShaderId::MulMmQ4KAlignedCoopmat,
     ShaderId::MulMmQ6KAlignedCoopmat,
+    ShaderId::MulMmQ4KCoopmatM,
+    ShaderId::MulMmQ6KCoopmatM,
+    ShaderId::MulMmQ4KAlignedCoopmatM,
+    ShaderId::MulMmQ6KAlignedCoopmatM,
     ShaderId::ProbeInt8Coopmat,
     ShaderId::BenchInt8CmGemm,
     ShaderId::BenchScalarGemm,
