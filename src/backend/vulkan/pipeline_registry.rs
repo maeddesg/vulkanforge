@@ -421,6 +421,7 @@ impl PipelineRegistry {
                 | ShaderId::BenchQkCoopmat
                 | ShaderId::BenchInt8CmGemm
                 | ShaderId::BenchScalarGemm
+                | ShaderId::BenchInt8CmQ4K
                 | ShaderId::FlashAttnCoopmat
                 | ShaderId::FlashAttnCoopmatFp16Kv => {
                     // No spec constants — BR/BC/HEAD_DIM/FP16_KV are

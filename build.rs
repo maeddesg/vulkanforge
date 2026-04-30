@@ -624,6 +624,15 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "bench_scalar_gemm.comp",
         defines: &[],
     },
+    // v0.2.1 Sprint 11G-C — Q4_K x Q8_1 -> FP32 GEMM via Int8 KHR-coopmat.
+    // Same packed buffer layouts (block_q4_K_packed32 + block_q8_1_x4_packed128)
+    // mul_mmq_q4_k consumes; M-tile (BM=BN=64, BK=32) for first real-format
+    // shader. Output is FP32 [N, M] column-major matching mul_mmq.
+    ShaderJob {
+        out_name: "bench_int8cm_q4k.spv",
+        entry_source: "bench_int8cm_q4k.comp",
+        defines: &[("DATA_A_Q4_K", "1")],
+    },
     ShaderJob {
         out_name: "mul_mm_q4_k_f32_coopmat.spv",
         entry_source: "mul_mm.comp",

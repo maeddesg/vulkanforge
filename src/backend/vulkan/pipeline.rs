@@ -133,6 +133,20 @@ pub struct BenchInt8CmGemmPushConstants {
 }
 const _: () = assert!(std::mem::size_of::<BenchInt8CmGemmPushConstants>() == 16);
 
+/// v0.2.1 Sprint 11G-C — push block for `bench_int8cm_q4k.comp`.
+/// 3 × u32 = 12 B. Same M/N/K convention as `MmqPushConstants` (M = weight
+/// rows, N = sequence length / activation tokens, K = hidden dim, multiple
+/// of 256). Output is FP32 [N, M] column-major matching the production
+/// mul_mmq output layout.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BenchInt8CmQ4KPushConstants {
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+}
+const _: () = assert!(std::mem::size_of::<BenchInt8CmQ4KPushConstants>() == 12);
+
 /// v0.2 Sprint 9d.2 — push block for `kv_copy_fp16.comp`. 3 × u32 = 12 B.
 /// `n_elements` is the FP32 element count to convert; `dst_uint_offset`
 /// and `src_float_offset` give the start positions within the bound

@@ -2034,6 +2034,150 @@ fn test_int8_coopmat_runtime_smoke() {
     fix.teardown();
 }
 
+/// Sprint 11G-C — Q4_K x Q8_1 -> FP32 GEMM via Int8 KHR-coopmat parity.
+/// Drops `bench_int8cm_q4k.comp` on the same packed buffers `mul_mmq_q4_k_f32`
+/// consumes (`block_q4_K_packed32` weights + `block_q8_1_x4_packed128`
+/// activations) and compares against the CPU FP64 reference. Threshold is
+/// `max(0.05 * |amax|, 0.5)`, matching `test_gemm_q4k_full_tile_128x128_mul_mmq_l`
+/// — the int32 dot is bit-exact, the FP32 scale-fold introduces FP rounding
+/// only.
+#[test]
+fn test_int8cm_q4k_microbench_parity() {
+    use vulkanforge::backend::vulkan::pipeline::BenchInt8CmQ4KPushConstants;
+    use vulkanforge::backend::vulkan::q4k;
+
+    let mut fix = Fixture::new();
+    let m: u32 = 64;  // = BM (single output WG row tile)
+    let n: u32 = 64;  // = BN (single output WG col tile)
+    let k: u32 = q4k::QUANT_K as u32; // 256 = 1 super-block, 8 BK chunks
+
+    let weights = q4k::build_random_weights(m as usize, k as usize, 0xCAFEBABE);
+    let w_buf = {
+        let device = fix.dev.device.clone();
+        let allocator = fix.allocator.as_mut().unwrap();
+        let mut b = GpuBuffer::new(
+            &device, allocator, weights.len() as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "w_int8cm_q4k",
+        ).expect("alloc weights");
+        b.write_bytes(&weights).expect("write weights");
+        fix.track(b)
+    };
+
+    let acts: Vec<f32> = (0..(n * k))
+        .map(|i| ((i as f32) * 0.0173).sin() * 0.5)
+        .collect();
+    let act_buf = fix.host_buffer_f32(&acts, "act_int8cm_q4k");
+
+    let q8_blocks_x4 = ((n * k + 127) / 128) as usize;
+    let q8_buf = {
+        let device = fix.dev.device.clone();
+        let allocator = fix.allocator.as_mut().unwrap();
+        let buf = GpuBuffer::new(
+            &device, allocator, (q8_blocks_x4 * 144) as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::GpuOnly, "q8_int8cm_q4k",
+        ).expect("alloc q8");
+        fix.track(buf)
+    };
+    let q8_pc = Q8_1QuantizePushConstants { ne: n * k, num_blocks: q8_blocks_x4 as u32 };
+    fix.dispatch(
+        ShaderId::QuantizeQ8_1, &[act_buf, q8_buf],
+        bytemuck::bytes_of(&q8_pc),
+        (q8_blocks_x4 as u32, 1, 1),
+    );
+
+    let out_buf = fix.output_buffer_f32((m * n) as usize, "out_int8cm_q4k");
+    let pc = BenchInt8CmQ4KPushConstants { m, n, k };
+    fix.dispatch(
+        ShaderId::BenchInt8CmQ4K, &[w_buf, q8_buf, out_buf],
+        bytemuck::bytes_of(&pc),
+        (m / 64, n / 64, 1),
+    );
+
+    let gpu = fix.read_output(out_buf, (m * n) as usize);
+    let cpu = cpu_gemm_q4k_ref(&weights, &acts, m as usize, n as usize, k as usize);
+
+    assert!(gpu.iter().all(|x| x.is_finite()), "int8cm Q4K produced NaN/Inf");
+
+    let max_err = max_abs_err(&gpu, &cpu);
+    let max_amax = cpu.iter().cloned().fold(0.0f32, |acc, v| acc.max(v.abs()));
+    let thresh = (max_amax * 0.05).max(0.5);
+    assert!(
+        max_err < thresh,
+        "int8cm Q4K vs CPU max_err = {max_err:e} >= {thresh:e} (amax = {max_amax:.3})",
+    );
+    fix.teardown();
+}
+
+/// Sprint 11G-C — same shader, larger multi-WG dispatch (M=128, N=128 = 4 WGs)
+/// at K = 4 super-blocks (= 1024). Catches K-loop drift and inter-WG layout
+/// bugs the single-WG `test_int8cm_q4k_microbench_parity` cannot see.
+#[test]
+fn test_int8cm_q4k_microbench_parity_multi_wg() {
+    use vulkanforge::backend::vulkan::pipeline::BenchInt8CmQ4KPushConstants;
+    use vulkanforge::backend::vulkan::q4k;
+
+    let mut fix = Fixture::new();
+    let m: u32 = 128; // = 2 WG rows
+    let n: u32 = 128; // = 2 WG cols
+    let k: u32 = 4 * q4k::QUANT_K as u32; // 1024 = 4 super-blocks, 32 BK chunks
+
+    let weights = q4k::build_random_weights(m as usize, k as usize, 0xBEEF1234);
+    let w_buf = {
+        let device = fix.dev.device.clone();
+        let allocator = fix.allocator.as_mut().unwrap();
+        let mut b = GpuBuffer::new(
+            &device, allocator, weights.len() as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "w_q4k_multi",
+        ).expect("alloc weights");
+        b.write_bytes(&weights).expect("write weights");
+        fix.track(b)
+    };
+
+    let acts: Vec<f32> = (0..(n * k))
+        .map(|i| ((i as f32) * 0.0091).cos() * 0.4 + ((i as f32) * 0.013).sin() * 0.2)
+        .collect();
+    let act_buf = fix.host_buffer_f32(&acts, "act_q4k_multi");
+
+    let q8_blocks_x4 = ((n * k + 127) / 128) as usize;
+    let q8_buf = {
+        let device = fix.dev.device.clone();
+        let allocator = fix.allocator.as_mut().unwrap();
+        let buf = GpuBuffer::new(
+            &device, allocator, (q8_blocks_x4 * 144) as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::GpuOnly, "q8_q4k_multi",
+        ).expect("alloc q8");
+        fix.track(buf)
+    };
+    let q8_pc = Q8_1QuantizePushConstants { ne: n * k, num_blocks: q8_blocks_x4 as u32 };
+    fix.dispatch(
+        ShaderId::QuantizeQ8_1, &[act_buf, q8_buf],
+        bytemuck::bytes_of(&q8_pc),
+        (q8_blocks_x4 as u32, 1, 1),
+    );
+
+    let out_buf = fix.output_buffer_f32((m * n) as usize, "out_q4k_multi");
+    let pc = BenchInt8CmQ4KPushConstants { m, n, k };
+    fix.dispatch(
+        ShaderId::BenchInt8CmQ4K, &[w_buf, q8_buf, out_buf],
+        bytemuck::bytes_of(&pc),
+        (m / 64, n / 64, 1),
+    );
+
+    let gpu = fix.read_output(out_buf, (m * n) as usize);
+    let cpu = cpu_gemm_q4k_ref(&weights, &acts, m as usize, n as usize, k as usize);
+
+    assert!(gpu.iter().all(|x| x.is_finite()), "int8cm Q4K multi-WG produced NaN/Inf");
+
+    let max_err = max_abs_err(&gpu, &cpu);
+    let max_amax = cpu.iter().cloned().fold(0.0f32, |acc, v| acc.max(v.abs()));
+    let thresh = (max_amax * 0.05).max(0.5);
+    assert!(
+        max_err < thresh,
+        "int8cm Q4K multi-WG vs CPU max_err = {max_err:e} >= {thresh:e} (amax = {max_amax:.3})",
+    );
+    fix.teardown();
+}
+
 /// Sprint 11G-B — Int8 GEMM micro-bench parity. Both `bench_int8cm_gemm`
 /// (KHR coopmat 16x16x16 I8xI8->I32, entry 14) and `bench_scalar_gemm`
 /// (dotPacked4x8EXT) compute identical integer arithmetic on the same

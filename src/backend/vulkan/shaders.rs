@@ -102,6 +102,12 @@ pub enum ShaderId {
     // shape and LDS layout as BenchInt8CmGemm; inner K instruction is
     // dotPacked4x8EXT (RDNA4 v_dot4_i32_iu8) instead of coopMatMulAdd.
     BenchScalarGemm,
+    // Sprint 11G-C — Q4_K x Q8_1 -> FP32 GEMM via Int8 KHR-coopmat.
+    // Consumes the SAME block_q4_K_packed32 / block_q8_1_x4_packed128
+    // buffers mul_mmq does, so the bench harness can drop both shaders
+    // on the same data and compare FP32 outputs directly. M-tile
+    // (BM=BN=64, BK=32, NUM_WARPS=4); L-tile is Sprint 11G-D.
+    BenchInt8CmQ4K,
     QuantizeQ8_1,
     // Phase 4B — online-softmax decode attention; drop-in for ScalarAttn.
     FlashAttn,
@@ -193,6 +199,7 @@ impl ShaderId {
             ShaderId::ProbeInt8Coopmat => "probe_int8_coopmat",
             ShaderId::BenchInt8CmGemm => "bench_int8cm_gemm",
             ShaderId::BenchScalarGemm => "bench_scalar_gemm",
+            ShaderId::BenchInt8CmQ4K => "bench_int8cm_q4k",
             ShaderId::QuantizeQ8_1 => "quantize_q8_1_f32",
             ShaderId::FlashAttn => "flash_attn_f32",
             ShaderId::FlashAttnSplit => "flash_attn_split_f32",
@@ -259,6 +266,7 @@ impl ShaderId {
             ShaderId::ProbeInt8Coopmat => PROBE_INT8_COOPMAT,
             ShaderId::BenchInt8CmGemm => BENCH_INT8CM_GEMM,
             ShaderId::BenchScalarGemm => BENCH_SCALAR_GEMM,
+            ShaderId::BenchInt8CmQ4K => BENCH_INT8CM_Q4K,
             ShaderId::MulCoopmatQ4KFwdBn64 => MUL_COOPMAT_Q4K_FWD_BN64,
             ShaderId::MulCoopmatQ4KFwdBn32 => MUL_COOPMAT_Q4K_FWD_BN32,
             ShaderId::MulCoopmatQ4KFwdBn16 => MUL_COOPMAT_Q4K_FWD_BN16,
@@ -301,6 +309,7 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::ProbeInt8Coopmat,
     ShaderId::BenchInt8CmGemm,
     ShaderId::BenchScalarGemm,
+    ShaderId::BenchInt8CmQ4K,
     ShaderId::QuantizeQ8_1,
     ShaderId::FlashAttn,
     ShaderId::FlashAttnSplit,
@@ -397,6 +406,8 @@ pub const BENCH_INT8CM_GEMM: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/bench_int8cm_gemm.spv"));
 pub const BENCH_SCALAR_GEMM: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/bench_scalar_gemm.spv"));
+pub const BENCH_INT8CM_Q4K: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/bench_int8cm_q4k.spv"));
 pub const MUL_COOPMAT_Q4K_FWD_BN64: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_q4k_fwd_bn64.spv"));
 pub const MUL_COOPMAT_Q4K_FWD_BN32: &[u8] =
