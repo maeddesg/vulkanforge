@@ -363,12 +363,17 @@ impl PipelineRegistry {
                     // local_size_x=64 hardcoded; layout = (3 SSBOs).
                     ComputeKernel::from_spv(device, &words, cache)
                 }
-                ShaderId::MulMmQ4KCoopmat => {
-                    // Sprint 11E — mul_mm.comp + COOPMAT, KHR coopmat
-                    // 16x16x16 FP16xFP16->FP32 fragments. Spec-constants
-                    // pinned from llama.cpp's warptile_mmq AMD-coopmat-
-                    // override (ggml-vulkan.cpp:3367) at gfx1201:
+                ShaderId::MulMmQ4KCoopmat | ShaderId::MulMmQ6KCoopmat => {
+                    // Sprint 11E (Q4_K) / Sprint 12K (Q6_K) — mul_mm.comp
+                    // + COOPMAT, KHR coopmat 16x16x16 FP16xFP16->FP32
+                    // fragments. Spec-constants pinned from llama.cpp's
+                    // warptile_mmq AMD-coopmat-override
+                    // (ggml-vulkan.cpp:3367) at gfx1201:
                     //   { 256, 128, 128, 32, 64, 64, 2, 16, 16, 16, 64 }
+                    //
+                    // Q4_K and Q6_K share the same warptile — only the
+                    // SPV binary differs (DATA_A_* + LOAD_VEC_A defines
+                    // are baked at SPIR-V build time in build.rs).
                     //
                     // WNITER = WM·WN/(WARP·TM·TN·WMITER) is non-integer
                     // here (64·64/(64·16·16·2) = 0.125) — but the COOPMAT
@@ -397,7 +402,7 @@ impl PipelineRegistry {
                         256, // BLOCK_SIZE
                         128, // BM
                         128, // BN
-                        32,  // BK (Q4_K → 32, per shader comment)
+                        32,  // BK (Q4_K / Q6_K → 32, per shader comment)
                         64,  // WM
                         64,  // WN
                         2,   // WMITER

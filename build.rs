@@ -660,6 +660,39 @@ const JOBS: &[ShaderJob] = &[
             ("COOPMAT", "1"),
         ],
     },
+    // Sprint 12K — Q6_K twin of the Q4_K coopmat build. Same FP16 LDS
+    // / FP32-acc COOPMAT path through mul_mm.comp; the only Q6_K-
+    // specific deltas vs the Q4_K block above are:
+    //   * DATA_A_Q6_K=1, A_TYPE=block_q6_K
+    //   * A_TYPE_PACKED16=block_q6_K_packed16 (Q6_K only ships
+    //     packed16, see the Q6_K mul_mm / mul_mmq jobs above)
+    //   * LOAD_VEC_A=2 — the Q6_K branch of load_a_to_shmem
+    //     writes one FLOAT_TYPEV2 per idx (mul_mm_funcs.glsl note,
+    //     see the Q6_K mul_mm job's comment above for context); the
+    //     Q4_K LOAD_VEC_A=4 leaves half of buf_a uninitialised on
+    //     the Q6_K path and surfaces as NaN logits at scale.
+    // Matches llama.cpp vulkan-shaders-gen.cpp:557-577 where q6_k
+    // takes the default load_vec_quant = "2" (q6_k is NOT in the
+    // q5_0/q4_k/... "load_vec_quant=4" branch on line 560).
+    ShaderJob {
+        out_name: "mul_mm_q6_k_f32_coopmat.spv",
+        entry_source: "mul_mm.comp",
+        defines: &[
+            ("DATA_A_Q6_K", "1"),
+            ("A_TYPE", "block_q6_K"),
+            ("A_TYPE_PACKED16", "block_q6_K_packed16"),
+            ("B_TYPE", "float"),
+            ("D_TYPE", "float"),
+            ("FLOAT16", "1"),
+            ("FLOAT_TYPE", "float16_t"),
+            ("FLOAT_TYPEV2", "f16vec2"),
+            ("FLOAT_TYPEV4", "f16vec4"),
+            ("ACC_TYPE", "float"),
+            ("ACC_TYPEV2", "vec2"),
+            ("LOAD_VEC_A", "2"),
+            ("COOPMAT", "1"),
+        ],
+    },
 ];
 
 fn main() {

@@ -89,6 +89,13 @@ pub enum ShaderId {
     // Spec-constants from llama.cpp's warptile_mmq AMD-coopmat-override
     // (ggml-vulkan.cpp:3367) at gfx1201.
     MulMmQ4KCoopmat,
+    // Sprint 12K — Q6_K twin of MulMmQ4KCoopmat. Routes the Q6_K-
+    // weighted GEMMs (gemm_v + gemm_down on Qwen3-8B-Q4_K_M) through
+    // the same KHR coopmat path Q4_K already uses. Without this the
+    // VULKANFORGE_USE_MM_COOPMAT=1 pipeline falls Q6_K off onto the
+    // scalar mul_mm FP32 path which is the slowest GEMM we have
+    // (Sprint 12J: gemm_down 61ms -> 89ms regression).
+    MulMmQ6KCoopmat,
     // Sprint 11F — Int8 coopmat runtime probe (16x16x16 I8xI8->I32).
     // Single-WG smoke shader; not used in production.
     ProbeInt8Coopmat,
@@ -199,6 +206,7 @@ impl ShaderId {
             ShaderId::MulMmqQ4K | ShaderId::MulMmqQ4KL => "mul_mmq_q4_k_f32",
             ShaderId::MulMmqQ6K | ShaderId::MulMmqQ6KL => "mul_mmq_q6_k_f32",
             ShaderId::MulMmQ4KCoopmat => "mul_mm_q4_k_f32_coopmat",
+            ShaderId::MulMmQ6KCoopmat => "mul_mm_q6_k_f32_coopmat",
             ShaderId::ProbeInt8Coopmat => "probe_int8_coopmat",
             ShaderId::BenchInt8CmGemm => "bench_int8cm_gemm",
             ShaderId::BenchScalarGemm => "bench_scalar_gemm",
@@ -267,6 +275,7 @@ impl ShaderId {
             ShaderId::MulMmQ4KAligned => MUL_MM_Q4_K_F32_ALIGNED,
             ShaderId::MulMmQ6KAligned => MUL_MM_Q6_K_F32_ALIGNED,
             ShaderId::MulMmQ4KCoopmat => MUL_MM_Q4_K_F32_COOPMAT,
+            ShaderId::MulMmQ6KCoopmat => MUL_MM_Q6_K_F32_COOPMAT,
             ShaderId::ProbeInt8Coopmat => PROBE_INT8_COOPMAT,
             ShaderId::BenchInt8CmGemm => BENCH_INT8CM_GEMM,
             ShaderId::BenchScalarGemm => BENCH_SCALAR_GEMM,
@@ -311,6 +320,7 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::MulMmqQ4KL,
     ShaderId::MulMmqQ6KL,
     ShaderId::MulMmQ4KCoopmat,
+    ShaderId::MulMmQ6KCoopmat,
     ShaderId::ProbeInt8Coopmat,
     ShaderId::BenchInt8CmGemm,
     ShaderId::BenchScalarGemm,
@@ -406,6 +416,8 @@ pub const MUL_MM_Q6_K_F32_ALIGNED: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q6_k_f32_aligned.spv"));
 pub const MUL_MM_Q4_K_F32_COOPMAT: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q4_k_f32_coopmat.spv"));
+pub const MUL_MM_Q6_K_F32_COOPMAT: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q6_k_f32_coopmat.spv"));
 pub const PROBE_INT8_COOPMAT: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/probe_int8_coopmat.spv"));
 pub const BENCH_INT8CM_GEMM: &[u8] =
