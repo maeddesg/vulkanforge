@@ -1,0 +1,83 @@
+#version 450
+
+// v0.2.1 Sprint 11G-D — empirical RDNA4 / RADV WMMA accumulator lane->cell
+// mapping probe (MMA-result variant).
+//
+// Forms an int32 accumulator fragment via `coopMatMulAdd` such that
+// `C[r, c] = r * 16 + c` (encodes cell coordinates), then each lane reads
+// its 4 owned components via `frag[i]` and writes (lane, elem_idx, value)
+// triples back. The Rust harness decodes value -> (row, col) and prints
+// the 64 lane * 4 elem -> (row, col) table.
+//
+// Encoding trick:
+//   A[i, k=0] = i,  A[i, k=1] = 1,  A[i, k>=2] = 0
+//   B[k=0, j] = 16, B[k=1, j] = j,  B[k>=2, j] = 0
+// Then C[i, j] = sum_k A[i,k] * B[k,j] = i*16 + j (k=0 and k=1 only).
+// All operands fit signed int8 [-128..127]. Result range 0..255 → int32.
+//
+// MMA-fragment layout differs from coopMatLoad-fragment layout — this
+// probe variant matches what `bench_int8cm_q4k.comp`'s direct fold
+// actually consumes.
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(local_size_x = 64) in;
+
+layout(set=0, binding=0) writeonly buffer BufOut { int32_t data_out[]; };
+layout(set=0, binding=1) writeonly buffer BufLen { uint    frag_len[]; };
+
+shared int8_t a_lds[16 * 16];
+shared int8_t b_lds[16 * 16];
+
+void main() {
+    uint tid  = gl_LocalInvocationID.x;
+    uint lane = gl_SubgroupInvocationID;
+
+    // Stage A and B for the encoded MMA. data_in is unused — we generate
+    // the encoded values directly so the host can recover (row, col).
+    for (uint i = tid; i < 256u; i += 64u) {
+        uint r = i / 16u;
+        uint c = i % 16u;
+        // A[r, c]: row-encoder column.
+        int8_t a_val;
+        if (c == 0u)      a_val = int8_t(r);
+        else if (c == 1u) a_val = int8_t(1);
+        else              a_val = int8_t(0);
+        a_lds[i] = a_val;
+        // B[r, c]: row 0 = 16, row 1 = c, else 0.
+        int8_t b_val;
+        if (r == 0u)      b_val = int8_t(16);
+        else if (r == 1u) b_val = int8_t(c);
+        else              b_val = int8_t(0);
+        b_lds[i] = b_val;
+    }
+    barrier();
+
+    coopmat<int8_t,  gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A_frag;
+    coopmat<int8_t,  gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B_frag;
+    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> C =
+        coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+
+    coopMatLoad(A_frag, a_lds, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    // B_frag wants the [k, n] layout; b_lds is [r, c] row-major, so we
+    // load with RowMajor and stride=16 to get the natural B = B[k, j].
+    coopMatLoad(B_frag, b_lds, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    C = coopMatMulAdd(A_frag, B_frag, C);
+
+    uint n_elems = C.length();
+    if (tid == 0u) {
+        frag_len[0] = n_elems;
+    }
+
+    for (uint i = 0u; i < n_elems; ++i) {
+        int32_t v    = C[i];
+        uint    base = (lane * n_elems + i) * 3u;
+        data_out[base + 0u] = int32_t(lane);
+        data_out[base + 1u] = int32_t(i);
+        data_out[base + 2u] = v;
+    }
+}

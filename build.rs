@@ -633,6 +633,12 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "bench_int8cm_q4k.comp",
         defines: &[("DATA_A_Q4_K", "1")],
     },
+    // Sprint 11G-D — empirical RDNA4 WMMA lane->cell mapping probe.
+    ShaderJob {
+        out_name: "probe_coopmat_layout.spv",
+        entry_source: "probe_coopmat_layout.comp",
+        defines: &[],
+    },
     ShaderJob {
         out_name: "mul_mm_q4_k_f32_coopmat.spv",
         entry_source: "mul_mm.comp",

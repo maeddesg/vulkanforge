@@ -14,12 +14,26 @@
 //   4 fragments per warp, 4 warps per WG = 16 fragments per WG output
 //   tile (= 64*64 = 4096 cells)
 //
-// LDS budget (~9 KB):
+// LDS budget (~5 KB):
 //   a_lds   : 64 * 32 = 2 KB int8
 //   b_lds   : 64 * 32 = 2 KB int8
 //   a_dm    : 64 * 8 B = 512 B  (per-row sub-block d*sub_scale, dmin*sub_min)
 //   b_ds    : 64 * 8 B = 512 B  (per-col Q8_1 d, s)
-//   scratch : 4 * 256 * 4 = 4 KB  (per-warp coopmat scale-fold scratch)
+//
+// Sprint 11G-D: replaced 11G-C's LDS scratch (4 KB) + coopMatStore +
+// 2*subgroupMemoryBarrierShared per fragment with direct fragment-element
+// indexing using the empirical RDNA4 / RADV / Wave64 lane->cell mapping
+// (validated by `probe_coopmat_layout` on gfx1201 / Mesa RADV 26.0):
+//
+//   row_in_frag = ((lane >> 5) & 1) * 4 + ((lane >> 4) & 1) * 8 + elem
+//   col_in_frag = lane & 15
+//
+// frag.length() = 4 elements per lane on Wave64. The row-group ordering
+// is NOT a simple `lane >> 4`: groups 1 and 2 (rows 4..7 and 8..11) are
+// swapped — lanes 16..31 own rows 8..11, lanes 32..47 own rows 4..7. The
+// row group index is the bit-reversal of `lane >> 4` over 2 bits, i.e.
+// the high half of the wave (lanes 32+) flips one bit and the inner
+// quarter (lanes 16..31) flips the other.
 //
 // Buffers consumed are the SAME packed types `mul_mmq` consumes, so a
 // drop-in performance comparison against the production scalar mul_mmq
@@ -82,7 +96,6 @@ shared int8_t  a_lds[BM * BK];
 shared int8_t  b_lds[BN * BK];
 shared vec2    a_dm[BM];      // (d * sub_scale,  dmin * sub_min) per row
 shared vec2    b_ds[BN];      // (d, s) per Q8_1 block per column
-shared int32_t scratch[NUM_WARPS][TM * TN];
 
 // ----- helpers -----------------------------------------------------------
 
@@ -219,7 +232,13 @@ void main() {
 
         barrier();
 
-        // --- Compute + scale-fold per fragment ---
+        // --- Compute + direct fragment-element scale-fold (no LDS scratch) ---
+        // Empirical RDNA4 / RADV Wave64 mapping (probe_coopmat_layout):
+        //   row_in_frag = ((lane >> 5) & 1) * 4 + ((lane >> 4) & 1) * 8 + elem
+        //   col_in_frag = lane & 15
+        uint col_in_frag = lane & 15u;
+        uint row_base    = ((lane >> 5) & 1u) * 4u + ((lane >> 4) & 1u) * 8u;
+
         [[unroll]] for (uint cm_row = 0u; cm_row < CMS_PER_ROW; ++cm_row) {
             [[unroll]] for (uint cm_col = 0u; cm_col < CMS_PER_COL; ++cm_col) {
                 coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> C =
@@ -230,12 +249,10 @@ void main() {
                     coopmat<int8_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> A_frag;
                     coopmat<int8_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> B_frag;
 
-                    // A is RowMajor in a_lds (a_lds[m_in_tile * BK + k_in_tile]).
                     uint a_off = (warp_r * WM + cm_row * TM) * BK + ks;
                     coopMatLoad(A_frag, a_lds, a_off, BK,
                                 gl_CooperativeMatrixLayoutRowMajor);
 
-                    // B is ColumnMajor in b_lds (b_lds[n_in_tile * BK + k_in_tile]).
                     uint b_off = (warp_c * WN + cm_col * TN) * BK + ks;
                     coopMatLoad(B_frag, b_lds, b_off, BK,
                                 gl_CooperativeMatrixLayoutColumnMajor);
@@ -243,45 +260,37 @@ void main() {
                     C = coopMatMulAdd(A_frag, B_frag, C);
                 }
 
-                // Store int32 fragment to per-warp scratch, then per-thread fold.
-                coopMatStore(C, scratch[warp_id], 0u, TN,
-                             gl_CooperativeMatrixLayoutRowMajor);
-                subgroupMemoryBarrierShared();
-
+                // Direct per-element fold — no coopMatStore, no LDS, no
+                // subgroup barrier. Each lane folds its 4 owned cells into
+                // its private fp32_out register array.
                 uint frag_idx = cm_row * CMS_PER_COL + cm_col;
-                [[unroll]] for (uint cell = 0u; cell < CELLS_PER_LANE; ++cell) {
-                    uint flat_idx = cell * WAVE_SIZE + lane;        // 0..255
-                    uint r_in = flat_idx / TN;                       // 0..15
-                    uint c_in = flat_idx % TN;                       // 0..15
-
+                uint n_in_wg = warp_c * WN + cm_col * TN + col_in_frag;
+                vec2 ds = b_ds[n_in_wg];
+                [[unroll]] for (uint elem = 0u; elem < CELLS_PER_LANE; ++elem) {
+                    uint r_in = row_base + elem;                            // 0..15
                     uint m_in_wg = warp_r * WM + cm_row * TM + r_in;
-                    uint n_in_wg = warp_c * WN + cm_col * TN + c_in;
-
-                    int32_t raw = scratch[warp_id][flat_idx];
                     vec2 dm = a_dm[m_in_wg];
-                    vec2 ds = b_ds[n_in_wg];
-                    float scaled = float(raw) * dm.x * ds.x - dm.y * ds.y;
-                    fp32_out[frag_idx * CELLS_PER_LANE + cell] += scaled;
+                    float scaled = float(C[elem]) * dm.x * ds.x - dm.y * ds.y;
+                    fp32_out[frag_idx * CELLS_PER_LANE + elem] += scaled;
                 }
-                subgroupMemoryBarrierShared();
             }
         }
 
         barrier();
     }
 
-    // --- Tail: write per-thread fp32_out to data_c[n * M + m] ---
+    // --- Tail: per-lane FP32 register array → global C[n*M + m] ---
+    uint col_in_frag = lane & 15u;
+    uint row_base    = ((lane >> 5) & 1u) * 4u + ((lane >> 4) & 1u) * 8u;
     [[unroll]] for (uint cm_row = 0u; cm_row < CMS_PER_ROW; ++cm_row) {
         [[unroll]] for (uint cm_col = 0u; cm_col < CMS_PER_COL; ++cm_col) {
             uint frag_idx = cm_row * CMS_PER_COL + cm_col;
-            [[unroll]] for (uint cell = 0u; cell < CELLS_PER_LANE; ++cell) {
-                uint flat_idx = cell * WAVE_SIZE + lane;
-                uint r_in = flat_idx / TN;
-                uint c_in = flat_idx % TN;
+            uint n = wg_n * BN + warp_c * WN + cm_col * TN + col_in_frag;
+            [[unroll]] for (uint elem = 0u; elem < CELLS_PER_LANE; ++elem) {
+                uint r_in = row_base + elem;
                 uint m = wg_m * BM + warp_r * WM + cm_row * TM + r_in;
-                uint n = wg_n * BN + warp_c * WN + cm_col * TN + c_in;
                 if (m < pc.M && n < pc.N) {
-                    data_c[n * pc.M + m] = fp32_out[frag_idx * CELLS_PER_LANE + cell];
+                    data_c[n * pc.M + m] = fp32_out[frag_idx * CELLS_PER_LANE + elem];
                 }
             }
         }
