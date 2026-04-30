@@ -299,6 +299,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let coherent_n = rows.iter().filter(|r| r.coherent).count();
     println!("  Coherent prompts: {}/{}", coherent_n, rows.len());
 
+    {
+        let (checked, issued) = session.forward.barrier_stats();
+        let elided = checked.saturating_sub(issued);
+        let pct = if checked > 0 { (elided as f64 / checked as f64) * 100.0 } else { 0.0 };
+        println!(
+            "  Barrier stats (cumulative): checked={checked} issued={issued} elided={elided} ({pct:.1}%) — elision_active={}",
+            session.forward.barrier_elision_active(),
+        );
+    }
+
     println!("\n=== 4-System Comparison ===");
     println!("                          Decode tok/s  Prefill tok/s");
     println!("  llama.cpp Vulkan:           114.2          4314    (reference)");

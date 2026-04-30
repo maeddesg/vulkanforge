@@ -24,6 +24,7 @@ use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 use vulkanforge::backend::vulkan::commands::CommandContext;
 use vulkanforge::backend::vulkan::decode::embedding_row;
 use vulkanforge::backend::vulkan::device::VulkanDevice;
+#[allow(unused_imports)]
 use vulkanforge::backend::vulkan::forward::Forward;
 use vulkanforge::backend::vulkan::gguf::{GgufFile, ModelConfig};
 use vulkanforge::backend::vulkan::kv_cache::{KvCache, KvCacheConfig};
@@ -202,5 +203,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     for (pp, med, mean, tps) in &rows {
         println!("{},{:.4},{:.4},{:.2}", pp, med, mean, tps);
     }
+    let (checked, issued) = forward.barrier_stats();
+    let elided = checked.saturating_sub(issued);
+    let pct = if checked > 0 { (elided as f64 / checked as f64) * 100.0 } else { 0.0 };
+    println!();
+    println!(
+        "Barrier stats: checked={checked}, issued={issued}, elided={elided} ({pct:.1}%) — elision_active={}",
+        forward.barrier_elision_active(),
+    );
     Ok(())
 }

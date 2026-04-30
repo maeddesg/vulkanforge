@@ -294,6 +294,19 @@ pub struct Forward {
     batch_up: GpuBuffer,
     batch_ffn_hidden: GpuBuffer,
     batch_ffn_out: GpuBuffer,
+
+    /// Sprint 12D — barrier elision via dirty-flag tracking. The set
+    /// holds `vk::Buffer` raw handles that have been written since the
+    /// last `compute_barrier`. `maybe_compute_barrier(reads)` skips the
+    /// barrier if none of the read buffers is in the dirty set.
+    /// Cleared by every barrier issuance (since `compute_barrier` is a
+    /// global `VkMemoryBarrier`, one barrier syncs everything).
+    /// `VULKANFORGE_DISABLE_BARRIER_ELISION=1` falls back to the legacy
+    /// always-barrier path for debugging / parity comparison.
+    pending_writes: std::collections::HashSet<u64>,
+    elision_disabled: bool,
+    barrier_stats_checked: u64,
+    barrier_stats_issued: u64,
 }
 
 impl Forward {
@@ -615,6 +628,13 @@ impl Forward {
             batch_input, batch_residual, batch_norm, batch_q8,
             batch_q, batch_k, batch_v, batch_attn_out, batch_o,
             batch_gate, batch_up, batch_ffn_hidden, batch_ffn_out,
+            // Sprint 12D — barrier elision tracker.
+            pending_writes: std::collections::HashSet::with_capacity(32),
+            elision_disabled: std::env::var("VULKANFORGE_DISABLE_BARRIER_ELISION")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            barrier_stats_checked: 0,
+            barrier_stats_issued: 0,
         })
     }
 
@@ -657,6 +677,8 @@ impl Forward {
         let mut per_layer: Vec<Duration> = Vec::with_capacity(n_layers);
         let mut final_dispatch = Duration::ZERO;
 
+        // Sprint 12D — fresh barrier-elision state per forward.
+        self.reset_barrier_state();
         let timings = cmd_ctx.one_shot_profiled(&dev.device, dev.compute_queue, |cmd| {
             let mut input = self.scratch_a.handle;
             let mut output = self.scratch_b.handle;
@@ -748,6 +770,8 @@ impl Forward {
         }
         let pre_setup = pre_start.elapsed();
 
+        // Sprint 12D — fresh barrier-elision state per forward.
+        self.reset_barrier_state();
         let timings = cmd_ctx.one_shot_profiled(&dev.device, dev.compute_queue, |cmd| {
             let mut input = self.scratch_a.handle;
             let mut output = self.scratch_b.handle;
@@ -838,6 +862,8 @@ impl Forward {
         // Pre-snapshot: we'll record per-layer profile boundaries.
         let mut per_layer_starts: Vec<usize> = Vec::with_capacity(self.config.n_layers as usize);
 
+        // Sprint 12D — fresh barrier-elision state per forward.
+        self.reset_barrier_state();
         cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
             if let Some(p) = self.profiler.as_mut() {
                 p.reset(&dev.device, cmd);
@@ -1323,11 +1349,25 @@ impl Forward {
     ) {
         let cfg = self.config.clone();
 
+        let q_buf = self.q_buf.handle;
+        let k_buf = self.k_buf.handle;
+        let v_buf = self.v_buf.handle;
+        let hidden_norm = self.hidden_norm.handle;
+        let attn_out = self.attn_out.handle;
+        let o_buf = self.o_buf.handle;
+        let res1 = self.res1.handle;
+        let gate_buf = self.gate_buf.handle;
+        let up_buf = self.up_buf.handle;
+        let ffn_hidden = self.ffn_hidden.handle;
+        let ffn_out = self.ffn_out.handle;
+
         // (a) attn_norm
         let w = layer_weight(model, layer, "attn_norm.weight");
-        self.run_rms_norm(dev, registry, cmd, input, w, self.hidden_norm.handle,
+        self.run_rms_norm(dev, registry, cmd, input, w, hidden_norm,
                          cfg.hidden_dim, 1, cfg.rms_norm_eps, "rms_norm_attn");
-        compute_barrier(dev, cmd);
+        self.mark_written(&[hidden_norm]);
+        // Next: (b) reads hidden_norm.
+        self.maybe_compute_barrier(dev, cmd, &[hidden_norm]);
 
         // (b) Q/K/V projections
         let wq = layer_weight(model, layer, "attn_q.weight");
@@ -1339,35 +1379,41 @@ impl Forward {
         let sk = layer_weight_shader(model, layer, "attn_k.weight");
         let sv = layer_weight_shader(model, layer, "attn_v.weight");
         self.run_gemv(dev, registry, cmd, sq,
-                      wq, self.hidden_norm.handle, self.q_buf.handle,
+                      wq, hidden_norm, q_buf,
                       cfg.hidden_dim, cfg.n_heads * cfg.head_dim, "gemv_q");
         self.run_gemv(dev, registry, cmd, sk,
-                      wk, self.hidden_norm.handle, self.k_buf.handle,
+                      wk, hidden_norm, k_buf,
                       cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, "gemv_k");
         self.run_gemv(dev, registry, cmd, sv,
-                      wv, self.hidden_norm.handle, self.v_buf.handle,
+                      wv, hidden_norm, v_buf,
                       cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, "gemv_v");
-        compute_barrier(dev, cmd);
+        self.mark_written(&[q_buf, k_buf, v_buf]);
+        // Next: (c) reads q_buf, k_buf (or (d) RoPE if no qk_norm).
+        self.maybe_compute_barrier(dev, cmd, &[q_buf, k_buf]);
 
         // (c) Q/K norm (per head) — only Qwen* sets this (Phase 4D).
         if cfg.has_qk_norm {
             let wqn = layer_weight(model, layer, "attn_q_norm.weight");
             let wkn = layer_weight(model, layer, "attn_k_norm.weight");
             self.run_rms_norm(dev, registry, cmd,
-                             self.q_buf.handle, wqn, self.q_buf.handle,
+                             q_buf, wqn, q_buf,
                              cfg.head_dim, cfg.n_heads, cfg.rms_norm_eps, "rms_norm_q");
             self.run_rms_norm(dev, registry, cmd,
-                             self.k_buf.handle, wkn, self.k_buf.handle,
+                             k_buf, wkn, k_buf,
                              cfg.head_dim, cfg.n_kv_heads, cfg.rms_norm_eps, "rms_norm_k");
-            compute_barrier(dev, cmd);
+            self.mark_written(&[q_buf, k_buf]);
+            // Next: (d) RoPE reads q_buf, k_buf.
+            self.maybe_compute_barrier(dev, cmd, &[q_buf, k_buf]);
         }
 
         // (d) RoPE NeoX on Q and K
-        self.run_rope_neox(dev, registry, cmd, self.q_buf.handle, self.q_buf.handle,
+        self.run_rope_neox(dev, registry, cmd, q_buf, q_buf,
                            cfg.head_dim, cfg.n_heads, position, "rope_q");
-        self.run_rope_neox(dev, registry, cmd, self.k_buf.handle, self.k_buf.handle,
+        self.run_rope_neox(dev, registry, cmd, k_buf, k_buf,
                            cfg.head_dim, cfg.n_kv_heads, position, "rope_k");
-        compute_barrier(dev, cmd);
+        self.mark_written(&[q_buf, k_buf]);
+        // Next: (e) KV-write reads k_buf, v_buf.
+        self.maybe_compute_barrier(dev, cmd, &[k_buf, v_buf]);
 
         // (e) KV-cache write — pos-major.
         // Sprint 9d.3: when the cache is FP16-allocated, dispatch the
@@ -1395,6 +1441,11 @@ impl Forward {
                 dev.device.cmd_copy_buffer(cmd, v_src, v_dst, std::slice::from_ref(&copy));
             });
         }
+        // (e) inline kv_bar — TRANSFER+COMPUTE → COMPUTE. Always
+        // emitted (not elided): it's the only barrier with a TRANSFER
+        // stage in this layer, the elision tracker only governs pure
+        // compute_barrier sites. After this barrier the dirty set
+        // also clears (a global VkMemoryBarrier covers everything).
         let kv_bar = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)
             .dst_access_mask(vk::AccessFlags::SHADER_READ);
@@ -1407,18 +1458,23 @@ impl Forward {
                 std::slice::from_ref(&kv_bar), &[], &[],
             );
         }
+        self.pending_writes.clear();
 
         // (f) Attention.
         self.run_scalar_attn(dev, registry, cmd, layer, position);
-        compute_barrier(dev, cmd);
+        self.mark_written(&[attn_out]);
+        // Next: (g) O-proj reads attn_out.
+        self.maybe_compute_barrier(dev, cmd, &[attn_out]);
 
         // (g) Output projection.
         let wo = layer_weight(model, layer, "attn_output.weight");
         let so = layer_weight_shader(model, layer, "attn_output.weight");
         self.run_gemv(dev, registry, cmd, so,
-                      wo, self.attn_out.handle, self.o_buf.handle,
+                      wo, attn_out, o_buf,
                       cfg.n_heads * cfg.head_dim, cfg.hidden_dim, "gemv_o");
-        compute_barrier(dev, cmd);
+        self.mark_written(&[o_buf]);
+        // Next: (h+i) reads input + o_buf.
+        self.maybe_compute_barrier(dev, cmd, &[input, o_buf]);
 
         // (h+i) Fused add_res1 + ffn_norm. v0.2 Sprint 9b folds
         //   res1 = input + o_buf
@@ -1427,12 +1483,14 @@ impl Forward {
         let w = layer_weight(model, layer, "ffn_norm.weight");
         self.run_multi_add_rms(
             dev, registry, cmd,
-            input, self.o_buf.handle, w,
-            /* sum_out  = */ self.res1.handle,
-            /* norm_out = */ self.hidden_norm.handle,
+            input, o_buf, w,
+            /* sum_out  = */ res1,
+            /* norm_out = */ hidden_norm,
             cfg.hidden_dim, 1, cfg.rms_norm_eps, "add_rms_ffn",
         );
-        compute_barrier(dev, cmd);
+        self.mark_written(&[res1, hidden_norm]);
+        // Next: (j) gate/up read hidden_norm.
+        self.maybe_compute_barrier(dev, cmd, &[hidden_norm]);
 
         // (j) gate / up
         let wg = layer_weight(model, layer, "ffn_gate.weight");
@@ -1440,36 +1498,46 @@ impl Forward {
         let sg = layer_weight_shader(model, layer, "ffn_gate.weight");
         let su = layer_weight_shader(model, layer, "ffn_up.weight");
         self.run_gemv(dev, registry, cmd, sg,
-                      wg, self.hidden_norm.handle, self.gate_buf.handle,
+                      wg, hidden_norm, gate_buf,
                       cfg.hidden_dim, cfg.ffn_dim, "gemv_gate");
         self.run_gemv(dev, registry, cmd, su,
-                      wu, self.hidden_norm.handle, self.up_buf.handle,
+                      wu, hidden_norm, up_buf,
                       cfg.hidden_dim, cfg.ffn_dim, "gemv_up");
-        compute_barrier(dev, cmd);
+        self.mark_written(&[gate_buf, up_buf]);
+        // Next: (k+l) swiglu reads gate_buf + up_buf.
+        self.maybe_compute_barrier(dev, cmd, &[gate_buf, up_buf]);
 
         // (k+l) Fused SwiGLU: ffn_hidden = silu(gate) * up. v0.2
         // Sprint 9a folds the previous silu(gate→gate) + barrier +
         // mul(gate, up→ffn_hidden) into one dispatch.
         self.run_swiglu(
             dev, registry, cmd,
-            self.gate_buf.handle, self.up_buf.handle, self.ffn_hidden.handle,
+            gate_buf, up_buf, ffn_hidden,
             cfg.ffn_dim, "swiglu",
         );
-        compute_barrier(dev, cmd);
+        self.mark_written(&[ffn_hidden]);
+        // Next: (m) FFN down reads ffn_hidden.
+        self.maybe_compute_barrier(dev, cmd, &[ffn_hidden]);
 
         // (m) FFN down — Q6_K in Q4_K_M, Q4_K otherwise.
         let wd = layer_weight(model, layer, "ffn_down.weight");
         let sd = layer_weight_shader(model, layer, "ffn_down.weight");
         self.run_gemv(dev, registry, cmd, sd,
-                      wd, self.ffn_hidden.handle, self.ffn_out.handle,
+                      wd, ffn_hidden, ffn_out,
                       cfg.ffn_dim, cfg.hidden_dim, "gemv_down");
-        compute_barrier(dev, cmd);
+        self.mark_written(&[ffn_out]);
+        // Next: (n) residual2 reads res1 + ffn_out.
+        self.maybe_compute_barrier(dev, cmd, &[res1, ffn_out]);
 
         // (n) Residual2 = res1 + ffn_out → output
         self.run_binary(dev, registry, cmd, ShaderId::Add,
-                        self.res1.handle, self.ffn_out.handle, output,
+                        res1, ffn_out, output,
                         cfg.hidden_dim, "add_res2");
-        compute_barrier(dev, cmd);
+        self.mark_written(&[output]);
+        // Next: next layer's attn_norm reads `output` (= its `input`),
+        // or dispatch_final reads `output`. Either way: caller's first
+        // op reads `output`.
+        self.maybe_compute_barrier(dev, cmd, &[output]);
     }
 
     fn dispatch_final(
@@ -1497,17 +1565,21 @@ impl Forward {
             _ => ShaderId::MulMatVecQ4K,
         };
 
+        let hidden_norm = self.hidden_norm.handle;
         self.run_rms_norm(
             dev, registry, cmd,
-            input, w_norm, self.hidden_norm.handle,
+            input, w_norm, hidden_norm,
             self.config.hidden_dim, 1, self.config.rms_norm_eps, "rms_norm_final",
         );
-        compute_barrier(dev, cmd);
+        self.mark_written(&[hidden_norm]);
+        // Next: lm_head GEMV reads hidden_norm.
+        self.maybe_compute_barrier(dev, cmd, &[hidden_norm]);
         self.run_gemv(
             dev, registry, cmd, lm_shader,
-            w_lm, self.hidden_norm.handle, self.logits_buf.handle,
+            w_lm, hidden_norm, self.logits_buf.handle,
             self.config.hidden_dim, self.config.vocab_size, "lm_head",
         );
+        self.mark_written(&[self.logits_buf.handle]);
     }
 
     // -------------------------------------------------------------
@@ -1613,7 +1685,74 @@ impl Forward {
             )?;
         }
         self.set_cache.clear();
+        // Sprint 12D — also reset the barrier-elision tracker so the
+        // first dispatch in the next forward can't see stale dirty
+        // flags from a previous (already-fence-waited) submit.
+        self.reset_barrier_state();
         Ok(())
+    }
+
+    /// Sprint 12D — mark `bufs` as pending-write so the next
+    /// `maybe_compute_barrier` that reads any of them will fire a
+    /// barrier. No-op when elision is disabled (legacy unconditional
+    /// path doesn't need the tracker).
+    #[inline]
+    fn mark_written(&mut self, bufs: &[vk::Buffer]) {
+        if self.elision_disabled {
+            return;
+        }
+        for b in bufs {
+            self.pending_writes.insert(b.as_raw());
+        }
+    }
+
+    /// Sprint 12D — issue a `compute_barrier` only when at least one of
+    /// `reads` is in the pending-write set. After issuance, every dirty
+    /// flag clears (the barrier is a global `VkMemoryBarrier`).
+    /// Returns `true` if a barrier was actually emitted (telemetry).
+    fn maybe_compute_barrier(
+        &mut self,
+        dev: &VulkanDevice,
+        cmd: vk::CommandBuffer,
+        reads: &[vk::Buffer],
+    ) -> bool {
+        self.barrier_stats_checked = self.barrier_stats_checked.saturating_add(1);
+        if self.elision_disabled {
+            compute_barrier(dev, cmd);
+            self.barrier_stats_issued = self.barrier_stats_issued.saturating_add(1);
+            return true;
+        }
+        let any_dirty = reads.iter().any(|b| self.pending_writes.contains(&b.as_raw()));
+        if any_dirty {
+            compute_barrier(dev, cmd);
+            self.pending_writes.clear();
+            self.barrier_stats_issued = self.barrier_stats_issued.saturating_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Sprint 12D — flush dirty state at the end of every forward so
+    /// the next forward starts with a clean slate (the
+    /// `vkWaitForFences` between submits guarantees ordering anyway,
+    /// so leaving stale entries would only over-issue barriers, not
+    /// cause a race).
+    #[inline]
+    fn reset_barrier_state(&mut self) {
+        self.pending_writes.clear();
+    }
+
+    /// Public accessor for the barrier-elision counters (used by
+    /// `examples/run_pp_bench` and the parity tests; not part of any
+    /// hot path).
+    pub fn barrier_stats(&self) -> (u64, u64) {
+        (self.barrier_stats_checked, self.barrier_stats_issued)
+    }
+
+    /// Public accessor for the elision flag.
+    pub fn barrier_elision_active(&self) -> bool {
+        !self.elision_disabled
     }
 
     fn write_bindings(
