@@ -610,6 +610,20 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "probe_int8_coopmat.comp",
         defines: &[],
     },
+    // v0.2.1 Sprint 11G-B — Int8-coopmat GEMM micro-benchmark vs scalar
+    // dotPacked4x8EXT reference. Both shaders share BM=BN=16 BK=32 tile
+    // shape and a 64-thread Wave64 WG; only the inner K instruction
+    // differs. Used by examples/bench_int8cm_gemm to gate Sprint 11G-C.
+    ShaderJob {
+        out_name: "bench_int8cm_gemm.spv",
+        entry_source: "bench_int8cm_gemm.comp",
+        defines: &[],
+    },
+    ShaderJob {
+        out_name: "bench_scalar_gemm.spv",
+        entry_source: "bench_scalar_gemm.comp",
+        defines: &[],
+    },
     ShaderJob {
         out_name: "mul_mm_q4_k_f32_coopmat.spv",
         entry_source: "mul_mm.comp",

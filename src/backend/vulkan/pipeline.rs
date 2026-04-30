@@ -119,6 +119,20 @@ pub struct BenchQkPushConstants {
 }
 const _: () = assert!(std::mem::size_of::<BenchQkPushConstants>() == 16);
 
+/// v0.2.1 Sprint 11G-B — push block for the int8 GEMM micro-bench shaders
+/// (`bench_int8cm_gemm` + `bench_scalar_gemm`). 4 × u32 = 16 B. M/N/K are
+/// the *total* output shape; n_reps amortises launch overhead inside the
+/// dispatch.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BenchInt8CmGemmPushConstants {
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    pub n_reps: u32,
+}
+const _: () = assert!(std::mem::size_of::<BenchInt8CmGemmPushConstants>() == 16);
+
 /// v0.2 Sprint 9d.2 — push block for `kv_copy_fp16.comp`. 3 × u32 = 12 B.
 /// `n_elements` is the FP32 element count to convert; `dst_uint_offset`
 /// and `src_float_offset` give the start positions within the bound

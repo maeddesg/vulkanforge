@@ -92,6 +92,16 @@ pub enum ShaderId {
     // Sprint 11F — Int8 coopmat runtime probe (16x16x16 I8xI8->I32).
     // Single-WG smoke shader; not used in production.
     ProbeInt8Coopmat,
+    // Sprint 11G-B — Int8-coopmat GEMM micro-benchmark. Computes
+    // C[M, N] = A[M, K] x B[K, N] (int8 x int8 -> int32) using
+    // VK_KHR_cooperative_matrix entry 14 (no saturate). Each WG owns
+    // a 16x16 output tile; the K-loop runs n_reps times for amortization.
+    // Used by examples/bench_int8cm_gemm.
+    BenchInt8CmGemm,
+    // Sprint 11G-B — scalar dotPacked4x8EXT GEMM reference. Same tile
+    // shape and LDS layout as BenchInt8CmGemm; inner K instruction is
+    // dotPacked4x8EXT (RDNA4 v_dot4_i32_iu8) instead of coopMatMulAdd.
+    BenchScalarGemm,
     QuantizeQ8_1,
     // Phase 4B — online-softmax decode attention; drop-in for ScalarAttn.
     FlashAttn,
@@ -181,6 +191,8 @@ impl ShaderId {
             ShaderId::MulMmqQ6K | ShaderId::MulMmqQ6KL => "mul_mmq_q6_k_f32",
             ShaderId::MulMmQ4KCoopmat => "mul_mm_q4_k_f32_coopmat",
             ShaderId::ProbeInt8Coopmat => "probe_int8_coopmat",
+            ShaderId::BenchInt8CmGemm => "bench_int8cm_gemm",
+            ShaderId::BenchScalarGemm => "bench_scalar_gemm",
             ShaderId::QuantizeQ8_1 => "quantize_q8_1_f32",
             ShaderId::FlashAttn => "flash_attn_f32",
             ShaderId::FlashAttnSplit => "flash_attn_split_f32",
@@ -245,6 +257,8 @@ impl ShaderId {
             ShaderId::MulMmQ6KAligned => MUL_MM_Q6_K_F32_ALIGNED,
             ShaderId::MulMmQ4KCoopmat => MUL_MM_Q4_K_F32_COOPMAT,
             ShaderId::ProbeInt8Coopmat => PROBE_INT8_COOPMAT,
+            ShaderId::BenchInt8CmGemm => BENCH_INT8CM_GEMM,
+            ShaderId::BenchScalarGemm => BENCH_SCALAR_GEMM,
             ShaderId::MulCoopmatQ4KFwdBn64 => MUL_COOPMAT_Q4K_FWD_BN64,
             ShaderId::MulCoopmatQ4KFwdBn32 => MUL_COOPMAT_Q4K_FWD_BN32,
             ShaderId::MulCoopmatQ4KFwdBn16 => MUL_COOPMAT_Q4K_FWD_BN16,
@@ -285,6 +299,8 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::MulMmqQ6KL,
     ShaderId::MulMmQ4KCoopmat,
     ShaderId::ProbeInt8Coopmat,
+    ShaderId::BenchInt8CmGemm,
+    ShaderId::BenchScalarGemm,
     ShaderId::QuantizeQ8_1,
     ShaderId::FlashAttn,
     ShaderId::FlashAttnSplit,
@@ -377,6 +393,10 @@ pub const MUL_MM_Q4_K_F32_COOPMAT: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q4_k_f32_coopmat.spv"));
 pub const PROBE_INT8_COOPMAT: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/probe_int8_coopmat.spv"));
+pub const BENCH_INT8CM_GEMM: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/bench_int8cm_gemm.spv"));
+pub const BENCH_SCALAR_GEMM: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/bench_scalar_gemm.spv"));
 pub const MUL_COOPMAT_Q4K_FWD_BN64: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_q4k_fwd_bn64.spv"));
 pub const MUL_COOPMAT_Q4K_FWD_BN32: &[u8] =

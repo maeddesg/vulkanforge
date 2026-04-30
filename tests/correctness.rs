@@ -2034,6 +2034,110 @@ fn test_int8_coopmat_runtime_smoke() {
     fix.teardown();
 }
 
+/// Sprint 11G-B — Int8 GEMM micro-bench parity. Both `bench_int8cm_gemm`
+/// (KHR coopmat 16x16x16 I8xI8->I32, entry 14) and `bench_scalar_gemm`
+/// (dotPacked4x8EXT) compute identical integer arithmetic on the same
+/// int8 inputs. With no rounding involved, both should match a CPU int64
+/// reference exactly. Shape M=N=16, K=128, n_reps=1 — single 16x16 tile,
+/// 4 BK chunks of K=32.
+#[test]
+fn test_int8cm_gemm_microbench_parity() {
+    use vulkanforge::backend::vulkan::pipeline::BenchInt8CmGemmPushConstants;
+
+    let mut fix = Fixture::new();
+    let m: u32 = 16;
+    let n: u32 = 16;
+    let k: u32 = 128;
+    let n_reps: u32 = 1;
+
+    // Deterministic int8 inputs in [-8, 8) — same generator the bench uses.
+    fn pseudo_i8(seed: u32) -> Vec<i8> {
+        let mut s = seed.wrapping_mul(2_654_435_761);
+        let mut out = Vec::with_capacity(seed as usize);
+        for _ in 0..seed {
+            s = s.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            let v = ((s >> 16) & 0xff) as i32;
+            out.push(((v % 16) - 8) as i8);
+        }
+        out
+    }
+    let a = pseudo_i8(m * k);
+    let b = pseudo_i8(k * n);
+    let mut cpu = vec![0_i64; (m * n) as usize];
+    for mi in 0..m as usize {
+        for ni in 0..n as usize {
+            let mut s: i64 = 0;
+            for ki in 0..k as usize {
+                s += a[mi * k as usize + ki] as i64 * b[ki * n as usize + ni] as i64;
+            }
+            cpu[mi * n as usize + ni] = s * n_reps as i64;
+        }
+    }
+
+    let a_bytes: Vec<u8> = a.iter().map(|&v| v as u8).collect();
+    let b_bytes: Vec<u8> = b.iter().map(|&v| v as u8).collect();
+
+    let make_a = |fix: &mut Fixture| {
+        let device = fix.dev.device.clone();
+        let allocator = fix.allocator.as_mut().unwrap();
+        let mut buf = GpuBuffer::new(
+            &device, allocator, a_bytes.len() as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "bench_a",
+        ).expect("alloc a");
+        buf.write_bytes(&a_bytes).expect("write a");
+        fix.track(buf)
+    };
+    let make_b = |fix: &mut Fixture| {
+        let device = fix.dev.device.clone();
+        let allocator = fix.allocator.as_mut().unwrap();
+        let mut buf = GpuBuffer::new(
+            &device, allocator, b_bytes.len() as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "bench_b",
+        ).expect("alloc b");
+        buf.write_bytes(&b_bytes).expect("write b");
+        fix.track(buf)
+    };
+    let make_c = |fix: &mut Fixture| {
+        let device = fix.dev.device.clone();
+        let allocator = fix.allocator.as_mut().unwrap();
+        let buf = GpuBuffer::new(
+            &device, allocator, ((m * n) as u64) * 4,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::GpuToCpu, "bench_c",
+        ).expect("alloc c");
+        fix.track(buf)
+    };
+
+    for shader in [ShaderId::BenchInt8CmGemm, ShaderId::BenchScalarGemm] {
+        let a_buf = make_a(&mut fix);
+        let b_buf = make_b(&mut fix);
+        let c_buf = make_c(&mut fix);
+
+        let pc = BenchInt8CmGemmPushConstants { m, n, k, n_reps };
+        fix.dispatch(
+            shader,
+            &[a_buf, b_buf, c_buf],
+            bytemuck::bytes_of(&pc),
+            (m / 16, n / 16, 1),
+        );
+
+        let raw = fix.read_output(c_buf, (m * n) as usize);
+        let got: Vec<i32> = raw.iter().map(|f| f.to_bits() as i32).collect();
+        let mismatches: Vec<(usize, i32, i64)> = got
+            .iter()
+            .zip(cpu.iter())
+            .enumerate()
+            .filter(|(_, (g, e))| **g as i64 != **e)
+            .take(5)
+            .map(|(i, (g, e))| (i, *g, *e))
+            .collect();
+        assert!(
+            mismatches.is_empty(),
+            "{shader:?} parity vs CPU int64 failed. First mismatches: {mismatches:?}",
+        );
+    }
+    fix.teardown();
+}
+
 /// Sprint 11E — COOPMAT mul_mm Q4_K parity at the L-tile shape.
 /// Dispatches `MulMmQ4KCoopmat` (BM=BN=128, KHR coopmat 16x16x16
 /// FP16xFP16->FP32) over the production-Qwen3 Q-projection shape
