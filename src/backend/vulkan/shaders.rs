@@ -96,6 +96,12 @@ pub enum ShaderId {
     // scalar mul_mm FP32 path which is the slowest GEMM we have
     // (Sprint 12J: gemm_down 61ms -> 89ms regression).
     MulMmQ6KCoopmat,
+    // Sprint 12L — aligned coopmat variants. LOAD_VEC_B=8 + mat2x4
+    // wide B loads (mirror of llama.cpp matmul_q*_k_f32_aligned_cm1).
+    // Selected at runtime by layer_weight_shader_gemm when
+    // seq_len % 8 == 0; misaligned shapes fall back to MulMm{Q4K,Q6K}Coopmat.
+    MulMmQ4KAlignedCoopmat,
+    MulMmQ6KAlignedCoopmat,
     // Sprint 11F — Int8 coopmat runtime probe (16x16x16 I8xI8->I32).
     // Single-WG smoke shader; not used in production.
     ProbeInt8Coopmat,
@@ -207,6 +213,8 @@ impl ShaderId {
             ShaderId::MulMmqQ6K | ShaderId::MulMmqQ6KL => "mul_mmq_q6_k_f32",
             ShaderId::MulMmQ4KCoopmat => "mul_mm_q4_k_f32_coopmat",
             ShaderId::MulMmQ6KCoopmat => "mul_mm_q6_k_f32_coopmat",
+            ShaderId::MulMmQ4KAlignedCoopmat => "mul_mm_q4_k_f32_aligned_coopmat",
+            ShaderId::MulMmQ6KAlignedCoopmat => "mul_mm_q6_k_f32_aligned_coopmat",
             ShaderId::ProbeInt8Coopmat => "probe_int8_coopmat",
             ShaderId::BenchInt8CmGemm => "bench_int8cm_gemm",
             ShaderId::BenchScalarGemm => "bench_scalar_gemm",
@@ -276,6 +284,8 @@ impl ShaderId {
             ShaderId::MulMmQ6KAligned => MUL_MM_Q6_K_F32_ALIGNED,
             ShaderId::MulMmQ4KCoopmat => MUL_MM_Q4_K_F32_COOPMAT,
             ShaderId::MulMmQ6KCoopmat => MUL_MM_Q6_K_F32_COOPMAT,
+            ShaderId::MulMmQ4KAlignedCoopmat => MUL_MM_Q4_K_F32_ALIGNED_COOPMAT,
+            ShaderId::MulMmQ6KAlignedCoopmat => MUL_MM_Q6_K_F32_ALIGNED_COOPMAT,
             ShaderId::ProbeInt8Coopmat => PROBE_INT8_COOPMAT,
             ShaderId::BenchInt8CmGemm => BENCH_INT8CM_GEMM,
             ShaderId::BenchScalarGemm => BENCH_SCALAR_GEMM,
@@ -321,6 +331,8 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::MulMmqQ6KL,
     ShaderId::MulMmQ4KCoopmat,
     ShaderId::MulMmQ6KCoopmat,
+    ShaderId::MulMmQ4KAlignedCoopmat,
+    ShaderId::MulMmQ6KAlignedCoopmat,
     ShaderId::ProbeInt8Coopmat,
     ShaderId::BenchInt8CmGemm,
     ShaderId::BenchScalarGemm,
@@ -418,6 +430,10 @@ pub const MUL_MM_Q4_K_F32_COOPMAT: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q4_k_f32_coopmat.spv"));
 pub const MUL_MM_Q6_K_F32_COOPMAT: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q6_k_f32_coopmat.spv"));
+pub const MUL_MM_Q4_K_F32_ALIGNED_COOPMAT: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q4_k_f32_aligned_coopmat.spv"));
+pub const MUL_MM_Q6_K_F32_ALIGNED_COOPMAT: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q6_k_f32_aligned_coopmat.spv"));
 pub const PROBE_INT8_COOPMAT: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/probe_int8_coopmat.spv"));
 pub const BENCH_INT8CM_GEMM: &[u8] =

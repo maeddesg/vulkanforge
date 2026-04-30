@@ -693,6 +693,61 @@ const JOBS: &[ShaderJob] = &[
             ("COOPMAT", "1"),
         ],
     },
+    // Sprint 12L — aligned coopmat variants. Mirrors llama.cpp's
+    // matmul_q4_k_f32_aligned_cm1 / matmul_q6_k_f32_aligned_cm1
+    // (vulkan-shaders-gen.cpp:580-581 with fp16=true, coopmat=true).
+    // Wider B-loads via LOAD_VEC_B=8 + B_TYPE=mat2x4 (eight FP32
+    // floats per data_b read, then narrowed to four f16vec2s in
+    // load_b_to_shmem at mul_mm_funcs.glsl:526-534). FLOAT_TYPEV8
+    // = f16mat2x4 (the FP16 narrow target) is the same pattern as
+    // FLOAT_TYPEV4 = f16vec4.
+    //
+    // Requires seq_len % 8 == 0 — runtime selector falls back to the
+    // unaligned coopmat above for misaligned shapes.
+    ShaderJob {
+        out_name: "mul_mm_q4_k_f32_aligned_coopmat.spv",
+        entry_source: "mul_mm.comp",
+        defines: &[
+            ("DATA_A_Q4_K", "1"),
+            ("A_TYPE", "block_q4_K"),
+            ("A_TYPE_PACKED32", "block_q4_K_packed32"),
+            ("B_TYPE", "mat2x4"),
+            ("D_TYPE", "float"),
+            ("FLOAT16", "1"),
+            ("FLOAT_TYPE", "float16_t"),
+            ("FLOAT_TYPEV2", "f16vec2"),
+            ("FLOAT_TYPEV4", "f16vec4"),
+            ("FLOAT_TYPEV8", "f16mat2x4"),
+            ("ACC_TYPE", "float"),
+            ("ACC_TYPEV2", "vec2"),
+            ("LOAD_VEC_A", "4"),
+            ("LOAD_VEC_B", "8"),
+            ("ALIGNED", "1"),
+            ("COOPMAT", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mm_q6_k_f32_aligned_coopmat.spv",
+        entry_source: "mul_mm.comp",
+        defines: &[
+            ("DATA_A_Q6_K", "1"),
+            ("A_TYPE", "block_q6_K"),
+            ("A_TYPE_PACKED16", "block_q6_K_packed16"),
+            ("B_TYPE", "mat2x4"),
+            ("D_TYPE", "float"),
+            ("FLOAT16", "1"),
+            ("FLOAT_TYPE", "float16_t"),
+            ("FLOAT_TYPEV2", "f16vec2"),
+            ("FLOAT_TYPEV4", "f16vec4"),
+            ("FLOAT_TYPEV8", "f16mat2x4"),
+            ("ACC_TYPE", "float"),
+            ("ACC_TYPEV2", "vec2"),
+            ("LOAD_VEC_A", "2"),
+            ("LOAD_VEC_B", "8"),
+            ("ALIGNED", "1"),
+            ("COOPMAT", "1"),
+        ],
+    },
 ];
 
 fn main() {

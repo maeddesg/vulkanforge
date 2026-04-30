@@ -363,7 +363,8 @@ impl PipelineRegistry {
                     // local_size_x=64 hardcoded; layout = (3 SSBOs).
                     ComputeKernel::from_spv(device, &words, cache)
                 }
-                ShaderId::MulMmQ4KCoopmat | ShaderId::MulMmQ6KCoopmat => {
+                ShaderId::MulMmQ4KCoopmat | ShaderId::MulMmQ6KCoopmat
+                | ShaderId::MulMmQ4KAlignedCoopmat | ShaderId::MulMmQ6KAlignedCoopmat => {
                     // Sprint 11E (Q4_K) / Sprint 12K (Q6_K) — mul_mm.comp
                     // + COOPMAT, KHR coopmat 16x16x16 FP16xFP16->FP32
                     // fragments. Spec-constants pinned from llama.cpp's
