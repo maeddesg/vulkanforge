@@ -1391,26 +1391,36 @@ impl Forward {
         // Next: (c) reads q_buf, k_buf (or (d) RoPE if no qk_norm).
         self.maybe_compute_barrier(dev, cmd, &[q_buf, k_buf]);
 
-        // (c) Q/K norm (per head) — only Qwen* sets this (Phase 4D).
+        // (c+d) Q/K norm + RoPE NeoX, fused via rms_norm_mul_rope when
+        // the model has Q/K-norm weights (Sprint 12E — same SPV used by
+        // dispatch_layer_batch since Sprint 9c.5). Saves 2 dispatches +
+        // 1 barrier per layer in decode by collapsing
+        // rms_norm_q + rope_q + rms_norm_k + rope_k = 4 dispatches into
+        // 2 fused dispatches.
+        //
+        // Models without `has_qk_norm` keep the original
+        // separate-rope-only path (no norm step to fuse with).
         if cfg.has_qk_norm {
             let wqn = layer_weight(model, layer, "attn_q_norm.weight");
             let wkn = layer_weight(model, layer, "attn_k_norm.weight");
-            self.run_rms_norm(dev, registry, cmd,
-                             q_buf, wqn, q_buf,
-                             cfg.head_dim, cfg.n_heads, cfg.rms_norm_eps, "rms_norm_q");
-            self.run_rms_norm(dev, registry, cmd,
-                             k_buf, wkn, k_buf,
-                             cfg.head_dim, cfg.n_kv_heads, cfg.rms_norm_eps, "rms_norm_k");
-            self.mark_written(&[q_buf, k_buf]);
-            // Next: (d) RoPE reads q_buf, k_buf.
-            self.maybe_compute_barrier(dev, cmd, &[q_buf, k_buf]);
+            self.run_rms_norm_mul_rope(
+                dev, registry, cmd,
+                q_buf, wqn, q_buf,
+                cfg.head_dim, cfg.n_heads, /* m = */ 1,
+                cfg.rms_norm_eps, "rms_norm_mul_rope_q",
+            );
+            self.run_rms_norm_mul_rope(
+                dev, registry, cmd,
+                k_buf, wkn, k_buf,
+                cfg.head_dim, cfg.n_kv_heads, /* m = */ 1,
+                cfg.rms_norm_eps, "rms_norm_mul_rope_k",
+            );
+        } else {
+            self.run_rope_neox(dev, registry, cmd, q_buf, q_buf,
+                               cfg.head_dim, cfg.n_heads, position, "rope_q");
+            self.run_rope_neox(dev, registry, cmd, k_buf, k_buf,
+                               cfg.head_dim, cfg.n_kv_heads, position, "rope_k");
         }
-
-        // (d) RoPE NeoX on Q and K
-        self.run_rope_neox(dev, registry, cmd, q_buf, q_buf,
-                           cfg.head_dim, cfg.n_heads, position, "rope_q");
-        self.run_rope_neox(dev, registry, cmd, k_buf, k_buf,
-                           cfg.head_dim, cfg.n_kv_heads, position, "rope_k");
         self.mark_written(&[q_buf, k_buf]);
         // Next: (e) KV-write reads k_buf, v_buf.
         self.maybe_compute_barrier(dev, cmd, &[k_buf, v_buf]);
