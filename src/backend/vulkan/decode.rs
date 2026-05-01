@@ -467,26 +467,100 @@ pub fn generate_from_tokens(
     // `config.sampling.seed`.
     let mut rng_state = config.sampling.seed.wrapping_add(start_pos as u64);
 
-    loop {
-        let next_id = sample_next_token(
+    // Sprint 15E — async pipelined decode loop, default-on. Hides the
+    // ~1836 µs CPU recording phase inside the ~9034 µs GPU compute
+    // window of the previous token by alternating two CB+fence pairs:
+    //   stage 1: pre_record(slot=cur, pos)   [during GPU(prev)]
+    //   stage 2: wait(prev) + read logits + sample + embedding lookup
+    //   stage 3: fill_embed + submit(cur)    [GPU(cur) starts]
+    //   slot rotates 0/1, repeat
+    // Opt-out: VULKANFORGE_DISABLE_ASYNC_DECODE=1 falls back to the
+    // serial path (single CB, record+submit+wait per token).
+    let async_decode = std::env::var("VULKANFORGE_DISABLE_ASYNC_DECODE")
+        .map(|v| v != "1" && !v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true);
+
+    if async_decode {
+        // ---- Async 3-stage pipeline ----
+        // First decode token: cold start the pipe.
+        let first_id = sample_next_token(
             &mut last_logits, &generated, &config.sampling, &mut rng_state,
         );
-        if tokenizer.is_eos(next_id) {
+        if tokenizer.is_eos(first_id) {
             stopped_on_eos = true;
-            break;
-        }
-        if generated.len() >= config.max_tokens as usize || pos >= max_seq {
-            break;
-        }
-        let raw = tokenizer.decode_token(next_id);
-        on_token(next_id, &raw);
-        generated.push(next_id);
+        } else if generated.len() < config.max_tokens as usize && pos < max_seq {
+            let raw = tokenizer.decode_token(first_id);
+            on_token(first_id, &raw);
+            generated.push(first_id);
 
-        let embd = embedding_row(gguf, cfg, next_id)?;
-        forward.forward_token(dev, registry, cmd_ctx, model, &embd, pos)?;
-        last_logits = forward.logits()?;
-        pos += 1;
+            let embd = embedding_row(gguf, cfg, first_id)?;
+            forward.pre_record(dev, registry, model, 0, pos)?;
+            forward.fill_embed_and_submit(dev, 0, &embd, pos)?;
+            let mut cur_slot = 1usize;
+            pos += 1;
+
+            loop {
+                if generated.len() >= config.max_tokens as usize || pos >= max_seq {
+                    break;
+                }
+                let prev_slot = 1 - cur_slot;
+
+                // Stage 1: pre-record the current slot's CB. References
+                // slots[cur_slot] handles only — embedding contents are
+                // written below, after sampling.
+                forward.pre_record(dev, registry, model, cur_slot, pos)?;
+
+                // Stage 2: wait for previous GPU work, read logits, sample.
+                last_logits = forward.wait_and_read_logits(dev, prev_slot)?;
+                let next_id = sample_next_token(
+                    &mut last_logits, &generated, &config.sampling, &mut rng_state,
+                );
+                if tokenizer.is_eos(next_id) {
+                    stopped_on_eos = true;
+                    // The pre-recorded CB at cur_slot is left unsubmitted;
+                    // it'll be reset on the next session's pre_record call.
+                    break;
+                }
+                let raw = tokenizer.decode_token(next_id);
+                on_token(next_id, &raw);
+                generated.push(next_id);
+
+                // Stage 3: write embedding + submit.
+                let embd = embedding_row(gguf, cfg, next_id)?;
+                forward.fill_embed_and_submit(dev, cur_slot, &embd, pos)?;
+
+                cur_slot = 1 - cur_slot;
+                pos += 1;
+            }
+
+            // Drain: read logits from the last submitted slot.
+            let last_slot = 1 - cur_slot;
+            last_logits = forward.wait_and_read_logits(dev, last_slot)?;
+        }
+    } else {
+        // ---- Serial path (pre-15E behaviour) ----
+        loop {
+            let next_id = sample_next_token(
+                &mut last_logits, &generated, &config.sampling, &mut rng_state,
+            );
+            if tokenizer.is_eos(next_id) {
+                stopped_on_eos = true;
+                break;
+            }
+            if generated.len() >= config.max_tokens as usize || pos >= max_seq {
+                break;
+            }
+            let raw = tokenizer.decode_token(next_id);
+            on_token(next_id, &raw);
+            generated.push(next_id);
+
+            let embd = embedding_row(gguf, cfg, next_id)?;
+            forward.forward_token(dev, registry, cmd_ctx, model, &embd, pos)?;
+            last_logits = forward.logits()?;
+            pos += 1;
+        }
     }
+    let _ = last_logits;
     let decode_time = decode_start.elapsed();
 
     let generated_text = tokenizer.decode(&generated);

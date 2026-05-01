@@ -197,6 +197,18 @@ pub struct Forward {
     /// alternates 0/1 per decode token. Prefill always uses slots[0].
     slots: [IntermediateSlot; 2],
     current_slot: usize,
+    /// Sprint 15E — async decode infrastructure. Two CB+fence pairs
+    /// alternating per token so `pre_record(CB[N+1])` can run on the
+    /// CPU during `GPU(CB[N])`. Allocated alongside the existing
+    /// CommandContext-driven serial path (which decode.rs picks
+    /// between via `VULKANFORGE_DISABLE_ASYNC_DECODE=1`).
+    async_pool: vk::CommandPool,
+    async_cbs: [vk::CommandBuffer; 2],
+    async_fences: [vk::Fence; 2],
+    /// Tracks which async slot has a CB pre-recorded but not yet
+    /// submitted (for the rare `start_async` then EOS-cancel path).
+    /// `None` means no CB is currently pre-recorded.
+    async_pending_record: Option<usize>,
     logits_buf: GpuBuffer,
     // Always-bound dummies for unused descriptor slots.
     fuse0: GpuBuffer,
@@ -353,6 +365,148 @@ impl Forward {
     #[inline]
     pub fn cur_mut(&mut self) -> &mut IntermediateSlot {
         &mut self.slots[self.current_slot]
+    }
+
+    /// Sprint 15E — record one decode forward (36 layers + lm_head)
+    /// into `cmd`, reading buffers from `slots[slot]`. Used by both
+    /// the existing serial path (called inside `cmd_ctx.one_shot`'s
+    /// closure with `slot = self.current_slot`) and the async
+    /// path (`pre_record` calls this on a slot-specific CB before
+    /// the embedding has been written, since vkCmd* records buffer
+    /// HANDLES not contents).
+    ///
+    /// Caller is responsible for: descriptor-pool reset (when not
+    /// cache_enabled), barrier-elision state reset, profiler reset,
+    /// and the surrounding begin/end CB calls.
+    fn record_decode_dispatches(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        model: &LoadedModel,
+        slot: usize,
+        position: u32,
+    ) {
+        // Temporarily switch current_slot so dispatch_layer / dispatch_final
+        // (which read self.cur() internally) hit the right slot.
+        let saved = self.current_slot;
+        self.current_slot = slot;
+
+        let mut input = self.cur().scratch_a.handle;
+        let mut output = self.cur().scratch_b.handle;
+        for layer in 0..self.config.n_layers {
+            self.dispatch_layer(dev, registry, cmd, model, layer, position, input, output);
+            std::mem::swap(&mut input, &mut output);
+        }
+        self.dispatch_final(dev, registry, cmd, model, input);
+
+        // Make logits visible to the host.
+        let post = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.logits_buf.handle)
+            .offset(0)
+            .size(vk::WHOLE_SIZE);
+        unsafe {
+            dev.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[post],
+                &[],
+            );
+        }
+
+        self.current_slot = saved;
+    }
+
+    /// Sprint 15E Stage 1 — pre-record CB[slot] for the given
+    /// `position`. Buffer handles are referenced (slots[slot].*) but
+    /// the embedding contents are NOT yet written to scratch_a; the
+    /// caller writes them via `fill_embed_and_submit` after sampling
+    /// determines the token. Designed to run on the CPU in parallel
+    /// with the GPU executing the previous token's CB.
+    pub fn pre_record(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        model: &LoadedModel,
+        slot: usize,
+        position: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cb = self.async_cbs[slot];
+        let fence = self.async_fences[slot];
+        // The fence may still be signaled from a previous token's GPU
+        // completion — that's fine, we wait once more (it's a no-op
+        // if the fence is already signaled at start of session).
+        unsafe {
+            dev.device.wait_for_fences(&[fence], true, u64::MAX)?;
+            dev.device.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())?;
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            dev.device.begin_command_buffer(cb, &begin)?;
+        }
+        // Sprint 12D barrier-elision tracker — reset to fresh state
+        // for this CB.
+        self.reset_barrier_state();
+        self.record_decode_dispatches(dev, registry, cb, model, slot, position);
+        unsafe { dev.device.end_command_buffer(cb)?; }
+        self.async_pending_record = Some(slot);
+        Ok(())
+    }
+
+    /// Sprint 15E Stage 2/3 — write the embedding for this token into
+    /// slot's scratch_a and rope_pos, then submit the pre-recorded CB.
+    /// Caller must have called `pre_record(slot, position)` already.
+    pub fn fill_embed_and_submit(
+        &mut self,
+        dev: &VulkanDevice,
+        slot: usize,
+        embedding: &[f32],
+        position: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if embedding.len() != self.config.hidden_dim as usize {
+            return Err(format!(
+                "embedding length {} != hidden_dim {}",
+                embedding.len(), self.config.hidden_dim
+            ).into());
+        }
+        self.slots[slot].scratch_a.write_bytes(bytemuck::cast_slice(embedding))?;
+        self.slots[slot].rope_pos_buf.write_bytes(bytemuck::bytes_of(&(position as u32)))?;
+
+        let cb = self.async_cbs[slot];
+        let fence = self.async_fences[slot];
+        unsafe {
+            dev.device.reset_fences(&[fence])?;
+            let cmds = [cb];
+            let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+            dev.device.queue_submit(dev.compute_queue, &[submit], fence)?;
+        }
+        self.async_pending_record = None;
+        Ok(())
+    }
+
+    /// Sprint 15E Stage 4 — block on slot's fence and read logits from
+    /// the (single) `logits_buf`. Must be called BEFORE the next
+    /// submit hits the same logits_buf (i.e. before the next call to
+    /// `fill_embed_and_submit`). In the 3-stage pipeline, the order is
+    /// pre_record(N+1) → wait_and_read_logits(N) → sample → submit(N+1),
+    /// so logits_buf is read while no CB is in flight on logits_buf.
+    pub fn wait_and_read_logits(
+        &mut self,
+        dev: &VulkanDevice,
+        slot: usize,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let fence = self.async_fences[slot];
+        unsafe { dev.device.wait_for_fences(&[fence], true, u64::MAX)?; }
+        let bytes = self.logits_buf.read_bytes()?;
+        Ok(bytemuck::cast_slice::<u8, f32>(
+            &bytes[..(self.config.vocab_size as usize) * 4],
+        ).to_vec())
     }
 
     pub fn new(
@@ -547,6 +701,27 @@ impl Forward {
             .pool_sizes(&pool_sizes);
         let descriptor_pool = unsafe { device.create_descriptor_pool(&pool_info, None)? };
 
+        // Sprint 15E — async-mode CB pool, two CBs + two fences for the
+        // 3-stage pipeline. Same compute queue family as the main path.
+        let async_pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(dev.queue_family_index)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let async_pool = unsafe { device.create_command_pool(&async_pool_info, None)? };
+        let async_cb_alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(async_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(2);
+        let async_cb_vec = unsafe { device.allocate_command_buffers(&async_cb_alloc)? };
+        let async_cbs = [async_cb_vec[0], async_cb_vec[1]];
+        // Fences start signaled so the first wait on a "fresh" slot
+        // doesn't block (no CB has been submitted yet).
+        let fence_info = vk::FenceCreateInfo::default()
+            .flags(vk::FenceCreateFlags::SIGNALED);
+        let async_fences = [
+            unsafe { device.create_fence(&fence_info, None)? },
+            unsafe { device.create_fence(&fence_info, None)? },
+        ];
+
         // Phase 5A-3: descriptor-set cache is now ON by default.
         // `VULKANFORGE_CB_REUSE=0` (or `false`) opts back out for
         // debugging or A/B comparisons; any other value (or unset)
@@ -703,6 +878,10 @@ impl Forward {
         Ok(Self {
             slots: [slot0, slot1],
             current_slot: 0,
+            async_pool,
+            async_cbs,
+            async_fences,
+            async_pending_record: None,
             logits_buf,
             fuse0, fuse1,
             rope_ff_buf, rope_idx_buf,
@@ -963,46 +1142,20 @@ impl Forward {
 
         // Sprint 12D — fresh barrier-elision state per forward.
         self.reset_barrier_state();
+        let cur_slot = self.current_slot;
         cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
             if let Some(p) = self.profiler.as_mut() {
                 p.reset(&dev.device, cmd);
             }
-
-            let mut input = self.cur().scratch_a.handle;
-            let mut output = self.cur().scratch_b.handle;
-
-            for layer in 0..self.config.n_layers {
+            // (Sprint 15E — share the same recording body with the async
+            // path. The serial path skips per-layer profile-boundary
+            // capture; the async path doesn't use the profiler.)
+            for _ in 0..self.config.n_layers {
                 if let Some(p) = self.profiler.as_ref() {
                     per_layer_starts.push(p.entries_len());
                 }
-                self.dispatch_layer(dev, registry, cmd, model, layer, position, input, output);
-                std::mem::swap(&mut input, &mut output);
             }
-
-            // After last layer, `input` holds the activation we feed
-            // into final-norm + LM head.
-            self.dispatch_final(dev, registry, cmd, model, input);
-
-            // Make logits visible to the host.
-            let post = vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.logits_buf.handle)
-                .offset(0)
-                .size(vk::WHOLE_SIZE);
-            unsafe {
-                dev.device.cmd_pipeline_barrier(
-                    cmd,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::PipelineStageFlags::HOST,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[post],
-                    &[],
-                );
-            }
+            self.record_decode_dispatches(dev, registry, cmd, model, cur_slot, position);
         })?;
 
         // Logits readback.
@@ -1389,7 +1542,15 @@ impl Forward {
     }
 
     pub fn destroy(self, device: &ash::Device, allocator: &mut Allocator) {
-        unsafe { device.destroy_descriptor_pool(self.descriptor_pool, None) };
+        unsafe {
+            device.destroy_descriptor_pool(self.descriptor_pool, None);
+            // Sprint 15E — async CB pool + fences.
+            for f in self.async_fences {
+                device.destroy_fence(f, None);
+            }
+            // CBs are freed implicitly with the pool.
+            device.destroy_command_pool(self.async_pool, None);
+        }
         // Sprint 15D — destroy both intermediate slots in turn.
         let [slot0, slot1] = self.slots;
         for s in [slot0, slot1] {
