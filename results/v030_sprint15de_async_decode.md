@@ -1,339 +1,348 @@
-# Sprint 15D + 15E — Async Decode: STOP, scope mismatch with single sprint
+# Sprint 15D + 15E — Async Pipelined Decode: 15D SHIPPED, 15E deferred
 
-**Premise.** Sprints 15A → 15B → 15C narrowed the v0.3 candidate
-list to one remaining lever: async multi-submit decode loop with
-`record(CB[N+1])` overlapping `GPU(CB[N])`. Theoretical ceiling
-calculated at +20 % decode (from Sprint 15A's
-`RECORD = 1 836 µs` + `GPU_WAIT = 9 034 µs` measurement). The
-brief structures this as 15D (double-buffered intermediates,
-infrastructure-only, perf-neutral) followed by 15E (the actual
-async loop). Bench-gate: decode ≥ 100 tok/s.
+**Premise (from prior brief).** After 13 falsified hypotheses
+across Sprints 12-15, the only remaining unfalsified candidate
+with material lift potential is async multi-submit decode.
+Theoretical ceiling: +20 % decode (Sprint 15A measurement of
+`RECORD = 1 836 µs` + `GPU_WAIT = 9 034 µs`). Brief structured the
+work as 15D (double-buffered intermediates infrastructure) then
+15E (the actual async loop). Bench-gate: decode ≥ 100 tok/s.
 
-**Verdict.** **STOP at scope assessment** — same pattern as
-15A / 15C. The brief's structuring is correct, but the **size of
-15D alone exceeds a single sprint** when measured against the
-actual `forward.rs` codebase. Per "INKREMENTELL!" + "BEI
-UNKLARHEITEN SOFORT STOP", this report documents the full
-15D refactor scope so a future multi-day sprint (or a 15D-only
-release) can pick it up cleanly. **No code changes shipped.**
-27/27 lib tests, 15/15 coherent (v0.2.4 default-config).
+**Verdict.** **15D shipped successfully** as commit `ca0d7ae`.
+The 17 per-forward intermediate buffers are now in an
+`IntermediateSlot` struct, doubled in `Forward.slots:
+[IntermediateSlot; 2]`, and all 96+ call sites in `forward.rs`
+have been rewritten via `self.cur()` / `self.cur_mut()` accessors.
+27/27 lib tests, 15/15 coherent on the bench suite, decode 91.2
+tok/s (within ±0.5 of v0.2.4 baseline 91.1 — perf-neutral as
+designed). Total diff: +239 / −181 LOC in `forward.rs`.
 
-This is the **13th honest stop** in the Sprint 12-15 arc. Each
-prior stop has been progressively more confident in the analysis
-and progressively cheaper than the hypothetical implementation
-that wouldn't have worked. This one is different: the hypothesis
-is right, the implementation is just bigger than its budget.
+**15E deferred** — but for a different reason than the brief
+expected. The user's pseudocode in the brief does not actually
+pipeline CPU recording with GPU compute (traced through below in
+§3); a working pipelined loop needs a 3-stage shape that requires
+splitting `cmd_ctx.one_shot` into separate stages and introducing
+a "pre-recorded but not yet submitted" CB state. That is
+3-5 hours of careful state-machine work, not the trivial loop
+rewrite the brief sketched. **15D is a real, shippable infrastructure
+win** (it enables several future optimisations including 15E,
+buffer-aliasing, dedicated lm_head paths). 15E remains the next
+sprint, with the correct design now documented in §4.
 
-## 1. Concrete scope of "Sprint 15D"
+## 1. Sprint 15D — what shipped
 
-### 1.1 Buffers needing double-buffering
+### 1.1 Struct refactor
 
-Walked through `forward.rs:161-340` (the `Forward` struct). The
-brief listed 14 decode-path intermediates; the actual scope
-includes more:
+```rust
+pub struct IntermediateSlot {
+    pub scratch_a: GpuBuffer,
+    pub scratch_b: GpuBuffer,
+    pub hidden_norm: GpuBuffer,
+    pub q_buf: GpuBuffer,
+    pub k_buf: GpuBuffer,
+    pub v_buf: GpuBuffer,
+    pub attn_out: GpuBuffer,
+    pub o_buf: GpuBuffer,
+    pub res1: GpuBuffer,
+    pub gate_buf: GpuBuffer,
+    pub up_buf: GpuBuffer,
+    pub ffn_hidden: GpuBuffer,
+    pub ffn_out: GpuBuffer,
+    pub rope_pos_buf: GpuBuffer,
+    pub fa_scratch_out: GpuBuffer,
+    pub fa_scratch_max: GpuBuffer,
+    pub fa_scratch_sum: GpuBuffer,
+}
 
-| # | Buffer | Memory | Brief's list? | Notes |
-|---|---|---|:---:|---|
-| 1 | `scratch_a` | CpuToGpu | ✅ | Embedding input, written CPU-side |
-| 2 | `scratch_b` | GpuOnly | ✅ | Layer ping-pong |
-| 3 | `hidden_norm` | GpuOnly | ✅ | Per-layer scratch |
-| 4 | `q_buf` | GpuOnly | ✅ | Attention Q |
-| 5 | `k_buf` | GpuOnly | ✅ | Attention K |
-| 6 | `v_buf` | GpuOnly | ✅ | Attention V |
-| 7 | `attn_out` | GpuOnly | ✅ | Attention output |
-| 8 | `o_buf` | GpuOnly | ✅ | Output projection |
-| 9 | `res1` | GpuOnly | ✅ | Residual |
-| 10 | `gate_buf` | GpuOnly | ✅ | FFN gate |
-| 11 | `up_buf` | GpuOnly | ✅ | FFN up |
-| 12 | `ffn_hidden` | GpuOnly | ✅ | FFN hidden |
-| 13 | `ffn_out` | GpuOnly | ✅ | FFN output |
-| 14 | `rope_pos_buf` | CpuToGpu | ✅ | Position for RoPE, host-written |
-| 15 | `fa_scratch_out` | GpuOnly | ❌ missed | Flash-attn split-K worker output |
-| 16 | `fa_scratch_max` | GpuOnly | ❌ missed | Flash-attn online-softmax max |
-| 17 | `fa_scratch_sum` | GpuOnly | ❌ missed | Flash-attn online-softmax denom |
-| 18 | `logits_buf` | GpuToCpu | (15E) | Output, double-buffer in 15E |
-| 19 | `rope_ff_buf` | (unused) | ✅ no | Read-only dummy |
-| 20 | `rope_idx_buf` | (unused) | ✅ no | Read-only dummy |
-| 21 | `fuse0`, `fuse1` | (dummies) | ✅ no | Read-only dummy descriptor slots |
-
-So the actual count is **17 decode-path intermediates** that need
-double-buffering, not 14. The Flash-Attention split-K scratch
-buffers participate in decode for long contexts (split-reduce path
-in `dispatch_layer`).
-
-### 1.2 Call-site counts
-
-Per-buffer reference counts in `forward.rs` (just the decode-path
-buffers from the brief's 14):
-
-```
-self.scratch_a:    19 refs
-self.scratch_b:     8 refs
-self.hidden_norm:   8 refs
-self.q_buf:        11 refs
-self.k_buf:        13 refs
-self.v_buf:         9 refs
-self.attn_out:      6 refs
-self.o_buf:         2 refs
-self.res1:          2 refs
-self.gate_buf:      2 refs
-self.up_buf:        2 refs
-self.ffn_hidden:    2 refs
-self.ffn_out:       2 refs
-self.rope_pos_buf: 10 refs
-                  ━━━━━━
-Total:             96 refs   ← brief's count
+pub struct Forward {
+    slots: [IntermediateSlot; 2],
+    current_slot: usize,
+    logits_buf: GpuBuffer,
+    fuse0: GpuBuffer,
+    fuse1: GpuBuffer,
+    rope_ff_buf: GpuBuffer,
+    rope_idx_buf: GpuBuffer,
+    // … other fields unchanged …
+}
 ```
 
-Plus `fa_scratch_out / max / sum` (probably 5-10 more refs each
-based on flash-attn dispatch sites).
+`Forward::new` now allocates two `IntermediateSlot`s via an inline
+`alloc_slot(slot_idx)` closure that suffixes the debug name with
+`_s1` for slot 1 (so `vulkaninfo` and RADV traces can distinguish
+them). The closure returns a fully-built `IntermediateSlot`; the
+caller does `slots: [slot0, slot1]`.
 
-Plus three **forward variants** each duplicating much of the
-buffer access:
+VRAM impact: ~+1-2 MB across the 17 buffers × 2 slots
+(dominated by the largest, `q_buf` at q_bytes ≈ 16 KB and
+`fa_scratch_out` at ~32 KB).
 
-- `forward_token` (line 874) — production decode
-- `forward_token_profile` (line 785) — Phase 5A profiling harness
-- `forward_token_profile_layers` (line 693) — per-layer profiling
+### 1.2 Accessor pattern
 
-Plus **prefill_batch** (`dispatch_layer_batch`) which uses *some*
-of the same buffers (e.g. `scratch_a` for the first layer's input
-upload) but has its own `batch_*` parallel suite for the bulk of
-the work. Prefill needs to either:
-
-- Always use slot 0 (simplest, doesn't break prefill parity)
-- Take a slot parameter (unnecessary churn since prefill is
-  one-shot, no async benefit)
-
-Realistic count: **120-150 reference updates** including the
-non-`forward_token` variants and prefill. Minimum 200-400 LOC of
-mechanical edits.
-
-### 1.3 Allocation site
-
-`Forward::new` (around line 379+) allocates each of those 14+ buffers
-with one `mk_storage(...)` call. Refactor to allocate twice into a
-`[GpuBuffer; 2]` array, or build a helper `IntermediateSlot::new(...)`
-struct constructor and instantiate it twice. ~50-80 LOC delta in
-construction code.
-
-### 1.4 Descriptor-set cache implications
-
-Sprint 5A's `alloc_or_get_set` (line 712-ish) caches descriptor
-sets keyed on `(layout, bindings)` where bindings include buffer
-handles. Doubling the buffer set means **doubling the cache
-entries** because slot-0 dispatches and slot-1 dispatches will
-produce different cache keys (different buffer handles).
-
-The `descriptor_pool` is sized `max_sets *= 4` per Sprint 5A's
-note (line 506-507) to allow rebuild after prefill_batch
-invalidation. Doubling cache occupancy on top of that may
-push past the pool size. Need to either:
-
-- Bump `max_sets *= 8` (cheap, ~40 KB extra device memory)
-- Or maintain two parallel caches keyed on slot index
-
-The bump-pool-size approach is simpler. Need to verify it doesn't
-trip RADV's max-allocations limit (vulkaninfo says
-`maxBoundDescriptorSets = 32`; we'd be far under).
-
-### 1.5 Test surface
-
-- `cargo test --release --lib`: 27 tests, all pass. Many test
-  parity between cache-on and cache-off paths (e.g.
-  `phase5a_cb_reuse_parity_qwen3`). Adding slot-indexing must not
-  break any of these.
-- `run_15prompt_bench`: 15/15 coherent on Qwen3-8B-Q4_K_M.
-- `profile_forward`, `profile_forward_layers`, `profile_prefill`,
-  `profile_positions`: all use `forward_token*` variants.
-  `profile_prefill` uses `prefill_batch`. Each example may need
-  refresh.
-
-The test-surface walkthrough alone is half a day.
-
-### 1.6 Total time budget — honest estimate
-
-- 1-2 hours: design `IntermediateSlot` struct, convert `Forward`
-  field layout, update `Forward::new`.
-- 3-4 hours: mechanical refactor of 96+ call sites across three
-  forward variants and prefill. Each touch is "self.foo →
-  self.slots[slot].foo" but the slot needs to thread through
-  `dispatch_layer`, `dispatch_layer_batch`, `dispatch_final`, and
-  every helper they call (run_gemv, run_rms_norm, run_flash_attn_*,
-  etc.). Some helpers don't take `&self` at the right level — they
-  may need the buffer passed explicitly rather than read from `self`.
-- 1 hour: descriptor-pool sizing, cache-key handling.
-- 1-2 hours: regression hunt — anything that broke the 27 lib tests
-  or the 15-prompt coherence under either cache-on or cache-off.
-- 0.5 hour: 15D-stop-gate validation, perf re-measure (must be
-  ≈ 91 tok/s, ±2 %).
-
-**Total: 6-9 hours of focused, careful work for 15D alone**, with
-15E as an additional 3-5 hours on top. That's 1.5-2 working days
-of high-risk-of-regression work. Not a single session.
-
-## 2. The "INKREMENTELL!" rule
-
-The brief's incremental structuring (15D first, perf-neutral
-gate, then 15E) is correct. The mistake is in the implicit
-assumption that 15D fits in one sprint. It doesn't, on this
-codebase, and the brief's own scope estimate (~20-50 call sites)
-underestimated the count by 2-3×.
-
-The **right way to do this** is to commit a multi-day v0.3-A
-sprint with concrete sub-deliverables:
-
-- **15D-1 (~3 hours)**: Extract `IntermediateSlot` struct with all
-  17 buffer fields. Update `Forward` to hold `[IntermediateSlot;
-  2] + current_slot: usize`. Write a single helper
-  `Forward::cur(&self) → &IntermediateSlot` and
-  `Forward::cur_mut(&mut self) → &mut IntermediateSlot`. Update
-  `Forward::new` to allocate both slots. **Don't yet update any
-  call sites — they all break.** The compiler error count is the
-  remaining work in 15D-2.
-- **15D-2 (~3-4 hours)**: Mechanical sweep through every call
-  site, replacing `self.foo` with `self.cur().foo` (read-only) or
-  the appropriate mutable variant. Compile-and-fix loop. After
-  the sweep: 27/27 lib tests + 15/15 coherent + decode 91±2
-  tok/s gate.
-- **15D-3 (~1 hour)**: Descriptor-pool sizing bump + fa_scratch
-  buffer audit (the brief missed three). Re-validate.
-- **15E-1 (~2 hours)**: Two-CB / two-fence pair plumbing in
-  `commands.rs`. Modify `forward_token` to do
-  `submit_no_wait + wait_fence(prev) + readback(prev) +
-  embed_write(cur) + submit(cur)`. Logits-buf double-buffering.
-  Special case for first/last token.
-- **15E-2 (~1-2 hours)**: Bench validation, env-var opt-out,
-  timing-instrumentation for the wait-fence-time delta (overlap
-  efficiency measure).
-
-**Total: 1.5-2 days of focused work, multi-sprint by any
-reasonable definition.**
-
-## 3. Why I am not attempting it inside this session
-
-The failure mode of attempting a 1.5-2-day refactor in a single
-session is the same failure mode the brief explicitly warns
-against:
-
-> **BEI UNKLARHEITEN SOFORT STOP. Das ist KERN-Infrastruktur!**
-> **REGRESSION: 27 lib Tests + 15-Prompt Coherence MÜSSEN grün —
-> NACH JEDEM Teil!**
-> **FALLS 15D CORRECTNESS BRICHT: STOP! Nicht zu 15E weitergehen!**
-
-A partial refactor that compiles but breaks one of the
-parity-test corner cases (e.g. cache-on vs cache-off,
-prefill→decode handoff, attn_v with the long-K Q6_K reduction)
-ships a Forward struct in an inconsistent state and risks the
-next session inheriting a half-finished refactor. Better to
-hand off the *plan*, properly scoped, than the *attempt*.
-
-The pattern across Sprints 15A / 15B / 15C / 15D matches: each
-stop was progressively more useful and progressively closer to a
-clean implementation brief. By 15D, the analysis is complete to
-the level of "every call site, every buffer, every test gate".
-A human (or a subagent with multi-hour budget) can execute this
-brief mechanically.
-
-## 4. Theoretical perf upper bound (unchanged from 15C)
-
-Repeating Sprint 15C's calculation for the record:
-
-```
-Sprint 15A measurement (pos=150-199 median, repeatable):
-  RECORD = 1836 µs (CPU)
-  GPU_WAIT = 9034 µs (GPU)
-  Sequential overhead = ~80 µs (reset / begin / end / submit /
-                                 readback / sample / embed_write)
-  TOTAL serial = 10934 µs → 91.5 tok/s ✓
-
-Perfect overlap (theoretical ceiling):
-  Wall = max(RECORD, GPU_WAIT) + sequential
-       = max(1836, 9034) + 80 = 9114 µs → 109.7 tok/s   (+20 %)
-
-Realistic 80 % overlap efficiency:
-  Hidden = 0.8 × 1836 = 1469 µs
-  Wall = 10934 - 1469 = 9465 µs → 105.7 tok/s   (+15 %)
-
-Realistic 50 % overlap efficiency (more conservative):
-  Hidden = 0.5 × 1836 = 918 µs
-  Wall = 10934 - 918 = 10016 µs → 99.8 tok/s   (+9 %)
-  *** Just below the 100 tok/s gate. ***
+```rust
+impl Forward {
+    #[inline]
+    pub fn cur(&self) -> &IntermediateSlot {
+        &self.slots[self.current_slot]
+    }
+    #[inline]
+    pub fn cur_mut(&mut self) -> &mut IntermediateSlot {
+        &mut self.slots[self.current_slot]
+    }
+}
 ```
 
-The bench-gate (≥ 100 tok/s) requires **at least 50 % overlap
-efficiency**. Anything less and 15D + 15E ships as opt-in only,
-following the same path as Sprint 13C's f16acc (correct,
-infrastructure-real, perf-marginal). The implementation team
-should plan for that outcome and not over-commit.
+`cur()` is used for read-only buffer access (handles, descriptors).
+`cur_mut()` is used for the CPU host-write helpers
+(`scratch_a.write_bytes`, `rope_pos_buf.write_bytes`).
+`destroy()` consumes `self` and unpacks the slots array directly to
+free both.
 
-## 5. Decode-gap ledger — final v0.2.x state
+### 1.3 The 96+ call-site sweep
 
-| # | Hypothesis | Sprint | Outcome |
-|---|---|---|---|
-|  1 | Barrier elision | 12D | 0 % falsified |
-|  2 | Norm + RoPE fusion | 12E | +1 % noise |
-|  3 | Q6_K shader optimisation | 12H | upstream-identical |
-|  4 | Mesa 26.1-rc3 driver | 13B | ±2 % noise |
-|  5 | f16-accumulator coopmat | 13C | −2 % (emulated on RDNA4) |
-|  6 | Wave32 / VOPD | 13D | 0 % decode |
-|  7 | `MMV_NUM_ROWS=2` (Path B) | 13E | −2.9 % |
-|  8 | Subgroup GEMV (Path A) | 14B | +0.16 % noise |
-|  9 | `MMV_NUM_ROWS=2` (Path A) | 14C | −1.5 % |
-| 10 | CB-reuse (template + UBO) | 15A | source-falsified (llama.cpp doesn't do this) |
-| 11 | lm_head NUM_ROWS=2 / coopmat | 15B | BW-bound at 94 % HBM ceiling |
-| 12 | Async multi-submit (1-day prototype) | 15C | infra-blocked, scope estimated |
-| 13 | Full 15D + 15E refactor (this) | 15D/15E | scope-blocked, plan delivered |
+The mechanical refactor was driven by `sed`:
 
-13 entries. The **only entry not falsified** is #13 (this).
-Its theoretical ceiling is real (+20 % decode). Its
-implementation cost is honest (1.5-2 days). The next move is
-*scoping* the v0.3 sprint properly — not stuffing it into a
-single session.
+```bash
+for buf in scratch_a scratch_b hidden_norm q_buf k_buf v_buf \
+           attn_out o_buf res1 gate_buf up_buf ffn_hidden ffn_out \
+           rope_pos_buf fa_scratch_out fa_scratch_max fa_scratch_sum; do
+    sed -i "s/self\.${buf}\./self.cur().${buf}./g" forward.rs
+done
+```
 
-## 6. Recommendation for the next session
+This handled ~95 % of the call sites in one pass. The remaining
+~5 % were:
 
-Pick one of:
+- **Multi-line `rope_pos_buf` access** (the field name on one
+  line, `.write_bytes(...)` on the next) — caught and fixed with
+  a targeted `sed -i 's/self\.rope_pos_buf$/self.cur().rope_pos_buf/'`.
+- **`write_bytes` calls needing `cur_mut()`** — second pass
+  upgraded `self.cur().scratch_a.write_bytes` → `self.cur_mut().scratch_a.write_bytes`
+  and similarly for `rope_pos_buf`.
+- **`destroy()` block** — `self.cur().X.destroy(...)` couldn't
+  compile (E0507: cannot move out of shared reference); rewrote
+  to unpack `let [slot0, slot1] = self.slots;` and iterate
+  `for s in [slot0, slot1] { s.X.destroy(...); }`.
 
-- **Path A — Commit the multi-day refactor**: schedule a
-  contiguous 1.5-2 day window. Use Section 2 of this report as
-  the work-breakdown. Validate at every sub-deliverable gate.
-  Bench-target +5-20 % decode based on overlap efficiency.
-- **Path B — Ship v0.2.4 as the durable v0.2 release**: stop
-  v0.3-decode work. Prefill is at 0.89 ×, decode at 0.80 ×,
-  shader-and-config-config tree exhausted. Pivot to other v0.3
-  features (multi-modal, larger context, more architectures).
-- **Path C — Scope down to 15D-1 only**: accept that "double-buffered
-  IntermediateSlot struct" is itself a useful sub-release (it
-  enables async, it enables overlapping prefill/decode, it
-  enables several other future optimisations). Land just that
-  much, ship as v0.2.5 with the new struct in place but
-  no async loop. Then 15E becomes a future single-sprint that
-  only touches the submit pattern.
+After that loop, `cargo build --release` came back with **0
+errors**. ~30 minutes of focused work — a reasonable beat for
+a 96-call-site refactor with deterministic transformations.
 
-I do not have a strong opinion on which is right. I have strong
-opinions that **none of them is "do it all in one session"**.
+### 1.4 Validation
 
-## 7. Outputs
+- `cargo build --release`: clean.
+- `cargo test --release --lib`: **27/27 passing**.
+- `run_15prompt_bench`: **15/15 coherent**, decode median **91.2
+  tok/s** (vs v0.2.4 baseline 91.1 — within run-to-run noise).
+- `run_pp_bench` pp=128: 2 551 tok/s (baseline 2 560, −0.4 %),
+  pp=512: 3 803 tok/s (baseline 3 863, −1.6 %). Single 3-run
+  sweep variance.
 
-- This report.
-- **No code changes.** v0.2.4 binary unchanged. 27 / 27 lib
-  tests, 15 / 15 coherent.
-- The Sprint 15D / 15E plan in Section 2 is concrete enough to
-  execute mechanically given the time budget.
+### 1.5 What 15D enables
 
-## 8. Honest framing — closing the v0.2.x → v0.3 transition
+Sprint 15E (async pipelined decode) needs every per-forward
+intermediate to be slot-indexed, which is what 15D delivers.
+Additionally, this refactor makes future work cheaper:
 
-The Sprint 12-15 arc has done its job. The decode-gap analysis
-is comprehensive (13 hypotheses), the surviving lever is
-identified (async multi-submit) with a real theoretical
-ceiling (+20 %), and the implementation scope is documented
-to the level of file-and-line concreteness. v0.2.4 is the
-honest production release: prefill 0.89 × llama.cpp, decode
-0.80 ×, all shader-config levers exhausted, the remaining gap
-is a multi-day infrastructure refactor away.
+- **Concurrent decode + speculative second-token recording**
+  (the original 15E goal).
+- **Dedicated `lm_head` GEMV pipeline** (Sprint 15B's downgraded
+  candidate) — could opportunistically use slots[1]'s logits_buf
+  if doubled there too.
+- **Buffer-aliasing experiments** — the slot abstraction
+  centralises buffer ownership, making it easier to swap in
+  shared/aliased allocations.
 
-This is what the v0.2 → v0.3 transition actually looks like.
-Not "one more sprint and we're at parity" — instead "every
-config-flip lever has been tried, the next move requires
-budgeted architectural work". That's progress, even when
-the user-visible perf number doesn't move.
+## 2. Why I stopped before 15E
+
+The brief's 15E pseudocode reads:
+
+```rust
+fn forward_token(&mut self, token_id, pos) {
+    let cur = self.current_slot;
+    self.slots[cur].scratch_a.write_bytes(&embedding);
+    self.slots[cur].rope_pos_buf.write_bytes(&pos_bytes);
+    self.reset_fence(cur);
+    self.begin_cb(cur);
+    self.record_forward(cur, pos);
+    self.end_cb(cur);
+    self.submit_no_wait(cur);
+    self.current_slot = 1 - cur;
+}
+
+// Caller loop:
+for pos in start..max_tokens {
+    if pos > start {
+        self.wait_fence(self.previous_slot());
+        let logits = self.read_logits(self.previous_slot());
+        next_token = sample(&logits);
+        if next_token == eos { break; }
+    }
+    self.forward_token(next_token, pos);
+}
+```
+
+**Tracing this against the timing budget** (RECORD = 1 836 µs,
+GPU = 9 034 µs):
+
+```
+T=0:    enter forward_token(token[0], pos=0)
+T=0..1.8ms:  record CB[0]    [CPU work, slot 0]
+T=1.8ms: submit CB[0]        [GPU starts running CB[0]]
+T=1.8ms: exit forward_token, return to caller
+T=1.8ms: caller loop iteration N+1 starts
+T=1.8ms: wait_fence(prev=0)  [CPU BLOCKS on GPU]
+T=10.8ms: GPU finishes CB[0], wait returns
+T=10.8ms: read logits, sample, ~50µs
+T=10.85ms: enter forward_token(token[1], pos=1)
+T=10.85..12.65ms: record CB[1] [CPU work, slot 1]
+T=12.65ms: submit CB[1]
+…
+```
+
+Per-token cost: **10.8 ms = same as serial**. No CPU/GPU overlap
+is achieved.
+
+**The reason**: in this layout the recording phase is *between
+wait and submit*, not *between submit and wait*. The CPU does the
+1.8 ms of recording AFTER the GPU finishes the previous token,
+not WHILE the previous token's GPU work is still in flight.
+
+For real overlap, the CPU must record CB[N+1] **during** GPU(CB[N])
+— i.e., before sampling the next token. That requires recording
+to NOT depend on the sampled token, which works because Vulkan
+records buffer *handles*, not buffer *contents*. The embedding
+data can be written to scratch_a *after* recording but *before*
+submitting.
+
+The correct pipeline shape is:
+
+## 3. The correct 15E design (3-stage pipeline)
+
+```
+T=0:    enter loop. pre_record(CB[0], pos=0) [CPU records, no submit]
+T=1.8ms: caller writes embed[0] to slots[0].scratch_a
+T=1.8ms: submit(CB[0])  [GPU starts]
+T=1.8ms: pre_record(CB[1], pos=1) [CPU records during GPU(CB[0])]
+T=3.6ms: pre_record done. CPU has 9.0 - 1.8 = 7.2ms to spare.
+         CPU spins / waits.
+T=10.8ms: wait(CB[0]) returns. read logits[0], sample → token[1].
+T=10.85ms: write embed[1] to slots[1].scratch_a
+T=10.85ms: submit(CB[1]) [GPU starts CB[1]]
+T=10.85ms: pre_record(CB[2], pos=2) [CPU records during GPU(CB[1])]
+T=12.65ms: pre_record done.
+T=19.85ms: wait(CB[1]) returns.
+…
+```
+
+Per-token cost from token 1 onwards:
+`max(record, GPU) + wait_overhead = max(1.8, 9.0) + 0.05 = 9.05 ms → 110.5 tok/s`
+
+That hits the +20 % theoretical ceiling. The pipeline only fills
+after the first token, so the first-token cost is unchanged
+(record+wait serially); but generation rate is dominated by
+steady-state.
+
+### 3.1 API surface needed for 15E
+
+The current `Forward::forward_token` is a single all-in-one
+method that calls `cmd_ctx.one_shot(...)` (which itself wraps
+reset → begin → record → end → submit → WAIT). To pipeline:
+
+1. **Two `CommandContext` instances** (each owns CB + fence)
+   replacing the current single context.
+2. **Split into three callable methods**:
+   - `forward.pre_record(pos: u32) -> SlotId` — selects the
+     next slot, resets that slot's CB+fence, begins CB,
+     calls `dispatch_layer × n_layers + dispatch_final`,
+     ends CB. Returns the slot for the caller to fill+submit.
+     Does NOT submit; CB stays in "ready to submit" state.
+   - `forward.fill_embed_and_submit(slot, embedding)` —
+     writes embed to slots[slot].scratch_a, host-write rope_pos
+     (pos was captured at pre_record time), submits CB.
+   - `forward.wait_and_logits(slot) -> Vec<f32>` — blocks on
+     slot's fence, reads logits_buf, returns logits.
+3. **Decode loop** in `decode.rs` orchestrates the 3-stage
+   timeline above. First-token has special handling (no
+   previous to wait for); last-token has special handling
+   (no successor to pre-record).
+4. **`logits_buf` does NOT need double-buffering** — readback
+   happens in `wait_and_logits` BEFORE `submit_next`, so
+   there's no race.
+
+### 3.2 Estimated implementation cost
+
+- 1 hour: extract three-method API on `Forward`, replace
+  `cmd_ctx.one_shot` with explicit phase calls.
+- 1-2 hours: rewrite `decode.rs`'s loop to use the 3-stage
+  pipeline. First/last token specials.
+- 0.5 hour: add `VULKANFORGE_DISABLE_ASYNC_DECODE=1` env-var
+  for opt-out.
+- 1 hour: bit-identical-output validation (compare async vs
+  serial outputs on the 15-prompt suite at temperature=0).
+- 0.5 hour: bench validation, timing instrumentation
+  (eprintln! the wait_fence elapsed time to confirm overlap).
+
+**Total: 3-5 hours of focused work.** Smaller than I estimated
+in the prior 15D/E scope-stop report (the brief's pseudocode
+was simpler than the correct shape, so I underestimated the
+deviation; but with 15D's struct refactor done, the remaining
+work is genuinely smaller than the 6-9h I'd reserved for 15D).
+
+## 4. What this report contributes
+
+- **15D shipped (commit `ca0d7ae`)**: real, validated,
+  reversible-via-`git revert`-or-stays-as-permanent-infra
+  contribution to the codebase. Not just a report.
+- **Honest analysis of the brief's 15E pseudocode**: it
+  wouldn't have hit the bench-gate even if implemented. The
+  trace in §2 shows why.
+- **Correct 15E pipeline shape (§3)**: 3-stage with the
+  embed-write deferred until after sampling. This is the
+  shape llama.cpp's async path uses (per Sprint 15A's
+  `ggml_vk_submit` reading — they use timeline semaphores
+  to enable exactly this kind of pipelining).
+- **Implementation budget for 15E**: 3-5 hours, smaller than
+  expected because 15D removed the largest blocker (struct
+  refactor). The remaining work is API surface + decode loop
+  rewrite + validation.
+
+## 5. Where the v0.2.4 → v0.3 transition stands now
+
+| Sprint | Status |
+|---|---|
+| 12D-12M, 13A-E, 14A-C | shipped or honest-negative |
+| 15A | analysis-only stop (template-CB hypothesis falsified at source-reading) |
+| 15B | honest-negative at pre-check (lm_head Q6_K already at 94 % HBM) |
+| 15C | feasibility-stop (1-day prototype impossible without 15D infra) |
+| 15D (this) | **shipped**: double-buffered intermediates, perf-neutral, infra ready |
+| 15E (next) | designed (§3 above), 3-5 hours of focused work, +20 % decode if it lands cleanly |
+
+The decode-gap analysis ledger has 13 entries (12 falsified + 1
+shipped infra). Sprint 15E is the *only remaining* candidate
+with realistic >5 % decode lift, and it now has both the
+infrastructure (15D) and the correct design (§3) in place.
+
+## 6. Outputs
+
+- `src/backend/vulkan/forward.rs`: +239 / −181 LOC. New
+  `IntermediateSlot` struct, two-slot allocation, `cur()` /
+  `cur_mut()` accessors, all 96+ buffer references rewritten.
+  Commit: `ca0d7ae`.
+- This report (`results/v030_sprint15de_async_decode.md`).
+- 27 / 27 lib tests, 15 / 15 coherent.
+- Decode 91.2 tok/s (v0.2.4 baseline 91.1, within noise).
+
+## 7. Next session
+
+Either:
+
+- **Implement 15E** using the 3-stage design in §3 — 3-5h
+  budget, +20 % decode if overlap lands cleanly, opt-out via
+  env var.
+- **Pause v0.3 decode work** — v0.2.4 stands as the durable
+  release; pivot to other v0.3 features (multi-modal, longer
+  context, more architectures).
+- **Review 15D's struct refactor** — even without 15E, 15D is
+  a useful infrastructure cleanup (centralises per-forward
+  buffer ownership, makes the slot index explicit). Could be
+  released as v0.2.5 if useful for downstream consumers.
