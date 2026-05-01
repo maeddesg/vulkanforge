@@ -31,6 +31,16 @@ use super::shaders::{self, ShaderId};
 // Phase-4A also tested BLOCK_SIZE=128 → also a wash (62.3 vs 61.8 at
 // pos=0, identical at pos=200) — VGPR pressure isn't moved by
 // spec-constant tuning, see results/phase4_step_4a_vgpr_reduction.md.
+//
+// Sprint 13E (2026-05-01) re-verified Phase-2A on the v0.2.2 codebase:
+// NUM_ROWS=2 mirrors llama.cpp `rm_kq=2` (ggml-vulkan.cpp:4128) for
+// non-GCN AMD, but per-dispatch profile shows gemv_q +21%, gemv_k +8%,
+// gemv_v +3% on RDNA4 because we don't enable llama.cpp's
+// subgroup-arithmetic reduction path (no requireSubgroupSize at
+// pipeline creation, no subgroupAdd in mul_mat_vec_base.glsl). The
+// shader is byte-identical to upstream; the difference is the
+// pipeline-config infrastructure llama.cpp ships that we don't.
+// See results/v023_sprint13e_mmv_numrows.md.
 pub const MMV_NUM_ROWS: u32 = 1;
 const MMV_SPEC_DATA: [u32; 3] = [64, MMV_NUM_ROWS, 1];
 
