@@ -366,35 +366,39 @@ impl PipelineRegistry {
                 ShaderId::MulMmQ4KCoopmat | ShaderId::MulMmQ6KCoopmat
                 | ShaderId::MulMmQ4KAlignedCoopmat | ShaderId::MulMmQ6KAlignedCoopmat
                 | ShaderId::MulMmQ4KCoopmatM | ShaderId::MulMmQ6KCoopmatM
-                | ShaderId::MulMmQ4KAlignedCoopmatM | ShaderId::MulMmQ6KAlignedCoopmatM => {
+                | ShaderId::MulMmQ4KAlignedCoopmatM | ShaderId::MulMmQ6KAlignedCoopmatM
+                | ShaderId::MulMmQ4KCoopmatS | ShaderId::MulMmQ6KCoopmatS
+                | ShaderId::MulMmQ4KAlignedCoopmatS | ShaderId::MulMmQ6KAlignedCoopmatS => {
                     // Sprint 11E (Q4_K) / Sprint 12K (Q6_K) / Sprint 12L
-                    // (aligned) / Sprint 12M (M-tile) — mul_mm.comp +
-                    // COOPMAT, KHR coopmat 16x16x16 FP16×FP16→FP32
-                    // fragments. Spec-constants pinned from llama.cpp's
-                    // warptile_mmq AMD-coopmat-override
+                    // (aligned) / Sprint 12M (M-tile) / Sprint 13A (S-tile)
+                    // — mul_mm.comp + COOPMAT, KHR coopmat 16x16x16
+                    // FP16×FP16→FP32 fragments. Spec-constants pinned from
+                    // llama.cpp's warptile_mmq AMD-coopmat-override
                     // (ggml-vulkan.cpp:3326-3367) at gfx1201:
                     //   L-tile: { 256, 128, 128, 32, 64, 64, 2, 16, 16, 16, 64 }
                     //   M-tile: { 128,  64,  64, 16, 64, 32, 2, 16, 16, 16, 64 }
+                    //   S-tile: {  64,  32,  32, 16, 32, 32, 2, 16, 16, 16, 64 }
                     //
                     // Q4_K / Q6_K and aligned / unaligned all share the
                     // same warptile per tile size — only the SPV binary
                     // differs (DATA_A_* / LOAD_VEC_A / LOAD_VEC_B /
                     // ALIGNED defines are baked at SPIR-V build time).
-                    // Sprint 12M's M-tile variants reuse the L-tile
-                    // SPVs (BM/BN/BK are spec-constants per
+                    // M-tile and S-tile variants reuse the L-tile SPVs
+                    // (BM/BN/BK are spec-constants per
                     // mul_mm.comp:103-118), so this match arm covers
-                    // eight ShaderIds with one piece of code.
-                    //
-                    // WNITER = WM·WN/(WARP·TM·TN·WMITER) is non-integer
-                    // for the L-tile (64·64/(64·16·16·2) = 0.125) — but
-                    // the COOPMAT path of mul_mm.comp uses cms_per_row =
-                    // WM/TM and cms_per_col = WN/TN in the inner loop
-                    // (line 178-179) instead of WNITER, so the 0
-                    // truncation in the unused scalar fallback is benign.
+                    // twelve ShaderIds with one piece of code.
                     //
                     // NUM_WARPS = BLOCK_SIZE/WARP, must equal (BM/WM)·(BN/WN):
                     //   L-tile: 256/64=4 = 2·2 ✓
                     //   M-tile: 128/64=2 = 1·2 ✓ (BM/WM=1, BN/WN=2)
+                    //   S-tile:  64/64=1 = 1·1 ✓ (BM/WM=1, BN/WN=1)
+                    let s_tile = matches!(
+                        id,
+                        ShaderId::MulMmQ4KCoopmatS
+                            | ShaderId::MulMmQ6KCoopmatS
+                            | ShaderId::MulMmQ4KAlignedCoopmatS
+                            | ShaderId::MulMmQ6KAlignedCoopmatS
+                    );
                     let m_tile = matches!(
                         id,
                         ShaderId::MulMmQ4KCoopmatM
@@ -415,7 +419,21 @@ impl PipelineRegistry {
                         entry(9, 36, 4),
                         entry(10, 40, 4),
                     ];
-                    let data: [u32; 11] = if m_tile {
+                    let data: [u32; 11] = if s_tile {
+                        [
+                            64,  // BLOCK_SIZE
+                            32,  // BM
+                            32,  // BN
+                            16,  // BK
+                            32,  // WM
+                            32,  // WN
+                            2,   // WMITER
+                            16,  // TM (coopmat_m)
+                            16,  // TN (coopmat_n)
+                            16,  // TK (coopmat_k)
+                            64,  // WARP — RDNA Wave64
+                        ]
+                    } else if m_tile {
                         [
                             128, // BLOCK_SIZE
                             64,  // BM

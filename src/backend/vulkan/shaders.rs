@@ -112,6 +112,15 @@ pub enum ShaderId {
     MulMmQ6KCoopmatM,
     MulMmQ4KAlignedCoopmatM,
     MulMmQ6KAlignedCoopmatM,
+    // Sprint 13A — S-tile (BM=32, BN=32) coopmat variants for very-small
+    // seq_len (n <= 32). Reuse the same SPV bytes as the L/M-tile variants —
+    // BM/BN/BK are spec-constants in mul_mm.comp:103-118. Selector:
+    // n <= 32 → S-tile; n <= 64 → M-tile; else → L-tile.
+    // At pp=32 N=12288: S-tile gives 6 WG/CU vs M-tile's 3 WG/CU.
+    MulMmQ4KCoopmatS,
+    MulMmQ6KCoopmatS,
+    MulMmQ4KAlignedCoopmatS,
+    MulMmQ6KAlignedCoopmatS,
     // Sprint 11F — Int8 coopmat runtime probe (16x16x16 I8xI8->I32).
     // Single-WG smoke shader; not used in production.
     ProbeInt8Coopmat,
@@ -229,6 +238,10 @@ impl ShaderId {
             ShaderId::MulMmQ6KCoopmatM => "mul_mm_q6_k_f32_coopmat_m",
             ShaderId::MulMmQ4KAlignedCoopmatM => "mul_mm_q4_k_f32_aligned_coopmat_m",
             ShaderId::MulMmQ6KAlignedCoopmatM => "mul_mm_q6_k_f32_aligned_coopmat_m",
+            ShaderId::MulMmQ4KCoopmatS => "mul_mm_q4_k_f32_coopmat_s",
+            ShaderId::MulMmQ6KCoopmatS => "mul_mm_q6_k_f32_coopmat_s",
+            ShaderId::MulMmQ4KAlignedCoopmatS => "mul_mm_q4_k_f32_aligned_coopmat_s",
+            ShaderId::MulMmQ6KAlignedCoopmatS => "mul_mm_q6_k_f32_aligned_coopmat_s",
             ShaderId::ProbeInt8Coopmat => "probe_int8_coopmat",
             ShaderId::BenchInt8CmGemm => "bench_int8cm_gemm",
             ShaderId::BenchScalarGemm => "bench_scalar_gemm",
@@ -307,6 +320,11 @@ impl ShaderId {
             ShaderId::MulMmQ6KCoopmatM => MUL_MM_Q6_K_F32_COOPMAT,
             ShaderId::MulMmQ4KAlignedCoopmatM => MUL_MM_Q4_K_F32_ALIGNED_COOPMAT,
             ShaderId::MulMmQ6KAlignedCoopmatM => MUL_MM_Q6_K_F32_ALIGNED_COOPMAT,
+            // Sprint 13A — S-tile variants reuse the same SPVs as L/M-tile.
+            ShaderId::MulMmQ4KCoopmatS => MUL_MM_Q4_K_F32_COOPMAT,
+            ShaderId::MulMmQ6KCoopmatS => MUL_MM_Q6_K_F32_COOPMAT,
+            ShaderId::MulMmQ4KAlignedCoopmatS => MUL_MM_Q4_K_F32_ALIGNED_COOPMAT,
+            ShaderId::MulMmQ6KAlignedCoopmatS => MUL_MM_Q6_K_F32_ALIGNED_COOPMAT,
             ShaderId::ProbeInt8Coopmat => PROBE_INT8_COOPMAT,
             ShaderId::BenchInt8CmGemm => BENCH_INT8CM_GEMM,
             ShaderId::BenchScalarGemm => BENCH_SCALAR_GEMM,
@@ -358,6 +376,10 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::MulMmQ6KCoopmatM,
     ShaderId::MulMmQ4KAlignedCoopmatM,
     ShaderId::MulMmQ6KAlignedCoopmatM,
+    ShaderId::MulMmQ4KCoopmatS,
+    ShaderId::MulMmQ6KCoopmatS,
+    ShaderId::MulMmQ4KAlignedCoopmatS,
+    ShaderId::MulMmQ6KAlignedCoopmatS,
     ShaderId::ProbeInt8Coopmat,
     ShaderId::BenchInt8CmGemm,
     ShaderId::BenchScalarGemm,

@@ -2833,6 +2833,9 @@ impl Forward {
             // S-tile mul_mmq variants. Used when seq_len ≤ 64.
             ShaderId::MulMmQ4KCoopmatM | ShaderId::MulMmQ6KCoopmatM
             | ShaderId::MulMmQ4KAlignedCoopmatM | ShaderId::MulMmQ6KAlignedCoopmatM => (64, 64),
+            // Sprint 13A — S-tile coopmat: BM=BN=32. Used when seq_len ≤ 32.
+            ShaderId::MulMmQ4KCoopmatS | ShaderId::MulMmQ6KCoopmatS
+            | ShaderId::MulMmQ4KAlignedCoopmatS | ShaderId::MulMmQ6KAlignedCoopmatS => (32, 32),
             _ => (64, 64),
         };
         let groups_x = (m + bm - 1) / bm;
@@ -3825,12 +3828,18 @@ fn layer_weight_shader_gemm(
     // shapes fall back to the unaligned coopmat (LOAD_VEC_B=2).
     let coopmat_aligned = coopmat_q4k_mm && n % 8 == 0;
     // Sprint 12M — pick M-tile (BM=64, BN=64) when seq_len is small.
-    // Port of llama.cpp ggml_vk_guess_matmul_pipeline:7141 reduced to
-    // the dimension that varies with prompt size (m = output rows is
-    // always >> 64 for our model: q_dim=4096, hidden=4096, ffn=12288).
-    // pp=64 with N=12288 + L-tile = 1.5 WG/CU → severe starvation;
-    // M-tile gives 3 WG/CU (still not great, but unblocks default-on).
-    let coopmat_m_tile = coopmat_q4k_mm && n <= 64;
+    // Sprint 13A — pick S-tile (BM=32, BN=32) when seq_len is very small
+    // (n ≤ 32). Three-way port of llama.cpp ggml_vk_guess_matmul_pipeline:7141:
+    //   m ≤ 32 || n ≤ 32 → S-tile
+    //   m ≤ 64 || n ≤ 64 → M-tile
+    //   else             → L-tile
+    // Reduced here to the dimension that varies with prompt size (m =
+    // output rows is always >> 64 for our model: q_dim=4096, hidden=4096,
+    // ffn=12288). WG-count vs N=12288:
+    //   pp=64  L-tile = 1.5 WG/CU,  M-tile = 3 WG/CU
+    //   pp=32  L-tile = 1.5 WG/CU,  M-tile = 3 WG/CU,  S-tile = 6 WG/CU
+    let coopmat_s_tile = coopmat_q4k_mm && n <= 32;
+    let coopmat_m_tile = coopmat_q4k_mm && n <= 64 && !coopmat_s_tile;
     match (gemm_kind, q6) {
         (GemmKind::MulMmAligned, true)  => ShaderId::MulMmQ6KAligned,
         (GemmKind::MulMmAligned, false) => ShaderId::MulMmQ4KAligned,
@@ -3840,19 +3849,27 @@ fn layer_weight_shader_gemm(
         // 61ms→89ms regression in 12J).
         // Sprint 12L — pick the aligned coopmat variant when shape allows.
         // Sprint 12M — pick the M-tile coopmat variant when seq_len ≤ 64.
-        (GemmKind::MulMm,        true)  => match (coopmat_q4k_mm, coopmat_aligned, coopmat_m_tile) {
-            (false, _,     _    ) => ShaderId::MulMmQ6K,
-            (true,  false, false) => ShaderId::MulMmQ6KCoopmat,
-            (true,  true,  false) => ShaderId::MulMmQ6KAlignedCoopmat,
-            (true,  false, true ) => ShaderId::MulMmQ6KCoopmatM,
-            (true,  true,  true ) => ShaderId::MulMmQ6KAlignedCoopmatM,
+        // Sprint 13A — pick the S-tile coopmat variant when seq_len ≤ 32.
+        // s_tile and m_tile are mutually exclusive by construction.
+        (GemmKind::MulMm,        true)  => match (coopmat_q4k_mm, coopmat_aligned, coopmat_m_tile, coopmat_s_tile) {
+            (false, _,     _,     _    ) => ShaderId::MulMmQ6K,
+            (true,  false, false, false) => ShaderId::MulMmQ6KCoopmat,
+            (true,  true,  false, false) => ShaderId::MulMmQ6KAlignedCoopmat,
+            (true,  false, true,  false) => ShaderId::MulMmQ6KCoopmatM,
+            (true,  true,  true,  false) => ShaderId::MulMmQ6KAlignedCoopmatM,
+            (true,  false, false, true ) => ShaderId::MulMmQ6KCoopmatS,
+            (true,  true,  false, true ) => ShaderId::MulMmQ6KAlignedCoopmatS,
+            (true,  _,     true,  true ) => unreachable!("s_tile and m_tile are mutually exclusive"),
         },
-        (GemmKind::MulMm,        false) => match (coopmat_q4k_mm, coopmat_aligned, coopmat_m_tile) {
-            (false, _,     _    ) => ShaderId::MulMmQ4K,
-            (true,  false, false) => ShaderId::MulMmQ4KCoopmat,
-            (true,  true,  false) => ShaderId::MulMmQ4KAlignedCoopmat,
-            (true,  false, true ) => ShaderId::MulMmQ4KCoopmatM,
-            (true,  true,  true ) => ShaderId::MulMmQ4KAlignedCoopmatM,
+        (GemmKind::MulMm,        false) => match (coopmat_q4k_mm, coopmat_aligned, coopmat_m_tile, coopmat_s_tile) {
+            (false, _,     _,     _    ) => ShaderId::MulMmQ4K,
+            (true,  false, false, false) => ShaderId::MulMmQ4KCoopmat,
+            (true,  true,  false, false) => ShaderId::MulMmQ4KAlignedCoopmat,
+            (true,  false, true,  false) => ShaderId::MulMmQ4KCoopmatM,
+            (true,  true,  true,  false) => ShaderId::MulMmQ4KAlignedCoopmatM,
+            (true,  false, false, true ) => ShaderId::MulMmQ4KCoopmatS,
+            (true,  true,  false, true ) => ShaderId::MulMmQ4KAlignedCoopmatS,
+            (true,  _,     true,  true ) => unreachable!("s_tile and m_tile are mutually exclusive"),
         },
         (GemmKind::Mmq,          true)  => if prefer_l { ShaderId::MulMmqQ6KL } else { ShaderId::MulMmqQ6K },
         (GemmKind::Mmq,          false) => if prefer_l { ShaderId::MulMmqQ4KL } else { ShaderId::MulMmqQ4K },
