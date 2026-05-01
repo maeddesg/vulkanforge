@@ -1,0 +1,169 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic      : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// VulkanForge Phase 4B — Flash-attention-style decode attention.
+//
+// Replaces the Phase-3A tiled `scalar_attn.comp` (192 VGPRs / 4-of-16
+// occupancy / shared float scores[2048] = 8 KB LDS) with an online-
+// softmax variant that:
+//
+//   * Eliminates the large LDS scores array (8 KB → 256 B / WG).
+//   * Eliminates the three-pass (score → softmax → V-sum) structure
+//     in favour of a single pass with running (max, sum, output)
+//     accumulators per thread.
+//   * Keeps the same dispatch shape (1 WG per Q-head, 32 WGs total)
+//     and the same descriptor bindings + push-constant struct as
+//     `scalar_attn.comp` so it's a drop-in replacement.
+//
+// Algorithm: classic Flash-Attention online softmax.  For each tile
+// of TILE=64 K positions:
+//   tile_max  = subgroupMax(score over tile)
+//   new_max   = max(running_max, tile_max)
+//   k         = exp(running_max - new_max)        // correction
+//   running_out *= k
+//   p         = exp(score - new_max)              // for valid lanes
+//   tile_sum  = subgroupAdd(p)
+//   running_sum = running_sum * k + tile_sum
+//   running_max = new_max
+//   running_out += p * V[t]                       // weighted V update
+//
+// At end: write running_out / running_sum to the output buffer.
+//
+// Workgroup is exactly one Wave64 (subgroupSize=64 on gfx1201), so
+// `subgroupMax`/`subgroupAdd` are workgroup-wide reductions in a single
+// instruction — same trick the Phase-3A tiled scalar_attn used.
+
+layout (constant_id = 0) const uint MAX_SEQ = 2048;
+
+const uint WGSIZE = 64;
+layout (local_size_x = WGSIZE) in;
+
+// Drop-in compatible bindings (same order as scalar_attn).
+layout (binding = 0) readonly  buffer Q { float q[]; };  // [n_heads, head_dim]
+// v0.2 Sprint 9d.3 — see flash_attn_tiled.comp for rationale. When
+// -DFP16_KV=1, K/V switch to packed-FP16 in `uint[]` storage and
+// are read via unpackHalf2x16; the index unit stays in elements.
+#if FP16_KV
+layout (binding = 1) readonly  buffer K { uint k_packed[]; };
+layout (binding = 2) readonly  buffer V { uint v_packed[]; };
+float load_k(uint idx) {
+    return unpackHalf2x16(k_packed[idx >> 1])[idx & 1u];
+}
+float load_v(uint idx) {
+    return unpackHalf2x16(v_packed[idx >> 1])[idx & 1u];
+}
+#else
+layout (binding = 1) readonly  buffer K { float k[]; };  // [pos, n_kv_heads, head_dim]
+layout (binding = 2) readonly  buffer V { float v[]; };  // [pos, n_kv_heads, head_dim]
+float load_k(uint idx) { return k[idx]; }
+float load_v(uint idx) { return v[idx]; }
+#endif
+layout (binding = 3) writeonly buffer O { float o[]; };  // [n_heads, head_dim]
+
+// Drop-in compatible push-constant block (`ScalarAttnPushConstants`).
+layout (push_constant) uniform Params {
+    uint  n_heads;
+    uint  n_kv_heads;
+    uint  head_dim;
+    uint  seq_len;
+    uint  max_seq;     // unused at runtime, kept for binary compat
+    float scale;
+} p;
+
+// Shared scores buffer holds the per-tile p values so the V-sum pass
+// can pick them up; tile is a single wavefront wide so 64 floats
+// (256 B) is enough.  Compare to scalar_attn.comp's 8 KB.
+const uint TILE = WGSIZE;
+shared float scores_lds[TILE];
+
+void main() {
+    uint h   = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (h >= p.n_heads) {
+        return;
+    }
+    uint group_size = p.n_heads / p.n_kv_heads;     // GQA: 4 for Qwen3
+    uint kvh        = h / group_size;
+
+    uint q_off      = h   * p.head_dim;
+    uint o_off      = h   * p.head_dim;
+    uint pos_stride = p.n_kv_heads * p.head_dim;
+    uint head_off   = kvh * p.head_dim;
+
+    // Per-thread output accumulators. With WGSIZE=64 and head_dim=128
+    // (Qwen3) each thread covers 2 output dimensions: `tid` and
+    // `tid + 64`. Bounds-checked at write time so smaller head_dim
+    // values still work.
+    float my_out0 = 0.0;
+    float my_out1 = 0.0;
+    float my_max  = -1e30;
+    float my_sum  = 0.0;
+
+    // ---- Tile loop over the cached K/V history ----
+    for (uint tile_base = 0; tile_base < p.seq_len; tile_base += TILE) {
+        uint t = tile_base + tid;
+        bool valid = t < p.seq_len;
+
+        // Per-thread score = Q·K[t] · scale.
+        float score = -1e30;
+        if (valid) {
+            uint k_pos_off = t * pos_stride + head_off;
+            float s = 0.0;
+            for (uint d = 0; d < p.head_dim; ++d) {
+                s += q[q_off + d] * load_k(k_pos_off + d);
+            }
+            score = s * p.scale;
+        }
+
+        // ---- Online-softmax update ----
+        float tile_max = subgroupMax(score);
+        float new_max  = max(my_max, tile_max);
+        // exp(my_max - new_max) is the correction factor for the
+        // running accumulators. When my_max == -inf (first tile)
+        // this evaluates to 0 which zeroes out un-initialised state
+        // — safe.
+        float kfac = exp(my_max - new_max);
+        my_out0 *= kfac;
+        my_out1 *= kfac;
+        my_sum  *= kfac;
+
+        float pscore = valid ? exp(score - new_max) : 0.0;
+        float tile_sum = subgroupAdd(pscore);
+        my_sum  += tile_sum;
+        my_max   = new_max;
+
+        // Stage the per-thread pscore so the V-sum pass below can
+        // read all 64 of them.
+        scores_lds[tid] = pscore;
+        barrier();
+
+        // ---- Weighted V-sum update ----
+        // Each thread accumulates over the full tile but only into
+        // its two output dims (tid, tid+64). With Qwen3's head_dim=128
+        // and WGSIZE=64 these always exist; we still bounds-check the
+        // upper one so smaller head_dim values are safe.
+        uint tile_size = min(TILE, p.seq_len - tile_base);
+        bool d1_valid = (tid + 64) < p.head_dim;
+        for (uint i = 0; i < tile_size; ++i) {
+            uint global_t  = tile_base + i;
+            uint v_pos_off = global_t * pos_stride + head_off;
+            float pi = scores_lds[i];
+            my_out0 += pi * load_v(v_pos_off + tid);
+            if (d1_valid) {
+                my_out1 += pi * load_v(v_pos_off + tid + 64);
+            }
+        }
+        barrier();   // before next tile rewrites scores_lds
+    }
+
+    // ---- Final normalisation + write-back. ----
+    float inv_sum = 1.0 / my_sum;
+    if (tid < p.head_dim) {
+        o[o_off + tid] = my_out0 * inv_sum;
+    }
+    if ((tid + 64) < p.head_dim) {
+        o[o_off + tid + 64] = my_out1 * inv_sum;
+    }
+}

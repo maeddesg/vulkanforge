@@ -1,0 +1,111 @@
+warning: vulkanforge@0.1.0: compiled mul_mat_vec_q4_k.comp -> mul_mat_vec_q4_k_f32_f32.spv (165424 bytes)
+warning: vulkanforge@0.1.0: compiled mul_mat_vec_q6_k.comp -> mul_mat_vec_q6_k_f32_f32.spv (174132 bytes)
+warning: vulkanforge@0.1.0: compiled rms_norm.comp -> rms_norm_f32.spv (218972 bytes)
+warning: vulkanforge@0.1.0: compiled rope_norm.comp -> rope_norm_f32.spv (142100 bytes)
+warning: vulkanforge@0.1.0: compiled rope_neox.comp -> rope_neox_f32.spv (142140 bytes)
+warning: vulkanforge@0.1.0: compiled add.comp -> add_f32.spv (137892 bytes)
+warning: vulkanforge@0.1.0: compiled mul.comp -> mul_f32.spv (136608 bytes)
+warning: vulkanforge@0.1.0: compiled silu.comp -> silu_f32.spv (127860 bytes)
+warning: vulkanforge@0.1.0: compiled soft_max.comp -> soft_max_f32.spv (229232 bytes)
+warning: vulkanforge@0.1.0: compiled copy.comp -> copy_f32_f32.spv (135252 bytes)
+warning: vulkanforge@0.1.0: compiled scalar_attn.comp -> scalar_attn_f32.spv (9140 bytes)
+warning: vulkanforge@0.1.0: compiled mul_mmq.comp -> mul_mmq_q4_k_f32.spv (185188 bytes)
+warning: vulkanforge@0.1.0: compiled mul_mmq.comp -> mul_mmq_q6_k_f32.spv (184524 bytes)
+warning: vulkanforge@0.1.0: compiled quantize_q8_1.comp -> quantize_q8_1_f32.spv (133516 bytes)
+warning: vulkanforge@0.1.0: total SPIR-V: 2121980 bytes across 14 shader(s)
+warning: unused variable: `hidden_bytes`
+    --> src/backend/vulkan/forward.rs:1572:13
+     |
+1572 |         let hidden_bytes = (hidden as u64) * 4;
+     |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_hidden_bytes`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `cpu_embedding_lookup` is never used
+   --> src/backend/vulkan/forward.rs:933:8
+    |
+127 | impl Forward {
+    | ------------ method in this implementation
+...
+933 |     fn cpu_embedding_lookup(
+    |        ^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `vulkanforge` (lib) generated 2 warnings (run `cargo fix --lib -p vulkanforge` to apply 1 suggestion)
+   Compiling vulkanforge v0.1.0 (/home/maeddes/projects/vulkanforge)
+warning: fields `prefill_ms`, `decode_ms`, and `excerpt` are never read
+   --> examples/run_15prompt_bench.rs:118:5
+    |
+112 | struct Row {
+    |        --- fields in this struct
+...
+118 |     prefill_ms: f64,
+    |     ^^^^^^^^^^
+119 |     decode_ms: f64,
+    |     ^^^^^^^^^
+...
+123 |     excerpt: String,
+    |     ^^^^^^^
+    |
+    = note: `Row` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `vulkanforge` (example "run_15prompt_bench") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 2.00s
+     Running `target/release/examples/run_15prompt_bench`
+VulkanForge — 15-prompt benchmark (15 prompts)
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+VulkanForge: GPU = AMD Radeon RX 9070 XT (RADV GFX1201)
+VulkanForge: Compute Queue Family = 0
+VulkanForge: validation layer ACTIVE
+  /home/maeddes/models/Qwen3-8B-Q4_K_M.gguf loaded in 0.5 s
+  # 1 Greeting                         pp= 20 gen=  15  prefill= 220.9 tok/s  decode= 75.9 tok/s  ✓
+  # 2 Simple Sequence                  pp= 31 gen=  15  prefill= 283.8 tok/s  decode= 71.3 tok/s  ✓
+  # 3 Prime Check (Python)             pp= 31 gen= 256  prefill= 283.4 tok/s  decode= 63.6 tok/s  ✓
+  # 4 LRU Cache (C++)                  pp= 47 gen= 512  prefill= 332.3 tok/s  decode= 53.6 tok/s  ✓
+  # 5 REST API (Go)                    pp= 62 gen= 419  prefill= 357.4 tok/s  decode= 55.3 tok/s  ✓
+  # 6 Mutex Explanation                pp= 29 gen= 128  prefill= 282.5 tok/s  decode= 67.9 tok/s  ✓
+  # 7 TCP vs UDP                       pp= 39 gen= 512  prefill= 316.0 tok/s  decode= 53.3 tok/s  ✗
+  # 8 GPU Architecture Blog Post       pp= 58 gen=1024  prefill= 345.4 tok/s  decode= 40.6 tok/s  ✓
+  # 9 Binary Search Complexity         pp= 30 gen= 256  prefill= 281.6 tok/s  decode= 63.4 tok/s  ✓
+  #10 Debug Code                       pp= 45 gen= 158  prefill= 326.3 tok/s  decode= 65.8 tok/s  ✓
+  #11 Distributed Message Queue        pp= 62 gen=1024  prefill= 350.6 tok/s  decode= 41.2 tok/s  ✗
+  #12 Long System Prompt + Question    pp=198 gen= 147  prefill= 281.0 tok/s  decode= 52.0 tok/s  ✓
+  #13 Long Output Story                pp= 67 gen= 512  prefill= 322.8 tok/s  decode= 49.5 tok/s  ✓
+  #14 Arithmetic (Q4_K Precision)      pp= 31 gen=  34  prefill= 280.5 tok/s  decode= 67.0 tok/s  ✓
+  #15 Emoji/Special Characters         pp= 52 gen= 128  prefill= 332.4 tok/s  decode= 62.4 tok/s  ✓
+
+=== Per-prompt results ===
+#   Name                       Category       PromTk GenTk    Prefill     Decode  Coh
+1   Greeting                   smoke             20    15     220.9       75.9  ✓
+2   Simple Sequence            smoke             31    15     283.8       71.3  ✓
+3   Prime Check (Python)       code_generati…    31   256     283.4       63.6  ✓
+4   LRU Cache (C++)            code_generati…    47   512     332.3       53.6  ✓
+5   REST API (Go)              code_generati…    62   419     357.4       55.3  ✓
+6   Mutex Explanation          prose             29   128     282.5       67.9  ✓
+7   TCP vs UDP                 prose             39   512     316.0       53.3  ✗
+8   GPU Architecture Blog Post prose             58  1024     345.4       40.6  ✓
+9   Binary Search Complexity   reasoning         30   256     281.6       63.4  ✓
+10  Debug Code                 reasoning         45   158     326.3       65.8  ✓
+11  Distributed Message Queue  reasoning         62  1024     350.6       41.2  ✗
+12  Long System Prompt + Ques… context_stress   198   147     281.0       52.0  ✓
+13  Long Output Story          context_stress    67   512     322.8       49.5  ✓
+14  Arithmetic (Q4_K Precisio… numerics          31    34     280.5       67.0  ✓
+15  Emoji/Special Characters   tokenizer_rob…    52   128     332.4       62.4  ✓
+
+=== Aggregate ===
+  Prompt tokens:  802
+  Decode tokens:  5140
+  Prefill total:  2618.4 ms  →  306.3 tok/s
+  Decode total:   105326.3 ms  →  48.8 tok/s
+  MEDIAN decode:  62.4 tok/s
+  MEDIAN prefill: 316.0 tok/s
+  Coherent prompts: 13/15
+
+=== 4-System Comparison ===
+                          Decode tok/s  Prefill tok/s
+  llama.cpp Vulkan:           114.2          4314    (reference)
+  ROCmForge HIP (latest):      95.4           768.6  (~/projects/ROCmForge/results/inference_test_20260425.md)
+  llama.cpp ROCm:              87.5          3684    (reference)
+  VulkanForge Phase 3C:        48.8          306.3  ← this run

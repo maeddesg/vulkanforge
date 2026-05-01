@@ -1,0 +1,74 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+// VulkanForge Phase 4C — Split-K Flash-Attention reducer.
+//
+// Combines the per-tile partials produced by `flash_attn_split.comp`
+// into the final per-head attention output. One WG per Q-head, 64
+// threads per WG. Each thread accumulates its 2 output dimensions
+// (`tid` and `tid + 64` — same pattern as the split worker) across
+// all tiles using the standard online-softmax merge:
+//
+//   new_max  = max(global_max, tile_max)
+//   k_old    = exp(global_max - new_max)   // correction for old acc
+//   k_new    = exp(tile_max  - new_max)    // weight for tile output
+//   global_out = global_out * k_old + tile_out * k_new
+//   global_sum = global_sum * k_old + tile_sum * k_new
+//   global_max = new_max
+//
+// At end: O[h * head_dim + d] = global_out / global_sum.
+
+const uint WGSIZE = 64;
+layout (local_size_x = WGSIZE) in;
+
+layout (binding = 0) readonly  buffer ScratchOut { float scratch_out[]; };
+layout (binding = 1) readonly  buffer ScratchMax { float scratch_max[]; };
+layout (binding = 2) readonly  buffer ScratchSum { float scratch_sum[]; };
+layout (binding = 3) writeonly buffer O          { float o[];          };
+
+layout (push_constant) uniform Params {
+    uint n_heads;
+    uint head_dim;
+    uint n_tiles;
+} p;
+
+void main() {
+    uint h   = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (h >= p.n_heads) {
+        return;
+    }
+    uint o_off = h * p.head_dim;
+    bool d1_valid = (tid + 64) < p.head_dim;
+
+    float global_max = -1e30;
+    float global_sum = 0.0;
+    float acc0       = 0.0;
+    float acc1       = 0.0;
+
+    for (uint t = 0; t < p.n_tiles; ++t) {
+        uint partial_idx = h * p.n_tiles + t;
+        float tile_max  = scratch_max[partial_idx];
+        float tile_sum  = scratch_sum[partial_idx];
+        float tile_out0 = scratch_out[partial_idx * p.head_dim + tid];
+        float tile_out1 = d1_valid
+            ? scratch_out[partial_idx * p.head_dim + tid + 64]
+            : 0.0;
+
+        float new_max = max(global_max, tile_max);
+        float k_old   = exp(global_max - new_max);
+        float k_new   = exp(tile_max   - new_max);
+        acc0       = acc0 * k_old + tile_out0 * k_new;
+        acc1       = acc1 * k_old + tile_out1 * k_new;
+        global_sum = global_sum * k_old + tile_sum * k_new;
+        global_max = new_max;
+    }
+
+    float inv_sum = 1.0 / global_sum;
+    if (tid < p.head_dim) {
+        o[o_off + tid] = acc0 * inv_sum;
+    }
+    if (d1_valid) {
+        o[o_off + tid + 64] = acc1 * inv_sum;
+    }
+}

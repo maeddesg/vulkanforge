@@ -1,0 +1,58 @@
+{
+  "version": "1.0",
+  "description": "Phase 5C Mistral 5-prompt smoke (Mutex, Haiku, 2+2, Translate, Primes)",
+  "created": "2026-04-27",
+  "model_target": "Mistral-7B-Instruct-v0.3.Q4_K_M.gguf",
+  "prompts": [
+    {
+      "id": 1,
+      "category": "explanation",
+      "difficulty": "short",
+      "name": "Mutex Explanation",
+      "max_tokens": 200,
+      "prompt": "Explain what a mutex is in one paragraph.",
+      "expected_behavior": "Definition + lock/unlock + use case",
+      "quality_check": "Mentions mutual exclusion, threads/locks, race conditions"
+    },
+    {
+      "id": 2,
+      "category": "creative",
+      "difficulty": "trivial",
+      "name": "Haiku",
+      "max_tokens": 80,
+      "prompt": "Write a haiku about the ocean.",
+      "expected_behavior": "Three short lines, 5-7-5 syllables, evocative",
+      "quality_check": "Three lines, theme matches the prompt"
+    },
+    {
+      "id": 3,
+      "category": "arithmetic",
+      "difficulty": "trivial",
+      "name": "Two Plus Two",
+      "max_tokens": 40,
+      "prompt": "What is 2 + 2?",
+      "expected_behavior": "Answer is 4, possibly with a short justification",
+      "quality_check": "Output contains the number 4"
+    },
+    {
+      "id": 4,
+      "category": "translation",
+      "difficulty": "trivial",
+      "name": "Translate to German",
+      "max_tokens": 80,
+      "prompt": "Translate to German: The quick brown fox jumps over the lazy dog.",
+      "expected_behavior": "Idiomatic German translation",
+      "quality_check": "Output contains 'Fuchs' (fox) and 'Hund' (dog)"
+    },
+    {
+      "id": 5,
+      "category": "code_generation",
+      "difficulty": "short",
+      "name": "Prime Check (Python)",
+      "max_tokens": 220,
+      "prompt": "Write a Python function that checks if a number is prime.",
+      "expected_behavior": "Idiomatic Python function with edge cases",
+      "quality_check": "Output contains 'def' and 'return'"
+    }
+  ]
+}

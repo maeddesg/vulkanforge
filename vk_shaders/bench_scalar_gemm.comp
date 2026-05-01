@@ -1,0 +1,114 @@
+#version 460
+
+// v0.2.1 Sprint 11G-B — scalar dotPacked4x8EXT GEMM micro-benchmark.
+//
+// Reference baseline for bench_int8cm_gemm.comp. Same tile shape
+// (BM=BN=16, BK=32), same WG geometry (1 Wave64 = 64 threads), same
+// LDS staging (16x32 int8 each side, 1 KB total), same n_reps outer
+// loop. The only difference is the inner K step: dotPacked4x8EXT
+// (RDNA4's `v_dot4_i32_iu8`) instead of coopMatMulAdd. This is the
+// fair compute baseline because it is the same instruction the existing
+// scalar mul_mmq path already uses.
+//
+// Each thread owns 4 of the 256 output cells in BM*BN (cell layout
+// stride=64 over the 256-cell tile). Per cell, the inner loop walks
+// BK in 4-element chunks of int8 packed into int32.
+//
+// 64 threads * 4 cells = 256 cells, exactly matching coopmat output.
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 64) in;
+
+layout(set=0, binding=0) readonly buffer BufA { int8_t  data_a[]; };
+layout(set=0, binding=1) readonly buffer BufB { int8_t  data_b[]; };
+layout(set=0, binding=2)          buffer BufC { int32_t data_c[]; };
+
+layout(push_constant) uniform PC {
+    uint M;
+    uint N;
+    uint K;
+    uint n_reps;
+} pc;
+
+const uint BM = 16;
+const uint BN = 16;
+const uint BK = 32;
+
+shared int8_t a_lds[BM * BK];
+shared int8_t b_lds[BN * BK];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wg_m = gl_WorkGroupID.x;
+    uint wg_n = gl_WorkGroupID.y;
+
+    // Each thread covers 4 cells: cell = c*64 + tid for c in 0..3.
+    // (cell_m, cell_n) = (cell / BN, cell % BN).
+    int32_t cell_total[4] = int32_t[4](0, 0, 0, 0);
+
+    for (uint rep = 0; rep < pc.n_reps; rep++) {
+        int32_t cell_acc[4] = int32_t[4](0, 0, 0, 0);
+
+        for (uint kk = 0; kk < pc.K; kk += BK) {
+            // Same A LDS layout as the coopmat shader: a_lds[row*BK + col].
+            for (uint i = tid; i < BM * BK; i += 64) {
+                uint row = i / BK;
+                uint col = i % BK;
+                a_lds[i] = data_a[(wg_m * BM + row) * pc.K + kk + col];
+            }
+            // B in scalar shader stays RowMajor: b_lds[row*BN + col] = B[kk+row, wg_n*BN+col].
+            // (Different layout from coopmat shader because dotPacked4x8EXT
+            // walks K contiguously per cell, so we want B[k,n] adjacent in K.)
+            for (uint i = tid; i < BN * BK; i += 64) {
+                uint row = i / BN;
+                uint col = i % BN;
+                b_lds[row * BN + col] = data_b[(kk + row) * pc.N + (wg_n * BN + col)];
+            }
+
+            barrier();
+
+            [[unroll]] for (uint c = 0; c < 4; c++) {
+                uint cell = c * 64 + tid;
+                uint cell_m = cell / BN;
+                uint cell_n = cell % BN;
+
+                int32_t acc = 0;
+                [[unroll]] for (uint k4 = 0; k4 < BK; k4 += 4) {
+                    int32_t a0 = int32_t(a_lds[cell_m * BK + k4    ]) & 0xff;
+                    int32_t a1 = int32_t(a_lds[cell_m * BK + k4 + 1]) & 0xff;
+                    int32_t a2 = int32_t(a_lds[cell_m * BK + k4 + 2]) & 0xff;
+                    int32_t a3 = int32_t(a_lds[cell_m * BK + k4 + 3]) & 0xff;
+                    int32_t a4 = a0 | (a1 << 8) | (a2 << 16) | (a3 << 24);
+
+                    int32_t b0 = int32_t(b_lds[(k4    ) * BN + cell_n]) & 0xff;
+                    int32_t b1 = int32_t(b_lds[(k4 + 1) * BN + cell_n]) & 0xff;
+                    int32_t b2 = int32_t(b_lds[(k4 + 2) * BN + cell_n]) & 0xff;
+                    int32_t b3 = int32_t(b_lds[(k4 + 3) * BN + cell_n]) & 0xff;
+                    int32_t b4 = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+
+                    acc += dotPacked4x8EXT(a4, b4);
+                }
+                cell_acc[c] += acc;
+            }
+
+            barrier();
+        }
+
+        cell_total[0] += cell_acc[0];
+        cell_total[1] += cell_acc[1];
+        cell_total[2] += cell_acc[2];
+        cell_total[3] += cell_acc[3];
+    }
+
+    [[unroll]] for (uint c = 0; c < 4; c++) {
+        uint cell = c * 64 + tid;
+        uint cell_m = cell / BN;
+        uint cell_n = cell % BN;
+        uint dst = (wg_m * BM + cell_m) * pc.N + (wg_n * BN + cell_n);
+        data_c[dst] = cell_total[c];
+    }
+}

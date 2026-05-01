@@ -1,0 +1,11 @@
+# Limit parallel test threads — every test under tests/regression.rs
+# loads ~5 GiB of Qwen3 weights into VRAM (16 GiB total on the
+# RX 9070 XT). With cargo's default `num_cpus`-many test threads, 6+
+# tests racing the same Vulkan device produces VK_ERROR_DEVICE_LOST.
+# 4 threads keeps peak VRAM at ~20 GiB worst-case (tests stagger their
+# allocations), and the regression suite still completes in <60 s.
+#
+# Lib unit tests + correctness tests don't load the model and are
+# unaffected by this throttle (they're already <1 s combined).
+[env]
+RUST_TEST_THREADS = "4"

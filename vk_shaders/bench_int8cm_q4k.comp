@@ -1,0 +1,298 @@
+#version 450
+
+// v0.2.1 Sprint 11G-C — Q4_K x Q8_1 -> FP32 GEMM via Int8 KHR-coopmat.
+//
+// First "real GGUF format" int8-coopmat shader for the VulkanForge Q4_K
+// prefill GEMM. Mirrors the Sprint 11G-A architecture: Q4_K nibbles
+// unpacked to int8 in LDS, Q8_1 qs[] staged to int8 in LDS, per-BK-chunk
+// int32 coopmat fragment scale-folded into a per-thread FP32 register
+// array via per-warp LDS scratch + subgroup-only barriers.
+//
+// Tile geometry (M-tile from Sprint 11G-A; deferring L-tile to 11G-D):
+//   BM = BN = 64, BK = 32 (Q4_K sub-block alignment)
+//   NUM_WARPS = 4, WM = WN = 32, cms_per_row = cms_per_col = 2
+//   4 fragments per warp, 4 warps per WG = 16 fragments per WG output
+//   tile (= 64*64 = 4096 cells)
+//
+// LDS budget (~5 KB):
+//   a_lds   : 64 * 32 = 2 KB int8
+//   b_lds   : 64 * 32 = 2 KB int8
+//   a_dm    : 64 * 8 B = 512 B  (per-row sub-block d*sub_scale, dmin*sub_min)
+//   b_ds    : 64 * 8 B = 512 B  (per-col Q8_1 d, s)
+//
+// Sprint 11G-D: replaced 11G-C's LDS scratch (4 KB) + coopMatStore +
+// 2*subgroupMemoryBarrierShared per fragment with direct fragment-element
+// indexing using the empirical RDNA4 / RADV / Wave64 lane->cell mapping
+// (validated by `probe_coopmat_layout` on gfx1201 / Mesa RADV 26.0):
+//
+//   row_in_frag = ((lane >> 5) & 1) * 4 + ((lane >> 4) & 1) * 8 + elem
+//   col_in_frag = lane & 15
+//
+// frag.length() = 4 elements per lane on Wave64. The row-group ordering
+// is NOT a simple `lane >> 4`: groups 1 and 2 (rows 4..7 and 8..11) are
+// swapped — lanes 16..31 own rows 8..11, lanes 32..47 own rows 4..7. The
+// row group index is the bit-reversal of `lane >> 4` over 2 bits, i.e.
+// the high half of the wave (lanes 32+) flips one bit and the inner
+// quarter (lanes 16..31) flips the other.
+//
+// Buffers consumed are the SAME packed types `mul_mmq` consumes, so a
+// drop-in performance comparison against the production scalar mul_mmq
+// kernel is meaningful.
+//
+//   binding 0: block_q4_K_packed32  data_a[]  (M*K/256 super-blocks)
+//   binding 1: block_q8_1_x4_packed128  data_b[]  (N*K/128 x4 groups)
+//   binding 2: float  data_c[]                (FP32 output, [N,M] col-major,
+//                                              i.e. data_c[n*M + m])
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+
+#include "types.glsl"
+
+const uint BM = 64;
+const uint BN = 64;
+const uint BK = 32;
+const uint TM = 16;
+const uint TN = 16;
+const uint TK = 16;
+const uint WM = 32;
+const uint WN = 32;
+const uint NUM_WARPS = 4;
+const uint WAVE_SIZE = 64;
+const uint BLOCK_SIZE = NUM_WARPS * WAVE_SIZE; // 256
+
+const uint CMS_PER_ROW = WM / TM;        // 2
+const uint CMS_PER_COL = WN / TN;        // 2
+const uint FRAGS_PER_WARP = CMS_PER_ROW * CMS_PER_COL; // 4
+const uint CELLS_PER_LANE = (TM * TN) / WAVE_SIZE;     // 4
+
+layout(local_size_x = BLOCK_SIZE) in;
+
+layout(set=0, binding=0) readonly buffer BufA {
+    block_q4_K_packed32 data_a[];
+};
+
+layout(set=0, binding=1) readonly buffer BufB {
+    block_q8_1_x4_packed128 data_b[];
+};
+
+layout(set=0, binding=2) writeonly buffer BufC {
+    float data_c[];
+};
+
+layout(push_constant) uniform PC {
+    uint M;       // total output rows = weight rows
+    uint N;       // total output cols = activation tokens
+    uint K;       // hidden dim, multiple of 256
+} pc;
+
+shared int8_t  a_lds[BM * BK];
+shared int8_t  b_lds[BN * BK];
+shared vec2    a_dm[BM];      // (d * sub_scale,  dmin * sub_min) per row
+shared vec2    b_ds[BN];      // (d, s) per Q8_1 block per column
+
+// ----- helpers -----------------------------------------------------------
+
+// Q4_K nibble extract from a block_q4_K_packed32 super-block.
+// e is the element index within the super-block (0..255).
+int8_t q4k_nibble(in block_q4_K_packed32 sb, uint e) {
+    uint sub_block = e >> 5;          // sb / 32
+    uint pos      = e & 31u;          // e % 32
+    uint pair      = sub_block >> 1;  // sb / 2
+    bool high_nib  = (sub_block & 1u) != 0u;
+    // Per-pair byte layout: pair p occupies bytes p*32 .. p*32+31 of qs[].
+    // qs[p*8 + (pos/4)] is the uint32 holding 4 bytes starting at pos & ~3.
+    uint chunk = sb.qs[pair * 8u + (pos >> 2)];
+    uint byte  = (chunk >> ((pos & 3u) * 8u)) & 0xFFu;
+    uint nib   = high_nib ? (byte >> 4) : (byte & 0xFu);
+    return int8_t(nib);
+}
+
+// Q4_K (sub_scale, sub_min) decode from the 12-byte scales[] field.
+// sb is the sub-block index 0..7. Output values are 6-bit (0..63).
+void q4k_sub_scale_min(in block_q4_K_packed32 sb_block, uint sb,
+                       out uint sub_scale, out uint sub_min) {
+    uint s_arr[12];
+    [[unroll]] for (uint i = 0u; i < 12u; ++i) {
+        s_arr[i] = (sb_block.scales[i >> 2] >> ((i & 3u) * 8u)) & 0xFFu;
+    }
+    if (sb < 4u) {
+        sub_scale = s_arr[sb] & 0x3Fu;
+        sub_min   = s_arr[sb + 4u] & 0x3Fu;
+    } else {
+        // sub-blocks 4..7: low 4 bits in scales[sb+4],
+        // high 2 bits borrowed from scales[sb-4] / scales[sb].
+        uint lo = s_arr[sb + 4u];
+        sub_scale = (lo & 0x0Fu) | (((s_arr[sb - 4u] >> 6) & 0x03u) << 4);
+        sub_min   = ((lo >> 4) & 0x0Fu) | (((s_arr[sb] >> 6) & 0x03u) << 4);
+    }
+}
+
+// Q8_1 byte extraction from packed-128 layout. blk_in_grp is 0..3,
+// pos_in_blk is 0..31.
+int8_t q8_1_byte(in block_q8_1_x4_packed128 grp, uint blk_in_grp, uint pos_in_blk) {
+    uint qs_idx   = blk_in_grp * 2u + (pos_in_blk >> 4);   // 0..7
+    uint pos_in16 = pos_in_blk & 15u;                       // 0..15
+    int int_val   = grp.qs[qs_idx][pos_in16 >> 2];          // 32-bit chunk holding 4 bytes
+    int shift_bits = int((pos_in16 & 3u) * 8u);
+    // Sign-extend by shifting the byte to the top and arithmetic-shift back.
+    int signed_byte = (int_val << (24 - shift_bits)) >> 24;
+    return int8_t(signed_byte);
+}
+
+// ----- main --------------------------------------------------------------
+
+void main() {
+    uint tid     = gl_LocalInvocationID.x;
+    uint warp_id = tid / WAVE_SIZE;            // 0..3
+    uint lane    = tid % WAVE_SIZE;            // 0..63
+    uint warp_r  = warp_id % (BM / WM);        // 0..1
+    uint warp_c  = warp_id / (BM / WM);        // 0..1
+
+    uint wg_m = gl_WorkGroupID.x;
+    uint wg_n = gl_WorkGroupID.y;
+
+    uint blocks_per_row_a    = pc.K >> 8;       // K / 256
+    uint q8_x4_groups_per_row = pc.K >> 7;      // K / 128
+
+    // Per-thread FP32 accumulator: 4 fragments × 4 cells per lane = 16 floats.
+    float fp32_out[FRAGS_PER_WARP * CELLS_PER_LANE];
+    [[unroll]] for (uint i = 0u; i < FRAGS_PER_WARP * CELLS_PER_LANE; ++i) {
+        fp32_out[i] = 0.0;
+    }
+
+    for (uint k_tile = 0u; k_tile < pc.K; k_tile += BK) {
+        uint super_block_off = k_tile >> 8;     // k_tile / 256
+        uint sb              = (k_tile >> 5) & 7u; // (k_tile / 32) % 8
+
+        // --- Load A: Q4_K -> int8 in LDS ---
+        for (uint i = tid; i < BM * BK; i += BLOCK_SIZE) {
+            uint row = i / BK;                  // 0..63
+            uint col = i % BK;                  // 0..31
+            uint global_m = wg_m * BM + row;
+            if (global_m < pc.M) {
+                uint blk_idx = global_m * blocks_per_row_a + super_block_off;
+                uint elem_in_super = sb * 32u + col;
+                a_lds[i] = q4k_nibble(data_a[blk_idx], elem_in_super);
+            } else {
+                a_lds[i] = int8_t(0);
+            }
+        }
+
+        // --- Load A scales (per-row, 1 sub-block per K-tile) ---
+        if (tid < BM) {
+            uint global_m = wg_m * BM + tid;
+            if (global_m < pc.M) {
+                uint blk_idx = global_m * blocks_per_row_a + super_block_off;
+                vec2 dm = vec2(data_a[blk_idx].dm);
+                uint ss, mn;
+                q4k_sub_scale_min(data_a[blk_idx], sb, ss, mn);
+                a_dm[tid] = vec2(dm.x * float(ss), dm.y * float(mn));
+            } else {
+                a_dm[tid] = vec2(0.0, 0.0);
+            }
+        }
+
+        // --- Load B: Q8_1 -> int8 in LDS (column-major for ColumnMajor coopMatLoad) ---
+        // b_lds[col * BK + row] = qs[k = k_tile + row, n = wg_n*BN + col]
+        for (uint i = tid; i < BN * BK; i += BLOCK_SIZE) {
+            uint col = i / BK;                  // 0..63 (= n_in_tile)
+            uint row = i % BK;                  // 0..31 (= k_in_tile)
+            uint global_n = wg_n * BN + col;
+            uint global_k = k_tile + row;
+            int8_t v = int8_t(0);
+            if (global_n < pc.N) {
+                uint blk_idx       = global_n * (pc.K >> 5) + (global_k >> 5);
+                uint x4_outer      = blk_idx >> 2;
+                uint x4_inner      = blk_idx & 3u;
+                uint pos_in_block  = global_k & 31u;
+                v = q8_1_byte(data_b[x4_outer], x4_inner, pos_in_block);
+            }
+            b_lds[col * BK + row] = v;
+        }
+
+        // --- Load B scales (per-col, 1 Q8_1 block per K-tile) ---
+        if (tid < BN) {
+            uint global_n = wg_n * BN + tid;
+            if (global_n < pc.N) {
+                uint blk_idx  = global_n * (pc.K >> 5) + (k_tile >> 5);
+                uint x4_outer = blk_idx >> 2;
+                uint x4_inner = blk_idx & 3u;
+                b_ds[tid] = vec2(data_b[x4_outer].ds[x4_inner]);
+            } else {
+                b_ds[tid] = vec2(0.0, 0.0);
+            }
+        }
+
+        barrier();
+
+        // --- Compute + direct fragment-element scale-fold (no LDS scratch) ---
+        // Empirical RDNA4 / RADV Wave64 mapping (probe_coopmat_layout):
+        //   row_in_frag = ((lane >> 5) & 1) * 4 + ((lane >> 4) & 1) * 8 + elem
+        //   col_in_frag = lane & 15
+        uint col_in_frag = lane & 15u;
+        uint row_base    = ((lane >> 5) & 1u) * 4u + ((lane >> 4) & 1u) * 8u;
+
+        [[unroll]] for (uint cm_row = 0u; cm_row < CMS_PER_ROW; ++cm_row) {
+            [[unroll]] for (uint cm_col = 0u; cm_col < CMS_PER_COL; ++cm_col) {
+                coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> C =
+                    coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0);
+
+                // BK / TK = 2 inner steps.
+                [[unroll]] for (uint ks = 0u; ks < BK; ks += TK) {
+                    coopmat<int8_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> A_frag;
+                    coopmat<int8_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> B_frag;
+
+                    uint a_off = (warp_r * WM + cm_row * TM) * BK + ks;
+                    coopMatLoad(A_frag, a_lds, a_off, BK,
+                                gl_CooperativeMatrixLayoutRowMajor);
+
+                    uint b_off = (warp_c * WN + cm_col * TN) * BK + ks;
+                    coopMatLoad(B_frag, b_lds, b_off, BK,
+                                gl_CooperativeMatrixLayoutColumnMajor);
+
+                    C = coopMatMulAdd(A_frag, B_frag, C);
+                }
+
+                // Direct per-element fold — no coopMatStore, no LDS, no
+                // subgroup barrier. Each lane folds its 4 owned cells into
+                // its private fp32_out register array.
+                uint frag_idx = cm_row * CMS_PER_COL + cm_col;
+                uint n_in_wg = warp_c * WN + cm_col * TN + col_in_frag;
+                vec2 ds = b_ds[n_in_wg];
+                [[unroll]] for (uint elem = 0u; elem < CELLS_PER_LANE; ++elem) {
+                    uint r_in = row_base + elem;                            // 0..15
+                    uint m_in_wg = warp_r * WM + cm_row * TM + r_in;
+                    vec2 dm = a_dm[m_in_wg];
+                    float scaled = float(C[elem]) * dm.x * ds.x - dm.y * ds.y;
+                    fp32_out[frag_idx * CELLS_PER_LANE + elem] += scaled;
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    // --- Tail: per-lane FP32 register array → global C[n*M + m] ---
+    uint col_in_frag = lane & 15u;
+    uint row_base    = ((lane >> 5) & 1u) * 4u + ((lane >> 4) & 1u) * 8u;
+    [[unroll]] for (uint cm_row = 0u; cm_row < CMS_PER_ROW; ++cm_row) {
+        [[unroll]] for (uint cm_col = 0u; cm_col < CMS_PER_COL; ++cm_col) {
+            uint frag_idx = cm_row * CMS_PER_COL + cm_col;
+            uint n = wg_n * BN + warp_c * WN + cm_col * TN + col_in_frag;
+            [[unroll]] for (uint elem = 0u; elem < CELLS_PER_LANE; ++elem) {
+                uint r_in = row_base + elem;
+                uint m = wg_m * BM + warp_r * WM + cm_row * TM + r_in;
+                if (m < pc.M && n < pc.N) {
+                    data_c[n * pc.M + m] = fp32_out[frag_idx * CELLS_PER_LANE + elem];
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,65 @@
+#version 460
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_float_e4m3 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+#extension GL_EXT_buffer_reference2 : enable
+
+// v0.2 smoke-test FP8 coopmat throughput micro-benchmark.
+//
+// Twin of bench_coopmat_pure.comp, but with FP8 E4M3 inputs:
+//   A : [M, K] floate4m3_t  row-major (1 byte / elem)
+//   B : [K, N] floate4m3_t  row-major (1 byte / elem)
+//   C : [M, N] f32          row-major
+//
+// One Wave64 per (16×16) C-tile. Each WG walks K in TILE_K=16 chunks
+// via coopMatLoad + coopMatMulAdd and stores once at the end. Identical
+// tiling structure to the BF16 bench so the two TFLOPS numbers are
+// directly comparable — the only thing that changes is the per-element
+// byte traffic (1 vs 2) and the WMMA element type.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly  buffer A { floate4m3_t a[]; };
+layout(set = 0, binding = 1) readonly  buffer B { floate4m3_t b[]; };
+layout(set = 0, binding = 2) writeonly buffer C { float        c[]; };
+
+layout(push_constant) uniform PC {
+    uint m;
+    uint n;
+    uint k;
+    uint stride_a;
+    uint stride_b;
+    uint stride_c;
+} pc;
+
+const uint TILE = 16;
+
+void main() {
+    uint tile_row = gl_WorkGroupID.x;
+    uint tile_col = gl_WorkGroupID.y;
+    if (tile_row * TILE >= pc.m || tile_col * TILE >= pc.n) {
+        return;
+    }
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    uint a_row_off = tile_row * TILE * pc.stride_a;
+    uint b_col_off = tile_col * TILE;
+
+    for (uint kk = 0; kk < pc.k; kk += TILE) {
+        coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA;
+        coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+
+        coopMatLoad(matA, a, a_row_off + kk, pc.stride_a, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB, b, kk * pc.stride_b + b_col_off, pc.stride_b, gl_CooperativeMatrixLayoutRowMajor);
+
+        acc = coopMatMulAdd(matA, matB, acc);
+    }
+
+    uint c_off = tile_row * TILE * pc.stride_c + tile_col * TILE;
+    coopMatStore(acc, c, c_off, pc.stride_c, gl_CooperativeMatrixLayoutRowMajor);
+}
