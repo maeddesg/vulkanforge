@@ -4,22 +4,29 @@
 
 ### Headline
 
-**Prefill peak +71 %** (2255 → 3863 tok/s @ pp=512), reaching **0.89 ×
-llama.cpp Vulkan** prefill at pp ≥ 256 (up from 0.52 × in v0.2.0).
-KHR cooperative-matrix WMMA prefill is now **default-on** for Q4_K and
-Q6_K GEMMs. Decode unchanged at 91.1 tok/s median (0.80 × llama.cpp).
-27 / 27 lib tests, 15 / 15 coherent on the bench suite.
+**Prefill peak +64 %** at pp=512 (2353 → 3863 tok/s) over the
+v0.2.2 default-off `mul_mmq` path; release-to-release v0.2.0 → v0.2.2
+is **+71 %** (2255 → 3863). Reaches **0.89 × llama.cpp Vulkan**
+prefill at pp ≥ 256 (up from 0.52 × in v0.2.0). KHR cooperative-matrix
+WMMA prefill is now **default-on** for Q4_K and Q6_K GEMMs. Decode
+unchanged at 91.1 tok/s median (0.80 × llama.cpp). 176 / 176 tests
+green (27 lib + 149 integration), 15 / 15 coherent on the bench suite.
 
 ### Performance (Qwen3-8B-Q4_K_M, RX 9070 XT, RUNS=5 median)
 
-| pp   | v0.2.0  | v0.2.2  | Δ        | vs llama.cpp Vulkan |
-|------|--------:|--------:|---------:|--------------------:|
-|   64 |   1511  |   1678  |  +11 %   | 0.73 × |
-|  128 |   2001  |   2560  |  +28 %   | 0.70 × |
-|  256 |   2200  |   3558  |  +62 %   | 0.89 × |
-|  512 |   2255  | **3863** | **+71 %** | **0.89 ×** |
-| 1024 |   2204  |   3748  |  +70 %   | 0.90 × |
-| 2048 |   1997  |   3172  |  +59 %   | 0.84 × |
+| pp   | v0.2.0 | v0.2.2 default-off | v0.2.2 default-on | vs default-off | v0.2.0 → v0.2.2 | vs llama.cpp Vulkan |
+|------|-------:|-------------------:|------------------:|---------------:|----------------:|--------------------:|
+|   64 |   1511 |               1513 |              1678 |          +11 % |          +11 %  | 0.73 × |
+|  128 |   2001 |               2010 |              2560 |          +27 % |          +28 %  | 0.70 × |
+|  256 |   2200 |               2199 |              3558 |          +62 % |          +62 %  | 0.89 × |
+|  512 |   2255 |               2353 |          **3863** |       **+64 %** |       **+71 %** | **0.89 ×** |
+| 1024 |   2204 |               2306 |              3748 |          +63 % |          +70 %  | 0.90 × |
+| 2048 |   1997 |               2088 |              3172 |          +52 % |          +59 %  | 0.84 × |
+
+`default-off` = the same v0.2.2 binary with
+`VULKANFORGE_DISABLE_MM_COOPMAT=1`, i.e. the integer-DP `mul_mmq`
+fallback path that v0.2.1 shipped as default. Source for these
+numbers: Sprint 12M `results/v022_sprint12m_mtile.md` table §1.
 
 llama.cpp reference: build 23b8cc4 with `-fa 1` on the same hardware.
 

@@ -8,7 +8,9 @@ Compute-only — no swapchain, no graphics queues — built directly on `ash 0.3
 
 **v0.2.2** — KHR cooperative-matrix WMMA prefill is now **default-on**, closing
 the prefill gap to llama.cpp Vulkan from 0.52× (v0.2.0) to **0.89×** at
-pp=512. Single-batch greedy decode (with optional temperature / top-k /
+pp=512. **+64% prefill** at pp=512 over the default `mul_mmq` path
+(2353 → 3863 tok/s); release-to-release improvement is +71% (v0.2.0
+peaked at 2255). Single-batch greedy decode (with optional temperature / top-k /
 top-p sampling) + multi-turn chat sessions with persistent KV cache.
 Supports the Qwen, Llama-3, DeepSeek-R1 and Mistral GGUF families
 out-of-the-box.
@@ -56,9 +58,10 @@ tensor layout work).
 | 2048 |              3172  |              1997  |             3765 | 0.84× |
 
 llama.cpp reference: build 23b8cc4 with `-fa 1` on the same hardware.
-Peak prefill throughput is **3863 tok/s @ pp=512**, up from 2255 in
-v0.2.0 (+71 %). The pp ≥ 256 ratio is now within run-to-run noise of
-llama.cpp's `mul_mm` Vulkan path.
+Peak prefill throughput is **3863 tok/s @ pp=512**: +64 % over the
+v0.2.2 `mul_mmq` default-off path (2353 tok/s) and +71 % over the
+v0.2.0 release (2255 tok/s). The pp ≥ 256 ratio is now within
+run-to-run noise of llama.cpp's `mul_mm` Vulkan path.
 
 ### 4-system comparison (Qwen3-8B, same hardware)
 
@@ -73,15 +76,20 @@ llama.cpp's `mul_mm` Vulkan path.
 vs v0.2.0: decode +0.7 % (90.5 → 91.1, run-to-run noise), prefill peak
 **+71 %** (2255 → 3863). Decode unchanged because coopmat is
 prefill-only — GEMV continues through the existing `mul_mat_vec_*`
-shaders.
+shaders. ROCm / ROCmForge HIP rows are carried forward from v0.2.0's
+4-system run; not re-measured for v0.2.2.
 
 ## Build
 
 ```bash
 cargo build --release             # ~2-3 s after first build (SPIR-V is cached)
 cargo run --release               # Phase 0 device-init smoke
-cargo test --release              # 27/27 lib tests
+cargo test --release              # 176 tests across 7 binaries (27 lib, 149 integration)
 ```
+
+The build compiles 68 SPIR-V binaries (53 in v0.2.0, 65 in v0.2.1,
++3 in v0.2.2: Q6_K coopmat, Q4_K aligned coopmat, Q6_K aligned
+coopmat).
 
 MSRV is **Rust 1.85** (edition 2024). Build dependencies require a working
 `shaderc` install (the `shaderc-sys` crate); on Arch / CachyOS this is
