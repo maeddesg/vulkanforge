@@ -136,8 +136,19 @@ impl VulkanDevice {
         // dispatch in 3D) can declare its `DotProduct` capabilities
         // cleanly — RADV/gfx1201 reports both 8-bit accelerated paths
         // available.
+        // Sprint 14A — subgroupSizeControl + computeFullSubgroups are
+        // both Vulkan 1.3 core. Required for
+        // VkPipelineShaderStageRequiredSubgroupSizeCreateInfo +
+        // PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT,
+        // which the GEMV pipelines opt into to enable subgroup-arithmetic
+        // reductions (Path A in mul_mat_vec_base.glsl) at Sprint 14B.
+        // RDNA4 advertises both as supported (vulkaninfo confirms
+        // subgroupSizeControl=true, computeFullSubgroups=true,
+        // requiredSubgroupSizeStages=COMPUTE_BIT, min=32, max=64).
         let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
-            .shader_integer_dot_product(true);
+            .shader_integer_dot_product(true)
+            .subgroup_size_control(true)
+            .compute_full_subgroups(true);
         let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
             .storage_buffer8_bit_access(true)
             .shader_int8(true);

@@ -445,19 +445,38 @@ impl ComputeKernel {
         spv_words: &[u32],
         cache: vk::PipelineCache,
     ) -> Result<Self, vk::Result> {
-        Self::from_spv_with_spec(device, spv_words, cache, &[], &[])
+        Self::from_spv_with_spec(device, spv_words, cache, &[], &[], None)
     }
 
     /// Like [`Self::from_spv`] but lets the caller pin specific
     /// specialization constants. `spec_entries` lists `(constant_id,
     /// offset, size)` triples and `spec_data` is the contiguous byte
     /// buffer they reference.
+    ///
+    /// Sprint 14A — `required_subgroup_size`: when `Some(N)`, chains
+    /// `VkPipelineShaderStageRequiredSubgroupSizeCreateInfo` with
+    /// `requiredSubgroupSize=N` and sets the
+    /// `REQUIRE_FULL_SUBGROUPS` stage flag. Used by the GEMV
+    /// pipelines (`MulMatVecQ4K`, `MulMatVecQ6K`) to pin the wave
+    /// width to 64, which is the precondition for the
+    /// subgroup-arithmetic reduction path (Path A) in
+    /// `mul_mat_vec_base.glsl` that Sprint 14B will switch on. With
+    /// `None` (the default for every other pipeline), the existing
+    /// behaviour is preserved bit-for-bit — RADV picks
+    /// `pdev->cs_wave_size` (64 on RDNA4) as before, but without the
+    /// driver-level guarantee that subgroup-arithmetic ops are safe
+    /// to lower aggressively.
+    ///
+    /// Caller must ensure the `Vulkan13Features::subgroupSizeControl`
+    /// feature is enabled at device creation when passing `Some(N)`
+    /// (we do this in `device.rs`).
     pub fn from_spv_with_spec(
         device: &ash::Device,
         spv_words: &[u32],
         cache: vk::PipelineCache,
         spec_entries: &[vk::SpecializationMapEntry],
         spec_data: &[u8],
+        required_subgroup_size: Option<u32>,
     ) -> Result<Self, vk::Result> {
         let reflection = spirv_reflect::reflect(spv_words);
 
@@ -528,12 +547,24 @@ impl ComputeKernel {
         let spec_info = vk::SpecializationInfo::default()
             .map_entries(spec_entries)
             .data(spec_data);
+        // Sprint 14A — required-subgroup-size pin.
+        // The struct must outlive the `pipeline_info` below so it stays
+        // in scope until `create_compute_pipelines` reads its pNext
+        // chain. Declaring it here (above stage construction) keeps it
+        // on this function's stack frame through the FFI call.
+        let mut req_sgs_info = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+            .required_subgroup_size(required_subgroup_size.unwrap_or(0));
         let mut stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(shader_module)
             .name(c"main");
         if !spec_entries.is_empty() {
             stage = stage.specialization_info(&spec_info);
+        }
+        if required_subgroup_size.is_some() {
+            stage = stage
+                .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
+                .push_next(&mut req_sgs_info);
         }
 
         let pipeline_info = vk::ComputePipelineCreateInfo::default()

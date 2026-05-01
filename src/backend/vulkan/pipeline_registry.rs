@@ -108,7 +108,14 @@ impl PipelineRegistry {
                 ShaderId::MulMatVecQ4K | ShaderId::MulMatVecQ6K => {
                     let entries = [entry(0, 0, 4), entry(1, 4, 4), entry(2, 8, 4)];
                     let bytes = bytemuck::bytes_of(&MMV_SPEC_DATA);
-                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
+                    // Sprint 14A — pin requiredSubgroupSize=64 for the GEMV
+                    // pipelines. RDNA4's compute wave size is 64 either way,
+                    // but the explicit pin + REQUIRE_FULL_SUBGROUPS flag is
+                    // the precondition for switching mul_mat_vec_base.glsl
+                    // to its subgroupAdd reduction (Path A) in Sprint 14B.
+                    // No behaviour change at this sprint — same SPV, same
+                    // wave size, just a driver-level guarantee.
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes, Some(64))
                 }
                 ShaderId::RmsNorm | ShaderId::RmsNormMulRope => {
                     // SpecId 0 = norepeat (false → broadcast-safe), 1 =
@@ -118,21 +125,21 @@ impl PipelineRegistry {
                     let data: [u32; 2] = [0, 1];
                     let entries = [entry(0, 0, 4), entry(1, 4, 4)];
                     let bytes = bytemuck::bytes_of(&data);
-                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes, None)
                 }
                 ShaderId::Add | ShaderId::Mul => {
                     // SpecId 0 = norepeat. false keeps broadcast support.
                     let data: [u32; 1] = [0];
                     let entries = [entry(0, 0, 4)];
                     let bytes = bytemuck::bytes_of(&data);
-                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes, None)
                 }
                 ShaderId::SoftMax => {
                     // SpecId 0 = BLOCK_SIZE (also drives local_size_x).
                     let data: [u32; 1] = [32];
                     let entries = [entry(0, 0, 4)];
                     let bytes = bytemuck::bytes_of(&data);
-                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes, None)
                 }
                 // silu, swiglu, multi_add_rms, copy, rope_norm,
                 // rope_neox: no spec consts.
@@ -151,7 +158,7 @@ impl PipelineRegistry {
                     let data: [u32; 1] = [2048];
                     let entries = [entry(0, 0, 4)];
                     let bytes = bytemuck::bytes_of(&data);
-                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes, None)
                 }
                 ShaderId::MulMmqQ4K | ShaderId::MulMmqQ6K
                 | ShaderId::MulMmqQ4KL | ShaderId::MulMmqQ6KL => {
@@ -282,14 +289,14 @@ impl PipelineRegistry {
                         64,  // WARP — RDNA Wave64 (subgroup_size_8 = max(64,8) on gfx1201)
                     ];
                     let bytes = bytemuck::bytes_of(&data);
-                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes, None)
                 }
                 ShaderId::QuantizeQ8_1 => {
                     // SpecId 0 = GROUP_SIZE (drives local_size_x).
                     let data: [u32; 1] = [32];
                     let entries = [entry(0, 0, 4)];
                     let bytes = bytemuck::bytes_of(&data);
-                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes, None)
                 }
                 ShaderId::FlashAttn | ShaderId::FlashAttnFp16Kv => {
                     // SpecId 0 = MAX_SEQ — same convention as scalar_attn.
@@ -301,7 +308,7 @@ impl PipelineRegistry {
                     let data: [u32; 1] = [2048];
                     let entries = [entry(0, 0, 4)];
                     let bytes = bytemuck::bytes_of(&data);
-                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes, None)
                 }
                 ShaderId::FlashAttnSplit | ShaderId::FlashAttnReduce => {
                     // No spec constants — TILE = 64 is hard-coded in
@@ -357,7 +364,7 @@ impl PipelineRegistry {
                         64,  // WARP — RDNA Wave64
                     ];
                     let bytes = bytemuck::bytes_of(&data);
-                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes, None)
                 }
                 ShaderId::FlashAttnBatch => {
                     // SpecId 0 = MAX_SEQ — kept for parity with FlashAttn
@@ -366,7 +373,7 @@ impl PipelineRegistry {
                     let data: [u32; 1] = [2048];
                     let entries = [entry(0, 0, 4)];
                     let bytes = bytemuck::bytes_of(&data);
-                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes, None)
                 }
                 ShaderId::ProbeInt8Coopmat => {
                     // Sprint 11F — pure runtime probe, no spec-constants.
@@ -475,7 +482,7 @@ impl PipelineRegistry {
                         ]
                     };
                     let bytes = bytemuck::bytes_of(&data);
-                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes)
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes, None)
                 }
                 ShaderId::FlashAttnTiledBr4
                 | ShaderId::FlashAttnTiledBr8
