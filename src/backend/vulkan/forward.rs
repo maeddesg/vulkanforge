@@ -158,26 +158,49 @@ impl ForwardTokenProfile {
     }
 }
 
+/// Sprint 15D — per-forward intermediate buffers grouped into a single
+/// struct so the whole set can be double-buffered for async pipelined
+/// decode. Two slots alternate per token; while the GPU runs CB[N]
+/// reading from `slots[N % 2]`, the CPU records CB[N+1] referencing
+/// `slots[(N+1) % 2]`. Without this double-buffering, the CPU host-write
+/// to `scratch_a` / `rope_pos_buf` for token N+1 would race with the GPU's
+/// read for token N, and the per-layer ping-pong target `scratch_b`
+/// would be overwritten by CB[N+1]'s first dispatch before CB[N]'s last
+/// dispatch finishes reading it.
+///
+/// Prefill (`dispatch_layer_batch`) is single-shot per prompt — async
+/// pipelining adds nothing, so it always uses `slots[0]` for any decode
+/// scratch it shares with the per-token path (currently just
+/// `scratch_a` for the first layer's input upload).
+pub struct IntermediateSlot {
+    pub scratch_a: GpuBuffer,
+    pub scratch_b: GpuBuffer,
+    pub hidden_norm: GpuBuffer,
+    pub q_buf: GpuBuffer,
+    pub k_buf: GpuBuffer,
+    pub v_buf: GpuBuffer,
+    pub attn_out: GpuBuffer,
+    pub o_buf: GpuBuffer,
+    pub res1: GpuBuffer,
+    pub gate_buf: GpuBuffer,
+    pub up_buf: GpuBuffer,
+    pub ffn_hidden: GpuBuffer,
+    pub ffn_out: GpuBuffer,
+    pub rope_pos_buf: GpuBuffer,
+    pub fa_scratch_out: GpuBuffer,
+    pub fa_scratch_max: GpuBuffer,
+    pub fa_scratch_sum: GpuBuffer,
+}
+
 pub struct Forward {
-    // Scratch (per-token reuse).
-    scratch_a: GpuBuffer,
-    scratch_b: GpuBuffer,
-    hidden_norm: GpuBuffer,
-    q_buf: GpuBuffer,
-    k_buf: GpuBuffer,
-    v_buf: GpuBuffer,
-    attn_out: GpuBuffer,
-    o_buf: GpuBuffer,
-    res1: GpuBuffer,
-    gate_buf: GpuBuffer,
-    up_buf: GpuBuffer,
-    ffn_hidden: GpuBuffer,
-    ffn_out: GpuBuffer,
+    /// Sprint 15D — double-buffered per-forward scratch. `current_slot`
+    /// alternates 0/1 per decode token. Prefill always uses slots[0].
+    slots: [IntermediateSlot; 2],
+    current_slot: usize,
     logits_buf: GpuBuffer,
     // Always-bound dummies for unused descriptor slots.
     fuse0: GpuBuffer,
     fuse1: GpuBuffer,
-    rope_pos_buf: GpuBuffer,    // 4 B host-visible: writes the current position
     rope_ff_buf: GpuBuffer,     // 16 B unused (has_ff=0)
     rope_idx_buf: GpuBuffer,    // 16 B unused (set_rows_stride=0)
 
@@ -273,15 +296,6 @@ pub struct Forward {
     rope_theta_scale: f32,
     attn_scale: f32,
 
-    // ---- Phase-4C split-K attention scratch ----
-    // Sized once at construction for the worst-case max_seq_len.
-    // Written by `flash_attn_split.comp` and read by
-    // `flash_attn_reduce.comp`. Single-buffer per kind — only one
-    // attention dispatch is in flight at a time.
-    fa_scratch_out: GpuBuffer,
-    fa_scratch_max: GpuBuffer,
-    fa_scratch_sum: GpuBuffer,
-
     // ---- Phase-3E batch-prefill scratch ----
     // Allocated once in `new` based on `max_prefill_tokens`. Memory
     // budget at the default (256 tokens) is ~60 MB — well within the
@@ -325,6 +339,22 @@ pub struct Forward {
 }
 
 impl Forward {
+    /// Sprint 15D — accessor for the active intermediate-buffer slot.
+    /// `forward_token` (decode) toggles `current_slot` 0/1 per token.
+    /// `prefill_batch` (single-shot per prompt) always uses `slots[0]`.
+    #[inline]
+    pub fn cur(&self) -> &IntermediateSlot {
+        &self.slots[self.current_slot]
+    }
+
+    /// Mutable view of the active slot — used by host-write helpers
+    /// (`scratch_a.write_bytes`, `rope_pos_buf.write_bytes`) where the
+    /// backing memory-mapped buffer needs &mut access.
+    #[inline]
+    pub fn cur_mut(&mut self) -> &mut IntermediateSlot {
+        &mut self.slots[self.current_slot]
+    }
+
     pub fn new(
         dev: &VulkanDevice,
         allocator: &mut Allocator,
@@ -376,60 +406,86 @@ impl Forward {
         let ffn_bytes = (config.ffn_dim as u64) * 4;
         let logits_bytes = (config.vocab_size as u64) * 4;
 
-        let scratch_a = mk_storage(hidden_bytes, MemoryLocation::CpuToGpu, "scratch_a")?;
-        let scratch_b = mk_storage(hidden_bytes, MemoryLocation::GpuOnly, "scratch_b")?;
-        let hidden_norm = mk_storage(hidden_bytes, MemoryLocation::GpuOnly, "hidden_norm")?;
-        let q_buf = mk_storage(q_bytes, MemoryLocation::GpuOnly, "q_buf")?;
-        let k_buf = mk_storage(kv_bytes, MemoryLocation::GpuOnly, "k_buf")?;
-        let v_buf = mk_storage(kv_bytes, MemoryLocation::GpuOnly, "v_buf")?;
-        let attn_out = mk_storage(q_bytes, MemoryLocation::GpuOnly, "attn_out")?;
-        let o_buf = mk_storage(hidden_bytes, MemoryLocation::GpuOnly, "o_buf")?;
-        let res1 = mk_storage(hidden_bytes, MemoryLocation::GpuOnly, "res1")?;
-        let gate_buf = mk_storage(ffn_bytes, MemoryLocation::GpuOnly, "gate_buf")?;
-        let up_buf = mk_storage(ffn_bytes, MemoryLocation::GpuOnly, "up_buf")?;
-        let ffn_hidden = mk_storage(ffn_bytes, MemoryLocation::GpuOnly, "ffn_hidden")?;
-        let ffn_out = mk_storage(hidden_bytes, MemoryLocation::GpuOnly, "ffn_out")?;
+        // Sprint 15D — allocate per-slot buffer suite. Each
+        // IntermediateSlot holds the 17 per-forward scratch buffers;
+        // we build two slots so async pipelined decode (Sprint 15E)
+        // can record CB[N+1] while CB[N] runs on the GPU without
+        // racing on shared scratch.
+        //
+        // Decode alternates `current_slot` 0/1 per token. Prefill
+        // (`dispatch_layer_batch`) is single-shot per prompt and always
+        // uses slots[0] — async pipelining wouldn't help a one-shot
+        // submit anyway.
+        let mut alloc_slot = |slot_idx: usize| -> Result<IntermediateSlot, Box<dyn std::error::Error>> {
+            let suf = if slot_idx == 0 { "" } else { "_s1" };
+            let scratch_a = mk_storage(hidden_bytes, MemoryLocation::CpuToGpu, &format!("scratch_a{suf}"))?;
+            let scratch_b = mk_storage(hidden_bytes, MemoryLocation::GpuOnly, &format!("scratch_b{suf}"))?;
+            let hidden_norm = mk_storage(hidden_bytes, MemoryLocation::GpuOnly, &format!("hidden_norm{suf}"))?;
+            let q_buf = mk_storage(q_bytes, MemoryLocation::GpuOnly, &format!("q_buf{suf}"))?;
+            let k_buf = mk_storage(kv_bytes, MemoryLocation::GpuOnly, &format!("k_buf{suf}"))?;
+            let v_buf = mk_storage(kv_bytes, MemoryLocation::GpuOnly, &format!("v_buf{suf}"))?;
+            let attn_out = mk_storage(q_bytes, MemoryLocation::GpuOnly, &format!("attn_out{suf}"))?;
+            let o_buf = mk_storage(hidden_bytes, MemoryLocation::GpuOnly, &format!("o_buf{suf}"))?;
+            let res1 = mk_storage(hidden_bytes, MemoryLocation::GpuOnly, &format!("res1{suf}"))?;
+            let gate_buf = mk_storage(ffn_bytes, MemoryLocation::GpuOnly, &format!("gate_buf{suf}"))?;
+            let up_buf = mk_storage(ffn_bytes, MemoryLocation::GpuOnly, &format!("up_buf{suf}"))?;
+            let ffn_hidden = mk_storage(ffn_bytes, MemoryLocation::GpuOnly, &format!("ffn_hidden{suf}"))?;
+            let ffn_out = mk_storage(hidden_bytes, MemoryLocation::GpuOnly, &format!("ffn_out{suf}"))?;
+            // Phase 3E drift-fix: rope_pos_buf must hold one slot per
+            // prefill token (otherwise the per-token host writes during
+            // command-buffer recording all collapse to the last value
+            // by the time the GPU executes — every token gets the same
+            // RoPE position). Forward_token uses slot 0 of this buffer;
+            // prefill_batch writes positions 0..seq_len into slots
+            // 0..seq_len-1 before submit and binds with per-token offset.
+            let rope_pos_buf = mk_storage(
+                (max_prefill_tokens.max(1) as u64) * 4,
+                MemoryLocation::CpuToGpu, &format!("rope_pos{suf}"),
+            )?;
+            // Phase-4C scratch for split-K attention. Sized for the
+            // worst case at max_seq_len; per-call dispatches use only the
+            // prefix that matches the current `n_tiles`. Sprint 15D —
+            // double-buffered along with the rest of the per-forward
+            // scratch.
+            const FA_TILE: u64 = 64;
+            let fa_max_tiles =
+                (kv_cache.config.max_seq_len as u64 + FA_TILE - 1) / FA_TILE;
+            let fa_scratch_out_bytes = (config.n_heads as u64)
+                * fa_max_tiles
+                * (config.head_dim as u64)
+                * 4;
+            let fa_scratch_red_bytes = (config.n_heads as u64) * fa_max_tiles * 4;
+            let fa_scratch_out = mk_storage(
+                fa_scratch_out_bytes,
+                MemoryLocation::GpuOnly,
+                &format!("fa_scratch_out{suf}"),
+            )?;
+            let fa_scratch_max = mk_storage(
+                fa_scratch_red_bytes,
+                MemoryLocation::GpuOnly,
+                &format!("fa_scratch_max{suf}"),
+            )?;
+            let fa_scratch_sum = mk_storage(
+                fa_scratch_red_bytes,
+                MemoryLocation::GpuOnly,
+                &format!("fa_scratch_sum{suf}"),
+            )?;
+            Ok(IntermediateSlot {
+                scratch_a, scratch_b, hidden_norm,
+                q_buf, k_buf, v_buf, attn_out, o_buf, res1,
+                gate_buf, up_buf, ffn_hidden, ffn_out,
+                rope_pos_buf,
+                fa_scratch_out, fa_scratch_max, fa_scratch_sum,
+            })
+        };
+        let slot0 = alloc_slot(0)?;
+        let slot1 = alloc_slot(1)?;
         let logits_buf = mk_storage(logits_bytes, MemoryLocation::GpuToCpu, "logits_buf")?;
         let fuse0 = mk_storage(16, MemoryLocation::GpuOnly, "fuse0_dummy")?;
         let fuse1 = mk_storage(16, MemoryLocation::GpuOnly, "fuse1_dummy")?;
-        // Phase 3E drift-fix: rope_pos_buf must hold one slot per
-        // prefill token (otherwise the per-token host writes during
-        // command-buffer recording all collapse to the last value
-        // by the time the GPU executes — every token gets the same
-        // RoPE position). Forward_token uses slot 0 of this buffer;
-        // prefill_batch writes positions 0..seq_len into slots
-        // 0..seq_len-1 before submit and binds with per-token offset.
-        let rope_pos_buf = mk_storage(
-            (max_prefill_tokens.max(1) as u64) * 4,
-            MemoryLocation::CpuToGpu, "rope_pos",
-        )?;
 
-        // Phase-4C scratch for split-K attention. Sized for the
-        // worst case at max_seq_len; per-call dispatches use only the
-        // prefix that matches the current `n_tiles`.
-        const FA_TILE: u64 = 64;
-        let fa_max_tiles =
-            (kv_cache.config.max_seq_len as u64 + FA_TILE - 1) / FA_TILE;
-        let fa_scratch_out_bytes = (config.n_heads as u64)
-            * fa_max_tiles
-            * (config.head_dim as u64)
-            * 4;
-        let fa_scratch_red_bytes = (config.n_heads as u64) * fa_max_tiles * 4;
-        let fa_scratch_out = mk_storage(
-            fa_scratch_out_bytes,
-            MemoryLocation::GpuOnly,
-            "fa_scratch_out",
-        )?;
-        let fa_scratch_max = mk_storage(
-            fa_scratch_red_bytes,
-            MemoryLocation::GpuOnly,
-            "fa_scratch_max",
-        )?;
-        let fa_scratch_sum = mk_storage(
-            fa_scratch_red_bytes,
-            MemoryLocation::GpuOnly,
-            "fa_scratch_sum",
-        )?;
+        // (fa_scratch_out / max / sum are now allocated per slot above
+        //  inside `alloc_slot`; rope_pos is also per-slot.)
         let rope_ff_buf = mk_storage(16, MemoryLocation::GpuOnly, "rope_ff_dummy")?;
         let rope_idx_buf = mk_storage(16, MemoryLocation::GpuOnly, "rope_idx_dummy")?;
 
@@ -645,12 +701,11 @@ impl Forward {
             (1.0_f32 / config.rope_freq_base).powf(2.0 / config.head_dim as f32);
 
         Ok(Self {
-            scratch_a, scratch_b, hidden_norm,
-            q_buf, k_buf, v_buf, attn_out, o_buf, res1,
-            gate_buf, up_buf, ffn_hidden, ffn_out,
+            slots: [slot0, slot1],
+            current_slot: 0,
             logits_buf,
             fuse0, fuse1,
-            rope_pos_buf, rope_ff_buf, rope_idx_buf,
+            rope_ff_buf, rope_idx_buf,
             kv_cache, config,
             descriptor_pool,
             set_cache: HashMap::new(),
@@ -668,7 +723,6 @@ impl Forward {
             coopmat_attn_enabled,
             profiler,
             rope_theta_scale, attn_scale,
-            fa_scratch_out, fa_scratch_max, fa_scratch_sum,
             max_prefill_tokens,
             batch_input, batch_residual, batch_norm, batch_q8,
             batch_q, batch_k, batch_v, batch_attn_out, batch_o,
@@ -704,8 +758,8 @@ impl Forward {
         if embedding.len() != self.config.hidden_dim as usize {
             return Err("embedding length mismatch".into());
         }
-        self.scratch_a.write_bytes(bytemuck::cast_slice(embedding))?;
-        self.rope_pos_buf
+        self.cur_mut().scratch_a.write_bytes(bytemuck::cast_slice(embedding))?;
+        self.cur_mut().rope_pos_buf
             .write_bytes(bytemuck::bytes_of(&(position as u32)))?;
         // Phase 5A-2 Stage 2D: skip the per-forward pool reset when
         // CB-reuse is on — cached sets stay alive across tokens.
@@ -725,8 +779,8 @@ impl Forward {
         // Sprint 12D — fresh barrier-elision state per forward.
         self.reset_barrier_state();
         let timings = cmd_ctx.one_shot_profiled(&dev.device, dev.compute_queue, |cmd| {
-            let mut input = self.scratch_a.handle;
-            let mut output = self.scratch_b.handle;
+            let mut input = self.cur().scratch_a.handle;
+            let mut output = self.cur().scratch_b.handle;
             for layer in 0..self.config.n_layers {
                 let t = Instant::now();
                 self.dispatch_layer(dev, registry, cmd, model, layer, position, input, output);
@@ -801,8 +855,8 @@ impl Forward {
             )
             .into());
         }
-        self.scratch_a.write_bytes(bytemuck::cast_slice(embedding))?;
-        self.rope_pos_buf
+        self.cur_mut().scratch_a.write_bytes(bytemuck::cast_slice(embedding))?;
+        self.cur_mut().rope_pos_buf
             .write_bytes(bytemuck::bytes_of(&(position as u32)))?;
         // Phase 5A-2 Stage 2D: skip the per-forward pool reset when
         // CB-reuse is on — cached sets stay alive across tokens.
@@ -818,8 +872,8 @@ impl Forward {
         // Sprint 12D — fresh barrier-elision state per forward.
         self.reset_barrier_state();
         let timings = cmd_ctx.one_shot_profiled(&dev.device, dev.compute_queue, |cmd| {
-            let mut input = self.scratch_a.handle;
-            let mut output = self.scratch_b.handle;
+            let mut input = self.cur().scratch_a.handle;
+            let mut output = self.cur().scratch_b.handle;
             for layer in 0..self.config.n_layers {
                 self.dispatch_layer(dev, registry, cmd, model, layer, position, input, output);
                 std::mem::swap(&mut input, &mut output);
@@ -889,9 +943,9 @@ impl Forward {
             )
             .into());
         }
-        self.scratch_a.write_bytes(bytemuck::cast_slice(embedding))?;
+        self.cur_mut().scratch_a.write_bytes(bytemuck::cast_slice(embedding))?;
         // Pre-write the RoPE position buffer.
-        self.rope_pos_buf
+        self.cur_mut().rope_pos_buf
             .write_bytes(bytemuck::bytes_of(&(position as u32)))?;
 
         // Reset descriptor pool for fresh allocations this forward —
@@ -914,8 +968,8 @@ impl Forward {
                 p.reset(&dev.device, cmd);
             }
 
-            let mut input = self.scratch_a.handle;
-            let mut output = self.scratch_b.handle;
+            let mut input = self.cur().scratch_a.handle;
+            let mut output = self.cur().scratch_b.handle;
 
             for layer in 0..self.config.n_layers {
                 if let Some(p) = self.profiler.as_ref() {
@@ -1016,8 +1070,8 @@ impl Forward {
         input_data: &[f32],
         target: DebugTarget,
     ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-        self.scratch_a.write_bytes(bytemuck::cast_slice(input_data))?;
-        self.rope_pos_buf
+        self.cur_mut().scratch_a.write_bytes(bytemuck::cast_slice(input_data))?;
+        self.cur_mut().rope_pos_buf
             .write_bytes(bytemuck::bytes_of(&(position as u32)))?;
         // Debug path uses a partial layer dispatch with non-stable
         // bindings — invalidate any cached sets from prior decode runs.
@@ -1025,28 +1079,28 @@ impl Forward {
         cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
             self.dispatch_layer_partial(
                 dev, registry, cmd, model, layer, position,
-                self.scratch_a.handle, target,
+                self.cur().scratch_a.handle, target,
             );
         })?;
 
         // Pick the relevant buffer + size for readback.
         let cfg = self.config.clone();
         let (src_buf, count) = match target {
-            DebugTarget::AttnNorm => (self.hidden_norm.handle, cfg.hidden_dim as u64),
+            DebugTarget::AttnNorm => (self.cur().hidden_norm.handle, cfg.hidden_dim as u64),
             DebugTarget::QProj | DebugTarget::QNormRope => (
-                self.q_buf.handle,
+                self.cur().q_buf.handle,
                 (cfg.n_heads * cfg.head_dim) as u64,
             ),
             DebugTarget::KProj | DebugTarget::KNormRope => (
-                self.k_buf.handle,
+                self.cur().k_buf.handle,
                 (cfg.n_kv_heads * cfg.head_dim) as u64,
             ),
             DebugTarget::VProj => (
-                self.v_buf.handle,
+                self.cur().v_buf.handle,
                 (cfg.n_kv_heads * cfg.head_dim) as u64,
             ),
             DebugTarget::AttnOut => (
-                self.attn_out.handle,
+                self.cur().attn_out.handle,
                 (cfg.n_heads * cfg.head_dim) as u64,
             ),
         };
@@ -1071,14 +1125,14 @@ impl Forward {
             );
             let copy = vk::BufferCopy::default()
                 .src_offset(0).dst_offset(0).size(count * 4);
-            dev.device.cmd_copy_buffer(cmd, src_buf, self.scratch_a.handle,
+            dev.device.cmd_copy_buffer(cmd, src_buf, self.cur().scratch_a.handle,
                 std::slice::from_ref(&copy));
             let post = vk::BufferMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::HOST_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.scratch_a.handle)
+                .buffer(self.cur().scratch_a.handle)
                 .offset(0)
                 .size(vk::WHOLE_SIZE);
             dev.device.cmd_pipeline_barrier(
@@ -1091,7 +1145,7 @@ impl Forward {
                 &[],
             );
         })?;
-        let bytes = self.scratch_a.read_bytes()?;
+        let bytes = self.cur().scratch_a.read_bytes()?;
         Ok(bytemuck::cast_slice::<u8, f32>(&bytes[..(count as usize) * 4]).to_vec())
     }
 
@@ -1110,7 +1164,7 @@ impl Forward {
 
         // attn_norm
         let w = layer_weight(model, layer, "attn_norm.weight");
-        self.run_rms_norm(dev, registry, cmd, input, w, self.hidden_norm.handle,
+        self.run_rms_norm(dev, registry, cmd, input, w, self.cur().hidden_norm.handle,
                          cfg.hidden_dim, 1, cfg.rms_norm_eps, "rms_norm_attn");
         if halt == DebugTarget::AttnNorm { return; }
         compute_barrier(dev, cmd);
@@ -1125,13 +1179,13 @@ impl Forward {
         let sk = layer_weight_shader(model, layer, "attn_k.weight", self.mul_mat_vec_subgroup_enabled);
         let sv = layer_weight_shader(model, layer, "attn_v.weight", self.mul_mat_vec_subgroup_enabled);
         self.run_gemv(dev, registry, cmd, sq,
-                      wq, self.hidden_norm.handle, self.q_buf.handle,
+                      wq, self.cur().hidden_norm.handle, self.cur().q_buf.handle,
                       cfg.hidden_dim, cfg.n_heads * cfg.head_dim, "gemv_q");
         self.run_gemv(dev, registry, cmd, sk,
-                      wk, self.hidden_norm.handle, self.k_buf.handle,
+                      wk, self.cur().hidden_norm.handle, self.cur().k_buf.handle,
                       cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, "gemv_k");
         self.run_gemv(dev, registry, cmd, sv,
-                      wv, self.hidden_norm.handle, self.v_buf.handle,
+                      wv, self.cur().hidden_norm.handle, self.cur().v_buf.handle,
                       cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, "gemv_v");
         if matches!(halt, DebugTarget::QProj | DebugTarget::KProj | DebugTarget::VProj) {
             return;
@@ -1143,18 +1197,18 @@ impl Forward {
             let wqn = layer_weight(model, layer, "attn_q_norm.weight");
             let wkn = layer_weight(model, layer, "attn_k_norm.weight");
             self.run_rms_norm(dev, registry, cmd,
-                             self.q_buf.handle, wqn, self.q_buf.handle,
+                             self.cur().q_buf.handle, wqn, self.cur().q_buf.handle,
                              cfg.head_dim, cfg.n_heads, cfg.rms_norm_eps, "rms_norm_q");
             self.run_rms_norm(dev, registry, cmd,
-                             self.k_buf.handle, wkn, self.k_buf.handle,
+                             self.cur().k_buf.handle, wkn, self.cur().k_buf.handle,
                              cfg.head_dim, cfg.n_kv_heads, cfg.rms_norm_eps, "rms_norm_k");
             compute_barrier(dev, cmd);
         }
 
         // RoPE
-        self.run_rope_neox(dev, registry, cmd, self.q_buf.handle, self.q_buf.handle,
+        self.run_rope_neox(dev, registry, cmd, self.cur().q_buf.handle, self.cur().q_buf.handle,
                            cfg.head_dim, cfg.n_heads, position, "rope_q");
-        self.run_rope_neox(dev, registry, cmd, self.k_buf.handle, self.k_buf.handle,
+        self.run_rope_neox(dev, registry, cmd, self.cur().k_buf.handle, self.cur().k_buf.handle,
                            cfg.head_dim, cfg.n_kv_heads, position, "rope_k");
         if matches!(halt, DebugTarget::QNormRope | DebugTarget::KNormRope) {
             return;
@@ -1166,8 +1220,8 @@ impl Forward {
         // keep the cheap vkCmdCopyBuffer transfer.
         let row_bytes = self.kv_cache.row_bytes();
         let dst_off = self.kv_cache.pos_offset_bytes(layer, position);
-        let k_src = self.k_buf.handle;
-        let v_src = self.v_buf.handle;
+        let k_src = self.cur().k_buf.handle;
+        let v_src = self.cur().v_buf.handle;
         let k_dst = self.kv_cache.k_buffer.handle;
         let v_dst = self.kv_cache.v_buffer.handle;
         if self.kv_cache.is_fp16() {
@@ -1225,14 +1279,14 @@ impl Forward {
         // Phase-2C debug: stage input via scratch_a, single layer
         // dispatch, read scratch_b. We rebuild the descriptor pool
         // (small) from a single big reset.
-        self.scratch_a.write_bytes(bytemuck::cast_slice(input_data))?;
-        self.rope_pos_buf
+        self.cur_mut().scratch_a.write_bytes(bytemuck::cast_slice(input_data))?;
+        self.cur_mut().rope_pos_buf
             .write_bytes(bytemuck::bytes_of(&(position as u32)))?;
         self.reset_descriptor_pool_and_cache(dev)?;
         cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
             self.dispatch_layer(
                 dev, registry, cmd, model, layer, position,
-                self.scratch_a.handle, self.scratch_b.handle,
+                self.cur().scratch_a.handle, self.cur().scratch_b.handle,
             );
             // Readback barrier so the next host map sees scratch_b.
             let post = vk::BufferMemoryBarrier::default()
@@ -1240,7 +1294,7 @@ impl Forward {
                 .dst_access_mask(vk::AccessFlags::HOST_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.scratch_b.handle)
+                .buffer(self.cur().scratch_b.handle)
                 .offset(0)
                 .size(vk::WHOLE_SIZE);
             unsafe {
@@ -1279,7 +1333,7 @@ impl Forward {
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.scratch_b.handle)
+                .buffer(self.cur().scratch_b.handle)
                 .offset(0)
                 .size(vk::WHOLE_SIZE);
             dev.device.cmd_pipeline_barrier(
@@ -1294,8 +1348,8 @@ impl Forward {
             let copy = vk::BufferCopy::default().src_offset(0).dst_offset(0).size(bytes);
             dev.device.cmd_copy_buffer(
                 cmd,
-                self.scratch_b.handle,
-                self.scratch_a.handle,
+                self.cur().scratch_b.handle,
+                self.cur().scratch_a.handle,
                 std::slice::from_ref(&copy),
             );
             // Post-barrier: TRANSFER_WRITE → HOST_READ
@@ -1304,7 +1358,7 @@ impl Forward {
                 .dst_access_mask(vk::AccessFlags::HOST_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.scratch_a.handle)
+                .buffer(self.cur().scratch_a.handle)
                 .offset(0)
                 .size(vk::WHOLE_SIZE);
             dev.device.cmd_pipeline_barrier(
@@ -1317,7 +1371,7 @@ impl Forward {
                 &[],
             );
         })?;
-        let bytes_slice = self.scratch_a.read_bytes()?;
+        let bytes_slice = self.cur().scratch_a.read_bytes()?;
         Ok(bytemuck::cast_slice::<u8, f32>(
             &bytes_slice[..(self.config.hidden_dim as usize) * 4],
         )
@@ -1336,28 +1390,32 @@ impl Forward {
 
     pub fn destroy(self, device: &ash::Device, allocator: &mut Allocator) {
         unsafe { device.destroy_descriptor_pool(self.descriptor_pool, None) };
-        self.scratch_a.destroy(device, allocator);
-        self.scratch_b.destroy(device, allocator);
-        self.hidden_norm.destroy(device, allocator);
-        self.q_buf.destroy(device, allocator);
-        self.k_buf.destroy(device, allocator);
-        self.v_buf.destroy(device, allocator);
-        self.attn_out.destroy(device, allocator);
-        self.o_buf.destroy(device, allocator);
-        self.res1.destroy(device, allocator);
-        self.gate_buf.destroy(device, allocator);
-        self.up_buf.destroy(device, allocator);
-        self.ffn_hidden.destroy(device, allocator);
-        self.ffn_out.destroy(device, allocator);
+        // Sprint 15D — destroy both intermediate slots in turn.
+        let [slot0, slot1] = self.slots;
+        for s in [slot0, slot1] {
+            s.scratch_a.destroy(device, allocator);
+            s.scratch_b.destroy(device, allocator);
+            s.hidden_norm.destroy(device, allocator);
+            s.q_buf.destroy(device, allocator);
+            s.k_buf.destroy(device, allocator);
+            s.v_buf.destroy(device, allocator);
+            s.attn_out.destroy(device, allocator);
+            s.o_buf.destroy(device, allocator);
+            s.res1.destroy(device, allocator);
+            s.gate_buf.destroy(device, allocator);
+            s.up_buf.destroy(device, allocator);
+            s.ffn_hidden.destroy(device, allocator);
+            s.ffn_out.destroy(device, allocator);
+            s.rope_pos_buf.destroy(device, allocator);
+            s.fa_scratch_out.destroy(device, allocator);
+            s.fa_scratch_max.destroy(device, allocator);
+            s.fa_scratch_sum.destroy(device, allocator);
+        }
         self.logits_buf.destroy(device, allocator);
         self.fuse0.destroy(device, allocator);
         self.fuse1.destroy(device, allocator);
-        self.rope_pos_buf.destroy(device, allocator);
         self.rope_ff_buf.destroy(device, allocator);
         self.rope_idx_buf.destroy(device, allocator);
-        self.fa_scratch_out.destroy(device, allocator);
-        self.fa_scratch_max.destroy(device, allocator);
-        self.fa_scratch_sum.destroy(device, allocator);
         self.batch_input.destroy(device, allocator);
         self.batch_residual.destroy(device, allocator);
         self.batch_norm.destroy(device, allocator);
@@ -1394,17 +1452,17 @@ impl Forward {
     ) {
         let cfg = self.config.clone();
 
-        let q_buf = self.q_buf.handle;
-        let k_buf = self.k_buf.handle;
-        let v_buf = self.v_buf.handle;
-        let hidden_norm = self.hidden_norm.handle;
-        let attn_out = self.attn_out.handle;
-        let o_buf = self.o_buf.handle;
-        let res1 = self.res1.handle;
-        let gate_buf = self.gate_buf.handle;
-        let up_buf = self.up_buf.handle;
-        let ffn_hidden = self.ffn_hidden.handle;
-        let ffn_out = self.ffn_out.handle;
+        let q_buf = self.cur().q_buf.handle;
+        let k_buf = self.cur().k_buf.handle;
+        let v_buf = self.cur().v_buf.handle;
+        let hidden_norm = self.cur().hidden_norm.handle;
+        let attn_out = self.cur().attn_out.handle;
+        let o_buf = self.cur().o_buf.handle;
+        let res1 = self.cur().res1.handle;
+        let gate_buf = self.cur().gate_buf.handle;
+        let up_buf = self.cur().up_buf.handle;
+        let ffn_hidden = self.cur().ffn_hidden.handle;
+        let ffn_out = self.cur().ffn_out.handle;
 
         // (a) attn_norm
         let w = layer_weight(model, layer, "attn_norm.weight");
@@ -1476,8 +1534,8 @@ impl Forward {
         // cheap vkCmdCopyBuffer transfer (FP32 → FP32) wins.
         let row_bytes = self.kv_cache.row_bytes();
         let dst_off = self.kv_cache.pos_offset_bytes(layer, position);
-        let k_src = self.k_buf.handle;
-        let v_src = self.v_buf.handle;
+        let k_src = self.cur().k_buf.handle;
+        let v_src = self.cur().v_buf.handle;
         let k_dst = self.kv_cache.k_buffer.handle;
         let v_dst = self.kv_cache.v_buffer.handle;
         if self.kv_cache.is_fp16() {
@@ -1622,7 +1680,7 @@ impl Forward {
             (_,             false) => ShaderId::MulMatVecQ4K,
         };
 
-        let hidden_norm = self.hidden_norm.handle;
+        let hidden_norm = self.cur().hidden_norm.handle;
         self.run_rms_norm(
             dev, registry, cmd,
             input, w_norm, hidden_norm,
@@ -2004,7 +2062,7 @@ impl Forward {
             &[
                 (0, input, 0, 0),
                 // 4-byte slot starting at pos_buf_offset.
-                (1, self.rope_pos_buf.handle, pos_buf_offset, 4),
+                (1, self.cur().rope_pos_buf.handle, pos_buf_offset, 4),
                 (2, self.rope_ff_buf.handle, 0, 0),
                 (3, output, 0, 0),
                 (4, self.rope_idx_buf.handle, 0, 0),
@@ -2087,10 +2145,10 @@ impl Forward {
         let set = self.alloc_or_get_set(
             dev, kernel.descriptor_set_layout,
             &[
-                (0, self.q_buf.handle, 0, 0),
+                (0, self.cur().q_buf.handle, 0, 0),
                 (1, self.kv_cache.k_buffer.handle, layer_off, layer_size),
                 (2, self.kv_cache.v_buffer.handle, layer_off, layer_size),
-                (3, self.attn_out.handle, 0, 0),
+                (3, self.cur().attn_out.handle, 0, 0),
             ],
         );
         let pc = ScalarAttnPushConstants {
@@ -2153,7 +2211,7 @@ impl Forward {
             dev, kernel.descriptor_set_layout,
             &[
                 (0, input, 0, 0),
-                (1, self.rope_pos_buf.handle, 0, pos_size),
+                (1, self.cur().rope_pos_buf.handle, 0, pos_size),
                 (2, self.rope_ff_buf.handle, 0, 0),
                 (3, output, 0, 0),
                 (4, self.rope_idx_buf.handle, 0, 0),
@@ -2405,12 +2463,12 @@ impl Forward {
         let split_set = self.alloc_or_get_set(
             dev, split_kernel.descriptor_set_layout,
             &[
-                (0, self.q_buf.handle, 0, 0),
+                (0, self.cur().q_buf.handle, 0, 0),
                 (1, self.kv_cache.k_buffer.handle, layer_off, layer_size),
                 (2, self.kv_cache.v_buffer.handle, layer_off, layer_size),
-                (3, self.fa_scratch_out.handle, 0, 0),
-                (4, self.fa_scratch_max.handle, 0, 0),
-                (5, self.fa_scratch_sum.handle, 0, 0),
+                (3, self.cur().fa_scratch_out.handle, 0, 0),
+                (4, self.cur().fa_scratch_max.handle, 0, 0),
+                (5, self.cur().fa_scratch_sum.handle, 0, 0),
             ],
         );
         let split_pc = FlashAttnSplitPushConstants {
@@ -2446,10 +2504,10 @@ impl Forward {
         let red_set = self.alloc_or_get_set(
             dev, red_kernel.descriptor_set_layout,
             &[
-                (0, self.fa_scratch_out.handle, 0, 0),
-                (1, self.fa_scratch_max.handle, 0, 0),
-                (2, self.fa_scratch_sum.handle, 0, 0),
-                (3, self.attn_out.handle, 0, 0),
+                (0, self.cur().fa_scratch_out.handle, 0, 0),
+                (1, self.cur().fa_scratch_max.handle, 0, 0),
+                (2, self.cur().fa_scratch_sum.handle, 0, 0),
+                (3, self.cur().attn_out.handle, 0, 0),
             ],
         );
         let red_pc = FlashAttnReducePushConstants {
@@ -2651,7 +2709,7 @@ impl Forward {
             &[
                 (0, qk, 0, 0),
                 (1, weight, 0, 0),
-                (3, self.rope_pos_buf.handle, 0, pos_size),
+                (3, self.cur().rope_pos_buf.handle, 0, pos_size),
                 (4, self.rope_ff_buf.handle, 0, 0),
                 (5, qk_out, 0, 0),
                 (6, self.rope_idx_buf.handle, 0, 0),
@@ -3090,7 +3148,7 @@ impl Forward {
         // start recording — otherwise the per-token RoPE dispatches
         // would all read the last-written value (Phase 3E drift bug).
         let positions: Vec<u32> = (0..seq_len).map(|t| base_pos + t).collect();
-        self.rope_pos_buf
+        self.cur_mut().rope_pos_buf
             .write_bytes(bytemuck::cast_slice(&positions))?;
 
         // prefill_batch's per-token attention loop binds varying
@@ -3157,7 +3215,7 @@ impl Forward {
             let last_off = ((seq_len - 1) as u64) * hidden_bytes;
             self.copy_batch_row(
                 dev, cmd, self.batch_residual.handle, last_off,
-                self.scratch_a.handle, hidden_bytes,
+                self.cur().scratch_a.handle, hidden_bytes,
             );
             let bar = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -3171,7 +3229,7 @@ impl Forward {
                     std::slice::from_ref(&bar), &[], &[],
                 );
             }
-            self.dispatch_final(dev, registry, cmd, model, self.scratch_a.handle);
+            self.dispatch_final(dev, registry, cmd, model, self.cur().scratch_a.handle);
 
             // Logits → host.
             let post = vk::BufferMemoryBarrier::default()
@@ -3484,9 +3542,9 @@ impl Forward {
             // Pull token-row Q/K/V into single-token scratch.
             let q_off = (t as u64) * q_bytes;
             let kv_off = (t as u64) * kv_bytes;
-            self.copy_batch_row(dev, cmd, self.batch_q.handle, q_off, self.q_buf.handle, q_bytes);
-            self.copy_batch_row(dev, cmd, self.batch_k.handle, kv_off, self.k_buf.handle, kv_bytes);
-            self.copy_batch_row(dev, cmd, self.batch_v.handle, kv_off, self.v_buf.handle, kv_bytes);
+            self.copy_batch_row(dev, cmd, self.batch_q.handle, q_off, self.cur().q_buf.handle, q_bytes);
+            self.copy_batch_row(dev, cmd, self.batch_k.handle, kv_off, self.cur().k_buf.handle, kv_bytes);
+            self.copy_batch_row(dev, cmd, self.batch_v.handle, kv_off, self.cur().v_buf.handle, kv_bytes);
             let bar = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ);
@@ -3502,22 +3560,22 @@ impl Forward {
             // Q/K-norm — Qwen-only.
             if let Some((wqn, wkn)) = qk_norm_weights {
                 self.run_rms_norm(
-                    dev, registry, cmd, self.q_buf.handle, wqn, self.q_buf.handle,
+                    dev, registry, cmd, self.cur().q_buf.handle, wqn, self.cur().q_buf.handle,
                     cfg.head_dim, cfg.n_heads, cfg.rms_norm_eps, "rms_norm_q_b",
                 );
                 self.run_rms_norm(
-                    dev, registry, cmd, self.k_buf.handle, wkn, self.k_buf.handle,
+                    dev, registry, cmd, self.cur().k_buf.handle, wkn, self.cur().k_buf.handle,
                     cfg.head_dim, cfg.n_kv_heads, cfg.rms_norm_eps, "rms_norm_k_b",
                 );
                 compute_barrier(dev, cmd);
             }
             // RoPE — each dispatch reads its OWN position slot.
             self.run_rope_neox_with_pos_offset(
-                dev, registry, cmd, self.q_buf.handle, self.q_buf.handle,
+                dev, registry, cmd, self.cur().q_buf.handle, self.cur().q_buf.handle,
                 cfg.head_dim, cfg.n_heads, pos, rope_pos_offset, "rope_q_b",
             );
             self.run_rope_neox_with_pos_offset(
-                dev, registry, cmd, self.k_buf.handle, self.k_buf.handle,
+                dev, registry, cmd, self.cur().k_buf.handle, self.cur().k_buf.handle,
                 cfg.head_dim, cfg.n_kv_heads, pos, rope_pos_offset, "rope_k_b",
             );
             compute_barrier(dev, cmd);
@@ -3532,12 +3590,12 @@ impl Forward {
                 let kv_elements = cfg.n_kv_heads * cfg.head_dim;
                 self.run_kv_copy_fp16(
                     dev, registry, cmd,
-                    self.k_buf.handle, self.kv_cache.k_buffer.handle,
+                    self.cur().k_buf.handle, self.kv_cache.k_buffer.handle,
                     kv_elements, dst_off, "kv_copy_fp16_k_t",
                 );
                 self.run_kv_copy_fp16(
                     dev, registry, cmd,
-                    self.v_buf.handle, self.kv_cache.v_buffer.handle,
+                    self.cur().v_buf.handle, self.kv_cache.v_buffer.handle,
                     kv_elements, dst_off, "kv_copy_fp16_v_t",
                 );
             } else {
@@ -3545,11 +3603,11 @@ impl Forward {
                     .src_offset(0).dst_offset(dst_off).size(row_bytes);
                 unsafe {
                     dev.device.cmd_copy_buffer(
-                        cmd, self.k_buf.handle, self.kv_cache.k_buffer.handle,
+                        cmd, self.cur().k_buf.handle, self.kv_cache.k_buffer.handle,
                         std::slice::from_ref(&copy),
                     );
                     dev.device.cmd_copy_buffer(
-                        cmd, self.v_buf.handle, self.kv_cache.v_buffer.handle,
+                        cmd, self.cur().v_buf.handle, self.kv_cache.v_buffer.handle,
                         std::slice::from_ref(&copy),
                     );
                 }
@@ -3576,7 +3634,7 @@ impl Forward {
                 .src_offset(0).dst_offset(q_off).size(q_bytes);
             unsafe {
                 dev.device.cmd_copy_buffer(
-                    cmd, self.attn_out.handle, self.batch_attn_out.handle,
+                    cmd, self.cur().attn_out.handle, self.batch_attn_out.handle,
                     std::slice::from_ref(&copy_back),
                 );
             }
