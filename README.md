@@ -6,16 +6,17 @@ Compute-only — no swapchain, no graphics queues — built directly on `ash 0.3
 
 ## Status
 
-**v0.2.4** — infrastructure + analysis release on top of v0.2.3.
-Adds `requiredSubgroupSize=64` pipeline plumbing and ships
-`subgroupAdd` (Path A) GEMV reduction default-on, matching
-llama.cpp's RDNA4 GEMV recipe. Documents Sprint 14 — the closing
-investigation of the GEMV-pipeline branch — and the definitive
-9-hypothesis decode-gap analysis spanning Sprints 12–14.
-**Default-config performance is unchanged** from v0.2.2 / v0.2.3:
-prefill 0.89× llama.cpp Vulkan at pp=512 (3863 tok/s), decode
-91.1 tok/s median (0.80×). Supports the Qwen, Llama-3, DeepSeek-R1
-and Mistral GGUF families out-of-the-box.
+**v0.3.0** — **decode breakthrough**. The 3-stage async pipelined
+decode loop hides CPU command-recording inside the GPU compute
+window of the previous token, lifting decode from 91.1 to **109.0
+tok/s** (**+19.3 %**, **0.95 × llama.cpp Vulkan**). Prefill
+remains at 0.89 × llama.cpp at pp=512 (3863 tok/s, unchanged from
+v0.2.2). Across the v0.2 → v0.3 arc, 13 decode-gap hypotheses
+were systematically tested and falsified across Sprints 12-15;
+the 14th — the correct 3-stage pipeline shape — delivered the
++19 %. The first decode performance gain since v0.2.0. Supports
+the Qwen, Llama-3, DeepSeek-R1 and Mistral GGUF families
+out-of-the-box.
 
 | Model | Arch | Tokenizer | Chat template | Status |
 |---|---|---|---|---|
@@ -24,7 +25,27 @@ and Mistral GGUF families out-of-the-box.
 | DeepSeek-R1-Distill-Llama-8B-Q4_K_M | llama | gpt2 / llama-bpe | DeepSeek-R1 | ✅ |
 | Mistral-7B-Instruct-v0.3.Q4_K_M | llama | llama (SPM) | Mistral | ✅ |
 
-### Key features (v0.2.4)
+### Key features (v0.3.0)
+
+- **Async pipelined decode loop** (default ON, new in v0.3.0) — the
+  CPU records the next token's command buffer while the GPU runs the
+  previous token's. 3-stage rolling pipeline:
+  ```
+  Stage 1: pre_record(CB[N+1])  ← during GPU(CB[N]), 1.8 ms hidden
+  Stage 2: wait(CB[N]) → readback → sample → token[N+1]
+  Stage 3: write_embed → submit(CB[N+1])
+  ```
+  Per-token wall drops from 10.9 ms to 9.1 ms; decode goes from
+  91 tok/s to **109 tok/s** (+19.3 %, 0.95 × llama.cpp). Vulkan
+  records buffer *handles* not contents, so the embedding can be
+  written after recording but before submission. Opt-out:
+  `VULKANFORGE_DISABLE_ASYNC_DECODE=1`.
+- **Double-buffered intermediates** (Sprint 15D infrastructure) —
+  17 per-forward scratch buffers (`scratch_a`/`b`, `hidden_norm`,
+  Q/K/V projections, attention scratch, FFN scratch, RoPE-pos,
+  flash-attention split scratch) extracted into an
+  `IntermediateSlot × 2` struct so two CBs can be in different
+  pipeline stages without buffer races.
 
 - **KHR cooperative matrix WMMA prefill** (default ON) — Q4_K and Q6_K
   GEMM dispatched through RDNA4's 128 AI Accelerators via
@@ -66,44 +87,47 @@ tensor layout work).
 
 ### Prefill throughput sweep (Qwen3-8B-Q4_K_M, RUNS=5 median)
 
-| pp   | VulkanForge v0.2.4 | VulkanForge v0.2.0 | llama.cpp Vulkan | Ratio (v0.2.4) |
-|------|-------------------:|-------------------:|-----------------:|---------------:|
-|   32 |          **975**   |              —     |             —    | — |
-|   64 |              1678  |              1511  |             2285 | 0.73× |
-|  128 |              2560  |              2001  |             3637 | 0.70× |
-|  256 |              3558  |              2200  |             3995 | 0.89× |
-|  512 |          **3863**  |              2255  |             4326 | **0.89×** |
-| 1024 |              3748  |              2204  |             4173 | 0.90× |
-| 2048 |              3172  |              1997  |             3765 | 0.84× |
+| pp / decode | v0.2.0 | v0.2.4 | **v0.3.0** | llama.cpp | Ratio (v0.3.0) |
+|-------------|-------:|-------:|-----------:|----------:|---------------:|
+| Decode      |   90.5 |   91.1 |  **109.0** |     114.2 | **0.95×** |
+| pp=32       |    —   |    975 |        975 |       —   | — |
+| pp=64       |   1511 |   1678 |       1678 |     2285  | 0.73× |
+| pp=128      |   2001 |   2560 |       2570 |     3637  | 0.71× |
+| pp=256      |   2200 |   3558 |       3558 |     3995  | 0.89× |
+| pp=512      |   2255 |   3863 |   **3865** |     4326  | **0.89×** |
+| pp=1024     |   2204 |   3748 |       3742 |     4173  | 0.90× |
+| pp=2048     |   1997 |   3172 |       3172 |     3765  | 0.84× |
 
 llama.cpp reference: build 23b8cc4 with `-fa 1` on the same hardware.
-Peak prefill throughput is **3863 tok/s @ pp=512** (unchanged from
-v0.2.2). pp=32 is the new measurement enabled by Sprint 13A's S-tile
-coopmat — 975 tok/s vs 765 tok/s on the scalar `mul_mmq` default-off
-path (+27 %). The pp ≥ 256 ratio is within run-to-run noise of
-llama.cpp's `mul_mm` Vulkan path; pp ≤ 128 carries a 0.70–0.73 × gap
-that lives in pipeline-creation infrastructure (subgroup-arithmetic
-reduction), not shader source. See "Limitations" and Sprint 13E.
+**Decode at 109 tok/s = 0.95 × llama.cpp** is the v0.3.0 headline
+gain (Sprint 15E async pipeline, +19.3 % over v0.2.4's 91.1).
+Prefill peak 3 865 tok/s @ pp=512 is unchanged from v0.2.2 (Sprint
+12L's aligned coopmat shipped that figure; v0.3.0's async pipeline
+only touches the decode GEMV path). The pp ≤ 128 gap (0.70–0.73 ×)
+lives in pipeline-creation infrastructure (subgroup-arithmetic
+reduction); the remaining ~5 % decode gap is dedicated `lm_head`
+coopmat + buffer-aliasing — see "Limitations".
 
 ### 4-system comparison (Qwen3-8B, same hardware)
 
 | System                     | Decode tok/s | Prefill peak tok/s | Decode ratio | Prefill ratio |
 |----------------------------|-------------:|-------------------:|-------------:|--------------:|
 | llama.cpp Vulkan           |      114.2   |              4326  |       1.00×  |        1.00×  |
-| **VulkanForge v0.2.4**     |   **91.1**   |          **3863**  |    **0.80×** |     **0.89×** |
+| **VulkanForge v0.3.0**     |  **109.0**   |          **3865**  |    **0.95×** |     **0.89×** |
+| VulkanForge v0.2.4         |       91.1   |              3863  |       0.80×  |        0.89×  |
 | VulkanForge v0.2.0         |       90.5   |              2255  |       0.79×  |        0.52×  |
 | llama.cpp ROCm             |       87.5   |              3684  |       0.77×  |        0.85×  |
 | ROCmForge (HIP)            |       95.4   |               769  |       0.84×  |        0.18×  |
 
-vs v0.2.0: decode +0.7 % (90.5 → 91.1, run-to-run noise), prefill peak
-**+71 %** (2255 → 3863). Decode unchanged because coopmat is
-prefill-only — GEMV continues through the existing `mul_mat_vec_*`
-shaders. ROCm / ROCmForge HIP rows are carried forward from v0.2.0's
-4-system run; not re-measured for v0.2.4. v0.2.3 / v0.2.4 default-
-config performance is identical to v0.2.2 — Sprint 13A added pp ≤ 32
-coverage without changing pp ≥ 64 numbers; Sprints 13B–13E and 14A–14C
-were investigations and infrastructure work that did not move the
-default-config wall.
+vs v0.2.4: decode **+19.3 %** (91.1 → 109.0); prefill flat (3 863 →
+3 865, run-to-run noise). The decode gain comes from the Sprint 15E
+async pipelined decode loop — CPU command-recording (~1 836 µs/token)
+now runs in parallel with GPU compute (~9 034 µs/token) of the
+previous token, dropping per-token wall from 10.9 ms to 9.1 ms.
+**0.95 × llama.cpp Vulkan decode** is the headline figure; the
+remaining 5 % gap lives in dedicated `lm_head` coopmat + buffer
+aliasing (analysis in Sprint 15B / 15C). ROCm / ROCmForge HIP rows
+carry forward from v0.2.0; not re-measured.
 
 ## Build
 
@@ -156,6 +180,7 @@ VF_MODEL_PATH=$HOME/models/Qwen3-8B-Q4_K_M.gguf \
 | `VULKANFORGE_USE_MM_COOPMAT=0` | (legacy alias) | Same effect as `DISABLE_MM_COOPMAT=1`. |
 | `VULKANFORGE_COOPMAT_F16ACC=1` | off (FP32 acc) | Opt-in FP16 accumulator for the aligned-L-tile coopmat path. **RDNA4-neutral-to-slightly-negative** (emulated, not native). May benefit NVIDIA Ampere+ / Intel XMX hardware. New in v0.2.3. |
 | `VULKANFORGE_DISABLE_SUBGROUP_GEMV=1` | off (Path A on) | Disables the subgroupAdd GEMV reduction (Path A) and falls back to the LDS tree-reduction (Path B). Both paths produce identical results within FP precision. The Path A pipeline pins `requiredSubgroupSize=64` via Sprint 14A's plumbing. New in v0.2.4. |
+| `VULKANFORGE_DISABLE_ASYNC_DECODE=1` | off (async ON) | Disables the 3-stage async pipelined decode loop and falls back to the serial path (record → submit → wait → readback per token). Output is bit-identical between modes; the async mode just hides CPU recording inside GPU compute. **New in v0.3.0** — this is the +19.3 % decode lever. |
 | `VULKANFORGE_FP16_KV=0` | on | Use FP32 KV cache (2× VRAM, parity with pre-v0.2.0). |
 | `VULKANFORGE_COOPMAT_ATTN=0` | on | Disable coopmat QK attention; falls back to scalar tiled. **DEVICE_LOSTs at pp ≥ 4096** — debugging only. |
 | `VULKANFORGE_BATCH_ATTN=0` | on | Per-token attention loop instead of batched. Parity testing only. |

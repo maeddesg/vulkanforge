@@ -1,5 +1,191 @@
 # Changelog
 
+## v0.3.0 — async pipelined decode (2026-05-02)
+
+### Headline
+
+**Decode breakthrough: 91.1 → 109.0 tok/s (+19.3 %, 0.95 × llama.cpp
+Vulkan).** The first decode performance gain since v0.2.0. The
+3-stage async pipelined decode loop hides CPU command-recording
+inside the GPU compute window of the previous token, matching the
++20 % theoretical ceiling Sprint 15A measured. Prefill unchanged
+at 0.89 × llama.cpp Vulkan @ pp=512 (3 865 tok/s — async only
+touches the decode GEMV path). 27 / 27 lib tests, 15 / 15 coherent
+under both async and serial paths, bit-identical generated output.
+
+| Metric  | v0.2.0 | v0.2.4 | **v0.3.0** | llama.cpp | Ratio (v0.3.0) |
+|---------|-------:|-------:|-----------:|----------:|---------------:|
+| Decode  |   90.5 |   91.1 |  **109.0** |     114.2 |       **0.95×** |
+| pp=512  |   2255 |   3863 |       3865 |      4326 |          0.89× |
+| pp=1024 |   2204 |   3748 |       3742 |      4173 |          0.90× |
+
+Benchmark: Qwen3-8B-Q4_K_M, RX 9070 XT (gfx1201), RADV Mesa 26.0.6.
+llama.cpp: build 23b8cc4 with `-fa 1` on the same hardware.
+
+### Shipped — Sprint 15D + 15E
+
+#### Sprint 15D — Double-buffered intermediate buffers
+
+Extracted 17 per-forward scratch buffers into a new
+`IntermediateSlot` struct (`scratch_a`, `scratch_b`, `hidden_norm`,
+`q_buf`, `k_buf`, `v_buf`, `attn_out`, `o_buf`, `res1`,
+`gate_buf`, `up_buf`, `ffn_hidden`, `ffn_out`, `rope_pos_buf`,
+`fa_scratch_out`, `fa_scratch_max`, `fa_scratch_sum`). `Forward`
+now holds `slots: [IntermediateSlot; 2]` and a `current_slot`
+index. 96+ buffer references across `forward.rs` were rewritten
+via `cur()` / `cur_mut()` accessors. **Performance-neutral** in
+isolation — Sprint 15E uses the slot pair to allow the next
+token's CB to be recorded while the current token's GPU work is
+in flight. VRAM impact: ~1-2 MB.
+
+#### Sprint 15E — 3-stage async pipelined decode loop
+
+Three new public methods on `Forward`:
+
+- `pre_record(slot, position)` — records the standard 36-layer +
+  lm_head dispatch sequence into `async_cbs[slot]`, referencing
+  `slots[slot]` buffer handles. Does **not** submit; runs in
+  parallel with GPU work on the other slot.
+- `fill_embed_and_submit(slot, embedding, position)` — host-writes
+  the embedding into `slots[slot].scratch_a` and the position
+  into `slots[slot].rope_pos_buf`, then submits `async_cbs[slot]`.
+- `wait_and_read_logits(slot)` — blocks on `async_fences[slot]`
+  and reads `logits_buf`.
+
+`Forward` got 4 new fields: `async_pool: vk::CommandPool`,
+`async_cbs: [vk::CommandBuffer; 2]`,
+`async_fences: [vk::Fence; 2]`, `async_pending_record:
+Option<usize>`. Allocated in `Forward::new`, freed in
+`Forward::destroy`. The `record_decode_dispatches` helper was
+extracted from `forward_token`'s `cmd_ctx.one_shot` closure body
+so both serial and async paths share the recording sequence
+(DRY).
+
+`decode.rs::generate_from_tokens` got an
+`if async_decode { … } else { serial fallback }` branch. The
+async branch implements the 3-stage rolling pipeline:
+
+```
+Token N:                                              GPU runs CB[N] (~9 ms)
+  Stage 1: pre_record(CB[N+1])  ──────┐
+  Stage 2: wait(CB[N]) → readback     │  CPU recording of CB[N+1]
+           → sample → embed lookup    │  hidden inside GPU(N) window
+  Stage 3: fill_embed → submit ───────┘
+           CB[N+1] starts on GPU
+```
+
+Per-token wall: max(record 1 836 µs, GPU 9 034 µs) + ~80 µs
+sequential = 9 114 µs → **109.7 tok/s theoretical, 109.0
+measured** (99.4 % of ceiling). The CPU recording is fully
+hidden inside the GPU's compute window.
+
+This works because Vulkan records buffer **handles**, not buffer
+*contents* — the embedding is written into `slots[(N+1)%2].scratch_a`
+*after* `pre_record` but *before* submit. Vulkan's queue
+ordering on a single queue guarantees CB[N+1] starts after CB[N]
+without needing timeline semaphores.
+
+Default-on; opt-out: `VULKANFORGE_DISABLE_ASYNC_DECODE=1`.
+Output is **bit-identical** between async and serial paths.
+First-token cold-start (no prev to wait for), EOS-mid-pipe
+(pre-recorded CB left unsubmitted, recycled next session), and
+drain-final are all handled.
+
+Shipped LOC: +227 / −47 in `forward.rs`, +102 in `decode.rs`.
+
+### Investigation — Sprints 12-15 decode-gap analysis arc
+
+Across 4 weeks of work, **13 decode-gap hypotheses** were
+systematically tested and falsified before the 14th — the correct
+3-stage pipeline shape — delivered the +19.3 % win. Each prior
+sprint either shipped infrastructure that 15E ultimately needed
+(Sprint 14A's `requiredSubgroupSize`, 14B's subgroup GEMV, 15D's
+slot refactor) or eliminated a candidate cleanly:
+
+| #  | Hypothesis                                | Sprint | Result on RDNA4                |
+|---:|--------------------------------------------|--------|--------------------------------|
+|  1 | Barrier elision (dirty-flag tracker)       | 12D    | 0 % wall-time impact           |
+|  2 | Norm + RoPE fusion                         | 12E    | +1 % (run-to-run noise)        |
+|  3 | Q6_K shader optimisation                   | 12H    | upstream-identical             |
+|  4 | Mesa 26.0.6 → 26.1-rc3 driver upgrade      | 13B    | ±2 % noise (llama.cpp also flat) |
+|  5 | f16-accumulator coopmat shader             | 13C    | −2 % (FP16 emulated on RDNA4)  |
+|  6 | Wave32 / VOPD dual-issue codegen           | 13D    | 0 % decode (memory-bound)      |
+|  7 | `MMV_NUM_ROWS=2` with LDS Path B           | 13E    | −2.9 % (LDS-doubling penalty)  |
+|  8 | `subgroupAdd` GEMV reduction (Path A)      | 14B    | +0.16 % (within noise)         |
+|  9 | `MMV_NUM_ROWS=2` with Path A               | 14C    | −1.5 % (per-WG VGPR)           |
+| 10 | Template CB-reuse via UBO                  | 15A    | falsified at source-reading    |
+| 11 | `lm_head` NUM_ROWS / coopmat               | 15B    | already at 94 % HBM ceiling    |
+| 12 | 1-day async prototype                      | 15C    | infra-blocked (no double-buffering) |
+| 13 | Naive 2-stage pipeline (record after wait) | 15E §2 | wouldn't pipeline (traced)     |
+| **14** | **3-stage pipeline (correct shape)**   | **15E** | **+19.3 % (shipped)**         |
+
+The methodology — measure first, falsify cheap, build only what
+survives the math — produced 13 honest negatives and 1 real
+positive. The analytical prediction (109.7 tok/s from CPU/GPU
+timing measurements) matched the final implementation
+(109.0 tok/s) to within 1 %.
+
+### Configuration
+
+| Variable                              | Default | Effect |
+|---------------------------------------|---------|--------|
+| `VULKANFORGE_DISABLE_ASYNC_DECODE=1`  | off     | **Disable async pipeline; use serial decode loop. New in v0.3.0.** |
+| `VULKANFORGE_DISABLE_MM_COOPMAT=1`    | off     | Disable coopmat prefill (use scalar `mul_mmq`). |
+| `VULKANFORGE_COOPMAT_F16ACC=1`        | off     | Opt-in FP16 accumulator (RDNA4-neutral; may help non-RDNA hardware). |
+| `VULKANFORGE_DISABLE_SUBGROUP_GEMV=1` | off     | Disable subgroupAdd GEMV reduction. |
+
+### What's still on the table
+
+The remaining ~5 % decode gap to llama.cpp lives in:
+
+- **Dedicated `lm_head` coopmat dispatch** (Sprint 15B analysis):
+  ~1 % decode lift estimated. lm_head is Q6_K and already at 94 %
+  HBM ceiling — coopmat can't reduce HBM bytes, so the lift is
+  small.
+- **Buffer-aliasing / live-set reduction**: 0–5 %, unmeasured.
+  ~20 SSBOs live per layer vs llama.cpp's 3-4. May matter for
+  L2 thrashing.
+- **`quantize_q8_1` fusion into the GEMM dispatch** (prefill,
+  smaller win): few % at pp=512.
+
+These are v0.4-class architectural changes if they materialise.
+
+### Files added / changed in v0.3.0
+
+```
+EDIT  Cargo.toml                              0.2.4 → 0.3.0
+EDIT  src/backend/vulkan/forward.rs           +466 / −228 LOC across 15D + 15E:
+                                                Sprint 15D (already shipped):
+                                                  IntermediateSlot struct, slots[2],
+                                                  cur()/cur_mut() helpers, 96+ refs
+                                                Sprint 15E (this release):
+                                                  4 new fields (async_pool, async_cbs[2],
+                                                  async_fences[2], async_pending_record),
+                                                  3 new public methods, record_decode_dispatches
+                                                  helper extraction
+EDIT  src/backend/vulkan/decode.rs            +102 LOC (async path branch in
+                                                generate_from_tokens with first-token,
+                                                EOS, and drain handling)
+NEW   results/v030_sprint15a_cb_reuse.md
+NEW   results/v030_sprint15b_lm_head.md
+NEW   results/v030_sprint15c_async_prototype.md
+NEW   results/v030_sprint15de_async_decode.md
+NEW   results/v030_sprint15e_async_pipeline.md
+EDIT  README.md                               v0.3.0 perf table + features
+EDIT  CHANGELOG.md                            this entry
+```
+
+### Stats
+
+- 72 SPVs (unchanged from v0.2.4)
+- 27 lib tests, 15 / 15 coherent on both async and serial paths
+- 12 coopmat GEMM pipeline variants (S/M/L × Q4_K/Q6_K ×
+  aligned/unaligned) + 2 f16acc opt-in + 4 GEMV (subgroup +
+  stock × Q4_K/Q6_K)
+- All shader sources byte-identical to llama.cpp upstream
+
+---
+
 ## v0.2.4 — subgroup-arithmetic GEMV + decode-gap analysis (2026-05-02)
 
 ### Headline
