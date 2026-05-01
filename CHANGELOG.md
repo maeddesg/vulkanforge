@@ -1,5 +1,157 @@
 # Changelog
 
+## v0.2.3 — tile coverage complete + RDNA4 root-cause analysis (2026-05-02)
+
+### Headline
+
+Default-config performance is **unchanged** from v0.2.2: prefill
+0.89 × llama.cpp Vulkan at pp=512 (3863 tok/s), decode 91.1 tok/s
+(0.80 ×). v0.2.3 is an **analysis + completeness** release. Two
+shipped changes (S-tile coopmat for pp ≤ 32; opt-in f16-accumulator
+coopmat) and four investigation sprints (Mesa 26.1, f16acc analysis,
+Wave32 / VOPD probe, `MMV_NUM_ROWS=2`) that systematically located
+where the remaining gap to llama.cpp lives. 27 / 27 lib tests,
+15 / 15 coherent on the bench suite, 70 SPVs (+2 vs v0.2.2).
+
+### Shipped changes
+
+- **S-tile coopmat (BM=32)** for `seq_len ≤ 32`. Completes the S/M/L
+  tile matrix; matches llama.cpp's `ggml_vk_guess_matmul_pipeline`
+  variant coverage. 4 new pipeline variants via spec-constants
+  (`{64, 32, 32, 16, 32, 32, 2, 16, 16, 16, 64}`); zero new SPVs.
+  Selector: `n ≤ 32 → S, n ≤ 64 → M, else → L`. At pp=32, S-tile is
+  +27 % over the scalar `mul_mmq` default-off path (765 → 975 tok/s);
+  vs M-tile alone +1.9 % (within run-to-run noise — the
+  saturation-by-WG-count theory does not translate at this shape on
+  RDNA4 because the kernel is already hiding HBM latency).
+  Sprint 13A: `results/v023_sprint13a_stile.md`.
+
+- **f16-accumulator coopmat path** (opt-in, default OFF).
+  `VULKANFORGE_COOPMAT_F16ACC=1` redirects the aligned-L-tile
+  coopmat dispatch to a new SPV with `ACC_TYPE = float16_t`,
+  `ACC_TYPE_MAX = float16_t(65504.0)`, and `D_TYPE = float`
+  (writeback stays FP32). 2 new SPVs:
+  `mul_mm_q{4,6}_k_f32_aligned_coopmat_f16acc.spv`. 27 / 27 lib tests
+  + 15 / 15 coherent under f16acc — precision-safe on Qwen3-8B-Q4_K_M
+  including the K=12288 reduction in `gemm_down`. **Performance on
+  RDNA4: −2 %** at pp=512 because RDNA4 has only
+  `v_wmma_f32_16x16x16_fp16` (FP32 result fragment) — the
+  cooperative-matrix API exposes a FP16→FP16 fragment shape, but
+  ACO lowers it onto the same f32 hardware path with
+  FP32↔FP16 conversions, costing wall time. Retained for users on
+  hardware with native f16 accumulator (NVIDIA Ampere+, Intel XMX).
+  Sprint 13C: `results/v023_sprint13c_f16acc.md`.
+
+### Investigation sprints (no perf change, documented)
+
+- **Sprint 13B — Mesa 26.1-rc3 driver test.** Built Mesa 26.1.0-rc3
+  locally (`~/tmp/mesa-26.1/`, RADV-only, opt-in via
+  `VK_ICD_FILENAMES` + `LD_LIBRARY_PATH`; system Mesa 26.0.6
+  untouched). Both VulkanForge and llama.cpp are flat between Mesa
+  26.0.6 and 26.1-rc3 (≤ ±2.3 % at every pp). The Mesa 26.1 f16acc
+  driver patches do not move our coopmat path on RDNA4 — neither do
+  they move llama.cpp's. **Production stays on Mesa 26.0.6.**
+
+- **Sprint 13D — Wave32 / VOPD probe.** On Mesa 26.1-rc3 with
+  `RADV_PERFTEST=cswave32` ACO emits **3 546** `v_dual_*` instructions
+  (vs 65 under Wave64) — the codegen feature works as designed.
+  But wall-time is flat: decode neutral (90.7 → 90.8), prefill mildly
+  negative (−1.8 to −3.2 % across pp). Sprint 12G-D's "27.5 % VALU
+  utilisation, 72.5 % idle" was memory-wait, not unfilled VALU slots;
+  doubled VOPD issuance fills cycles that were already wait-states.
+  **Wave32 not recommended for v0.3.** 27 / 27 lib + 15 / 15 coherent.
+
+- **Sprint 13E — `MMV_NUM_ROWS=2` GEMV pipelines.** llama.cpp
+  unconditionally uses `NUM_ROWS = 2` for K-quant GEMV pipelines on
+  non-GCN AMD (`ggml-vulkan.cpp:4128 rm_kq = 2`). The Vulkan shader
+  source is byte-identical and `NUM_ROWS` is a spec-constant
+  (`mul_mat_vec_base.glsl:90`), so the change is a one-line edit.
+  Same-session A/B with `profile_positions`: NUM_ROWS=2 is
+  **measurably slower** per-dispatch — gemv_q +21 %, gemv_k +7.7 %,
+  gemv_v +2.6 %; forward wall +2.9 %. Reason: llama.cpp pairs
+  NUM_ROWS=2 with the subgroup-arithmetic reduction (`subgroupAdd`)
+  gated on `USE_SUBGROUP_ADD` + `requireFullSubgroups` +
+  `requiredSubgroupSize=64` at pipeline creation. We ship only the
+  LDS-tree-reduction fallback path; doubling NUM_ROWS doubles LDS
+  traffic without halving reduction depth. **Reverted.** Real port
+  is a Sprint 14 / v0.3 infrastructure item.
+
+### Where the remaining gap lives — root-cause analysis
+
+The remaining ~10 % prefill gap (0.89 ×) and ~20 % decode gap (0.80 ×)
+to llama.cpp on RDNA4 is **NOT** in:
+
+- Shader source (md5-identical to upstream `23b8cc4`, Sprint 12H/12I)
+- Coopmat tile spec-constants (S/M/L parity, Sprint 12M / 13A)
+- Driver version (Mesa 26.0.6 ≡ 26.1-rc3 within noise, Sprint 13B)
+- f16-accumulator coopmat (emulated on RDNA4, Sprint 13C)
+- Wave32 / VOPD dual-issue (memory-bound workload, Sprint 13D)
+- `MMV_NUM_ROWS=2` GEMV (needs subgroup arithmetic first, Sprint 13E)
+
+It **IS** in pipeline-creation infrastructure:
+
+1. `requireFullSubgroups` + `requiredSubgroupSize=64` pinning at
+   pipeline creation (we don't pass these).
+2. Subgroup-arithmetic reduction in `mul_mat_vec_base.glsl` Path A
+   (`subgroupAdd` over 64 lanes) vs our Path B (LDS tree reduction
+   in 6 levels with barriers).
+3. Multi-submit pipeline parallelism in prefill (Sprint 12B audit).
+4. `quantize_q8_1` fusion into the GEMM dispatch (Sprint 12I §6).
+
+These are v0.3-class infrastructure work items touching every shader's
+pipeline path. Outside the scope of single-line config flips.
+
+### Configuration
+
+- `VULKANFORGE_DISABLE_MM_COOPMAT=1` — disable coopmat for prefill
+  (use the `mul_mmq` integer-DP fallback).
+- **`VULKANFORGE_COOPMAT_F16ACC=1` (new)** — opt-in FP16 accumulator
+  for the aligned-L-tile coopmat path. RDNA4-neutral-to-slightly-negative.
+- On Mesa 26.1+: `RADV_PERFTEST=cswave32` to test Wave32 (neutral).
+
+### New shaders / SPVs
+
+```
+NEW   mul_mm_q4_k_f32_aligned_coopmat_f16acc.spv  (Sprint 13C)
+NEW   mul_mm_q6_k_f32_aligned_coopmat_f16acc.spv  (Sprint 13C)
+```
+
+Total SPV count went 68 → 70. S-tile pipelines are 0 new SPVs
+(reuse L/M-tile binaries via spec-constants).
+
+### Files added / changed in v0.2.3
+
+```
+EDIT  Cargo.toml                              0.2.2 → 0.2.3
+EDIT  build.rs                                +44 LOC (2 f16acc ShaderJobs)
+EDIT  src/backend/vulkan/shaders.rs           +30 LOC (4 S-tile + 2 f16acc ShaderIds)
+EDIT  src/backend/vulkan/pipeline_registry.rs +20 LOC (S-tile spec-constants
+                                              + f16acc folded into match arm
+                                              + NUM_ROWS=1 rationale comment)
+EDIT  src/backend/vulkan/forward.rs           +35 LOC (S-tile selector,
+                                              f16acc env var + struct field +
+                                              routing guard, six call-site
+                                              updates for the new arg)
+NEW   results/v023_sprint13a_stile.md
+NEW   results/v023_sprint13b_mesa26.1_test.md
+NEW   results/v023_sprint13c_f16acc.md
+NEW   results/v023_sprint13d_wave32_probe.md
+NEW   results/v023_sprint13e_mmv_numrows.md
+EDIT  README.md                               v0.2.3 perf table + features
+EDIT  CHANGELOG.md                            this entry
+```
+
+### What's still on the table for v0.3
+
+- Subgroup-arithmetic GEMV pipeline + `requiredSubgroupSize` plumbing
+  (unblocks NUM_ROWS=2 — Sprint 13E §7).
+- Decode-side coopmat for `lm_head` (vocab-major GEMV with
+  N=151 936; ~3 % decode improvement potential).
+- Multi-submit prefill graph (Sprint 12B audit; ~5–10 % at pp=512).
+- `quantize_q8_1` fusion into the GEMM dispatch (Sprint 12I §6).
+
+---
+
 ## v0.2.2 — coopmat WMMA prefill default-on (2026-05-01)
 
 ### Headline
