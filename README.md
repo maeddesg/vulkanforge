@@ -6,15 +6,16 @@ Compute-only — no swapchain, no graphics queues — built directly on `ash 0.3
 
 ## Status
 
-**v0.2.3** — analysis + completeness release on top of v0.2.2's
-coopmat default-on prefill. The S/M/L coopmat tile matrix is now
-complete (S-tile BM=32 added for `seq_len ≤ 32`, matching llama.cpp's
-variant coverage), an opt-in f16-accumulator coopmat path is shipped,
-and five Sprint 13 investigation reports document the remaining gap
-to llama.cpp on RDNA4. Default-config performance is **unchanged**
-from v0.2.2: prefill 0.89× llama.cpp Vulkan at pp=512 (3863 tok/s),
-decode 91.1 tok/s median (0.80×). Supports the Qwen, Llama-3,
-DeepSeek-R1 and Mistral GGUF families out-of-the-box.
+**v0.2.4** — infrastructure + analysis release on top of v0.2.3.
+Adds `requiredSubgroupSize=64` pipeline plumbing and ships
+`subgroupAdd` (Path A) GEMV reduction default-on, matching
+llama.cpp's RDNA4 GEMV recipe. Documents Sprint 14 — the closing
+investigation of the GEMV-pipeline branch — and the definitive
+9-hypothesis decode-gap analysis spanning Sprints 12–14.
+**Default-config performance is unchanged** from v0.2.2 / v0.2.3:
+prefill 0.89× llama.cpp Vulkan at pp=512 (3863 tok/s), decode
+91.1 tok/s median (0.80×). Supports the Qwen, Llama-3, DeepSeek-R1
+and Mistral GGUF families out-of-the-box.
 
 | Model | Arch | Tokenizer | Chat template | Status |
 |---|---|---|---|---|
@@ -23,7 +24,7 @@ DeepSeek-R1 and Mistral GGUF families out-of-the-box.
 | DeepSeek-R1-Distill-Llama-8B-Q4_K_M | llama | gpt2 / llama-bpe | DeepSeek-R1 | ✅ |
 | Mistral-7B-Instruct-v0.3.Q4_K_M | llama | llama (SPM) | Mistral | ✅ |
 
-### Key features (v0.2.3)
+### Key features (v0.2.4)
 
 - **KHR cooperative matrix WMMA prefill** (default ON) — Q4_K and Q6_K
   GEMM dispatched through RDNA4's 128 AI Accelerators via
@@ -39,6 +40,15 @@ DeepSeek-R1 and Mistral GGUF families out-of-the-box.
   fragment is emulated on top of `v_wmma_f32_16x16x16_fp16`. Retained
   for hardware with native f16 accumulator support (NVIDIA Ampere+,
   Intel XMX).
+- **Subgroup-arithmetic GEMV reduction** (default ON, new in v0.2.4) —
+  K-quant decode GEMVs use `subgroupAdd` over the 64-lane wave instead
+  of an LDS tree-reduction. Removes 6 LDS barrier levels from the
+  reduction step, matching llama.cpp's RDNA4 GEMV recipe. Wall-time
+  delta on this hardware is within noise (the reduction was < 0.2 % of
+  per-dispatch time at BLOCK_SIZE=64), but the path is the prerequisite
+  for any future GEMV change that depends on a fixed subgroup size.
+  Pipeline pins `requiredSubgroupSize=64` via Sprint 14A's plumbing.
+  Opt out with `VULKANFORGE_DISABLE_SUBGROUP_GEMV=1`.
 - **coopmat QK attention** — KHR cooperative matrix WMMA replaces the
   scalar inner loop in `flash_attn_coopmat.comp`. ~85 % faster prefill
   at pp=2048 vs scalar; resolves the pp=4096 TDR crash.
@@ -56,7 +66,7 @@ tensor layout work).
 
 ### Prefill throughput sweep (Qwen3-8B-Q4_K_M, RUNS=5 median)
 
-| pp   | VulkanForge v0.2.3 | VulkanForge v0.2.0 | llama.cpp Vulkan | Ratio (v0.2.3) |
+| pp   | VulkanForge v0.2.4 | VulkanForge v0.2.0 | llama.cpp Vulkan | Ratio (v0.2.4) |
 |------|-------------------:|-------------------:|-----------------:|---------------:|
 |   32 |          **975**   |              —     |             —    | — |
 |   64 |              1678  |              1511  |             2285 | 0.73× |
@@ -80,7 +90,7 @@ reduction), not shader source. See "Limitations" and Sprint 13E.
 | System                     | Decode tok/s | Prefill peak tok/s | Decode ratio | Prefill ratio |
 |----------------------------|-------------:|-------------------:|-------------:|--------------:|
 | llama.cpp Vulkan           |      114.2   |              4326  |       1.00×  |        1.00×  |
-| **VulkanForge v0.2.3**     |   **91.1**   |          **3863**  |    **0.80×** |     **0.89×** |
+| **VulkanForge v0.2.4**     |   **91.1**   |          **3863**  |    **0.80×** |     **0.89×** |
 | VulkanForge v0.2.0         |       90.5   |              2255  |       0.79×  |        0.52×  |
 | llama.cpp ROCm             |       87.5   |              3684  |       0.77×  |        0.85×  |
 | ROCmForge (HIP)            |       95.4   |               769  |       0.84×  |        0.18×  |
@@ -89,10 +99,11 @@ vs v0.2.0: decode +0.7 % (90.5 → 91.1, run-to-run noise), prefill peak
 **+71 %** (2255 → 3863). Decode unchanged because coopmat is
 prefill-only — GEMV continues through the existing `mul_mat_vec_*`
 shaders. ROCm / ROCmForge HIP rows are carried forward from v0.2.0's
-4-system run; not re-measured for v0.2.3. v0.2.3 default-config
-performance is identical to v0.2.2 — Sprint 13A added pp ≤ 32 coverage
-without changing pp ≥ 64 numbers, and Sprint 13B-13E investigations
-were measurement-only.
+4-system run; not re-measured for v0.2.4. v0.2.3 / v0.2.4 default-
+config performance is identical to v0.2.2 — Sprint 13A added pp ≤ 32
+coverage without changing pp ≥ 64 numbers; Sprints 13B–13E and 14A–14C
+were investigations and infrastructure work that did not move the
+default-config wall.
 
 ## Build
 
@@ -102,9 +113,9 @@ cargo run --release               # Phase 0 device-init smoke
 cargo test --release              # 176 tests across 7 binaries (27 lib, 149 integration)
 ```
 
-The build compiles 70 SPIR-V binaries (53 in v0.2.0, 65 in v0.2.1,
-68 in v0.2.2, +2 in v0.2.3: Q4_K and Q6_K aligned coopmat with f16
-accumulator).
+The build compiles 72 SPIR-V binaries (53 in v0.2.0, 65 in v0.2.1,
+68 in v0.2.2, 70 in v0.2.3 with f16-accumulator coopmat, +2 in
+v0.2.4: Q4_K and Q6_K subgroup GEMV variants).
 
 MSRV is **Rust 1.85** (edition 2024). Build dependencies require a working
 `shaderc` install (the `shaderc-sys` crate); on Arch / CachyOS this is
@@ -144,6 +155,7 @@ VF_MODEL_PATH=$HOME/models/Qwen3-8B-Q4_K_M.gguf \
 | `VULKANFORGE_DISABLE_MM_COOPMAT=1` | off (coopmat ON) | Falls back to scalar `mul_mmq` GEMM (v0.2.1 behaviour). |
 | `VULKANFORGE_USE_MM_COOPMAT=0` | (legacy alias) | Same effect as `DISABLE_MM_COOPMAT=1`. |
 | `VULKANFORGE_COOPMAT_F16ACC=1` | off (FP32 acc) | Opt-in FP16 accumulator for the aligned-L-tile coopmat path. **RDNA4-neutral-to-slightly-negative** (emulated, not native). May benefit NVIDIA Ampere+ / Intel XMX hardware. New in v0.2.3. |
+| `VULKANFORGE_DISABLE_SUBGROUP_GEMV=1` | off (Path A on) | Disables the subgroupAdd GEMV reduction (Path A) and falls back to the LDS tree-reduction (Path B). Both paths produce identical results within FP precision. The Path A pipeline pins `requiredSubgroupSize=64` via Sprint 14A's plumbing. New in v0.2.4. |
 | `VULKANFORGE_FP16_KV=0` | on | Use FP32 KV cache (2× VRAM, parity with pre-v0.2.0). |
 | `VULKANFORGE_COOPMAT_ATTN=0` | on | Disable coopmat QK attention; falls back to scalar tiled. **DEVICE_LOSTs at pp ≥ 4096** — debugging only. |
 | `VULKANFORGE_BATCH_ATTN=0` | on | Per-token attention loop instead of batched. Parity testing only. |
@@ -183,8 +195,11 @@ tile sweeps without rebuilding SPV.
   tiles, aligned/unaligned, and the f16acc opt-in path.
 * `src/backend/vulkan/pipeline_registry.rs` — pipeline-layout +
   spec-constants, including the `mul_mm` S/M/L tile warptile blocks
-  and the GEMV `MMV_NUM_ROWS` (= 1 — the v0.2.3 rationale for *not*
-  going to 2 is in `results/v023_sprint13e_mmv_numrows.md`).
+  and the GEMV `MMV_NUM_ROWS` (= 1 — see
+  `results/v023_sprint13e_mmv_numrows.md` and
+  `results/v024_sprint14c_numrows2_redux.md` for why NUM_ROWS=2
+  was tested with both LDS and subgroupAdd reductions and reverted
+  in both cases).
 
 ## Conventions
 
@@ -215,6 +230,9 @@ Phase write-ups live in `results/`. Notable v0.2 series:
 * `v023_sprint13c_f16acc.md` — f16-accumulator coopmat (opt-in, RDNA4-neutral).
 * `v023_sprint13d_wave32_probe.md` — Wave32 / VOPD probe (neutral).
 * `v023_sprint13e_mmv_numrows.md` — `MMV_NUM_ROWS=2` GEMV (slight regression).
+* `v024_sprint14a_subgroup_size.md` — `requiredSubgroupSize=64` plumbing.
+* `v024_sprint14b_subgroup_gemv.md` — subgroupAdd GEMV (Path A, default-on).
+* `v024_sprint14c_numrows2_redux.md` — `MMV_NUM_ROWS=2` re-tested with Path A (still regresses, reverted).
 
 ## Limitations
 
@@ -222,14 +240,25 @@ Phase write-ups live in `results/`. Notable v0.2 series:
 * **Decode at 0.80× llama.cpp Vulkan** — coopmat is prefill-only.
   Decode-side coopmat (e.g. `lm_head` GEMV) remains a v0.3 candidate.
 * **Remaining ~0.10–0.15× prefill / ~0.20× decode gap** to llama.cpp
-  is in pipeline-creation infrastructure, not shader source. Sprint 13
-  systematically falsified five "port llama.cpp's config" hypotheses:
-  Mesa 26.1-rc3 (neutral, 13B), f16 accumulator (emulated on RDNA4,
-  13C), Wave32 / VOPD (memory-bound workload, 13D), and
-  `MMV_NUM_ROWS=2` (needs subgroup-arithmetic reduction, 13E). The
-  real next levers — `requiredSubgroupSize` pinning, subgroup-add
-  GEMV reductions, multi-submit prefill, `quantize_q8_1` GEMM fusion
-  — are v0.3-class infrastructure work.
+  is **structural at the graph level**, not at the shader or
+  pipeline-config level. Sprints 12–14 systematically tested and
+  falsified **nine** "port llama.cpp's config" hypotheses on RDNA4 +
+  this codebase. The remaining levers — multi-submit / command-buffer
+  reuse decode loop, dedicated `lm_head` coopmat dispatch,
+  buffer-aliasing / live-set reduction, `quantize_q8_1` fusion into
+  the GEMM dispatch — are v0.3-class architectural changes.
+
+  | # | Hypothesis | Sprint | Result |
+  |---|---|---|---|
+  | 1 | Barrier elision (dirty-flag tracker) | 12D | 0 % impact |
+  | 2 | Norm + RoPE fusion | 12E | +1 % (run-to-run noise) |
+  | 3 | Q6_K shader optimisation | 12H | upstream-identical |
+  | 4 | Mesa 26.0.6 → 26.1-rc3 driver upgrade | 13B | ±2 % noise |
+  | 5 | f16-accumulator coopmat shader | 13C | −2 % (emulated on RDNA4) |
+  | 6 | Wave32 / VOPD dual-issue codegen | 13D | 0 % decode |
+  | 7 | `MMV_NUM_ROWS=2` with LDS reduction (Path B) | 13E | −2.9 % |
+  | 8 | `subgroupAdd` GEMV reduction (Path A) | 14B | +0.16 % noise |
+  | 9 | `MMV_NUM_ROWS=2` with Path A | 14C | −1.5 % |
 * All compute shaders ported from llama.cpp (`mul_mm.comp`,
   `mul_mmq.comp`, `mul_mat_vec_q*_k.comp`) are **byte-identical to
   upstream HEAD `23b8cc4`**. Performance differences are configuration,

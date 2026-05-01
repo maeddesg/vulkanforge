@@ -1,5 +1,180 @@
 # Changelog
 
+## v0.2.4 — subgroup-arithmetic GEMV + decode-gap analysis (2026-05-02)
+
+### Headline
+
+Default-config performance is **unchanged** from v0.2.2 / v0.2.3:
+prefill 0.89 × llama.cpp Vulkan at pp=512 (3863 tok/s), decode
+91.1 tok/s median (0.80 ×). v0.2.4 is an **infrastructure +
+analysis** release. Two shipped infrastructure changes
+(`requiredSubgroupSize=64` pipeline plumbing; `subgroupAdd`
+GEMV reduction default-on) and one investigation that closed
+the GEMV-pipeline branch of the decode-optimisation tree
+(`MMV_NUM_ROWS=2` re-tested with subgroupAdd, still regresses
+on RDNA4, reverted). The release is anchored by a definitive
+9-hypothesis decode-gap analysis spanning Sprints 12-14.
+27 / 27 lib tests, 15 / 15 coherent on the bench suite,
+72 SPVs (+2 vs v0.2.3).
+
+### Shipped changes
+
+- **`requiredSubgroupSize=64` pipeline plumbing** (Sprint 14A).
+  Device-creation now enables `Vulkan13Features::subgroupSizeControl`
+  + `computeFullSubgroups`. `ComputeKernel::from_spv_with_spec`
+  accepts an optional `required_subgroup_size: Option<u32>`
+  parameter; when `Some(N)` it chains
+  `VkPipelineShaderStageRequiredSubgroupSizeCreateInfo` and sets
+  the `REQUIRE_FULL_SUBGROUPS` stage flag. GEMV pipelines (the
+  four `MulMatVec*` ShaderIds, including the new `_subgroup`
+  variants) pin `Some(64)`; every other pipeline keeps `None`.
+  No measurable performance delta (verified ±3 % at every pp);
+  this is purely infrastructure for Sprint 14B and any future
+  work that depends on a fixed subgroup size.
+  Sprint 14A: `results/v024_sprint14a_subgroup_size.md`.
+
+- **Subgroup-arithmetic GEMV reduction** (Sprint 14B,
+  default-on). New SPVs
+  `mul_mat_vec_q{4,6}_k_f32_f32_subgroup.spv` built with
+  `USE_SUBGROUP_ADD=1` flip `mul_mat_vec_base.glsl`'s
+  `reduce_result()` from the LDS tree-reduction (Path B,
+  6 barrier levels at BLOCK_SIZE=64) to a single wave-wide
+  `subgroupAdd` (Path A, 0 barriers, 0 LDS for the actual
+  reduction step). Matches llama.cpp's RDNA4 GEMV recipe
+  (`ggml-vulkan.cpp:4180`) exactly. **Wall-time impact ≤ 0.16 %
+  at pos=200** — the LDS reduction was already a < 0.2 % slice
+  of per-dispatch GEMV time. The change is shipped because (a) it
+  matches upstream, (b) it is the prerequisite for any future
+  GEMV port that depends on subgroupSize being pinned, and
+  (c) it is cleanly correctness-verified (15 / 15 coherent under
+  both paths).
+  Opt out: `VULKANFORGE_DISABLE_SUBGROUP_GEMV=1` (falls back to
+  the LDS Path B SPVs).
+  Sprint 14B: `results/v024_sprint14b_subgroup_gemv.md`.
+
+### Investigation: `MMV_NUM_ROWS=2` redux (Sprint 14C, reverted)
+
+Sprint 13E showed `NUM_ROWS=2` was a regression with Path B
+(LDS-doubling at NUM_ROWS=2 → gemv_q +21 %). Hypothesis: with
+Path A active, NUM_ROWS=2 should finally be net-positive
+(`subgroupAdd` cost is constant per row).
+
+Verdict: **falsified again.** One-line spec-constant flip,
+27 / 27 lib tests, 15 / 15 coherent. But:
+
+- Per-dispatch GEMV total at pos=200: 10 618 µs (NR=2 Path A)
+  vs 10 188 µs (NR=1 Path A baseline) = **+4.2 % slower**.
+- 15-prompt decode median: 90.1 tok/s vs 91.5 (NR=1) = **−1.5 %**.
+
+The Sprint 13E +21 % `gemv_q` disaster *is* gone (same-session
+sanity test confirmed Path A and Path B are now within 0.08 % at
+NUM_ROWS=2 → Path A did fix the LDS-doubling lever). The
+remaining +4 % regression is structural: per-WG VGPR pressure
+grows with NUM_ROWS, ACO's superblock-loop unroll heuristics are
+tuned for NR=1, and GEMVs are already memory-bandwidth-bound on
+RDNA4 (77-91 % peak HBM per Sprint 12G-D / 12H), so halving the
+WG count from 1024 → 512 just reorders bytes.
+
+Reverted to `MMV_NUM_ROWS = 1`. The pipeline-registry comment
+documents the full 13E → 14B → 14C arc.
+Sprint 14C: `results/v024_sprint14c_numrows2_redux.md`.
+
+### Decode-gap analysis: 9 hypotheses, all falsified
+
+The 91 → 114 tok/s decode gap to llama.cpp on RDNA4 + this
+codebase has now been exhaustively investigated at the
+shader-config / pipeline-config / driver-flag level. Every
+"port llama.cpp's recipe" hypothesis tested in Sprints 12-14
+has been measured and falsified:
+
+| # | Hypothesis | Sprint | Result on RDNA4 |
+|---|---|---|---|
+| 1 | Barrier elision (dirty-flag tracker) | 12D | 0 % wall-time impact |
+| 2 | Norm + RoPE fusion | 12E | +1 % (run-to-run noise) |
+| 3 | Q6_K shader optimisation | 12H | upstream-identical, nothing to port |
+| 4 | Mesa 26.0.6 → 26.1-rc3 driver | 13B | ±2 % noise (llama.cpp also flat) |
+| 5 | f16-accumulator coopmat shader | 13C | −2 % (FP16 fragment emulated, not native) |
+| 6 | Wave32 / VOPD dual-issue codegen | 13D | 0 % decode (memory-bound, not VALU-bound) |
+| 7 | `MMV_NUM_ROWS=2` with LDS Path B | 13E | −2.9 % (LDS-doubling penalty) |
+| 8 | `subgroupAdd` GEMV reduction (Path A) | 14B | +0.16 % (within noise) |
+| 9 | `MMV_NUM_ROWS=2` with Path A | 14C | −1.5 % (per-WG VGPR + saturated CUs) |
+
+**The remaining gap is structural at the graph level.** The
+candidates that have *not* been falsified:
+
+- **Multi-submit / command-buffer reuse decode loop.** llama.cpp
+  re-submits a single prebuilt CB per token; we re-record per
+  token. Sprint 5A's CB-reuse infrastructure exists for parity
+  testing only — extending it to the production decode path
+  needs template-based push-constants and touches every shader's
+  pipeline-layout. Estimated lift: 5-10 % decode.
+- **Dedicated `lm_head` coopmat dispatch.** N=151 936; ~6 % of
+  decode forward today. A coopmat path could shave ~3 %.
+- **Buffer-aliasing / live-set reduction.** 20+ live SSBOs per
+  layer vs llama.cpp's 3-4. Possibly L2-relevant; not yet
+  measured.
+- **`quantize_q8_1` fusion into GEMM dispatch.** Few % at
+  pp=512 estimated.
+
+These are v0.3-class architectural changes, not single-line
+config flips. The Sprint 12-14 arc closes the
+shader-and-pipeline-config branch of the optimisation tree.
+
+### Configuration
+
+- `VULKANFORGE_DISABLE_MM_COOPMAT=1` — disable coopmat for prefill
+  (use `mul_mmq` integer-DP fallback).
+- `VULKANFORGE_COOPMAT_F16ACC=1` — opt-in FP16 accumulator
+  (RDNA4-neutral).
+- **`VULKANFORGE_DISABLE_SUBGROUP_GEMV=1` (new)** — disable
+  subgroupAdd GEMV reduction; falls back to LDS tree-reduction
+  Path B.
+
+### New SPVs
+
+```
+NEW   mul_mat_vec_q4_k_f32_f32_subgroup.spv  (Sprint 14B, Path A)
+NEW   mul_mat_vec_q6_k_f32_f32_subgroup.spv  (Sprint 14B, Path A)
+```
+
+Total SPV count went 70 → 72.
+
+### Files added / changed in v0.2.4
+
+```
+EDIT  Cargo.toml                              0.2.3 → 0.2.4
+EDIT  build.rs                                +30 LOC (2 _subgroup ShaderJobs)
+EDIT  src/backend/vulkan/device.rs            +9 LOC (Vulkan13Features
+                                              subgroupSizeControl + computeFullSubgroups)
+EDIT  src/backend/vulkan/pipeline.rs          +18 LOC (required_subgroup_size param,
+                                              VkPipelineShaderStageRequiredSubgroupSizeCreateInfo
+                                              chained on pNext, REQUIRE_FULL_SUBGROUPS flag)
+EDIT  src/backend/vulkan/pipeline_registry.rs +7 LOC (13 from_spv_with_spec
+                                              call sites updated; GEMV match arm
+                                              extended to 4 ShaderIds with Some(64) pin;
+                                              MMV_NUM_ROWS comment refresh for 14B/14C)
+EDIT  src/backend/vulkan/shaders.rs           +12 LOC (2 ShaderId variants
+                                              MulMatVec{Q4K,Q6K}Subgroup + plumbing)
+EDIT  src/backend/vulkan/forward.rs           +30 LOC (mul_mat_vec_subgroup_enabled
+                                              field + env-var; layer_weight_shader
+                                              extended with subgroup boolean; 9 call
+                                              sites + lm_head selection updated)
+NEW   results/v024_sprint14a_subgroup_size.md
+NEW   results/v024_sprint14b_subgroup_gemv.md
+NEW   results/v024_sprint14c_numrows2_redux.md
+EDIT  README.md                               v0.2.4 features + env var + 9-hyp table
+EDIT  CHANGELOG.md                            this entry
+```
+
+### What's still on the table for v0.3
+
+- **Multi-submit / CB-reuse decode loop** (5–10 % decode lift estimated).
+- **Dedicated `lm_head` coopmat dispatch** (~3 % decode).
+- **Buffer-aliasing / live-set reduction**.
+- **`quantize_q8_1` fusion into the GEMM dispatch** (small prefill lift).
+
+---
+
 ## v0.2.3 — tile coverage complete + RDNA4 root-cause analysis (2026-05-02)
 
 ### Headline
