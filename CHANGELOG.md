@@ -1,5 +1,186 @@
 # Changelog
 
+## v0.2.2 — coopmat WMMA prefill default-on (2026-05-01)
+
+### Headline
+
+**Prefill peak +71 %** (2255 → 3863 tok/s @ pp=512), reaching **0.89 ×
+llama.cpp Vulkan** prefill at pp ≥ 256 (up from 0.52 × in v0.2.0).
+KHR cooperative-matrix WMMA prefill is now **default-on** for Q4_K and
+Q6_K GEMMs. Decode unchanged at 91.1 tok/s median (0.80 × llama.cpp).
+27 / 27 lib tests, 15 / 15 coherent on the bench suite.
+
+### Performance (Qwen3-8B-Q4_K_M, RX 9070 XT, RUNS=5 median)
+
+| pp   | v0.2.0  | v0.2.2  | Δ        | vs llama.cpp Vulkan |
+|------|--------:|--------:|---------:|--------------------:|
+|   64 |   1511  |   1678  |  +11 %   | 0.73 × |
+|  128 |   2001  |   2560  |  +28 %   | 0.70 × |
+|  256 |   2200  |   3558  |  +62 %   | 0.89 × |
+|  512 |   2255  | **3863** | **+71 %** | **0.89 ×** |
+| 1024 |   2204  |   3748  |  +70 %   | 0.90 × |
+| 2048 |   1997  |   3172  |  +59 %   | 0.84 × |
+
+llama.cpp reference: build 23b8cc4 with `-fa 1` on the same hardware.
+
+### What changed
+
+- **KHR cooperative-matrix WMMA prefill** — Q4_K and Q6_K GEMM
+  dispatch now flows through RDNA4's 128 AI Accelerators via
+  `VK_KHR_cooperative_matrix`, mirroring llama.cpp's `mul_mm.comp`
+  pipeline. All shader sources remain **byte-identical** to llama.cpp
+  HEAD (`md5sum` confirmed across the entire arc) — every gain came
+  from build-defines, spec-constants, SPV variants and runtime
+  routing.
+- **Aligned coopmat variant** — `LOAD_VEC_B=8` with `B_TYPE=mat2x4`,
+  4 × wider B-matrix loads. Selected when `seq_len % 8 == 0`. Single
+  biggest sprint gain (+64 % at pp=512).
+- **L-tile + M-tile pipelines** — L `{256,128,128,32,64,64,2,16,16,16,64}`
+  and M `{128,64,64,16,64,32,2,16,16,16,64}` warptiles share SPV
+  binaries; only spec-constants differ. The runtime selector is a
+  port of llama.cpp's `ggml_vk_guess_matmul_pipeline`.
+- **Q6_K coopmat shader** — `mul_mm_q6_k_f32_coopmat.spv` built with
+  `LOAD_VEC_A=2` (Q6_K is 2 weights / idx, not 4), removing the
+  scalar-FP32 fallback that previously routed `ffn_down` /
+  `attn_v` GEMMs through the slowest path.
+- **Default-on toggle** — `VULKANFORGE_DISABLE_MM_COOPMAT=1` (or the
+  legacy `VULKANFORGE_USE_MM_COOPMAT=0`) opts out. Default with no
+  env var: **on**.
+
+### New shaders / SPVs
+
+```
+NEW   vk_shaders/spirv/mul_mm_q6_k_f32_coopmat.spv          (Sprint 12K)
+NEW   vk_shaders/spirv/mul_mm_q4_k_f32_aligned_coopmat.spv  (Sprint 12L)
+NEW   vk_shaders/spirv/mul_mm_q6_k_f32_aligned_coopmat.spv  (Sprint 12L)
+```
+
+M-tile pipelines are 0 new SPVs — they reuse the L-tile binaries via
+spec-constants.
+
+### Sprint highlights (v0.2.2 series, 2026-05-01)
+
+- **Sprint 12I — prefill RGP profiling.** Confirmed the v0.2.0/v0.2.1
+  prefill gap is entirely the missing KHR coopmat WMMA pipeline.
+  GEMV-side shaders are already at 77–91 % peak HBM bandwidth
+  (verified in 12G-D / 12H).
+- **Sprint 12J — coopmat WMMA prefill (diagnosis).** First end-to-end
+  coopmat run was 6 % slower than `mul_mmq`. Root cause: Q6_K GEMMs
+  fell to the scalar `mul_mm` FP32 path because no Q6_K coopmat SPV
+  existed.
+- **Sprint 12K — Q6_K coopmat shader + routing.** Built the Q6_K
+  coopmat SPV, fixed `(GemmKind::MulMm, q6) => MulMmQ6K` routing arm.
+  `gemm_down` 89 568 → 43 074 µs (−51 %), pp=512 2 348 → 2 697.
+- **Sprint 12L — aligned LOAD_VEC_B=8 mat2x4.** Largest single-sprint
+  win. Closes pp=128 from 1 427 to 2 576, pp=512 to 3 858 (0.89 ×
+  llama.cpp). Regressed pp=64 by 18 % (L-tile starvation).
+- **Sprint 12M — M-tile + default-on.** Added `BM=64` warptile for
+  small `seq_len`, fixed pp=64 regression (1 234 → 1 678), flipped
+  coopmat default-on.
+
+### Sprint 12 analysis arc (v0.2.1 work feeding into v0.2.2)
+
+- **12A / 12B / 12C** — llama.cpp + VulkanForge Vulkan-backend audits
+  + gap analysis. Identified KHR coopmat as the remaining lever.
+- **12D** — barrier elision: 0 % wall-time impact. Honest negative.
+- **12E** — decode norm+rope fusion: +1 %. Dispatch overhead is not
+  the decode bottleneck. Honest negative.
+- **12G-A / G-B** — ggml shared-layer audit + VulkanForge
+  shared-layer audit (we have none of it).
+- **12G-C / G-D** — per-dispatch GPU timestamp profiling + RGP GUI
+  capture analysis. Discovered the `vkCmdWriteTimestamp` artifact
+  for back-to-back RAW-independent dispatches (inflates the
+  second's `TOP_OF_PIPE` reading).
+- **12H — Q6_K BW recovery.** Honest negative: GEMV/GEMM shaders are
+  byte-identical to llama.cpp HEAD; the "50 % peak BW" reading was
+  an RGP `INSTRUCTION_TIMING` perturbation artifact (real BW
+  77 %).
+
+### Key methodology findings
+
+- Per-dispatch CPU overhead is **not** the bottleneck on RDNA4 at
+  steady-state decode (verified at 0.1 % CPU residency).
+- `vkCmdWriteTimestamp` is unreliable for barrier-less dispatch
+  pairs — a 1-line dispatch-order swap detects the artifact.
+- `RADV_THREAD_TRACE_INSTRUCTION_TIMING` inflates kernel durations
+  by 50–60 % vs no-instruction tracing — needed for source mapping
+  but not for absolute wall-time numbers.
+- All compute-shader sources are upstream-identical to llama.cpp;
+  the prefill gap was 100 % build-define / spec-constant / SPV
+  / routing, never GLSL.
+- Pre-check methodology (md5sum vs upstream + variant-table diff)
+  saved weeks across Sprints 11A / 11D / 11E / 12A / 12H — six
+  hits, all honest negatives.
+
+### Negative results (kept as documentation)
+
+- **12D** barrier elision — every barrier is at a RAW boundary;
+  0 % can be elided.
+- **12E** norm + rope fusion — +1 %, below noise; dispatch
+  overhead is not the lever.
+- **12H** Q6_K shader optimisation — md5-identical to upstream;
+  nothing to port.
+- **12J** coopmat WMMA first-pass — Q6_K regression masked the
+  Q4_K wins; resolved in 12K.
+
+### Files added / changed in v0.2.2
+
+```
+EDIT  Cargo.toml                              0.2.0 → 0.2.2
+EDIT  src/backend/vulkan/forward.rs           coopmat selector + routing
+                                              + default-on env-var parsing
+EDIT  src/backend/vulkan/pipeline_registry.rs L/M-tile spec-constants
+EDIT  src/backend/vulkan/shaders.rs           +7 ShaderId variants
+EDIT  build.rs                                +3 SPV compile jobs
+NEW   vk_shaders/.../mul_mm_q6_k_f32_coopmat.spv
+NEW   vk_shaders/.../mul_mm_q4_k_f32_aligned_coopmat.spv
+NEW   vk_shaders/.../mul_mm_q6_k_f32_aligned_coopmat.spv
+NEW   results/v021_sprint12{a,b,c,d,e,f}_*.md
+NEW   results/v021_sprint12g{a,b,c}_*.md
+NEW   results/v021_sprint12gd_*.md (3 files: analysis, retry, GUI)
+NEW   results/v021_sprint12h_q6k_bw_recovery.md
+NEW   results/v022_sprint12i_prefill_rgp.md
+NEW   results/v022_sprint12j_coopmat_prefill.md
+NEW   results/v022_sprint12k_q6k_coopmat.md
+NEW   results/v022_sprint12l_sml_tiles.md
+NEW   results/v022_sprint12m_mtile.md
+EDIT  README.md                               v0.2.2 perf table + features
+EDIT  CHANGELOG.md                            this entry
+```
+
+### What's still on the table
+
+- **S-tile (BM=32)** for pp ≤ 32 / short-prompt 15-prompt suite.
+  ~30 LOC, ~1 hr.
+- **Decode coopmat for `lm_head`** (vocab-major GEMV with N=151 936) —
+  RGP showed 6 % of decode; ~3 % decode improvement potential.
+- **f16-accumulator coopmat variant** (`f16acc`) llama.cpp ships —
+  closes the remaining ~0.10–0.15 × peak-WMMA gap. Bigger lift.
+
+---
+
+## v0.2.1 — sprint 11/12 prefill instrumentation (internal, 2026-04-30)
+
+Sprints 11G-A through 12H landed on `main` between v0.2.0 and v0.2.2
+without a tagged release. Highlights:
+
+- **L-tile `mul_mmq`** prefill spec-constants tuned (Sprint 11E).
+  +4–5 % across pp range.
+- **`SyncTracker`** barrier infrastructure with elision audit
+  (Sprint 12D).
+- **`rms_norm_mul_rope`** decode-side fusion shader experiments
+  (Sprint 12E, negative result).
+- **Per-dispatch GPU timestamp profiler** (`ShaderProfiler`,
+  Sprint 12G-C) and **RGP capture infrastructure** (Sprint 12G-C
+  / G-D).
+- **End-state perf snapshot** (Sprint 12F): decode 91.5 tok/s,
+  pp=512 2 352 tok/s.
+
+These are individually committed but not released; the v0.2.2 tag
+covers the full range.
+
+---
+
 ## v0.2.0 — coopmat attention + FP16 KV + kernel fusion (2026-04-29)
 
 ### Headline
