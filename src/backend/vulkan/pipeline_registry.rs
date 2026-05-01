@@ -105,16 +105,15 @@ impl PipelineRegistry {
             // prompt §6 — is to pin every spec const a shader exposes
             // rather than trust the default path.
             let result = match id {
-                ShaderId::MulMatVecQ4K | ShaderId::MulMatVecQ6K => {
+                ShaderId::MulMatVecQ4K | ShaderId::MulMatVecQ6K
+                | ShaderId::MulMatVecQ4KSubgroup | ShaderId::MulMatVecQ6KSubgroup => {
                     let entries = [entry(0, 0, 4), entry(1, 4, 4), entry(2, 8, 4)];
                     let bytes = bytemuck::bytes_of(&MMV_SPEC_DATA);
                     // Sprint 14A — pin requiredSubgroupSize=64 for the GEMV
-                    // pipelines. RDNA4's compute wave size is 64 either way,
-                    // but the explicit pin + REQUIRE_FULL_SUBGROUPS flag is
-                    // the precondition for switching mul_mat_vec_base.glsl
-                    // to its subgroupAdd reduction (Path A) in Sprint 14B.
-                    // No behaviour change at this sprint — same SPV, same
-                    // wave size, just a driver-level guarantee.
+                    // pipelines. Sprint 14B — same pin applies to the
+                    // _subgroup variants; without it, ACO could pick Wave32,
+                    // which would have subgroupAdd reduce over only 32 lanes
+                    // instead of 64 and produce half-sums.
                     ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes, Some(64))
                 }
                 ShaderId::RmsNorm | ShaderId::RmsNormMulRope => {

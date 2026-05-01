@@ -221,6 +221,13 @@ pub struct Forward {
     /// `VULKANFORGE_COOPMAT_F16ACC=1` opts in.
     mul_mm_coopmat_f16acc_enabled: bool,
 
+    /// Sprint 14B — route decode K-quant GEMV through the `_subgroup`
+    /// SPV variants which use `subgroupAdd` (Path A) instead of the
+    /// LDS tree-reduction (Path B). Default ON; opt-out via
+    /// `VULKANFORGE_DISABLE_SUBGROUP_GEMV=1`. Requires the
+    /// requiredSubgroupSize=64 pipeline pin shipped in Sprint 14A.
+    mul_mat_vec_subgroup_enabled: bool,
+
     /// Sprint 3C — when coopmat is on, route through the FP8-narrowed
     /// padded variant instead of BF16. Default OFF;
     /// `VULKANFORGE_COOPMAT_FP8=1` flips it on. The two paths emit
@@ -555,6 +562,16 @@ impl Forward {
             _ => false,
         };
 
+        // Sprint 14B — subgroupAdd ("Path A") GEMV reduction. Default
+        // ON. The _subgroup SPVs replace the LDS tree-reduction
+        // (6 barrier levels) with one wave-wide subgroupAdd, requiring
+        // the Sprint 14A requiredSubgroupSize=64 pipeline pin to be
+        // legally consumable.
+        let mul_mat_vec_subgroup_enabled = match std::env::var("VULKANFORGE_DISABLE_SUBGROUP_GEMV") {
+            Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => false,
+            _ => true,
+        };
+
         // Sprint 3A — Q4_K coopmat for gemm_q only. Default OFF until
         // logits-parity is established at scale.
         let coopmat_q4k_enabled = match std::env::var("VULKANFORGE_COOPMAT") {
@@ -643,6 +660,7 @@ impl Forward {
             coopmat_q4k_enabled,
             mul_mm_coopmat_enabled,
             mul_mm_coopmat_f16acc_enabled,
+            mul_mat_vec_subgroup_enabled,
             coopmat_fp8_enabled,
             fa_tiled_enabled,
             fa_tiled_br,
@@ -1103,9 +1121,9 @@ impl Forward {
         let wv = layer_weight(model, layer, "attn_v.weight");
         // attn_v.weight is Q6_K in Q4_K_M (mixed-quant) — pick the
         // matching GEMV pipeline per tensor's actual ggml_type.
-        let sq = layer_weight_shader(model, layer, "attn_q.weight");
-        let sk = layer_weight_shader(model, layer, "attn_k.weight");
-        let sv = layer_weight_shader(model, layer, "attn_v.weight");
+        let sq = layer_weight_shader(model, layer, "attn_q.weight", self.mul_mat_vec_subgroup_enabled);
+        let sk = layer_weight_shader(model, layer, "attn_k.weight", self.mul_mat_vec_subgroup_enabled);
+        let sv = layer_weight_shader(model, layer, "attn_v.weight", self.mul_mat_vec_subgroup_enabled);
         self.run_gemv(dev, registry, cmd, sq,
                       wq, self.hidden_norm.handle, self.q_buf.handle,
                       cfg.hidden_dim, cfg.n_heads * cfg.head_dim, "gemv_q");
@@ -1402,9 +1420,9 @@ impl Forward {
         let wv = layer_weight(model, layer, "attn_v.weight");
         // attn_v.weight is Q6_K in Q4_K_M (mixed-quant) — pick the
         // matching GEMV pipeline per tensor's actual ggml_type.
-        let sq = layer_weight_shader(model, layer, "attn_q.weight");
-        let sk = layer_weight_shader(model, layer, "attn_k.weight");
-        let sv = layer_weight_shader(model, layer, "attn_v.weight");
+        let sq = layer_weight_shader(model, layer, "attn_q.weight", self.mul_mat_vec_subgroup_enabled);
+        let sk = layer_weight_shader(model, layer, "attn_k.weight", self.mul_mat_vec_subgroup_enabled);
+        let sv = layer_weight_shader(model, layer, "attn_v.weight", self.mul_mat_vec_subgroup_enabled);
         self.run_gemv(dev, registry, cmd, sq,
                       wq, hidden_norm, q_buf,
                       cfg.hidden_dim, cfg.n_heads * cfg.head_dim, "gemv_q");
@@ -1505,7 +1523,7 @@ impl Forward {
 
         // (g) Output projection.
         let wo = layer_weight(model, layer, "attn_output.weight");
-        let so = layer_weight_shader(model, layer, "attn_output.weight");
+        let so = layer_weight_shader(model, layer, "attn_output.weight", self.mul_mat_vec_subgroup_enabled);
         self.run_gemv(dev, registry, cmd, so,
                       wo, attn_out, o_buf,
                       cfg.n_heads * cfg.head_dim, cfg.hidden_dim, "gemv_o");
@@ -1532,8 +1550,8 @@ impl Forward {
         // (j) gate / up
         let wg = layer_weight(model, layer, "ffn_gate.weight");
         let wu = layer_weight(model, layer, "ffn_up.weight");
-        let sg = layer_weight_shader(model, layer, "ffn_gate.weight");
-        let su = layer_weight_shader(model, layer, "ffn_up.weight");
+        let sg = layer_weight_shader(model, layer, "ffn_gate.weight", self.mul_mat_vec_subgroup_enabled);
+        let su = layer_weight_shader(model, layer, "ffn_up.weight", self.mul_mat_vec_subgroup_enabled);
         self.run_gemv(dev, registry, cmd, sg,
                       wg, hidden_norm, gate_buf,
                       cfg.hidden_dim, cfg.ffn_dim, "gemv_gate");
@@ -1558,7 +1576,7 @@ impl Forward {
 
         // (m) FFN down — Q6_K in Q4_K_M, Q4_K otherwise.
         let wd = layer_weight(model, layer, "ffn_down.weight");
-        let sd = layer_weight_shader(model, layer, "ffn_down.weight");
+        let sd = layer_weight_shader(model, layer, "ffn_down.weight", self.mul_mat_vec_subgroup_enabled);
         self.run_gemv(dev, registry, cmd, sd,
                       wd, ffn_hidden, ffn_out,
                       cfg.ffn_dim, cfg.hidden_dim, "gemv_down");
@@ -1597,9 +1615,11 @@ impl Forward {
             .or_else(|| model.tensor("token_embd.weight"))
             .expect("LM head present");
         let w_lm = lm.buffer.handle;
-        let lm_shader = match lm.ggml_type {
-            GgmlType::Q6K => ShaderId::MulMatVecQ6K,
-            _ => ShaderId::MulMatVecQ4K,
+        let lm_shader = match (lm.ggml_type, self.mul_mat_vec_subgroup_enabled) {
+            (GgmlType::Q6K, true ) => ShaderId::MulMatVecQ6KSubgroup,
+            (GgmlType::Q6K, false) => ShaderId::MulMatVecQ6K,
+            (_,             true ) => ShaderId::MulMatVecQ4KSubgroup,
+            (_,             false) => ShaderId::MulMatVecQ4K,
         };
 
         let hidden_norm = self.hidden_norm.handle;
@@ -3948,15 +3968,23 @@ fn layer_weight(model: &LoadedModel, layer: u32, suffix: &str) -> vk::Buffer {
 
 /// Q4_K_M mixes quant types — `attn_v.weight` and `ffn_down.weight`
 /// are Q6_K, the rest are Q4_K. Pick the matching GEMV pipeline.
-fn layer_weight_shader(model: &LoadedModel, layer: u32, suffix: &str) -> ShaderId {
+///
+/// Sprint 14B — `subgroup` selects the subgroupAdd SPV variants
+/// (Path A reduction) over the LDS tree-reduction stock variants
+/// (Path B). Default-on at decode; opt-out via
+/// `VULKANFORGE_DISABLE_SUBGROUP_GEMV=1`.
+fn layer_weight_shader(model: &LoadedModel, layer: u32, suffix: &str, subgroup: bool) -> ShaderId {
     let key = format!("blk.{layer}.{suffix}");
-    match model
+    let q6 = model
         .tensor(&key)
         .unwrap_or_else(|| panic!("missing tensor '{key}'"))
         .ggml_type
-    {
-        GgmlType::Q6K => ShaderId::MulMatVecQ6K,
-        _ => ShaderId::MulMatVecQ4K,
+        == GgmlType::Q6K;
+    match (q6, subgroup) {
+        (true,  true ) => ShaderId::MulMatVecQ6KSubgroup,
+        (true,  false) => ShaderId::MulMatVecQ6K,
+        (false, true ) => ShaderId::MulMatVecQ4KSubgroup,
+        (false, false) => ShaderId::MulMatVecQ4K,
     }
 }
 

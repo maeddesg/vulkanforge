@@ -54,6 +54,55 @@ const JOBS: &[ShaderJob] = &[
             ("FLOAT_TYPEV2", "vec2"),
         ],
     },
+    // Sprint 14B — subgroupAdd ("Path A") variants of the K-quant GEMV
+    // shaders. Defining USE_SUBGROUP_ADD switches `reduce_result` in
+    // `mul_mat_vec_base.glsl:135-141` from the LDS tree-reduction
+    // fallback (Path B, 6 barrier levels for BLOCK_SIZE=64) to a single
+    // `subgroupAdd` over the 64-lane wave plus one cross-subgroup
+    // barrier (with our BLOCK_SIZE=64 = subgroup_size=64, gl_NumSubgroups
+    // is 1, so the cross-subgroup loop runs once and is trivial).
+    //
+    // Mirrors llama.cpp `vulkan-shaders-gen.cpp:712` which builds three
+    // GEMV variants per quant: stock, _subgroup, _subgroup_no_shmem.
+    // We ship variant 2; variant 3 is a follow-on for v0.3 if needed.
+    //
+    // Requires `requiredSubgroupSize=64` to be pinned on the pipeline
+    // (Sprint 14A). Without that pin, ACO would have to emit code that
+    // handles `subgroupSize ∈ [32, 64]`; with the pin it emits a single
+    // wave-wide reduction.
+    //
+    // The shader's `#extension GL_KHR_shader_subgroup_arithmetic`
+    // directives at line 5-7 are gated on `USE_SUBGROUP_ADD ||
+    // USE_SUBGROUP_ADD_NO_SHMEM`, so they are pulled in automatically
+    // by adding the define here.
+    ShaderJob {
+        out_name: "mul_mat_vec_q4_k_f32_f32_subgroup.spv",
+        entry_source: "mul_mat_vec_q4_k.comp",
+        defines: &[
+            ("DATA_A_Q4_K", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("USE_SUBGROUP_ADD", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mat_vec_q6_k_f32_f32_subgroup.spv",
+        entry_source: "mul_mat_vec_q6_k.comp",
+        defines: &[
+            ("DATA_A_Q6_K", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("USE_SUBGROUP_ADD", "1"),
+        ],
+    },
     // RMSNorm. generic_binary_head: 3 SSBOs (input A, weight B, output D).
     ShaderJob {
         out_name: "rms_norm_f32.spv",

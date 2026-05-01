@@ -11,6 +11,15 @@
 pub enum ShaderId {
     MulMatVecQ4K,
     MulMatVecQ6K,
+    // Sprint 14B — subgroupAdd ("Path A") GEMV variants. Same shader
+    // source as MulMatVec{Q4K,Q6K} (`mul_mat_vec_base.glsl` is byte-
+    // identical to upstream, USE_SUBGROUP_ADD selects the reduction
+    // path at compile time). Replaces 6-level LDS tree-reduction with
+    // a single wave-wide subgroupAdd. Pipeline must pin
+    // requiredSubgroupSize=64 (Sprint 14A plumbing). Default-on for
+    // K-quant decode; opt-out via VULKANFORGE_DISABLE_SUBGROUP_GEMV=1.
+    MulMatVecQ4KSubgroup,
+    MulMatVecQ6KSubgroup,
     RmsNorm,
     RopeNorm,
     RopeNeox,
@@ -214,6 +223,8 @@ impl ShaderId {
         match self {
             ShaderId::MulMatVecQ4K => "mul_mat_vec_q4_k_f32_f32",
             ShaderId::MulMatVecQ6K => "mul_mat_vec_q6_k_f32_f32",
+            ShaderId::MulMatVecQ4KSubgroup => "mul_mat_vec_q4_k_f32_f32_subgroup",
+            ShaderId::MulMatVecQ6KSubgroup => "mul_mat_vec_q6_k_f32_f32_subgroup",
             ShaderId::RmsNorm => "rms_norm_f32",
             ShaderId::RopeNorm => "rope_norm_f32",
             ShaderId::RopeNeox => "rope_neox_f32",
@@ -282,6 +293,8 @@ impl ShaderId {
         match self {
             ShaderId::MulMatVecQ4K => MUL_MAT_VEC_Q4_K_F32_F32,
             ShaderId::MulMatVecQ6K => MUL_MAT_VEC_Q6_K_F32_F32,
+            ShaderId::MulMatVecQ4KSubgroup => MUL_MAT_VEC_Q4_K_F32_F32_SUBGROUP,
+            ShaderId::MulMatVecQ6KSubgroup => MUL_MAT_VEC_Q6_K_F32_F32_SUBGROUP,
             ShaderId::RmsNorm => RMS_NORM_F32,
             ShaderId::RopeNorm => ROPE_NORM_F32,
             ShaderId::RopeNeox => ROPE_NEOX_F32,
@@ -354,6 +367,8 @@ impl ShaderId {
 pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::MulMatVecQ4K,
     ShaderId::MulMatVecQ6K,
+    ShaderId::MulMatVecQ4KSubgroup,
+    ShaderId::MulMatVecQ6KSubgroup,
     ShaderId::RmsNorm,
     ShaderId::RopeNorm,
     ShaderId::RopeNeox,
@@ -421,6 +436,10 @@ pub const ALL_SHADERS: &[ShaderId] = &[
 
 pub const MUL_MAT_VEC_Q4_K_F32_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q4_k_f32_f32.spv"));
+pub const MUL_MAT_VEC_Q4_K_F32_F32_SUBGROUP: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q4_k_f32_f32_subgroup.spv"));
+pub const MUL_MAT_VEC_Q6_K_F32_F32_SUBGROUP: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q6_k_f32_f32_subgroup.spv"));
 pub const MUL_MAT_VEC_Q6_K_F32_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q6_k_f32_f32.spv"));
 pub const RMS_NORM_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm_f32.spv"));
