@@ -368,7 +368,9 @@ impl PipelineRegistry {
                 | ShaderId::MulMmQ4KCoopmatM | ShaderId::MulMmQ6KCoopmatM
                 | ShaderId::MulMmQ4KAlignedCoopmatM | ShaderId::MulMmQ6KAlignedCoopmatM
                 | ShaderId::MulMmQ4KCoopmatS | ShaderId::MulMmQ6KCoopmatS
-                | ShaderId::MulMmQ4KAlignedCoopmatS | ShaderId::MulMmQ6KAlignedCoopmatS => {
+                | ShaderId::MulMmQ4KAlignedCoopmatS | ShaderId::MulMmQ6KAlignedCoopmatS
+                | ShaderId::MulMmQ4KAlignedCoopmatF16Acc
+                | ShaderId::MulMmQ6KAlignedCoopmatF16Acc => {
                     // Sprint 11E (Q4_K) / Sprint 12K (Q6_K) / Sprint 12L
                     // (aligned) / Sprint 12M (M-tile) / Sprint 13A (S-tile)
                     // — mul_mm.comp + COOPMAT, KHR coopmat 16x16x16

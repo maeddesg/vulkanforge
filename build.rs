@@ -748,6 +748,69 @@ const JOBS: &[ShaderJob] = &[
             ("COOPMAT", "1"),
         ],
     },
+    // Sprint 13C — f16-accumulator coopmat variants. Mirror of Sprint
+    // 12L's aligned coopmat with ACC_TYPE = float16_t, ACC_TYPEV2 = f16vec2,
+    // and ACC_TYPE_MAX = float16_t(65504.0) (Q4_K weights × seq_len up to
+    // 2048 + K = 12288 needs the clamp before D_TYPE writeback to avoid
+    // FP16 saturation at the buffer boundary). The accumulator
+    // `coopmat<ACC_TYPE,...,gl_MatrixUseAccumulator>` (mul_mm.comp:255)
+    // becomes a float16 fragment, halving its VGPR footprint vs FP32 acc.
+    // D_TYPE stays `float` so the writeback path remains FP32 for
+    // numerically-faithful logits.
+    //
+    // RDNA4 cooperativeMatrix table entry 16: FP16 × FP16 → FP16 → FP16
+    // at 16×16×16, Subgroup scope — confirmed via probe_coopmat. llama.cpp
+    // routes default-precision dequant Q*_K GEMMs through this path
+    // (ggml-vulkan.cpp:6211).
+    //
+    // Opt-in via VULKANFORGE_COOPMAT_F16ACC=1; default-off until precision
+    // is validated end-to-end across the bench suite.
+    ShaderJob {
+        out_name: "mul_mm_q4_k_f32_aligned_coopmat_f16acc.spv",
+        entry_source: "mul_mm.comp",
+        defines: &[
+            ("DATA_A_Q4_K", "1"),
+            ("A_TYPE", "block_q4_K"),
+            ("A_TYPE_PACKED32", "block_q4_K_packed32"),
+            ("B_TYPE", "mat2x4"),
+            ("D_TYPE", "float"),
+            ("FLOAT16", "1"),
+            ("FLOAT_TYPE", "float16_t"),
+            ("FLOAT_TYPEV2", "f16vec2"),
+            ("FLOAT_TYPEV4", "f16vec4"),
+            ("FLOAT_TYPEV8", "f16mat2x4"),
+            ("ACC_TYPE", "float16_t"),
+            ("ACC_TYPEV2", "f16vec2"),
+            ("ACC_TYPE_MAX", "float16_t(65504.0)"),
+            ("LOAD_VEC_A", "4"),
+            ("LOAD_VEC_B", "8"),
+            ("ALIGNED", "1"),
+            ("COOPMAT", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mm_q6_k_f32_aligned_coopmat_f16acc.spv",
+        entry_source: "mul_mm.comp",
+        defines: &[
+            ("DATA_A_Q6_K", "1"),
+            ("A_TYPE", "block_q6_K"),
+            ("A_TYPE_PACKED16", "block_q6_K_packed16"),
+            ("B_TYPE", "mat2x4"),
+            ("D_TYPE", "float"),
+            ("FLOAT16", "1"),
+            ("FLOAT_TYPE", "float16_t"),
+            ("FLOAT_TYPEV2", "f16vec2"),
+            ("FLOAT_TYPEV4", "f16vec4"),
+            ("FLOAT_TYPEV8", "f16mat2x4"),
+            ("ACC_TYPE", "float16_t"),
+            ("ACC_TYPEV2", "f16vec2"),
+            ("ACC_TYPE_MAX", "float16_t(65504.0)"),
+            ("LOAD_VEC_A", "2"),
+            ("LOAD_VEC_B", "8"),
+            ("ALIGNED", "1"),
+            ("COOPMAT", "1"),
+        ],
+    },
 ];
 
 fn main() {

@@ -213,6 +213,14 @@ pub struct Forward {
     /// for Q6_K shipped). Opt-in via `VULKANFORGE_USE_MM_COOPMAT=1`.
     mul_mm_coopmat_enabled: bool,
 
+    /// Sprint 13C — when coopmat is on AND this flag is set, route the
+    /// L-tile aligned coopmat dispatches through the f16-accumulator
+    /// SPVs (ACC_TYPE = float16_t) instead of the FP32-accumulator SPVs.
+    /// Halves accumulator VGPR pressure; precision-risk on long K
+    /// reductions (K=12288 in gemm_down) so default OFF.
+    /// `VULKANFORGE_COOPMAT_F16ACC=1` opts in.
+    mul_mm_coopmat_f16acc_enabled: bool,
+
     /// Sprint 3C — when coopmat is on, route through the FP8-narrowed
     /// padded variant instead of BF16. Default OFF;
     /// `VULKANFORGE_COOPMAT_FP8=1` flips it on. The two paths emit
@@ -538,6 +546,15 @@ impl Forward {
             _ => false,
         };
 
+        // Sprint 13C — f16-accumulator coopmat opt-in. Selects the
+        // ACC_TYPE=float16_t aligned coopmat SPVs for L-tile dispatches.
+        // Default OFF until precision is validated end-to-end (FP16 acc
+        // over K=12288 reductions in gemm_down is the worst case).
+        let mul_mm_coopmat_f16acc_enabled = match std::env::var("VULKANFORGE_COOPMAT_F16ACC") {
+            Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
+            _ => false,
+        };
+
         // Sprint 3A — Q4_K coopmat for gemm_q only. Default OFF until
         // logits-parity is established at scale.
         let coopmat_q4k_enabled = match std::env::var("VULKANFORGE_COOPMAT") {
@@ -625,6 +642,7 @@ impl Forward {
             mul_mm_enabled,
             coopmat_q4k_enabled,
             mul_mm_coopmat_enabled,
+            mul_mm_coopmat_f16acc_enabled,
             coopmat_fp8_enabled,
             fa_tiled_enabled,
             fa_tiled_br,
@@ -2828,7 +2846,9 @@ impl Forward {
         let (bm, bn): (u32, u32) = match shader_id {
             ShaderId::MulMmqQ4KL | ShaderId::MulMmqQ6KL
             | ShaderId::MulMmQ4KCoopmat | ShaderId::MulMmQ6KCoopmat
-            | ShaderId::MulMmQ4KAlignedCoopmat | ShaderId::MulMmQ6KAlignedCoopmat => (128, 128),
+            | ShaderId::MulMmQ4KAlignedCoopmat | ShaderId::MulMmQ6KAlignedCoopmat
+            | ShaderId::MulMmQ4KAlignedCoopmatF16Acc
+            | ShaderId::MulMmQ6KAlignedCoopmatF16Acc => (128, 128),
             // Sprint 12M — M-tile coopmat: BM=BN=64, same shape as the
             // S-tile mul_mmq variants. Used when seq_len ≤ 64.
             ShaderId::MulMmQ4KCoopmatM | ShaderId::MulMmQ6KCoopmatM
@@ -3234,9 +3254,10 @@ impl Forward {
         let wk = layer_weight(model, layer, "attn_k.weight");
         let wv = layer_weight(model, layer, "attn_v.weight");
         let cm_mm = self.mul_mm_coopmat_enabled;
-        let sq = layer_weight_shader_gemm(model, layer, "attn_q.weight", gemm_kind, q_dim, seq_len, cm_mm);
-        let sk = layer_weight_shader_gemm(model, layer, "attn_k.weight", gemm_kind, kv_dim, seq_len, cm_mm);
-        let sv = layer_weight_shader_gemm(model, layer, "attn_v.weight", gemm_kind, kv_dim, seq_len, cm_mm);
+        let cm_f16 = self.mul_mm_coopmat_f16acc_enabled;
+        let sq = layer_weight_shader_gemm(model, layer, "attn_q.weight", gemm_kind, q_dim, seq_len, cm_mm, cm_f16);
+        let sk = layer_weight_shader_gemm(model, layer, "attn_k.weight", gemm_kind, kv_dim, seq_len, cm_mm, cm_f16);
+        let sv = layer_weight_shader_gemm(model, layer, "attn_v.weight", gemm_kind, kv_dim, seq_len, cm_mm, cm_f16);
         // Sprint 3A: gemm_q can opt into the Q4_K coopmat fusion.
         // Coopmat reads activations from `batch_norm` (FP32) regardless
         // of the mul_mm/mul_mmq route the rest of the layer takes, so
@@ -3625,7 +3646,7 @@ impl Forward {
                 compute_barrier(dev, cmd);
                 self.batch_q8.handle
             };
-            let so = layer_weight_shader_gemm(model, layer, "attn_output.weight", gemm_kind, hidden, seq_len, self.mul_mm_coopmat_enabled);
+            let so = layer_weight_shader_gemm(model, layer, "attn_output.weight", gemm_kind, hidden, seq_len, self.mul_mm_coopmat_enabled, self.mul_mm_coopmat_f16acc_enabled);
             self.run_gemm(
                 dev, registry, cmd, so, wo,
                 gemm_input_o, self.batch_o.handle,
@@ -3696,8 +3717,8 @@ impl Forward {
                 ffn, n_padded, hidden, gu_bm, gu_bn, "gemm_up_coopmat",
             );
         } else {
-            let sg = layer_weight_shader_gemm(model, layer, "ffn_gate.weight", gemm_kind, ffn, seq_len, self.mul_mm_coopmat_enabled);
-            let su = layer_weight_shader_gemm(model, layer, "ffn_up.weight", gemm_kind, ffn, seq_len, self.mul_mm_coopmat_enabled);
+            let sg = layer_weight_shader_gemm(model, layer, "ffn_gate.weight", gemm_kind, ffn, seq_len, self.mul_mm_coopmat_enabled, self.mul_mm_coopmat_f16acc_enabled);
+            let su = layer_weight_shader_gemm(model, layer, "ffn_up.weight", gemm_kind, ffn, seq_len, self.mul_mm_coopmat_enabled, self.mul_mm_coopmat_f16acc_enabled);
             self.run_gemm(
                 dev, registry, cmd, sg, wg,
                 gemm_input_ffn, self.batch_gate.handle,
@@ -3740,7 +3761,7 @@ impl Forward {
             self.batch_q8.handle
         };
         let wd = layer_weight(model, layer, "ffn_down.weight");
-        let sd = layer_weight_shader_gemm(model, layer, "ffn_down.weight", gemm_kind, hidden, seq_len, self.mul_mm_coopmat_enabled);
+        let sd = layer_weight_shader_gemm(model, layer, "ffn_down.weight", gemm_kind, hidden, seq_len, self.mul_mm_coopmat_enabled, self.mul_mm_coopmat_f16acc_enabled);
         self.run_gemm(
             dev, registry, cmd, sd, wd,
             gemm_input_down, self.batch_ffn_out.handle,
@@ -3812,6 +3833,7 @@ fn layer_weight_shader_gemm(
     m: u32,
     n: u32,
     coopmat_q4k_mm: bool,
+    coopmat_f16acc: bool,
 ) -> ShaderId {
     let key = format!("blk.{layer}.{suffix}");
     let q6 = model
@@ -3851,9 +3873,14 @@ fn layer_weight_shader_gemm(
         // Sprint 12M — pick the M-tile coopmat variant when seq_len ≤ 64.
         // Sprint 13A — pick the S-tile coopmat variant when seq_len ≤ 32.
         // s_tile and m_tile are mutually exclusive by construction.
+        // Sprint 13C — f16acc opt-in. Only redirects the aligned-L-tile
+        // case (the bread-and-butter pp ≥ 128 dispatch), which is also
+        // the only f16acc SPV we ship. Unaligned / M-tile / S-tile keep
+        // the FP32-accumulator path even when the env var is set.
         (GemmKind::MulMm,        true)  => match (coopmat_q4k_mm, coopmat_aligned, coopmat_m_tile, coopmat_s_tile) {
             (false, _,     _,     _    ) => ShaderId::MulMmQ6K,
             (true,  false, false, false) => ShaderId::MulMmQ6KCoopmat,
+            (true,  true,  false, false) if coopmat_f16acc => ShaderId::MulMmQ6KAlignedCoopmatF16Acc,
             (true,  true,  false, false) => ShaderId::MulMmQ6KAlignedCoopmat,
             (true,  false, true,  false) => ShaderId::MulMmQ6KCoopmatM,
             (true,  true,  true,  false) => ShaderId::MulMmQ6KAlignedCoopmatM,
@@ -3864,6 +3891,7 @@ fn layer_weight_shader_gemm(
         (GemmKind::MulMm,        false) => match (coopmat_q4k_mm, coopmat_aligned, coopmat_m_tile, coopmat_s_tile) {
             (false, _,     _,     _    ) => ShaderId::MulMmQ4K,
             (true,  false, false, false) => ShaderId::MulMmQ4KCoopmat,
+            (true,  true,  false, false) if coopmat_f16acc => ShaderId::MulMmQ4KAlignedCoopmatF16Acc,
             (true,  true,  false, false) => ShaderId::MulMmQ4KAlignedCoopmat,
             (true,  false, true,  false) => ShaderId::MulMmQ4KCoopmatM,
             (true,  true,  true,  false) => ShaderId::MulMmQ4KAlignedCoopmatM,
