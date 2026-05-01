@@ -25,22 +25,31 @@ use super::shaders::{self, ShaderId};
 /// happy and makes Phase-2A dispatch behaviour identical to Phase-1.
 // Phase-3C spec-tuning. BLOCK_SIZE=64 (was 32) makes one workgroup
 // equal one Wave64 subgroup, eliminating the cross-subgroup tree
-// reduction. NUM_ROWS=1 stays as Phase-2A measured: NUM_ROWS=2 was
-// ~5% faster at pos=0 but ~4% slower at pos=200, a wash on average.
-// `forward.rs::run_gemv` reads `MMV_NUM_ROWS` so the two stay in sync.
-// Phase-4A also tested BLOCK_SIZE=128 → also a wash (62.3 vs 61.8 at
-// pos=0, identical at pos=200) — VGPR pressure isn't moved by
-// spec-constant tuning, see results/phase4_step_4a_vgpr_reduction.md.
+// reduction. `forward.rs::run_gemv` reads `MMV_NUM_ROWS` so the two
+// stay in sync.
 //
-// Sprint 13E (2026-05-01) re-verified Phase-2A on the v0.2.2 codebase:
-// NUM_ROWS=2 mirrors llama.cpp `rm_kq=2` (ggml-vulkan.cpp:4128) for
-// non-GCN AMD, but per-dispatch profile shows gemv_q +21%, gemv_k +8%,
-// gemv_v +3% on RDNA4 because we don't enable llama.cpp's
-// subgroup-arithmetic reduction path (no requireSubgroupSize at
-// pipeline creation, no subgroupAdd in mul_mat_vec_base.glsl). The
-// shader is byte-identical to upstream; the difference is the
-// pipeline-config infrastructure llama.cpp ships that we don't.
-// See results/v023_sprint13e_mmv_numrows.md.
+// Phase-4A also tested BLOCK_SIZE=128 → a wash — VGPR pressure isn't
+// moved by spec-constant tuning, see
+// results/phase4_step_4a_vgpr_reduction.md.
+//
+// History on NUM_ROWS:
+// - Phase-2A: NUM_ROWS=2 was a wash with Path B reduction (LDS).
+// - Sprint 13E (Path B + 14A pin): NUM_ROWS=2 regressed gemv_q by
+//   +21 % and the forward wall by +2.9 % because Path B doubled
+//   LDS traffic without halving reduction depth.
+// - Sprint 14B shipped Path A (`subgroupAdd`, USE_SUBGROUP_ADD=1)
+//   default-on. Path A's reduction cost is constant per row,
+//   eliminating the LDS-doubling penalty at NUM_ROWS=2.
+// - Sprint 14C re-tested NUM_ROWS=2 with Path A active. The 13E
+//   gemv_q +21 % disaster is GONE (Path A removed that
+//   bottleneck), but per-dispatch GEMV total still rises by
+//   +4.2 % at pos=200 and 15-prompt decode median drops to 90.1
+//   tok/s (vs 91.5 with NUM_ROWS=1). Halving the WG count
+//   doesn't translate to wall time on RDNA4 because the GEMVs
+//   are already memory-bandwidth-bound (77-91 % peak HBM per
+//   Sprint 12G-D / 12H), and per-WG VGPR / register pressure
+//   grows with NUM_ROWS=2 in ways that hurt occupancy. Reverted.
+//   See results/v024_sprint14c_numrows2_redux.md.
 pub const MMV_NUM_ROWS: u32 = 1;
 const MMV_SPEC_DATA: [u32; 3] = [64, MMV_NUM_ROWS, 1];
 
