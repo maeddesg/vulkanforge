@@ -1,0 +1,32 @@
+#version 450
+
+// v0.2 Sprint 9a — Fused SwiGLU.
+//   out[i] = silu(gate[i]) * up[i]
+//          = (gate[i] / (1.0 + exp(-gate[i]))) * up[i]
+//
+// Replaces the separate silu(gate→gate) + mul(gate, up→out) pair so
+// the FFN block drops one dispatch and one compute barrier per layer.
+// Bindings + per-thread arithmetic match the separate-kernel path so
+// argmax results stay bit-identical (FP32 registers carry the SiLU
+// intermediate just like the global-memory round-trip in the
+// non-fused version — no extra precision is introduced).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer Gate { float data_gate[]; };
+layout (binding = 1) readonly  buffer Up   { float data_up[];   };
+layout (binding = 2) writeonly buffer Out  { float data_out[];  };
+
+layout (push_constant) uniform parameter {
+    uint n;
+} p;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.n) return;
+
+    const float g = data_gate[idx];
+    const float u = data_up[idx];
+    const float silu_g = g / (1.0f + exp(-g));
+    data_out[idx] = silu_g * u;
+}

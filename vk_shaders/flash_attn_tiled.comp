@@ -1,0 +1,234 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic      : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// VulkanForge Sprint 7 — Br>1 tiled-Q flash-attention for prefill.
+//
+// Same online-softmax algorithm as flash_attn_batch.comp, but each
+// workgroup handles BR consecutive queries in a Q-tile that shares
+// ONE K/V tile load. The K-tile is staged in LDS once and reused
+// for BR queries inside the WG, reducing total dispatch count by
+// BR× (e.g. 32k WGs at pp=4096 with BR=4 vs 131k WGs with BR=1).
+//
+// Dispatch shape: (n_heads, ceil(m / BR), 1).
+//   gl_WorkGroupID.x = head_index
+//   gl_WorkGroupID.y = q_tile_index (= 0..ceil(m/BR)-1)
+//
+// Bind / PC layout: IDENTICAL to flash_attn_batch.comp. The runtime
+// can swap pipelines (gated behind VULKANFORGE_FA_TILED=1) without
+// changing any descriptor or push-constant code.
+//
+// LDS budget (RDNA4: 64 KB per CU):
+//   q_lds:      BR × HEAD_DIM × 4 = 4 × 128 × 4 = 2 KB
+//   k_lds:      TILE × HEAD_DIM × 4 = 64 × 128 × 4 = 32 KB
+//   scores_lds: BR × TILE × 4 = 4 × 64 × 4 = 1 KB
+//   Total: 35 KB.  V is read from global (V-LDS would push us over
+//   64 KB; the existing pattern of adjacent threads reading adjacent
+//   V dims is already wave-coalesced).
+
+// Sprint 7.5 — BR is set per-SPV via -DBR=4/8/16.
+// Sprint 7.6 — BC is set per-SPV via -DBC=32/64. GLSL forbids
+// shared arrays sized by spec constants, so we emit one SPV per
+// (Br, Bc) pair.
+//
+// WGSIZE=64 (Wave64 minimum on RDNA4) is FIXED. With BC=32, only
+// threads 0..31 cover real K-positions; threads 32..63 still
+// participate in cooperative loads (threads 0..63 each fetch one
+// dim half of an LDS row) but contribute score=-inf / pscore=0
+// to the subgroup reductions and skip the scores_lds write. Net
+// effect: half the LDS for K-tile + scores at the cost of 50%
+// idle threads in the score-compute step — viable when the LDS
+// budget enables higher WG-occupancy.
+#ifndef BR
+#define BR 4
+#endif
+#ifndef BC
+#define BC 64
+#endif
+const uint WGSIZE   = 64;
+const uint TILE     = BC;
+const uint HEAD_DIM = 128;       // Hardcoded: Qwen3 / Llama-3.1 / Mistral / DSR1.
+
+layout (local_size_x = WGSIZE) in;
+
+layout (binding = 0) readonly  buffer Q { float q[]; };   // [m, n_heads, head_dim]
+// v0.2 Sprint 9d.2 — K/V bindings switch to packed-FP16 (2 FP16 per
+// uint, decoded with unpackHalf2x16) when this SPV is built with
+// -DFP16_KV=1. The element layout is unchanged from the caller's
+// perspective: index `idx` still names the same element, but the
+// underlying buffer has half the byte size and we read it through
+// the `load_k` / `load_v` helpers.
+#if FP16_KV
+layout (binding = 1) readonly  buffer K { uint k_packed[]; };
+layout (binding = 2) readonly  buffer V { uint v_packed[]; };
+float load_k(uint idx) {
+    return unpackHalf2x16(k_packed[idx >> 1])[idx & 1u];
+}
+float load_v(uint idx) {
+    return unpackHalf2x16(v_packed[idx >> 1])[idx & 1u];
+}
+#else
+layout (binding = 1) readonly  buffer K { float k[]; };   // [n_kv, n_kv_heads, head_dim]
+layout (binding = 2) readonly  buffer V { float v[]; };   // [n_kv, n_kv_heads, head_dim]
+float load_k(uint idx) { return k[idx]; }
+float load_v(uint idx) { return v[idx]; }
+#endif
+layout (binding = 3) writeonly buffer O { float o[]; };   // [m, n_heads, head_dim]
+
+// 28 B push block — same as flash_attn_batch.
+layout (push_constant) uniform Params {
+    uint  n_heads;
+    uint  n_kv_heads;
+    uint  head_dim;
+    uint  m;
+    uint  n_kv;
+    uint  q_start;
+    float scale;
+} p;
+
+shared float q_lds[BR * HEAD_DIM];
+shared float k_lds[TILE * HEAD_DIM];
+shared float scores_lds[BR * TILE];
+
+void main() {
+    uint h        = gl_WorkGroupID.x;
+    uint q_tile   = gl_WorkGroupID.y;
+    uint tid      = gl_LocalInvocationID.x;
+    if (h >= p.n_heads) return;
+
+    uint q_base = q_tile * BR;
+    if (q_base >= p.m) return;
+    uint actual_br = min(BR, p.m - q_base);
+
+    uint group_size = p.n_heads / p.n_kv_heads;
+    uint kvh        = h / group_size;
+    uint pos_stride = p.n_kv_heads * p.head_dim;
+    uint head_off   = kvh * p.head_dim;
+
+    // (1) Load Q-tile into LDS. Each thread loads BR × 2 floats.
+    // Layout: q_lds[qi * HEAD_DIM + d] = Q[q_base + qi][h][d].
+    [[unroll]] for (uint qi = 0; qi < BR; ++qi) {
+        if (qi < actual_br) {
+            uint q_off = ((q_base + qi) * p.n_heads + h) * p.head_dim;
+            q_lds[qi * HEAD_DIM + tid]      = q[q_off + tid];
+            q_lds[qi * HEAD_DIM + tid + 64] = q[q_off + tid + 64];
+        } else {
+            q_lds[qi * HEAD_DIM + tid]      = 0.0;
+            q_lds[qi * HEAD_DIM + tid + 64] = 0.0;
+        }
+    }
+    barrier();
+
+    // Per-query running state — registers (BR=4 → 16 floats/thread).
+    float my_max[BR];
+    float my_sum[BR];
+    float my_out0[BR];
+    float my_out1[BR];
+    [[unroll]] for (uint qi = 0; qi < BR; ++qi) {
+        my_max[qi]  = -1e30;
+        my_sum[qi]  = 0.0;
+        my_out0[qi] = 0.0;
+        my_out1[qi] = 0.0;
+    }
+
+    // Causal upper bound for this Q-tile = max(q_pos)+1 across qi.
+    uint causal_len_max = p.q_start + q_base + actual_br;
+    causal_len_max = min(causal_len_max, p.n_kv);
+
+    // (2) Tile loop over visible KV positions [0, causal_len_max).
+    for (uint tile_base = 0; tile_base < causal_len_max; tile_base += TILE) {
+        // (2a) Stage K-tile into LDS — wave-coalesced load. Each
+        // thread loads dim `tid` and `tid+64` of every K row in the
+        // tile. Threads 0..63 access adjacent dims of the same row,
+        // so the burst is one cache-line per K row per dim-half.
+        for (uint local_pos = 0; local_pos < TILE; ++local_pos) {
+            uint global_t = tile_base + local_pos;
+            if (global_t < causal_len_max) {
+                uint kv_off = global_t * pos_stride + head_off;
+                k_lds[local_pos * HEAD_DIM + tid]      = load_k(kv_off + tid);
+                k_lds[local_pos * HEAD_DIM + tid + 64] = load_k(kv_off + tid + 64);
+            }
+        }
+        barrier();
+
+        // (2b) Compute scores for THIS thread's K-position in the
+        // tile (= tile_base + tid). Repeat the QK dot for each query
+        // qi in the Q-tile, doing the per-query online-softmax update
+        // immediately. Subgroup reductions are sequential per qi.
+        // Sprint 7.6: at BC<WGSIZE, threads with tid >= BC are out
+        // of tile range and must contribute score=-inf to the
+        // subgroup reductions (and skip the LDS write).
+        uint t_global = tile_base + tid;
+        bool tid_in_tile = tid < BC;
+        bool t_in_range = tid_in_tile && t_global < causal_len_max;
+        [[unroll]] for (uint qi = 0; qi < BR; ++qi) {
+            uint q_pos_qi = p.q_start + q_base + qi;
+            bool valid = t_in_range
+                      && qi < actual_br
+                      && t_global <= q_pos_qi;
+
+            float score = -1e30;
+            if (valid) {
+                float s = 0.0;
+                for (uint d = 0; d < HEAD_DIM; ++d) {
+                    s += q_lds[qi * HEAD_DIM + d] * k_lds[tid * HEAD_DIM + d];
+                }
+                score = s * p.scale;
+            }
+
+            // Online-softmax update — same recurrence as flash_attn_batch.
+            float tile_max = subgroupMax(score);
+            float new_max  = max(my_max[qi], tile_max);
+            // exp(-inf - -inf) is NaN in some implementations; guard.
+            float kfac = (new_max == -1e30) ? 1.0 : exp(my_max[qi] - new_max);
+            my_out0[qi] *= kfac;
+            my_out1[qi] *= kfac;
+            my_sum[qi]  *= kfac;
+
+            float pscore = (valid && new_max > -1e30)
+                         ? exp(score - new_max) : 0.0;
+            float tile_sum = subgroupAdd(pscore);
+            my_sum[qi] += tile_sum;
+            my_max[qi]  = new_max;
+
+            // Only threads inside the tile own a slot in scores_lds.
+            if (tid_in_tile) {
+                scores_lds[qi * TILE + tid] = pscore;
+            }
+        }
+        barrier();
+
+        // (2c) Weighted V-sum across this tile. V is read from global
+        // (LDS budget too tight for V-staging at 64 KB).
+        for (uint i = 0; i < TILE; ++i) {
+            uint global_t = tile_base + i;
+            if (global_t >= causal_len_max) break;
+            uint v_off = global_t * pos_stride + head_off;
+            float v_d0 = load_v(v_off + tid);
+            float v_d1 = load_v(v_off + tid + 64);
+            [[unroll]] for (uint qi = 0; qi < BR; ++qi) {
+                float pi = scores_lds[qi * TILE + i];
+                my_out0[qi] += pi * v_d0;
+                my_out1[qi] += pi * v_d1;
+            }
+        }
+        barrier();
+    }
+
+    // (3) Normalize and write back. Skip qi ≥ actual_br (padding).
+    for (uint qi = 0; qi < actual_br; ++qi) {
+        // my_sum is always > 0 in valid prefill (queries see at least
+        // their own KV position). Defensive guard catches edge-cases
+        // (unmasked-but-not-yet-written tiles).
+        float denom = (my_sum[qi] > 0.0) ? my_sum[qi] : 1.0;
+        float inv_sum = 1.0 / denom;
+        uint o_off = ((q_base + qi) * p.n_heads + h) * p.head_dim;
+        if (tid < HEAD_DIM) {
+            o[o_off + tid] = my_out0[qi] * inv_sum;
+        }
+        if ((tid + 64) < HEAD_DIM) {
+            o[o_off + tid + 64] = my_out1[qi] * inv_sum;
+        }
+    }
+}

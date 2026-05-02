@@ -1,0 +1,127 @@
+#version 460
+
+// v0.2 Sprint 2A — isolated Q4_K dequant micro-benchmark + correctness probe.
+//
+// One workgroup per Q4_K block (256 weights). Each of the 64 threads
+// dequantises 4 weights (so the WG covers exactly one block: 64 × 4 = 256).
+// The output type is selected at compile time via -DOUT_FP32 / -DOUT_BF16 /
+// -DOUT_FP8 so we can compare:
+//   * raw dequant cost (FP32 output, no convert)
+//   * dequant + bf16 narrowing convert (compiler emits the 5-VALU-op
+//     software sequence on RDNA4 since GL_EXT_bfloat16 has no native
+//     pack instruction)
+//   * dequant + fp8 narrowing convert (compiler should emit
+//     v_cvt_pk_fp8_f32 native on gfx1201 — the smoking-gun ISA we want
+//     to confirm)
+//
+// Decoding logic mirrors src/backend/vulkan/q4k.rs `dequant_block` and
+// the `DATA_A_Q4_K` branch of mul_mm_funcs.glsl. `block_q4_K` is laid
+// out as { f16vec2 dm; u8 scales[12]; u8 qs[128] } = 144 bytes.
+
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#ifdef OUT_BF16
+#extension GL_EXT_bfloat16 : enable
+#endif
+
+#ifdef OUT_FP8
+#extension GL_EXT_float_e4m3 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#endif
+
+#extension GL_EXT_control_flow_attributes : enable
+
+const uint QUANT_K   = 256;        // weights per block
+const uint BLOCK_BYTES = 144;
+const uint BLOCK_SIZE  = 64;       // one Wave64 / WG
+const uint PER_THREAD  = QUANT_K / BLOCK_SIZE; // = 4
+
+struct block_q4_K {
+    f16vec2 dm;
+    uint8_t scales[12];
+    uint8_t qs[128];
+};
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BufA { block_q4_K data_a[]; };
+
+#if defined(OUT_FP32)
+layout(set = 0, binding = 1) writeonly buffer BufC { float data_c[]; };
+#elif defined(OUT_BF16)
+layout(set = 0, binding = 1) writeonly buffer BufC { bfloat16_t data_c[]; };
+#elif defined(OUT_FP8)
+layout(set = 0, binding = 1, scalar) writeonly buffer BufC { floate4m3_t data_c[]; };
+#else
+#error "Define OUT_FP32, OUT_BF16, or OUT_FP8"
+#endif
+
+layout(push_constant) uniform PC {
+    uint n_blocks;
+} pc;
+
+void main() {
+    const uint block_id = gl_WorkGroupID.x;
+    if (block_id >= pc.n_blocks) {
+        return;
+    }
+    const uint tid = gl_LocalInvocationID.x; // 0..63
+
+    // ---- decode the per-block scale/min table once per thread ----
+    // 12 scale bytes pack 8 sub-block (scale, min) pairs as 6-bit
+    // values. Layout matches src/backend/vulkan/q4k.rs:dequant_block.
+    const float d    = float(data_a[block_id].dm.x);
+    const float dmin = float(data_a[block_id].dm.y);
+
+    // Each thread covers PER_THREAD=4 contiguous weights.
+    [[unroll]] for (uint w = 0; w < PER_THREAD; w++) {
+        const uint pos = tid * PER_THREAD + w;       // 0..255
+        const uint sb  = pos >> 5;                   // 0..7 — sub-block
+        const uint k   = pos & 31u;                  // 0..31 — within sub-block
+
+        // Decode (scale_sb, min_sb) — 6-bit values from the 12-byte table.
+        // For sb < 4: lower 6 bits of bytes[sb] / bytes[sb+4] respectively.
+        // For sb ≥ 4: composite from low nibble of bytes[sb+4]/bytes[sb+4]
+        // and the high 2 bits of bytes[sb-4]/bytes[sb] (matches the CPU
+        // dequant_block branches at q4k.rs:89-101).
+        uint scale_u, min_u;
+        if (sb < 4u) {
+            scale_u = uint(data_a[block_id].scales[sb])      & 0x3Fu;
+            min_u   = uint(data_a[block_id].scales[sb + 4u]) & 0x3Fu;
+        } else {
+            const uint lo_byte = uint(data_a[block_id].scales[sb + 4u]);
+            const uint scale_lo4 = lo_byte & 0x0Fu;
+            const uint min_lo4   = (lo_byte >> 4) & 0x0Fu;
+            const uint scale_hi2 = (uint(data_a[block_id].scales[sb - 4u]) >> 6) & 0x03u;
+            const uint min_hi2   = (uint(data_a[block_id].scales[sb])      >> 6) & 0x03u;
+            scale_u = scale_lo4 | (scale_hi2 << 4);
+            min_u   = min_lo4   | (min_hi2   << 4);
+        }
+        const float scale = float(scale_u);
+        const float min_  = float(min_u);
+
+        // Decode the 4-bit nibble for this position. Sub-blocks are
+        // grouped in pairs of 32-byte halves: even sb in low nibble,
+        // odd sb in high nibble.
+        const uint pair  = sb >> 1;                  // 0..3
+        const uint hi    = sb & 1u;                  // 0 or 1
+        const uint qbyte = uint(data_a[block_id].qs[pair * 32u + k]);
+        const uint nib   = (hi == 1u) ? ((qbyte >> 4) & 0xFu) : (qbyte & 0xFu);
+
+        const float val_f32 = d * scale * float(nib) - dmin * min_;
+
+        const uint out_idx = block_id * QUANT_K + pos;
+#if defined(OUT_FP32)
+        data_c[out_idx] = val_f32;
+#elif defined(OUT_BF16)
+        data_c[out_idx] = bfloat16_t(val_f32);
+#elif defined(OUT_FP8)
+        data_c[out_idx] = floate4m3_t(val_f32);
+#endif
+    }
+}

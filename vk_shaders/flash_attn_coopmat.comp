@@ -1,0 +1,246 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic      : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// VulkanForge v0.2 Sprint 10C — Coopmat Flash-Attention v1.
+//
+// Drop-in replacement for flash_attn_tiled.comp with the same
+// bindings, push-constants, dispatch geometry, and online-softmax
+// state — but the QK score matrix is computed by a single
+// 16×16×8 coopmat MulAdd chain instead of the scalar dot-product
+// inner loop. Softmax + V-sum stay scalar and identical to the
+// proven scalar tiled path.
+//
+// The MVP scope: only QK is coopmat'd. PV stays scalar (per-thread
+// my_out0[BR]/my_out1[BR] register accumulators read V from
+// global). Sprint 10D will also coopmat the PV step.
+//
+// Sprint 10B microbench measured the QK-only coopmat win as 47.5×
+// vs scalar FMA on Br=Bc=16 head_dim=128. End-to-end gain is
+// smaller because softmax + PV remain scalar, but QK is the
+// dominant compute term in attention so a meaningful speedup is
+// expected — the parity-test gate verifies correctness first.
+//
+// LDS budget (BR=Bc=16, head_dim=128):
+//   q_lds      = 16 × 128 × 2 B (FP16) = 4 KB
+//   k_lds      = 16 × 128 × 2 B (FP16) = 4 KB
+//   scores_lds = 16 ×  16 × 4 B (FP32) = 1 KB
+//   Total: 9 KB  (vs scalar tiled's 26 KB; FP16 LDS halves Q/K)
+
+#ifndef BR
+#define BR 16
+#endif
+#ifndef BC
+#define BC 16
+#endif
+const uint WGSIZE   = 64;
+const uint TILE     = BC;
+const uint HEAD_DIM = 128;       // Hardcoded: Qwen3 / Llama-3.1 / Mistral / DSR1.
+
+layout (local_size_x = WGSIZE) in;
+
+layout (binding = 0) readonly  buffer Q { float q[]; };   // [m, n_heads, head_dim]
+// FP16 KV path matches Sprint 9d.2 — same packing as flash_attn_tiled.
+#if FP16_KV
+layout (binding = 1) readonly  buffer K { uint k_packed[]; };
+layout (binding = 2) readonly  buffer V { uint v_packed[]; };
+float load_k(uint idx) {
+    return unpackHalf2x16(k_packed[idx >> 1])[idx & 1u];
+}
+float load_v(uint idx) {
+    return unpackHalf2x16(v_packed[idx >> 1])[idx & 1u];
+}
+#else
+layout (binding = 1) readonly  buffer K { float k[]; };
+layout (binding = 2) readonly  buffer V { float v[]; };
+float load_k(uint idx) { return k[idx]; }
+float load_v(uint idx) { return v[idx]; }
+#endif
+layout (binding = 3) writeonly buffer O { float o[]; };
+
+// 28 B push block — same as flash_attn_tiled.
+layout (push_constant) uniform Params {
+    uint  n_heads;
+    uint  n_kv_heads;
+    uint  head_dim;
+    uint  m;
+    uint  n_kv;
+    uint  q_start;
+    float scale;
+} p;
+
+// Q and K LDS in FP16 (coopmat A/B fragment type). Sprint 10B's
+// microbench used the same pattern (with FP32 source data). The
+// scale is applied per-thread in the softmax loop (after reading
+// the FP32 coopmat-computed score), so coopMatMulAdd computes the
+// raw Q·K^T and softmax pulls it × scale out of LDS.
+shared float16_t q_lds[BR * HEAD_DIM];
+shared float16_t k_lds[BC * HEAD_DIM];
+shared float     scores_lds[BR * BC];
+
+void main() {
+    uint h        = gl_WorkGroupID.x;
+    uint q_tile   = gl_WorkGroupID.y;
+    uint tid      = gl_LocalInvocationID.x;
+    if (h >= p.n_heads) return;
+
+    uint q_base = q_tile * BR;
+    if (q_base >= p.m) return;
+    uint actual_br = min(BR, p.m - q_base);
+
+    uint group_size = p.n_heads / p.n_kv_heads;
+    uint kvh        = h / group_size;
+    uint pos_stride = p.n_kv_heads * p.head_dim;
+    uint head_off   = kvh * p.head_dim;
+
+    // (1) Load Q-tile into FP16 LDS. Each thread loads BR × 2 floats
+    // and converts to FP16. Layout: q_lds[qi * HEAD_DIM + d] =
+    // float16_t(Q[q_base + qi][h][d]).
+    [[unroll]] for (uint qi = 0; qi < BR; ++qi) {
+        if (qi < actual_br) {
+            uint q_off = ((q_base + qi) * p.n_heads + h) * p.head_dim;
+            q_lds[qi * HEAD_DIM + tid]      = float16_t(q[q_off + tid]);
+            q_lds[qi * HEAD_DIM + tid + 64] = float16_t(q[q_off + tid + 64]);
+        } else {
+            q_lds[qi * HEAD_DIM + tid]      = float16_t(0);
+            q_lds[qi * HEAD_DIM + tid + 64] = float16_t(0);
+        }
+    }
+    barrier();
+
+    // Per-query running state — registers (BR=16 → 64 floats/thread).
+    float my_max[BR];
+    float my_sum[BR];
+    float my_out0[BR];
+    float my_out1[BR];
+    [[unroll]] for (uint qi = 0; qi < BR; ++qi) {
+        my_max[qi]  = -1e30;
+        my_sum[qi]  = 0.0;
+        my_out0[qi] = 0.0;
+        my_out1[qi] = 0.0;
+    }
+
+    // Causal upper bound for this Q-tile = max(q_pos)+1 across qi.
+    uint causal_len_max = p.q_start + q_base + actual_br;
+    causal_len_max = min(causal_len_max, p.n_kv);
+
+    // (2) Tile loop over visible KV positions [0, causal_len_max).
+    for (uint tile_base = 0; tile_base < causal_len_max; tile_base += TILE) {
+        // (2a) Stage K-tile into FP16 LDS — wave-coalesced load.
+        for (uint local_pos = 0; local_pos < TILE; ++local_pos) {
+            uint global_t = tile_base + local_pos;
+            if (global_t < causal_len_max) {
+                uint kv_off = global_t * pos_stride + head_off;
+                k_lds[local_pos * HEAD_DIM + tid]      = float16_t(load_k(kv_off + tid));
+                k_lds[local_pos * HEAD_DIM + tid + 64] = float16_t(load_k(kv_off + tid + 64));
+            } else {
+                // Pad partial K-tiles with zeros so coopMatLoad sees
+                // a clean fragment; out-of-range scores are masked
+                // to -inf in the softmax loop anyway.
+                k_lds[local_pos * HEAD_DIM + tid]      = float16_t(0);
+                k_lds[local_pos * HEAD_DIM + tid + 64] = float16_t(0);
+            }
+        }
+        barrier();
+
+        // (2b) QK score = Q · K^T via coopmat. The K^T view is
+        // obtained by reading K with ColumnMajor + stride=HEAD_DIM
+        // (Sprint 10B verified this layout). HEAD_DIM/16 = 8
+        // coopMatMulAdd steps amortize over all 256 score cells.
+        {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> C_frag =
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            for (uint d = 0; d < HEAD_DIM; d += 16) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A_frag;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B_frag;
+                coopMatLoad(A_frag, q_lds, d, HEAD_DIM,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(B_frag, k_lds, d, HEAD_DIM,
+                            gl_CooperativeMatrixLayoutColumnMajor);
+                C_frag = coopMatMulAdd(A_frag, B_frag, C_frag);
+            }
+            // Stash raw Q·K^T in LDS. Scale + causal mask + softmax
+            // are applied per-thread per-qi below.
+            coopMatStore(C_frag, scores_lds, 0, BC,
+                         gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+
+        // (2c) Online-softmax — per-qi loop. Reads coopmat-computed
+        // score from scores_lds, applies scale + causal mask, runs
+        // the same recurrence as flash_attn_tiled.comp. Threads
+        // tid >= BC have no real score in this tile and contribute
+        // -inf to subgroup reductions.
+        uint t_global = tile_base + tid;
+        bool tid_in_tile = tid < BC;
+        bool t_in_range = tid_in_tile && t_global < causal_len_max;
+        [[unroll]] for (uint qi = 0; qi < BR; ++qi) {
+            uint q_pos_qi = p.q_start + q_base + qi;
+            bool valid = t_in_range
+                      && qi < actual_br
+                      && t_global <= q_pos_qi;
+
+            float score = -1e30;
+            if (valid) {
+                // coopmat wrote raw Q·K^T; apply scale here.
+                score = scores_lds[qi * BC + tid] * p.scale;
+            }
+
+            // Online-softmax update — IDENTICAL to flash_attn_tiled.
+            float tile_max = subgroupMax(score);
+            float new_max  = max(my_max[qi], tile_max);
+            float kfac = (new_max == -1e30) ? 1.0 : exp(my_max[qi] - new_max);
+            my_out0[qi] *= kfac;
+            my_out1[qi] *= kfac;
+            my_sum[qi]  *= kfac;
+
+            float pscore = (valid && new_max > -1e30)
+                         ? exp(score - new_max) : 0.0;
+            float tile_sum = subgroupAdd(pscore);
+            my_sum[qi] += tile_sum;
+            my_max[qi]  = new_max;
+
+            // Threads inside the tile own a slot in scores_lds —
+            // overwrite the raw score with pscore for the V-sum.
+            if (tid_in_tile) {
+                scores_lds[qi * BC + tid] = pscore;
+            }
+        }
+        barrier();
+
+        // (2d) Weighted V-sum across this tile — IDENTICAL scalar
+        // path to flash_attn_tiled. PV will be coopmat'd in
+        // Sprint 10D; this v1 only proves the QK rewiring is
+        // correct.
+        for (uint i = 0; i < TILE; ++i) {
+            uint global_t = tile_base + i;
+            if (global_t >= causal_len_max) break;
+            uint v_off = global_t * pos_stride + head_off;
+            float v_d0 = load_v(v_off + tid);
+            float v_d1 = load_v(v_off + tid + 64);
+            [[unroll]] for (uint qi = 0; qi < BR; ++qi) {
+                float pi = scores_lds[qi * BC + i];
+                my_out0[qi] += pi * v_d0;
+                my_out1[qi] += pi * v_d1;
+            }
+        }
+        barrier();
+    }
+
+    // (3) Normalize and write back. Skip qi ≥ actual_br (padding).
+    for (uint qi = 0; qi < actual_br; ++qi) {
+        float denom = (my_sum[qi] > 0.0) ? my_sum[qi] : 1.0;
+        float inv_sum = 1.0 / denom;
+        uint o_off = ((q_base + qi) * p.n_heads + h) * p.head_dim;
+        if (tid < HEAD_DIM) {
+            o[o_off + tid] = my_out0[qi] * inv_sum;
+        }
+        if ((tid + 64) < HEAD_DIM) {
+            o[o_off + tid + 64] = my_out1[qi] * inv_sum;
+        }
+    }
+}

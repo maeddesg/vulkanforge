@@ -1,0 +1,225 @@
+#version 460
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// FP8_MODE flips the narrow element type from bfloat16_t (default)
+// to floate4m3_t. Sprint 3C re-tests FP8 because Sprint 3A's
+// "FP8 precision failure" was actually a partial-tile-store bug
+// (not a precision issue). With N-padding ensuring all output tiles
+// are full 16×16, FP8 should behave too.
+#ifdef FP8_MODE
+#extension GL_EXT_float_e4m3 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#define ELEM_TYPE floate4m3_t
+#else
+#extension GL_EXT_bfloat16 : enable
+#define ELEM_TYPE bfloat16_t
+#endif
+
+// PADDED_OUTPUT: the runtime guarantees that pc.n is rounded up to
+// the next multiple of TILE (=16) and the activation buffer's tail
+// rows are zeroed before the dispatch. This lets the kernel use a
+// direct ColumnMajor coopMatStore — no LDS staging, no per-thread
+// bounds-checked write. Cuts ~1088 B of LDS and one barrier per WG.
+//
+// Without PADDED_OUTPUT the kernel falls back to the Sprint-3B
+// safe path (LDS-staged store + per-thread bounds check).
+
+// v0.2 Sprint 3B — naive Q4_K dequant-fusion coopmat with BF16
+// narrowing. Two design changes vs Sprint 2B/3A:
+//
+//   1. BF16 instead of FP8: 7 mantissa bits vs 3 → 16× finer
+//      grid → preserves precision through the 36-layer Qwen3 stack
+//      (Sprint 3A FP8 lost the signal entirely after layer
+//      compounding).
+//
+//   2. Naive geometry: 1 Wave64 per WG, single 16×16 output tile,
+//      tiny LDS staging (272 bf16 per A and B tile = ~1 KiB total).
+//      Matches the kernel shape of `bench_coopmat_pure.comp` from
+//      Phase 6A. Targets skinny-N prefill (seq_len ≤ 64) where
+//      Sprint 1A.5/3A's tiled kernels regress because the
+//      LDS-staging overhead doesn't amortise against limited
+//      data reuse.
+//
+// Memory layout matches Sprint 3A's FORWARD_LAYOUT convention so
+// the kernel slots into `forward.rs::run_gemm_coopmat_q4k` without
+// any push-constant changes:
+//   * A : Q4_K weight blocks ([M × K] in (block_q4_K[]))
+//   * B : FP32 activations  [N, K] row-major (= batch_norm)
+//   * C : FP32 output       [N, M] row-major (= mul_mmq layout)
+
+const uint BLOCK_SIZE     = 64;       // 1 Wave64 = 1 Subgroup
+const uint TILE           = 16;       // WMMA M = N = K = 16
+const uint Q4K_PER_BLOCK  = 256;
+
+// Tiny LDS staging — just enough to feed coopMatLoad once per
+// K-step. +1 bf16 padding breaks bank-conflict patterns the same
+// way the larger tiled kernels do.
+const uint A_STRIDE = TILE + 1;       // 17 bf16
+const uint B_STRIDE = TILE + 1;       // 17 bf16
+
+shared ELEM_TYPE buf_a[TILE * A_STRIDE];   // 16 * 17 = 272 elem
+shared ELEM_TYPE buf_b[TILE * B_STRIDE];   // 272 elem
+
+#ifndef PADDED_OUTPUT
+// Sprint 3B safe path — staging buffer for the FP32 output tile.
+// PADDED_OUTPUT skips this in favour of a direct coopMatStore.
+shared float buf_c[TILE * (TILE + 1)];      // 16 * 17 = 272 fp32 ≈ 1088 B
+#endif
+
+struct block_q4_K {
+    f16vec2  dm;
+    uint8_t  scales[12];
+    uint8_t  qs[128];
+};
+
+layout(local_size_x = BLOCK_SIZE) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufA { block_q4_K data_a[]; };
+layout(set = 0, binding = 1) readonly  buffer BufB { float       b[]; };
+layout(set = 0, binding = 2) writeonly buffer BufC { float       c[]; };
+
+layout(push_constant) uniform PC {
+    uint m;
+    uint n;
+    uint k;
+    uint stride_a;       // = K (logical row stride of weights)
+    uint stride_b;       // = K (B is [N, K] row-major)
+    uint stride_c;       // = M (C is [N, M] row-major)
+} pc;
+
+float q4k_dequant_one(uint pos, float d, float dmin,
+                      const uint scale_u[8], const uint min_u[8],
+                      uint block_id) {
+    const uint sb    = pos >> 5;             // 0..7
+    const uint k     = pos & 31u;            // 0..31
+    const uint pair  = sb >> 1;              // 0..3
+    const uint hi    = sb & 1u;
+    const uint qbyte = uint(data_a[block_id].qs[pair * 32u + k]);
+    const uint nib   = (hi == 1u) ? ((qbyte >> 4) & 0xFu) : (qbyte & 0xFu);
+    return d * float(scale_u[sb]) * float(nib) - dmin * float(min_u[sb]);
+}
+
+void q4k_decode_scales(uint block_id, out uint scale_u[8], out uint min_u[8]) {
+    [[unroll]] for (uint sb = 0; sb < 4u; sb++) {
+        scale_u[sb] = uint(data_a[block_id].scales[sb])      & 0x3Fu;
+        min_u[sb]   = uint(data_a[block_id].scales[sb + 4u]) & 0x3Fu;
+    }
+    [[unroll]] for (uint sb = 4; sb < 8u; sb++) {
+        const uint lo_byte   = uint(data_a[block_id].scales[sb + 4u]);
+        const uint scale_lo4 = lo_byte & 0x0Fu;
+        const uint min_lo4   = (lo_byte >> 4) & 0x0Fu;
+        const uint scale_hi2 = (uint(data_a[block_id].scales[sb - 4u]) >> 6) & 0x03u;
+        const uint min_hi2   = (uint(data_a[block_id].scales[sb])      >> 6) & 0x03u;
+        scale_u[sb] = scale_lo4 | (scale_hi2 << 4);
+        min_u[sb]   = min_lo4   | (min_hi2   << 4);
+    }
+}
+
+void main() {
+    const uint wg_m = gl_WorkGroupID.x * TILE;
+    const uint wg_n = gl_WorkGroupID.y * TILE;
+    const uint tid  = gl_LocalInvocationID.x;
+
+    coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> acc =
+        coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
+
+    // A-side thread mapping: 4 threads per row × 16 rows = 64.
+    // Each thread covers PER_THREAD_K = 4 contiguous K positions
+    // from the *same* Q4_K block, so the per-row scale-table decode
+    // happens once per K-step.
+    const uint a_row    = tid / 4u;          // 0..15
+    const uint a_k_base = (tid & 3u) * 4u;   // 0, 4, 8, 12
+
+    const uint blocks_per_row = pc.k / Q4K_PER_BLOCK;
+    const uint global_row     = wg_m + a_row;
+    const bool row_in_bounds  = global_row < pc.m;
+
+    for (uint kk = 0; kk < pc.k; kk += TILE) {
+        // ---- A load: Q4_K → FP32 → BF16 → LDS ----
+        const uint block_id = global_row * blocks_per_row + (kk / Q4K_PER_BLOCK);
+        const uint pos_base = (kk + a_k_base) % Q4K_PER_BLOCK;
+
+        float d = 0.0, dmin = 0.0;
+        uint scale_u[8], min_u[8];
+        if (row_in_bounds) {
+            d    = float(data_a[block_id].dm.x);
+            dmin = float(data_a[block_id].dm.y);
+            q4k_decode_scales(block_id, scale_u, min_u);
+        }
+        [[unroll]] for (uint w = 0; w < 4u; w++) {
+            const uint k_idx  = a_k_base + w;
+            float val_f32 = 0.0;
+            if (row_in_bounds) {
+                val_f32 = q4k_dequant_one(pos_base + w, d, dmin,
+                                          scale_u, min_u, block_id);
+            }
+            buf_a[a_row * A_STRIDE + k_idx] = ELEM_TYPE(val_f32);
+        }
+
+        // ---- B load: FP32 → BF16 → LDS ----
+        // 64 threads × 4 elements = 256 elements (= TILE * TILE).
+        // Layout in B is [N, K] row-major — so element (k_idx,
+        // n_idx) of the per-step B-tile lives at b[gn * K + gk].
+        [[unroll]] for (uint w = 0; w < 4u; w++) {
+            const uint fidx  = w * BLOCK_SIZE + tid;        // 0..255
+            const uint k_idx = fidx / TILE;                 // 0..15
+            const uint n_idx = fidx & (TILE - 1u);          // 0..15
+            const uint gk    = kk + k_idx;
+            const uint gn    = wg_n + n_idx;
+            const bool ok    = gk < pc.k && gn < pc.n;
+            const float vf   = ok ? b[gn * pc.stride_b + gk] : 0.0;
+            buf_b[k_idx * B_STRIDE + n_idx] = ELEM_TYPE(vf);
+        }
+
+        barrier();
+
+        // ---- Compute: one 16x16 WMMA per K-step ----
+        coopmat<ELEM_TYPE, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> matA;
+        coopmat<ELEM_TYPE, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> matB;
+        coopMatLoad(matA, buf_a, 0u, A_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB, buf_b, 0u, B_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        acc = coopMatMulAdd(matA, matB, acc);
+
+        barrier();
+    }
+
+    // ---- Store: 16x16 tile → output [N, M] row-major ----
+#ifdef PADDED_OUTPUT
+    // Sprint 3C — runtime guarantees pc.n is a multiple of TILE and
+    // M (= pc.m) is always a multiple of 16 for current models, so
+    // every output tile is full and we can write directly with a
+    // single ColumnMajor coopMatStore. Stride is M; base offset is
+    // wg_n * M + wg_m.
+    coopMatStore(acc, c, wg_n * pc.stride_c + wg_m, pc.stride_c,
+                 gl_CooperativeMatrixLayoutColumnMajor);
+#else
+    // Sprint 3B safe path — partial tiles in either axis must drop
+    // out-of-bounds elements rather than corrupt neighbouring
+    // memory. Stage the acc into LDS RowMajor, then per-thread
+    // bounds-checked write.
+    const uint C_STRIDE = TILE + 1u;
+    coopMatStore(acc, buf_c, 0u, C_STRIDE,
+                 gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+    [[unroll]] for (uint w = 0; w < 4u; w++) {
+        const uint fidx    = w * BLOCK_SIZE + tid;
+        const uint m_local = fidx / TILE;             // 0..15
+        const uint n_local = fidx & (TILE - 1u);      // 0..15
+        const uint gm      = wg_m + m_local;
+        const uint gn      = wg_n + n_local;
+        if (gm < pc.m && gn < pc.n) {
+            c[gn * pc.stride_c + gm] = buf_c[m_local * C_STRIDE + n_local];
+        }
+    }
+#endif
+}

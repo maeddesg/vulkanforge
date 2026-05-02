@@ -1,0 +1,231 @@
+{
+  "version": "1.0",
+  "description": "ROCmForge v1.0 Inference Validation — 15 Prompts",
+  "created": "2026-04-21",
+  "model_target": "Qwen3-8B-Q4_K_M.gguf",
+  "prompts": [
+    {
+      "id": 1,
+      "category": "smoke",
+      "difficulty": "trivial",
+      "name": "Greeting",
+      "max_tokens": 64,
+      "prompt": "Hallo",
+      "expected_behavior": "Kurze freundliche Antwort, zeigt dass Decode grundsätzlich funktioniert",
+      "quality_check": "Antwort ist kohärent und kontextbezogen, kein Müll/Wiederholung"
+    },
+    {
+      "id": 2,
+      "category": "smoke",
+      "difficulty": "trivial",
+      "name": "Simple Sequence",
+      "max_tokens": 64,
+      "prompt": "Zähle von 1 bis 10",
+      "expected_behavior": "Sequenz 1-10, zeigt dass Token-Generierung stabil ist",
+      "quality_check": "Korrekte Zahlenfolge 1-10 ohne Auslassungen oder Wiederholungen"
+    },
+    {
+      "id": 3,
+      "category": "code_generation",
+      "difficulty": "short",
+      "name": "Prime Check (Python)",
+      "max_tokens": 256,
+      "prompt": "Write a Python function that checks if a number is prime.",
+      "expected_behavior": "Funktionierender Python-Code mit korrekter Logik",
+      "quality_check": "Syntaktisch korrektes Python, korrekte Primzahl-Logik (Schleife bis sqrt(n), Edge-Cases 0/1/2)"
+    },
+    {
+      "id": 4,
+      "category": "code_generation",
+      "difficulty": "medium",
+      "name": "LRU Cache (C++)",
+      "max_tokens": 512,
+      "prompt": "Write a C++ class implementing a thread-safe LRU cache with get, put, and delete operations. Include proper mutex locking and comments.",
+      "expected_behavior": "C++ Klasse mit std::mutex, std::unordered_map, std::list",
+      "quality_check": "Kompilierbares C++, korrekte LRU-Eviction-Logik, Thread-Safety via Mutex"
+    },
+    {
+      "id": 5,
+      "category": "code_generation",
+      "difficulty": "long",
+      "name": "REST API (Go)",
+      "max_tokens": 1024,
+      "prompt": "Write a REST API in Go with endpoints for user authentication (register, login, logout), JWT token handling, password hashing with bcrypt, and rate limiting middleware. Include error handling, input validation, and code comments.",
+      "expected_behavior": "Strukturierter Go-Code mit HTTP-Handler, JWT-Library, bcrypt",
+      "quality_check": "Go-Syntax korrekt, sinnvolle Endpoint-Struktur, Security-Basics (Hashing, JWT)"
+    },
+    {
+      "id": 6,
+      "category": "prose",
+      "difficulty": "short",
+      "name": "Mutex Explanation",
+      "max_tokens": 128,
+      "prompt": "Explain what a mutex is in one paragraph.",
+      "expected_behavior": "Klare, präzise Erklärung von Mutual Exclusion",
+      "quality_check": "Technisch korrekt, erwähnt Thread-Safety/Locking, verständlich"
+    },
+    {
+      "id": 7,
+      "category": "prose",
+      "difficulty": "medium",
+      "name": "TCP vs UDP",
+      "max_tokens": 512,
+      "prompt": "Compare and contrast TCP and UDP protocols. Cover reliability, speed, use cases, and header differences.",
+      "expected_behavior": "Strukturierter Vergleich mit korrekten technischen Details",
+      "quality_check": "TCP=reliable/ordered, UDP=fast/connectionless, korrekte Use-Cases (HTTP vs DNS/Gaming)"
+    },
+    {
+      "id": 8,
+      "category": "prose",
+      "difficulty": "long",
+      "name": "GPU Architecture Blog Post",
+      "max_tokens": 1024,
+      "prompt": "Write a detailed technical blog post about the evolution of GPU architectures from CUDA to modern compute shaders, covering parallel processing concepts, memory hierarchies, and real-world applications in machine learning and graphics.",
+      "expected_behavior": "Langer kohärenter Text mit technischer Tiefe",
+      "quality_check": "Historisch korrekt (CUDA 2007+), erwähnt SIMD/SIMT, Memory-Hierarchie, ML-Anwendungen"
+    },
+    {
+      "id": 9,
+      "category": "reasoning",
+      "difficulty": "short",
+      "name": "Binary Search Complexity",
+      "max_tokens": 256,
+      "prompt": "What is the time complexity of binary search and why?",
+      "expected_behavior": "O(log n) mit korrekter Begründung (Halbierung pro Schritt)",
+      "quality_check": "O(log n) korrekt, Begründung verständlich, optional: Best/Worst-Case"
+    },
+    {
+      "id": 10,
+      "category": "reasoning",
+      "difficulty": "medium",
+      "name": "Debug Code",
+      "max_tokens": 256,
+      "prompt": "Debug this code and explain the issue: for(int i=0; i<=arr.length; i++) sum += arr[i];",
+      "expected_behavior": "Off-by-one Error erkannt (<=  statt <), ArrayIndexOutOfBounds",
+      "quality_check": "Bug korrekt identifiziert, Erklärung warum <= falsch ist, Fix vorgeschlagen"
+    },
+    {
+      "id": 11,
+      "category": "reasoning",
+      "difficulty": "long",
+      "name": "Distributed Message Queue",
+      "max_tokens": 1024,
+      "prompt": "Design a distributed message queue system. Describe the architecture, how you would handle failover, message persistence, ordering guarantees, and horizontal scaling. Compare tradeoffs between at-least-once and exactly-once delivery.",
+      "expected_behavior": "Durchdachtes System-Design mit Trade-off-Analyse",
+      "quality_check": "Erwähnt Partitioning, Replication, WAL/Persistence, Consumer-Groups, At-least-once vs Exactly-once Trade-offs"
+    },
+    {
+      "id": 12,
+      "category": "context_stress",
+      "difficulty": "medium",
+      "name": "Long System Prompt + Question",
+      "max_tokens": 256,
+      "prompt": "You are an expert systems architect specializing in high-performance computing, distributed systems, and GPU programming. You have extensive experience with AMD RDNA architectures, ROCm software stack, HIP programming, and CUDA-to-HIP porting. You understand memory hierarchies including L1/L2 caches, LDS (Local Data Share), and global memory access patterns. You are familiar with wave-level programming, VGPR/SGPR register management, and occupancy optimization. You have worked on inference engines for large language models and understand quantization formats like GGUF Q4_K, Q6_K, and Q8_0. Your expertise includes matrix multiplication optimization using WMMA instructions, kernel fusion strategies, and genetic algorithm-based auto-tuning. You always provide precise, technically accurate answers with concrete examples.\n\nGiven this expertise, what are the three most impactful optimizations for improving LLM decode throughput on consumer AMD GPUs?",
+      "expected_behavior": "Technisch tiefe Antwort die den langen System-Prompt berücksichtigt (Prefill-Stress-Test)",
+      "quality_check": "Antwort bezieht sich auf GPU/AMD-Kontext, nicht generisch. Erwähnt mindestens: Memory-Bandwidth, Quantisierung, Kernel-Fusion oder Batching"
+    },
+    {
+      "id": 13,
+      "category": "context_stress",
+      "difficulty": "medium",
+      "name": "Long Output Story",
+      "max_tokens": 512,
+      "prompt": "Erzähle eine ausführliche Geschichte über einen kleinen Roboter namens Pixel, der in einer verlassenen Fabrik aufwacht und herausfinden muss, wer ihn gebaut hat.",
+      "expected_behavior": "Kohärente Geschichte über ~200-400 Tokens, testet längeren Decode-Output",
+      "quality_check": "Geschichte hat Anfang/Mitte/Ende, Roboter heißt Pixel, Setting=verlassene Fabrik, keine Wiederholungs-Loops"
+    },
+    {
+      "id": 14,
+      "category": "numerics",
+      "difficulty": "short",
+      "name": "Arithmetic (Q4_K Precision)",
+      "max_tokens": 64,
+      "prompt": "Was ist 17 × 23?",
+      "expected_behavior": "391 — empfindlich auf Quantisierungsrauschen in Attention-Scores",
+      "quality_check": "Korrekte Antwort 391. Falsche Antwort deutet auf Numerik-Problem im Q4_K-Pfad"
+    },
+    {
+      "id": 15,
+      "category": "tokenizer_robustness",
+      "difficulty": "short",
+      "name": "Emoji/Special Characters",
+      "max_tokens": 128,
+      "prompt": "🎉🎊🎈 What do these emojis mean and when would you use them?",
+      "expected_behavior": "Erkennt Party/Celebration-Emojis, antwortet sinnvoll",
+      "quality_check": "Emojis korrekt als Feier/Party erkannt, kohärente Antwort, kein Tokenizer-Crash"
+    },
+    {
+      "id": 16,
+      "category": "context_retention",
+      "difficulty": "multi_turn",
+      "name": "Alice Context Retention",
+      "type": "multi_turn",
+      "max_tokens": 100,
+      "prompt": "(see examples/run_alice_test.rs — 6-turn ChatSession test)",
+      "turns": [
+        {
+          "turn": 1,
+          "user": "My name is Alice.",
+          "expect_contains": ["Alice"],
+          "critical": false,
+          "max_tokens": 60
+        },
+        {
+          "turn": 2,
+          "user": "What is 2 + 2?",
+          "expect_contains": ["4"],
+          "critical": false,
+          "max_tokens": 40
+        },
+        {
+          "turn": 3,
+          "user": "What is my name?",
+          "expect_contains": ["Alice"],
+          "critical": true,
+          "max_tokens": 50
+        },
+        {
+          "turn": 4,
+          "user": "I live in Berlin.",
+          "expect_contains": ["Berlin"],
+          "critical": false,
+          "max_tokens": 60
+        },
+        {
+          "turn": 5,
+          "user": "Where do I live?",
+          "expect_contains": ["Berlin"],
+          "critical": true,
+          "max_tokens": 50
+        },
+        {
+          "turn": 6,
+          "user": "What is my name and where do I live?",
+          "expect_contains": ["Alice", "Berlin"],
+          "critical": true,
+          "max_tokens": 100
+        }
+      ],
+      "expected_behavior": "KV cache persists across turns; model recalls user-stated facts on critical turns 3, 5, 6",
+      "quality_check": "All 3 critical turns must contain the expected keywords; failure indicates a multi-turn KV-cache or chat-template-continuation bug"
+    }
+  ],
+  "evaluation": {
+    "ratings": ["korrekt", "teilweise", "falsch", "müll"],
+    "pass_threshold": "12/15 korrekt für Phase-1-Akzeptanz",
+    "critical_failures": [
+      "Prompt 1-2 müll → Fundamentaler Forward-Pass-Bug",
+      "Prompt 14 falsch → Q4_K Numerik-Problem",
+      "Prompt 12 ignoriert System-Prompt → Prefill/KV-Cache-Bug",
+      "Wiederholungs-Loops bei Prompt 13 → Sampling/Temperature-Bug"
+    ]
+  },
+  "metrics_per_prompt": {
+    "prefill_tokens": "Anzahl Tokens im Prompt",
+    "prefill_ms": "Prefill-Zeit in Millisekunden",
+    "decode_tokens": "Anzahl generierter Tokens",
+    "decode_tok_s": "Decode-Geschwindigkeit in Tokens/Sekunde",
+    "total_ms": "Gesamtzeit",
+    "vram_mb": "VRAM-Verbrauch während Generation"
+  }
+}

@@ -1,0 +1,267 @@
+#version 460
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_float_e4m3 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// v0.2 Sprint 2B — Q4_K dequant-fusion in coopmat FP8 GEMM kernel.
+//
+//   A : Q4_K weights (144 bytes / 256 weights = 0.5625 B/elem on the wire)
+//   B : FP32 activations
+//   C : FP32 output
+//
+// Two memory-layout conventions are supported via -DFORWARD_LAYOUT:
+//   * default: B is [K, N] row-major, C is [M, N] row-major. This is
+//     the Sprint 2B test/bench convention.
+//   * FORWARD_LAYOUT: B is [N, K] row-major (matches the runtime
+//     batch_norm = [seq_len, hidden] = [N, K] activation buffer), and
+//     C is [N, M] row-major (matches the runtime mul_mmq output =
+//     [seq_len, output_dim] = [N, M]). This is the variant wired into
+//     the Sprint 3A forward-pass slot for gemm_q.
+//
+// Each K-step:
+//   1. Cooperative-load 64 rows × 16 cols of A:
+//      decode the source Q4_K block (dm + scales) once per thread,
+//      dequant 4 consecutive weights, narrow each to FP8 via the
+//      native v_cvt_pk_fp8_f32 instruction, store in LDS.
+//   2. Cooperative-load 16 × BN cols of B from FP32 in VRAM:
+//      narrow each FP32 element to FP8 via v_cvt_pk_fp8_f32, store
+//      in LDS.
+//   3. Subgroups load matA / matB tiles from LDS into coopmat
+//      operands and run coopMatMulAdd (FP8 × FP8 → FP32).
+//
+// Tile geometry, parametric BN (16/32/64) subgroup grid, and barrier
+// placement are identical to mul_coopmat_fp8.comp (Sprint 1B). The
+// only thing that changes is the A load phase.
+
+#ifndef BN
+#define BN 64
+#endif
+
+const uint BLOCK_SIZE = 256;
+const uint BM         = 64;
+const uint BK         = 16;
+const uint TM         = 16;
+const uint TN         = 16;
+const uint TK         = 16;
+const uint Q4K_PER_BLOCK = 256;   // weights per Q4_K block
+
+#if BN >= 64
+  #define SG_M_COUNT  2
+  #define SG_N_COUNT  2
+  #define WMMAS_M     2
+  #define WMMAS_N     2
+#elif BN == 32
+  #define SG_M_COUNT  4
+  #define SG_N_COUNT  1
+  #define WMMAS_M     1
+  #define WMMAS_N     2
+#elif BN == 16
+  #define SG_M_COUNT  4
+  #define SG_N_COUNT  1
+  #define WMMAS_M     1
+  #define WMMAS_N     1
+#else
+  #error "BN must be 16, 32, or 64"
+#endif
+
+const uint WM = WMMAS_M * TM;
+const uint WN = WMMAS_N * TN;
+
+const uint A_STRIDE = BK + 1;
+const uint B_STRIDE = BN + 1;
+
+shared floate4m3_t buf_a[BM * A_STRIDE];
+shared floate4m3_t buf_b[BK * B_STRIDE];
+
+const uint B_PASSES = (BK * BN + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+struct block_q4_K {
+    f16vec2 dm;
+    uint8_t scales[12];
+    uint8_t qs[128];
+};
+
+layout(local_size_x = BLOCK_SIZE) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufA { block_q4_K data_a[]; };
+layout(set = 0, binding = 1) readonly  buffer BufB { float       b[]; };
+layout(set = 0, binding = 2) writeonly buffer BufC { float       c[]; };
+
+layout(push_constant) uniform PC {
+    uint m;
+    uint n;
+    uint k;             // = K, must be a multiple of Q4K_PER_BLOCK
+    uint stride_a;      // = K (logical row stride of A in weights)
+#ifdef FORWARD_LAYOUT
+    uint stride_b;      // = K (B is [N, K] row-major; row stride is K)
+    uint stride_c;      // = M (C is [N, M] row-major; row stride is M)
+#else
+    uint stride_b;      // = N (B is [K, N] row-major)
+    uint stride_c;      // = N (C is [M, N] row-major)
+#endif
+} pc;
+
+// Dequant a single Q4_K weight at position `pos` in [0, 256) of the
+// block whose pre-decoded scale[8]/min[8] (6-bit each) and (d, dmin)
+// have been provided by the caller. This avoids redoing the scale
+// table for every weight inside the per-thread 4-weight unroll.
+float q4k_dequant_one(uint pos, float d, float dmin,
+                      const uint scale_u[8], const uint min_u[8],
+                      uint block_id) {
+    const uint sb = pos >> 5;            // 0..7
+    const uint k  = pos & 31u;           // 0..31
+    const uint pair = sb >> 1;           // 0..3
+    const uint hi   = sb & 1u;
+    const uint qbyte = uint(data_a[block_id].qs[pair * 32u + k]);
+    const uint nib   = (hi == 1u) ? ((qbyte >> 4) & 0xFu) : (qbyte & 0xFu);
+    return d * float(scale_u[sb]) * float(nib) - dmin * float(min_u[sb]);
+}
+
+// Pre-decode the 8 (scale, min) 6-bit pairs out of the 12-byte scales
+// table. Mirrors src/backend/vulkan/q4k.rs::dequant_block.
+void q4k_decode_scales(uint block_id, out uint scale_u[8], out uint min_u[8]) {
+    [[unroll]] for (uint sb = 0; sb < 4u; sb++) {
+        scale_u[sb] = uint(data_a[block_id].scales[sb])      & 0x3Fu;
+        min_u[sb]   = uint(data_a[block_id].scales[sb + 4u]) & 0x3Fu;
+    }
+    [[unroll]] for (uint sb = 4; sb < 8u; sb++) {
+        const uint lo_byte   = uint(data_a[block_id].scales[sb + 4u]);
+        const uint scale_lo4 = lo_byte & 0x0Fu;
+        const uint min_lo4   = (lo_byte >> 4) & 0x0Fu;
+        const uint scale_hi2 = (uint(data_a[block_id].scales[sb - 4u]) >> 6) & 0x03u;
+        const uint min_hi2   = (uint(data_a[block_id].scales[sb])      >> 6) & 0x03u;
+        scale_u[sb] = scale_lo4 | (scale_hi2 << 4);
+        min_u[sb]   = min_lo4   | (min_hi2   << 4);
+    }
+}
+
+void main() {
+    const uint wg_m = gl_WorkGroupID.x * BM;
+    const uint wg_n = gl_WorkGroupID.y * BN;
+    const uint tid  = gl_LocalInvocationID.x;
+
+    const uint sg   = gl_SubgroupID;
+    const uint sg_m = sg / SG_N_COUNT;
+    const uint sg_n = sg % SG_N_COUNT;
+
+    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> acc[WMMAS_M * WMMAS_N];
+    [[unroll]] for (uint i = 0; i < WMMAS_M * WMMAS_N; i++) {
+        acc[i] = coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
+    }
+
+    // Thread → A-tile mapping. BLOCK_SIZE=256 threads fill a 64×16
+    // tile: 4 threads cover one row, each thread handles
+    // PER_THREAD_K=4 consecutive K positions. All four weights for a
+    // thread come from the SAME Q4_K block, so the per-thread
+    // (dm, scales)-decode happens once per K-step.
+    const uint a_row     = tid / 4;             // 0..63 — row in A-tile
+    const uint a_k_base  = (tid & 3u) * 4u;     // 0,4,8,12 — K offset
+    const uint blocks_per_row = pc.k / Q4K_PER_BLOCK;
+    const uint global_row = wg_m + a_row;
+    const bool row_in_bounds = global_row < pc.m;
+
+    for (uint kk = 0; kk < pc.k; kk += BK) {
+        // -- A load: Q4_K → FP32 → FP8 → LDS -------------------------------
+        // For this row & K-step the source block index is fixed; pull dm
+        // and the 8 (scale, min) pairs once, then dequant 4 weights.
+        const uint block_id = global_row * blocks_per_row + (kk / Q4K_PER_BLOCK);
+        const uint pos_base = (kk + a_k_base) % Q4K_PER_BLOCK;
+
+        float d    = 0.0;
+        float dmin = 0.0;
+        uint scale_u[8];
+        uint min_u[8];
+        if (row_in_bounds) {
+            d    = float(data_a[block_id].dm.x);
+            dmin = float(data_a[block_id].dm.y);
+            q4k_decode_scales(block_id, scale_u, min_u);
+        }
+
+        [[unroll]] for (uint w = 0; w < 4u; w++) {
+            const uint k_idx = a_k_base + w;     // 0..15
+            float val_f32 = 0.0;
+            if (row_in_bounds) {
+                val_f32 = q4k_dequant_one(pos_base + w, d, dmin,
+                                          scale_u, min_u, block_id);
+            }
+            buf_a[a_row * A_STRIDE + k_idx] = floate4m3_t(val_f32);
+        }
+
+        // -- B load: FP32 → FP8 → LDS --------------------------------------
+        [[unroll]] for (uint pass = 0; pass < B_PASSES; pass++) {
+            const uint fidx = pass * BLOCK_SIZE + tid;
+            if (fidx < BK * BN) {
+                const uint k_idx = fidx / BN;
+                const uint n_idx = fidx & (BN - 1);
+                const uint gk    = kk + k_idx;
+                const uint gn    = wg_n + n_idx;
+                const bool ok    = gk < pc.k && gn < pc.n;
+#ifdef FORWARD_LAYOUT
+                // B is stored as [N, K] row-major (token-major activations).
+                // stride_b = K, so element (gk, gn) lives at b[gn * K + gk].
+                const float vf   = ok ? b[gn * pc.stride_b + gk] : 0.0;
+#else
+                const float vf   = ok ? b[gk * pc.stride_b + gn] : 0.0;
+#endif
+                buf_b[k_idx * B_STRIDE + n_idx] = floate4m3_t(vf);
+            }
+        }
+
+        barrier();
+
+        // -- Compute --------------------------------------------------------
+        coopmat<floate4m3_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> matA[WMMAS_M];
+        coopmat<floate4m3_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> matB[WMMAS_N];
+
+        [[unroll]] for (uint mi = 0; mi < WMMAS_M; mi++) {
+            const uint a_off = (sg_m * WM + mi * TM) * A_STRIDE;
+            coopMatLoad(matA[mi], buf_a, a_off, A_STRIDE,
+                        gl_CooperativeMatrixLayoutRowMajor);
+        }
+        [[unroll]] for (uint ni = 0; ni < WMMAS_N; ni++) {
+            const uint b_off = sg_n * WN + ni * TN;
+            coopMatLoad(matB[ni], buf_b, b_off, B_STRIDE,
+                        gl_CooperativeMatrixLayoutRowMajor);
+        }
+        [[unroll]] for (uint mi = 0; mi < WMMAS_M; mi++) {
+            [[unroll]] for (uint ni = 0; ni < WMMAS_N; ni++) {
+                acc[mi * WMMAS_N + ni] = coopMatMulAdd(
+                    matA[mi], matB[ni], acc[mi * WMMAS_N + ni]);
+            }
+        }
+
+        barrier();
+    }
+
+    // -- Store -------------------------------------------------------------
+    [[unroll]] for (uint mi = 0; mi < WMMAS_M; mi++) {
+        [[unroll]] for (uint ni = 0; ni < WMMAS_N; ni++) {
+            const uint c_row = wg_m + sg_m * WM + mi * TM;
+            const uint c_col = wg_n + sg_n * WN + ni * TN;
+            if (c_row + TM <= pc.m && c_col + TN <= pc.n) {
+#ifdef FORWARD_LAYOUT
+                // C is [N, M] row-major: write the 16x16 output tile
+                // ColumnMajor with stride_c = M so element (mi, ni)
+                // lands at c[(c_col + ni) * M + (c_row + mi)].
+                coopMatStore(acc[mi * WMMAS_N + ni], c,
+                             c_col * pc.stride_c + c_row, pc.stride_c,
+                             gl_CooperativeMatrixLayoutColumnMajor);
+#else
+                coopMatStore(acc[mi * WMMAS_N + ni], c,
+                             c_row * pc.stride_c + c_col, pc.stride_c,
+                             gl_CooperativeMatrixLayoutRowMajor);
+#endif
+            }
+        }
+    }
+}
