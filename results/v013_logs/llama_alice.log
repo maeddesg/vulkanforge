@@ -1,0 +1,52 @@
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+VulkanForge: GPU = AMD Radeon RX 9070 XT (RADV GFX1201)
+VulkanForge: Compute Queue Family = 0
+VulkanForge: validation layer ACTIVE
+VulkanForge — Alice multi-turn context-retention test
+  model    = /home/maeddes/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
+  arch     = llama
+  template = Llama3
+  rope     = Norm
+  qk_norm  = false
+
+─── Turn 1/6
+  USER: My name is Alice.
+  ASST: Nice to meet you, Alice! How can I assist you today?
+  KW ["Alice"] → ✅ · pp=26 gen=14 · 511 tok/s prefill, 99.2 tok/s decode · pos=40
+
+─── Turn 2/6
+  USER: What is 2 + 2?
+  ASST: Alice, the answer to 2 + 2 is 4!
+  KW ["4"] → ✅ · pp=18 gen=14 · 459 tok/s prefill, 94.1 tok/s decode · pos=72
+
+─── Turn 3/6 [CRITICAL]
+  USER: What is my name?
+  ASST: Your name is Alice!
+  KW ["Alice"] → ✅ · pp=15 gen=5 · 376 tok/s prefill, 90.8 tok/s decode · pos=92
+
+─── Turn 4/6
+  USER: I live in Berlin.
+  ASST: Berlin is a wonderful city! What do you like most about living there, Alice?
+  KW ["Berlin"] → ✅ · pp=15 gen=17 · 369 tok/s prefill, 93.7 tok/s decode · pos=124
+
+─── Turn 5/6 [CRITICAL]
+  USER: Where do I live?
+  ASST: You live in Berlin, Alice!
+  KW ["Berlin"] → ✅ · pp=15 gen=7 · 367 tok/s prefill, 93.3 tok/s decode · pos=146
+
+─── Turn 6/6 [CRITICAL]
+  USER: What is my name and where do I live?
+  ASST: Your name is Alice, and you live in Berlin!
+  KW ["Alice", "Berlin"] → ✅ · pp=20 gen=11 · 481 tok/s prefill, 94.0 tok/s decode · pos=177
+
+=== Alice summary ===
+    Turn 1: ✅  ["Alice"] → Nice to meet you, Alice! How can I assist you today?
+    Turn 2: ✅  ["4"] → Alice, the answer to 2 + 2 is 4!
+  * Turn 3: ✅  ["Alice"] → Your name is Alice!
+    Turn 4: ✅  ["Berlin"] → Berlin is a wonderful city! What do you like most about living there, Alice?
+  * Turn 5: ✅  ["Berlin"] → You live in Berlin, Alice!
+  * Turn 6: ✅  ["Alice", "Berlin"] → Your name is Alice, and you live in Berlin!
+
+  Critical score: 3/3  (PASS)
+  Aggregate: 109 prompt + 68 gen tokens, prefill 431 tok/s, decode 94.6 tok/s
+  Final KV pos: 177 / 2048

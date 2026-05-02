@@ -1,0 +1,52 @@
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+VulkanForge: GPU = AMD Radeon RX 9070 XT (RADV GFX1201)
+VulkanForge: Compute Queue Family = 0
+VulkanForge: validation layer ACTIVE
+VulkanForge — Alice multi-turn context-retention test
+  model    = /home/maeddes/models/DeepSeek-R1-Distill-Llama-8B-Q4_K_M.gguf
+  arch     = llama
+  template = DeepSeekR1
+  rope     = Norm
+  qk_norm  = false
+
+─── Turn 1/6
+  USER: My name is Alice.
+  ASST: Okay, so the user introduced themselves as Alice. I should respond in a friendly and welcoming manner. Maybe ask how I can assist her today. Keep it open-ended to encourage her to share what she needs help with. ⏎ </think> ⏎  ⏎ Hello, Alice! How …
+  KW ["Alice"] → ✅ · pp=17 gen=57 · 336 tok/s prefill, 97.3 tok/s decode · pos=74
+
+─── Turn 2/6
+  USER: What is 2 + 2?
+  ASST: Alright, the user just asked, "What is 2 + 2?" I need to figure out the best way to respond. Since the previous conversation was about introducing myself, now it's time
+  KW ["4"] → ❌ · pp=14 gen=40 · 348 tok/s prefill, 93.7 tok/s decode · pos=128
+
+─── Turn 3/6 [CRITICAL]
+  USER: What is my name?
+  ASST: Okay, so the user just asked, "What is my name?" Hmm, that's interesting. In our previous interaction, they introduced themselves as Alice. Now they're asking for their name. I need to be careful here. ⏎  ⏎ First, I should
+  KW ["Alice"] → ✅ · pp=11 gen=50 · 271 tok/s prefill, 94.0 tok/s decode · pos=189
+
+─── Turn 4/6
+  USER: I live in Berlin.
+  ASST: Alright, the user just said, "I live in Berlin." I need to respond appropriately. Let me think about how to acknowledge that information. ⏎  ⏎ I should start by thanking them for sharing. Then, I can express enthusiasm about Berlin, mentioning …
+  KW ["Berlin"] → ✅ · pp=11 gen=60 · 261 tok/s prefill, 94.5 tok/s decode · pos=260
+
+─── Turn 5/6 [CRITICAL]
+  USER: Where do I live?
+  ASST: Okay, the user just asked, "Where do I live?" I need to figure out the best way to respond. In the previous conversation, they mentioned living in Berlin, so I should refer back to that. ⏎  ⏎ I should acknowledge their previous statement and
+  KW ["Berlin"] → ✅ · pp=11 gen=50 · 256 tok/s prefill, 93.9 tok/s decode · pos=321
+
+─── Turn 6/6 [CRITICAL]
+  USER: What is my name and where do I live?
+  ASST: Alright, the user is asking again, "What is my name and where do I live?" I need to address this carefully. ⏎  ⏎ From the conversation history, the user introduced themselves as Alice and mentioned living in Berlin. However, I should be cautiou…
+  KW ["Alice", "Berlin"] → ✅ · pp=16 gen=100 · 351 tok/s prefill, 94.5 tok/s decode · pos=437
+
+=== Alice summary ===
+    Turn 1: ✅  ["Alice"] → Okay, so the user introduced themselves as Alice. I should respond in a friendly…
+    Turn 2: ❌  ["4"] → Alright, the user just asked, "What is 2 + 2?" I need to figure out the best way…
+  * Turn 3: ✅  ["Alice"] → Okay, so the user just asked, "What is my name?" Hmm, that's interesting. In our…
+    Turn 4: ✅  ["Berlin"] → Alright, the user just said, "I live in Berlin." I need to respond appropriately…
+  * Turn 5: ✅  ["Berlin"] → Okay, the user just asked, "Where do I live?" I need to figure out the best way …
+  * Turn 6: ✅  ["Alice", "Berlin"] → Alright, the user is asking again, "What is my name and where do I live?" I need…
+
+  Critical score: 3/3  (PASS)
+  Aggregate: 80 prompt + 357 gen tokens, prefill 305 tok/s, decode 94.7 tok/s
+  Final KV pos: 437 / 2048

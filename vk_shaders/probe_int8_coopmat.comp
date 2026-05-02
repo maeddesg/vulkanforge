@@ -1,0 +1,33 @@
+#version 450
+// Sprint 11F runtime probe — Int8 coopmat smoke test.
+//
+// Computes a single 16x16 INT8 × INT8 → INT32 GEMM:
+//   A[16][16] = all 1s
+//   B[16][16] = all 1s
+//   C = A·B    → C[i][j] = sum_k(A[i][k]·B[k][j]) = 16
+//
+// If this dispatch produces 16 in every cell, RDNA4's Int8-coopmat
+// path (advertised entry 14: I8 × I8 → I32 → I32) is fully usable
+// from Vulkan / RADV. STRONG GO for Sprint 11G coopmat-int-DP GEMM.
+#extension GL_KHR_cooperative_matrix             : require
+#extension GL_KHR_memory_scope_semantics         : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8  : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+layout(local_size_x = 64) in;
+
+layout(set=0, binding=0) readonly  buffer A_Buf { int8_t  a_data[]; };
+layout(set=0, binding=1) readonly  buffer B_Buf { int8_t  b_data[]; };
+layout(set=0, binding=2) writeonly buffer C_Buf { int32_t c_data[]; };
+
+void main() {
+    coopmat<int8_t,  gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
+    coopmat<int8_t,  gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
+    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> C =
+        coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+
+    coopMatLoad(A, a_data, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(B, b_data, 0u, 16u, gl_CooperativeMatrixLayoutColumnMajor);
+    C = coopMatMulAdd(A, B, C);
+    coopMatStore(C, c_data, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+}

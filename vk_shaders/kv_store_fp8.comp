@@ -1,0 +1,67 @@
+#version 450
+
+// Sprint 18A — FP32 → FP8 E4M3 conversion for KV-cache writes.
+//
+// Sibling of `kv_copy_fp16.comp`: where that shader packs 2 FP16
+// values per uint via `packHalf2x16`, this packs **4 FP8 E4M3
+// values per uint** via the native `floate4m3_t` GLSL type
+// (`GL_EXT_float_e4m3` + `floate4m3BitsToUintEXT`). One thread
+// converts a four-element group, so workgroup-size = 256 covers
+// 1024 FP32 elements per dispatch.
+//
+// Storage layout (output buffer is `uint[]` as in the FP16 path):
+//   src (binding 0): FP32 element-array; index unit = float (4 B).
+//   dst (binding 1): uint  element-array; index unit = uint  (4 B).
+//                    Each uint holds 4 FP8 values; total bytes for
+//                    `n_elements` of FP8 = `n_elements`, written as
+//                    `n_elements / 4` uints.
+//
+// `dst_uint_offset` is the destination start in uint units
+// (= byte_offset / 4). The caller computes it from
+// `KvCache::pos_offset_bytes(layer, pos) / 4`. `src_float_offset`
+// is the source start in float units.
+//
+// Dispatch: ceil(n_elements / 4 / 256) workgroups.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_float_e4m3                          : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8  : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+layout(local_size_x = 256) in;
+
+layout (binding = 0) readonly  buffer Src { float data_in[]; };
+layout (binding = 1) writeonly buffer Dst { uint  data_out[]; };
+
+layout (push_constant) uniform parameter {
+    uint n_elements;        // total FP32 elements to convert
+    uint dst_uint_offset;   // start offset in dst (uint units)
+    uint src_float_offset;  // start offset in src (float units)
+} p;
+
+uint pack_fp8_quad(vec4 v) {
+    // Convert each lane to E4M3 and pack into one uint:
+    //   byte 0 = LSB, byte 3 = MSB.
+    uint b0 = uint(floate4m3BitsToUintEXT(floate4m3_t(v.x)));
+    uint b1 = uint(floate4m3BitsToUintEXT(floate4m3_t(v.y)));
+    uint b2 = uint(floate4m3BitsToUintEXT(floate4m3_t(v.z)));
+    uint b3 = uint(floate4m3BitsToUintEXT(floate4m3_t(v.w)));
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+void main() {
+    const uint quad_idx = gl_GlobalInvocationID.x;
+    const uint elem_idx = quad_idx * 4u;
+    if (elem_idx >= p.n_elements) {
+        return;
+    }
+    // Load up to 4 floats; tail-zero pad if n_elements isn't a
+    // multiple of 4 (rare — rows are typically n_kv_heads*head_dim
+    // which is a clean multiple).
+    vec4 v;
+    v.x = data_in[p.src_float_offset + elem_idx];
+    v.y = (elem_idx + 1u < p.n_elements) ? data_in[p.src_float_offset + elem_idx + 1u] : 0.0;
+    v.z = (elem_idx + 2u < p.n_elements) ? data_in[p.src_float_offset + elem_idx + 2u] : 0.0;
+    v.w = (elem_idx + 3u < p.n_elements) ? data_in[p.src_float_offset + elem_idx + 3u] : 0.0;
+    data_out[p.dst_uint_offset + quad_idx] = pack_fp8_quad(v);
+}

@@ -1,0 +1,104 @@
+#version 460
+
+// v0.2.1 Sprint 11G-B — Int8-coopmat GEMM micro-benchmark.
+//
+// Computes C[16, 16] = A[16, K] * B[K, 16] (int8 * int8 -> int32) using
+// VK_KHR_cooperative_matrix WMMA fragments (RDNA4 entry 14, no saturate).
+// One WG = one Wave64 = one 16x16 output tile. Outer dispatch covers
+// the M/16 x N/16 tile grid. Inside each WG, the K-loop is repeated
+// n_reps times so the per-dispatch GPU time stays well above launch
+// overhead.
+//
+// LDS staging mirrors the Sprint 11G-A architecture proposal: A and B
+// are pre-unpacked int8 buffers (no Q4_K nibble unpack, no Q8_1 scales),
+// staged into LDS one BK=32 chunk at a time, then consumed via
+// coopMatLoad / coopMatMulAdd. The accumulator is int32 (entry 14 of
+// VK_KHR_cooperative_matrix on gfx1201).
+//
+// Pair: bench_scalar_gemm.comp uses the exact same tile shape, LDS
+// layout, and n_reps loop, but its inner K step is dotPacked4x8EXT
+// instead of coopMatMulAdd. Speedup at fixed n_reps answers the
+// GO/NO-GO question for Sprint 11G-C (full Q4_K x Q8_1 shader).
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 64) in;
+
+layout(set=0, binding=0) readonly buffer BufA { int8_t  data_a[]; };
+layout(set=0, binding=1) readonly buffer BufB { int8_t  data_b[]; };
+layout(set=0, binding=2)          buffer BufC { int32_t data_c[]; };
+
+layout(push_constant) uniform PC {
+    uint M;       // total output rows
+    uint N;       // total output cols
+    uint K;       // inner dim (multiple of 32)
+    uint n_reps;  // bench iterations per dispatch
+} pc;
+
+const uint TM = 16;
+const uint TN = 16;
+const uint TK = 16;
+const uint BM = 16;
+const uint BN = 16;
+const uint BK = 32;
+
+// LDS: 16x32 + 16x32 = 1 KB. Plenty of headroom for high WG/CU.
+shared int8_t a_lds[BM * BK];
+shared int8_t b_lds[BN * BK];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wg_m = gl_WorkGroupID.x;
+    uint wg_n = gl_WorkGroupID.y;
+
+    coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> total =
+        coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0);
+
+    for (uint rep = 0; rep < pc.n_reps; rep++) {
+        coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> C =
+            coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0);
+
+        for (uint kk = 0; kk < pc.K; kk += BK) {
+            // A is laid out RowMajor in LDS: a_lds[row * BK + col] = A[wg_m*BM + row, kk + col].
+            // 16 * 32 = 512 bytes / 64 threads = 8 bytes per thread.
+            for (uint i = tid; i < BM * BK; i += 64) {
+                uint row = i / BK;
+                uint col = i % BK;
+                a_lds[i] = data_a[(wg_m * BM + row) * pc.K + kk + col];
+            }
+            // B is laid out ColumnMajor in LDS: b_lds[col * BK + row] = B[kk + row, wg_n*BN + col].
+            // The ColumnMajor coopMatLoad below treats stride=BK as the column stride.
+            for (uint i = tid; i < BN * BK; i += 64) {
+                uint col = i / BK;
+                uint row = i % BK;
+                b_lds[col * BK + row] = data_b[(kk + row) * pc.N + (wg_n * BN + col)];
+            }
+
+            barrier();
+
+            // BK / TK = 2 coopMatMulAdd per K chunk.
+            [[unroll]] for (uint ks = 0; ks < BK; ks += TK) {
+                coopmat<int8_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> A_frag;
+                coopmat<int8_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> B_frag;
+
+                coopMatLoad(A_frag, a_lds, ks, BK, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(B_frag, b_lds, ks, BK, gl_CooperativeMatrixLayoutColumnMajor);
+
+                C = coopMatMulAdd(A_frag, B_frag, C);
+            }
+
+            barrier();
+        }
+
+        // Anti-elision: each rep's contribution feeds into total.
+        total += C;
+    }
+
+    coopMatStore(total, data_c,
+                 (wg_m * BM) * pc.N + (wg_n * BN),
+                 pc.N, gl_CooperativeMatrixLayoutRowMajor);
+}

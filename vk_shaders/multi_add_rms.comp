@@ -1,0 +1,97 @@
+#version 450
+
+// v0.2 Sprint 9b — Fused Residual-Add + RMSNorm-Mul ("multi_add_rms").
+//
+// Replaces the (add → barrier → rms_norm_mul) pair at Stelle 1
+// (add_res1 + rms_norm_ffn) with a single dispatch:
+//
+//     sum[row, c]      = a[row, c] + b[row, c]      // residual update
+//     mean_sq          = mean_c(sum[row, c]²)        // row reduction
+//     scale            = 1 / sqrt(mean_sq + eps)
+//     norm_out[row, c] = sum[row, c] * scale * weight[c]
+//
+// 4 SSBOs:
+//   binding 0 — `a`        (read)   residual input  (decode: input,
+//                                    batched: batch_residual)
+//   binding 1 — `b`        (read)   gemm output     (o_buf / batch_o)
+//   binding 2 — `weight`   (read)   per-column rms_norm gamma
+//   binding 3 — `sum`      (write)  residual + b   — `sum` MAY alias
+//                                    `a` for in-place residual updates
+//                                    (the batched dispatch passes
+//                                    `batch_residual` for both).
+//   binding 4 — `norm_out` (write)  rms_norm(sum) * weight
+//
+// Push constants: ne00 (cols), n_rows, eps. The dispatch is
+// (n_rows, 1, 1) workgroups; each WG handles one row with
+// BLOCK_SIZE=512 threads.
+//
+// Reduction: in-LDS tree-reduce over the BLOCK_SIZE partial sums,
+// matching the pattern in rms_norm.comp. No partial-sum scratch
+// buffer (unlike llama.cpp's multi_add_rms + rms_norm_partials
+// 2-dispatch flow) because our 4096-wide rows fit a single WG.
+//
+// Same-thread re-read invariant: thread `tid` writes positions
+// {tid, tid+512, tid+1024, ...} of `sum` in Phase 1 and reads
+// the *same* positions in Phase 3. Cross-thread ordering for
+// `sum` is therefore not required — only the LDS tree-reduce
+// barrier matters.
+
+#extension GL_EXT_control_flow_attributes : enable
+
+#define BLOCK_SIZE 512
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer A      { float data_a[];      };
+layout (binding = 1) readonly  buffer B      { float data_b[];      };
+layout (binding = 2) readonly  buffer Weight { float data_weight[]; };
+layout (binding = 3)           buffer Sum    { float data_sum[];    };
+layout (binding = 4) writeonly buffer Norm   { float data_norm[];   };
+
+layout (push_constant) uniform parameter {
+    uint ne00;     // columns per row (e.g. 4096)
+    uint n_rows;   // number of rows  (1 in decode, seq_len in batch)
+    float eps;
+} p;
+
+shared float sumsh[BLOCK_SIZE];
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    if (row >= p.n_rows) return;
+
+    const uint tid       = gl_LocalInvocationID.x;
+    const uint cols      = p.ne00;
+    const uint row_off   = row * cols;
+
+    // Phase 1: a + b → sum, accumulate per-thread Σ(sum²).
+    float local_sum_sq = 0.0;
+    [[unroll]] for (uint c = tid; c < cols; c += BLOCK_SIZE) {
+        const float v = data_a[row_off + c] + data_b[row_off + c];
+        data_sum[row_off + c] = v;
+        local_sum_sq += v * v;
+    }
+
+    // Phase 2: LDS tree-reduce. Same shape as rms_norm.comp.
+    sumsh[tid] = local_sum_sq;
+    barrier();
+    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (int(tid) < s) {
+            sumsh[tid] += sumsh[tid + s];
+        }
+        barrier();
+    }
+    const float total_sq = sumsh[0];
+
+    const float mean = total_sq / float(cols);
+    const float scale = inversesqrt(mean + p.eps);
+
+    // Phase 3: write norm_out[c] = sum[c] * scale * weight[c].
+    // Each thread re-reads only the positions it just wrote, so no
+    // cross-thread ordering on `sum` is needed beyond the Phase-2
+    // shared-memory barriers.
+    [[unroll]] for (uint c = tid; c < cols; c += BLOCK_SIZE) {
+        const float v = data_sum[row_off + c];
+        data_norm[row_off + c] = v * scale * data_weight[c];
+    }
+}

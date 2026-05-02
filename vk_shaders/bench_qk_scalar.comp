@@ -1,0 +1,65 @@
+#version 450
+
+// v0.2 Sprint 10B — Scalar QK micro-benchmark (baseline).
+//
+// Computes Score[Br, Bc] = Q[Br, head_dim] · K^T[head_dim, Bc]
+// using plain FP32 FMA. Same algorithm as the inner score-loop in
+// flash_attn_tiled.comp, isolated for direct comparison vs the
+// coopmat variant in bench_qk_coopmat.comp.
+//
+// Q and K are staged into LDS once per dispatch; the bench loop
+// iterates n_tiles times to amortize launch overhead. Results are
+// accumulated into a per-thread `total` so the compiler can't elide
+// repeated iterations.
+
+layout(local_size_x = 64) in;
+
+layout(set=0, binding=0) readonly buffer BufQ { float data_q[]; };
+layout(set=0, binding=1) readonly buffer BufK { float data_k[]; };
+layout(set=0, binding=2)          buffer BufS { float data_s[]; };
+
+layout(push_constant) uniform PC {
+    uint Br;        // 16
+    uint Bc;        // 16
+    uint head_dim;  // 128
+    uint n_tiles;   // bench iteration count
+} pc;
+
+// LDS for Q[16, 128] + K[16, 128] = 8 KB + 8 KB = 16 KB.
+shared float q_lds[16 * 128];
+shared float k_lds[16 * 128];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+    // Cooperative LDS load.
+    for (uint i = tid; i < pc.Br * pc.head_dim; i += 64) {
+        q_lds[i] = data_q[i];
+    }
+    for (uint i = tid; i < pc.Bc * pc.head_dim; i += 64) {
+        k_lds[i] = data_k[i];
+    }
+    barrier();
+
+    // Bench loop. Each rep recomputes the full Score matrix; the
+    // running `total` keeps every iteration's contribution alive.
+    float total = 0.0;
+    for (uint rep = 0; rep < pc.n_tiles; ++rep) {
+        // Each thread covers Br*Bc/64 = 4 (qi, ki) cells.
+        for (uint i = tid; i < pc.Br * pc.Bc; i += 64) {
+            uint qi = i / pc.Bc;
+            uint ki = i % pc.Bc;
+            float s = 0.0;
+            for (uint d = 0; d < pc.head_dim; ++d) {
+                s += q_lds[qi * pc.head_dim + d] * k_lds[ki * pc.head_dim + d];
+            }
+            total += s;
+        }
+    }
+
+    // Each thread writes its accumulator. 64 threads → 64 outputs.
+    // The score buffer must be at least 64 elements.
+    if (tid < pc.Br * pc.Bc) {
+        data_s[tid] = total;
+    }
+}

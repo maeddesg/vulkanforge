@@ -1,0 +1,72 @@
+#version 460
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_bfloat16 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+#extension GL_EXT_buffer_reference2 : enable
+
+// Phase 6A pure-WMMA throughput micro-benchmark.
+//
+// Computes C = A * B with
+//   A : [M, K] bfloat16_t   row-major
+//   B : [K, N] bfloat16_t   row-major
+//   C : [M, N] f32          row-major
+//
+// One workgroup = one Wave64 = one (16x16) output tile of C. The
+// outer (gx, gy) work-group grid covers M/16 × N/16 tiles. Each WG
+// walks K in TILE_K=16-sized chunks via coopMatLoad + coopMatMulAdd
+// and stores once at the end.
+//
+// This is the SIMPLEST possible coopmat GEMM — no shared-memory
+// staging, no thread-block tiling beyond the WMMA fragment, no
+// double-buffering. The Phase-6B production shader would do all of
+// that. The point of this version is to read out raw WMMA throughput.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly  buffer A { bfloat16_t a[]; };
+layout(set = 0, binding = 1) readonly  buffer B { bfloat16_t b[]; };
+layout(set = 0, binding = 2) writeonly buffer C { float       c[]; };
+
+layout(push_constant) uniform PC {
+    uint m;          // C rows  (multiple of 16)
+    uint n;          // C cols  (multiple of 16)
+    uint k;          // contraction dim (multiple of 16)
+    uint stride_a;   // = K  (row stride of A, in elements)
+    uint stride_b;   // = N  (row stride of B, in elements)
+    uint stride_c;   // = N
+} pc;
+
+const uint TILE = 16;
+
+void main() {
+    uint tile_row = gl_WorkGroupID.x;   // 0 .. M/16 - 1
+    uint tile_col = gl_WorkGroupID.y;   // 0 .. N/16 - 1
+    if (tile_row * TILE >= pc.m || tile_col * TILE >= pc.n) {
+        return;
+    }
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    // Tile-walk down K in steps of 16.
+    uint a_row_off = tile_row * TILE * pc.stride_a;   // top-left of A tile
+    uint b_col_off = tile_col * TILE;                 // top-left of B tile (col-offset)
+
+    for (uint kk = 0; kk < pc.k; kk += TILE) {
+        coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA;
+        coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+
+        // A[tile_row*16 .. +16, kk .. kk+16]   row-major, stride = K
+        coopMatLoad(matA, a, a_row_off + kk, pc.stride_a, gl_CooperativeMatrixLayoutRowMajor);
+        // B[kk .. kk+16, tile_col*16 .. +16]   row-major, stride = N
+        coopMatLoad(matB, b, kk * pc.stride_b + b_col_off, pc.stride_b, gl_CooperativeMatrixLayoutRowMajor);
+
+        acc = coopMatMulAdd(matA, matB, acc);
+    }
+
+    uint c_off = tile_row * TILE * pc.stride_c + tile_col * TILE;
+    coopMatStore(acc, c, c_off, pc.stride_c, gl_CooperativeMatrixLayoutRowMajor);
+}

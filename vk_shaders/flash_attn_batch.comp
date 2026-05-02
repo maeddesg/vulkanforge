@@ -1,0 +1,189 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic      : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// VulkanForge Phase 5B.1 — Batched-Q flash-attention for prefill.
+//
+// Decode-only `flash_attn.comp` runs ONE query against the whole KV
+// cache; for prefill we need M queries against (q_start + M) KV
+// positions in a single dispatch — otherwise prefill spends ~O(M^2)
+// dispatches in the attention step alone (one per token, each with
+// its own descriptor-update + submit overhead).
+//
+// Dispatch shape: (n_heads, M, 1).
+//   gl_WorkGroupID.x = head_index               (0..n_heads-1)
+//   gl_WorkGroupID.y = query_index inside batch (0..m-1)
+//
+// One Wave64 per (head, query) — same workgroup geometry as the
+// decode shader, so each query reuses the proven online-softmax
+// state machine and the 256-byte LDS scores tile.
+//
+// Causal mask: query at batch-offset `q_idx` corresponds to KV
+// position `q_start + q_idx`, and may attend over KV positions
+// `0..=q_start + q_idx`. We collapse that into `causal_len =
+// q_start + q_idx + 1`, then run the same per-tile flash-attention
+// loop as `flash_attn.comp`. Tail tiles past `causal_len` produce
+// `score = -inf` → `p = 0`, which contributes nothing to either the
+// running sum or the V-weighted accumulator. The running max stays
+// well-defined because the very first valid score is always
+// reachable via `q_idx == 0` ⇒ `causal_len >= 1`.
+//
+// Buffer layouts (all f32, all storage):
+//   Q[m * n_heads * head_dim]              — [q_idx, h, d] row-major
+//   K[(q_start + m) * n_kv_heads * head_dim] — [pos, kvh, d] (= KV cache)
+//   V[(q_start + m) * n_kv_heads * head_dim]
+//   O[m * n_heads * head_dim]              — [q_idx, h, d] row-major
+//
+// The K/V layout matches what `flash_attn.comp` already consumes —
+// position-major with `pos_stride = n_kv_heads * head_dim` — so the
+// integration step (Phase 5B.2) can feed the existing KV-cache
+// buffers without copying.
+
+layout (constant_id = 0) const uint MAX_SEQ = 2048;
+
+const uint WGSIZE = 64;
+layout (local_size_x = WGSIZE) in;
+
+layout (binding = 0) readonly  buffer Q { float q[]; };  // [m, n_heads, head_dim]
+// v0.2 Sprint 9d.2 — see flash_attn_tiled.comp for rationale. When
+// -DFP16_KV=1, K/V switch to packed-FP16 in `uint[]` storage and are
+// read via unpackHalf2x16; index unit stays in elements.
+#if FP8_KV
+#extension GL_EXT_float_e4m3                          : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8  : require
+layout (binding = 1) readonly  buffer K { uint k_packed[]; };
+layout (binding = 2) readonly  buffer V { uint v_packed[]; };
+float load_k(uint idx) {
+    uint w = k_packed[idx >> 2];
+    uint b = (w >> ((idx & 3u) * 8u)) & 0xFFu;
+    return float(uintBitsToFloate4m3EXT(uint8_t(b)));
+}
+float load_v(uint idx) {
+    uint w = v_packed[idx >> 2];
+    uint b = (w >> ((idx & 3u) * 8u)) & 0xFFu;
+    return float(uintBitsToFloate4m3EXT(uint8_t(b)));
+}
+#elif FP16_KV
+layout (binding = 1) readonly  buffer K { uint k_packed[]; };
+layout (binding = 2) readonly  buffer V { uint v_packed[]; };
+float load_k(uint idx) {
+    return unpackHalf2x16(k_packed[idx >> 1])[idx & 1u];
+}
+float load_v(uint idx) {
+    return unpackHalf2x16(v_packed[idx >> 1])[idx & 1u];
+}
+#else
+layout (binding = 1) readonly  buffer K { float k[]; };  // [n_kv, n_kv_heads, head_dim]
+layout (binding = 2) readonly  buffer V { float v[]; };  // [n_kv, n_kv_heads, head_dim]
+float load_k(uint idx) { return k[idx]; }
+float load_v(uint idx) { return v[idx]; }
+#endif
+layout (binding = 3) writeonly buffer O { float o[]; };  // [m, n_heads, head_dim]
+
+// 7 × 4 = 28 B push block. Field order matches `FlashAttnBatchPushConstants`
+// in pipeline.rs and is asserted there at compile time.
+layout (push_constant) uniform Params {
+    uint  n_heads;
+    uint  n_kv_heads;
+    uint  head_dim;
+    uint  m;          // Number of queries in this batch.
+    uint  n_kv;       // Total KV positions populated (= q_start + m).
+    uint  q_start;    // KV position of the first query in this batch.
+    float scale;      // Typically 1 / sqrt(head_dim).
+} p;
+
+const uint TILE = WGSIZE;
+shared float scores_lds[TILE];
+
+void main() {
+    uint h     = gl_WorkGroupID.x;
+    uint q_idx = gl_WorkGroupID.y;
+    uint tid   = gl_LocalInvocationID.x;
+    if (h >= p.n_heads || q_idx >= p.m) {
+        return;
+    }
+    uint group_size = p.n_heads / p.n_kv_heads;
+    uint kvh        = h / group_size;
+
+    // Causal mask: query at batch-offset q_idx sits at KV position
+    // (q_start + q_idx) and may attend to positions 0..=that.
+    uint causal_len = p.q_start + q_idx + 1;
+    // Defence-in-depth: never read past the populated KV range.
+    causal_len = min(causal_len, p.n_kv);
+
+    uint q_off      = (q_idx * p.n_heads + h) * p.head_dim;
+    uint o_off      = (q_idx * p.n_heads + h) * p.head_dim;
+    uint pos_stride = p.n_kv_heads * p.head_dim;
+    uint head_off   = kvh * p.head_dim;
+
+    // Two output dims per thread (tid, tid + 64) — head_dim=128 (Qwen3 /
+    // Llama-3.1 / Mistral-7B / DeepSeek-R1) is the only configuration
+    // we exercise; smaller head_dims work via the bounds check at write.
+    float my_out0 = 0.0;
+    float my_out1 = 0.0;
+    float my_max  = -1e30;
+    float my_sum  = 0.0;
+
+    // Tile loop over visible KV positions [0, causal_len).
+    for (uint tile_base = 0; tile_base < causal_len; tile_base += TILE) {
+        uint t = tile_base + tid;
+        bool valid = t < causal_len;
+
+        // Per-thread score = scale * Q[q_idx, h] · K[t, kvh].
+        float score = -1e30;
+        if (valid) {
+            uint k_pos_off = t * pos_stride + head_off;
+            float s = 0.0;
+            for (uint d = 0; d < p.head_dim; ++d) {
+                s += q[q_off + d] * load_k(k_pos_off + d);
+            }
+            score = s * p.scale;
+        }
+
+        // Online-softmax update: same recurrence as `flash_attn.comp`.
+        float tile_max = subgroupMax(score);
+        float new_max  = max(my_max, tile_max);
+        float kfac     = exp(my_max - new_max);
+        my_out0 *= kfac;
+        my_out1 *= kfac;
+        my_sum  *= kfac;
+
+        float pscore = valid ? exp(score - new_max) : 0.0;
+        float tile_sum = subgroupAdd(pscore);
+        my_sum  += tile_sum;
+        my_max   = new_max;
+
+        // Stage scores; barrier so every thread can read the whole tile.
+        scores_lds[tid] = pscore;
+        barrier();
+
+        // Weighted V-sum across this tile. `tile_size` clamps to the
+        // causal triangle for the last tile (e.g. q_idx=0 has
+        // causal_len=1, so only scores_lds[0] is real and only V[0]
+        // contributes — the rest were masked to p=0 above).
+        uint tile_size = min(TILE, causal_len - tile_base);
+        bool d1_valid = (tid + 64) < p.head_dim;
+        for (uint i = 0; i < tile_size; ++i) {
+            uint global_t  = tile_base + i;
+            uint v_pos_off = global_t * pos_stride + head_off;
+            float pi = scores_lds[i];
+            my_out0 += pi * load_v(v_pos_off + tid);
+            if (d1_valid) {
+                my_out1 += pi * load_v(v_pos_off + tid + 64);
+            }
+        }
+        barrier();
+    }
+
+    // Final normalisation + write-back. By construction `my_sum > 0`
+    // (every query has at least one valid key, since causal_len >= 1),
+    // so the divide is safe.
+    float inv_sum = 1.0 / my_sum;
+    if (tid < p.head_dim) {
+        o[o_off + tid] = my_out0 * inv_sum;
+    }
+    if ((tid + 64) < p.head_dim) {
+        o[o_off + tid + 64] = my_out1 * inv_sum;
+    }
+}

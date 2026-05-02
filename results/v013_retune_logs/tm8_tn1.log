@@ -1,0 +1,36 @@
+VulkanForge — 5-prompt benchmark
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+VulkanForge: GPU = AMD Radeon RX 9070 XT (RADV GFX1201)
+VulkanForge: Compute Queue Family = 0
+VulkanForge: validation layer ACTIVE
+  /home/maeddes/models/Qwen3-8B-Q4_K_M.gguf loaded in 0.5 s
+  arch=qwen3 rope=Neox template=ChatML qk_norm=true
+  # 1 Greeting                         pp= 20 gen=  64  prefill= 302.5 tok/s  decode= 90.5 tok/s  ✓
+  # 2 Simple Sequence                  pp= 31 gen=  64  prefill= 556.8 tok/s  decode= 89.6 tok/s  ✓
+  # 3 Prime Check (Python)             pp= 31 gen= 256  prefill= 568.5 tok/s  decode= 89.0 tok/s  ✓
+  # 4 LRU Cache (C++)                  pp= 47 gen= 512  prefill= 866.9 tok/s  decode= 89.0 tok/s  ✓
+  # 5 REST API (Go)                    pp= 62 gen=1024  prefill=1128.3 tok/s  decode= 80.3 tok/s  ✓
+
+=== Per-prompt results ===
+#   Name                       Category       PromTk GenTk    Prefill     Decode  Coh
+1   Greeting                   smoke             20    64     302.5       90.5  ✓
+2   Simple Sequence            smoke             31    64     556.8       89.6  ✓
+3   Prime Check (Python)       code_generati…    31   256     568.5       89.0  ✓
+4   LRU Cache (C++)            code_generati…    47   512     866.9       89.0  ✓
+5   REST API (Go)              code_generati…    62  1024    1128.3       80.3  ✓
+
+=== Aggregate ===
+  Prompt tokens:  191
+  Decode tokens:  1920
+  Prefill total:  285.5 ms  →  669.0 tok/s
+  Decode total:   22800.3 ms  →  84.2 tok/s
+  MEDIAN decode:  89.0 tok/s
+  MEDIAN prefill: 568.5 tok/s
+  Coherent prompts: 5/5
+
+=== 4-System Comparison ===
+                          Decode tok/s  Prefill tok/s
+  llama.cpp Vulkan:           114.2          4314    (reference)
+  ROCmForge HIP (latest):      95.4           768.6  (~/projects/ROCmForge/results/inference_test_20260425.md)
+  llama.cpp ROCm:              87.5          3684    (reference)
+  VulkanForge Phase 3C:        84.2          669.0  ← this run
