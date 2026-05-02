@@ -6,47 +6,67 @@ Compute-only — no swapchain, no graphics queues — built directly on `ash 0.3
 
 ## Status
 
-**v0.3.1** — **packaging release**. v0.3.0's async-decode performance
-(decode **109.0 tok/s** = **0.95 × llama.cpp Vulkan**, prefill **3865
-tok/s** at pp=512 = **0.89 ×**) carries forward unchanged. v0.3.1
-focuses on shipping a usable binary on top of that engine:
+**v0.3.2** — multi-arch + K-quant family. **Decode 131.1 tok/s
+on Qwen3-8B-Q3_K_M = 1.15 × llama.cpp Vulkan** (and 1.14 × on
+Mistral-7B Q4_K_M, 1.06 × on Llama-3.1-8B Q4_K_M); the Qwen3-8B
+Q4_K_M baseline stays at 109.0 tok/s = 0.95 × from v0.3.0. Prefill
+peak 3 865 tok/s @ pp=512 unchanged.
 
-- **`vulkanforge` CLI** with three subcommands — `chat` (interactive
-  REPL with sampling flags + `rustyline` line editing), `bench`
-  (decode + pp sweep), `info` (GGUF metadata + GPU info, no weight
-  upload).
-- **GGUF auto-detection + preflight** — `info` works on every GGUF
-  (Qwen3 / Qwen2.5 / Llama / Mistral / DeepSeek-R1-Distill); `chat`
-  / `bench` exit with a clear message before Vulkan init when the
-  architecture or quantization isn't wired through the forward pass.
-- **Sampling polish** — temperature / top-K / top-P /
-  repetition-penalty pipeline (already shipped in 0.2.x, now properly
-  exposed via CLI flags), plus auto-seed-from-clock so
-  `--temperature 0.7` produces a fresh sequence each run.
-- **Bugfixes** — Vulkan device features (`shaderFloat16`,
-  `vulkanMemoryModel`, `cooperativeMatrix`) properly requested; UTF-8
-  byte-buffer in the streaming path so emoji render correctly mid-token;
-  Sprint-3 era FP8/BF16 probe shaders no longer eager-load by default
-  (16 spurious validation errors → 0).
+| Model + quant                       | Decode (tok/s) | vs llama.cpp |
+|-------------------------------------|---------------:|-------------:|
+| Qwen3-8B-Q3_K_M                     |      **131.1** |   **1.15 ×** |
+| Mistral-7B-Instruct-v0.3 Q4_K_M     |          130.0 |       1.14 × |
+| Meta-Llama-3.1-8B-Instruct Q4_K_M   |          121.1 |       1.06 × |
+| Qwen3-8B-Q4_K_M                     |          109.0 |       0.95 × |
 
-Across the v0.2 → v0.3 arc, 13 decode-gap hypotheses were
-systematically tested and falsified across Sprints 12-15; the 14th —
-the correct 3-stage pipeline shape — delivered the +19 %.
+Sprints 17A → 17D extended the engine across architectures and
+the K-quant family without touching the v0.3.0 decode-async hot
+path:
 
-**Multi-arch support landed in v0.3.2** (Sprint 17A). The forward
-pass and loader were already generic over tensor names, RoPE variant
-was already arch-selected, Q/K-norm was already gated by tensor
-presence, and `ChatTemplate::Llama3` / `Mistral` / `DeepSeekR1` had
-shipped at v0.2.x without ever being wired to the runtime. One line
-in `inference_support()` and one call to `ChatTemplate::detect()`
-unblocked the whole family.
+- **Multi-arch (17A)** — Qwen3 / Qwen2.5 / Llama-3.1 /
+  Mistral-7B / DeepSeek-R1-Distill-Llama. The forward pass and
+  loader were already generic over tensor names; RoPE variant
+  arch-selected; Q/K-norm gated by tensor presence;
+  `ChatTemplate::Llama3 / Mistral / DeepSeekR1` had shipped at
+  v0.2.x without runtime wiring. One line in
+  `inference_support()` + one call to `ChatTemplate::detect()`
+  unblocked the family.
+- **Q3_K (17B)** — decode GEMV + Mmq prefill shaders, byte-identical
+  to llama.cpp upstream. Initial Q3_K_M ship was broken (Sprint
+  17B-debug found Q3_K_M actually contains Q5_K weights for
+  attn_v / ffn_down — the brief had it wrong). Latent
+  `MulMmqQ3KL` L-tile dispatch bug fixed during the debug session.
+- **Q5_K (17C)** — completes the K-quant chain (Q3 → Q4 → Q5 →
+  Q6). Simultaneously fixed Q3_K_M end-to-end and unlocked Q5_K_S
+  / Q5_K_M file_types.
+- **Q4_0 infra (17D)** — shader is bit-exact correct, but Qwen2.5
+  Q4_0 GGUFs need missing Q/K/V bias-add (architectural) plus
+  Q4_1 / Q8_0 shaders for the mixed-quant variants. Q4_0
+  preflight stays gated until the Qwen2.5 sprint.
 
-| Model | Arch | Tokenizer | Chat template | Status |
-|---|---|---|---|---|
-| Qwen3-8B-Q4_K_M | qwen3 | gpt2 / qwen2 | ChatML | ✅ reference |
-| Meta-Llama-3.1-8B-Instruct-Q4_K_M | llama | gpt2 / llama-bpe | Llama3 | ✅ |
-| DeepSeek-R1-Distill-Llama-8B-Q4_K_M | llama | gpt2 / llama-bpe | DeepSeek-R1 | ✅ |
-| Mistral-7B-Instruct-v0.3.Q4_K_M | llama | llama (SPM) | Mistral | ✅ |
+| Model                                | Arch    | Tokenizer        | Chat template | Status      |
+|--------------------------------------|---------|------------------|---------------|-------------|
+| Qwen3-8B Q3_K_M / Q4_K_M             | qwen3   | gpt2 / qwen2     | ChatML        | ✅ reference |
+| Qwen2.5-{0.5B, 7B, 14B} Q4_K_M       | qwen2   | gpt2 / qwen2     | ChatML        | ✅           |
+| Qwen2.5-* Q4_0                       | qwen2   | gpt2 / qwen2     | ChatML        | infra ready, gated (Qwen2.5 needs bias-add) |
+| Meta-Llama-3.1-8B-Instruct Q4_K_M    | llama   | gpt2 / llama-bpe | Llama3        | ✅           |
+| DeepSeek-R1-Distill-Llama-8B Q4_K_M  | llama   | gpt2 / llama-bpe | DeepSeek-R1   | ✅           |
+| Mistral-7B-Instruct-v0.3 Q4_K_M      | llama   | llama (SPM)      | Mistral       | ✅           |
+
+**81 SPIR-V pipelines, 40+ GPU correctness tests, 27/27 lib tests,
+15/15 prompts coherent on Qwen3-8B Q4_K_M @ 109 tok/s.** See
+`INSTALL.md` for setup; sprint reports are in `results/`.
+
+### v0.3.1 surface (still current)
+
+- **`vulkanforge` CLI** with three subcommands — `chat` (REPL with
+  sampling flags + `rustyline` editing), `bench` (decode + pp
+  sweep), `info` (GGUF metadata + GPU info, no weight upload).
+- **GGUF auto-detection + preflight** — `info` works on every GGUF;
+  `chat` / `bench` exit cleanly when the architecture or quant
+  isn't wired through the forward pass.
+- **Sampling** — temperature / top-K / top-P / repetition-penalty
+  with auto-seed-from-clock when `--seed` is unset.
 
 ### Key features (v0.3.0 engine, v0.3.1 surface)
 

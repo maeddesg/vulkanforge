@@ -1,5 +1,97 @@
 # Changelog
 
+## v0.3.2 — multi-arch + K-quant family (2026-05-03)
+
+### Headline
+
+**Qwen3-8B-Q3_K_M decode 131.1 tok/s = 1.15 × llama.cpp Vulkan.**
+Three of four tested configurations now lead llama.cpp:
+
+| Model + quant                     | Decode (tok/s) | vs llama.cpp |
+|-----------------------------------|---------------:|-------------:|
+| Qwen3-8B-Q3_K_M                   |      **131.1** |   **1.15 ×** |
+| Mistral-7B-Instruct-v0.3 Q4_K_M   |          130.0 |       1.14 × |
+| Meta-Llama-3.1-8B-Instruct Q4_K_M |          121.1 |       1.06 × |
+| Qwen3-8B-Q4_K_M                   |          109.0 |       0.95 × |
+
+Prefill peak 3 865 tok/s @ pp=512 (Qwen3-8B-Q4_K_M) unchanged from
+v0.3.0. Async-decode pipeline + coopmat prefill from v0.3.0 carry
+forward.
+
+### Sprint 17A — multi-architecture support
+
+Qwen3 / Qwen2.5 / Llama-3.1 / Mistral-7B / DeepSeek-R1-Distill-Llama
+all run end-to-end on the same forward pass. Pre-check found that
+the loader was already generic over tensor names, RoPE variant was
+already arch-selected, Q/K-norm was already gated by tensor presence,
+and `ChatTemplate::Llama3 / Mistral / DeepSeekR1` had shipped at
+v0.2.x without runtime wiring — one line in `inference_support()`
+to add `"llama"` to the arch whitelist + one call to
+`ChatTemplate::detect()` from the GGUF metadata unblocked the whole
+family. Net source delta: 12 LOC.
+
+### Sprint 17B + 17B-debug — Q3_K shader
+
+Decode GEMV + Mmq prefill shaders for Q3_K, byte-identical to
+llama.cpp upstream. Initial 17B ship was broken — Q3_K_M chat
+emitted `!!!!!!!!!` despite hitting the bandwidth target. The
+debug session ruled out CPU dequant (test added), ruled out the
+GEMV decode shader (test added, bit-exact vs CPU), and pinned the
+root cause in 17C. Also fixed a latent `MulMmqQ3KL` L-tile dispatch
+bug — pipeline_registry pinned BM=128 spec-constants but
+`run_gemm` dispatched with bm=64 groups, causing workgroups to
+race on output tiles.
+
+### Sprint 17C — Q5_K shader (Q3_K_M unblock + Q5_K_M unlock)
+
+`dump_q3k_m_layer0_quant_types` walked every weight in
+`Qwen3-8B-Q3_K_M.gguf` and revealed that `attn_v.weight` and
+`ffn_down.weight` are **Q5_K, not Q4_K** as the Sprint 17B brief
+assumed. Without a Q5_K shader, those tensors fell through to
+`MulMmqQ4K` and read 144-byte blocks out of a 176-byte stride →
+garbage compute → uniform-logit collapse. Sprint 17C copied the
+upstream `mul_mat_vec_q5_k.comp`, added Q5_K to the Mmq build
+defines, ported `dequantize_row_q5_K` to Rust, and wired the
+`GgmlType::Q5K` match arm. Result: Q3_K_M coherent at 131 tok/s and
+Q5_K_S / Q5_K_M file_types unlocked for free (same shader covers
+both bulk-Q5_K models).
+
+### Sprint 17D — Q4_0 shader infrastructure (gated)
+
+Q4_0 the shader ships and is bit-exact vs CPU at every shape
+tested. **No Qwen2.5 Q4_0 GGUF runs end-to-end yet** because the
+brief's "all weights Q4_0" assumption didn't survive contact with
+real GGUFs:
+
+- 7B-Pure: pure Q4_0 — needs Q/K/V bias-add (architectural)
+- 7B / 14B: Q4_1 ffn_down — needs a Q4_1 shader sprint
+- 0.5B: Q8_0 output.weight — needs a Q8_0 shader sprint
+
+`file_type=2` stays gated out of preflight; the infrastructure is
+ready for the future arch-Qwen2.5 sprint. Generic
+`mul_mat_vec.comp` + `dequant_funcs.glsl` from upstream copied as
+the first non-K-quant GEMV path.
+
+### What's tested
+
+- 27 / 27 lib tests
+- 15 / 15 prompts coherent on Qwen3-8B Q4_K_M @ 109 tok/s
+  (`run_15prompt_bench`, unchanged from v0.3.1)
+- Q3_K_M, Q4_K_M, Llama-3.1, Mistral, DeepSeek-R1-Distill all
+  produce coherent reasoning output
+- 9 new diagnostic + GPU-correctness tests across Q3_K, Q5_K, Q4_0
+- 6 new Mmq parity tests in `tests/correctness.rs` (Q3_K + Q5_K)
+- 81 SPIR-V pipelines (was 75 in v0.3.1)
+
+### Limitations
+
+- Qwen2.5 Q4_0 GGUFs gated out of preflight. Cleanest blocker is
+  Q/K/V bias-add (every Qwen2.5 variant); Q4_1 and Q8_0 shaders are
+  smaller follow-on tasks once biases land.
+- Q3_K / Q5_K prefill is Mmq-only (no MulMm coopmat path); Q4_K_M's
+  faster prefill comes from the coopmat path. `MulMmQ3K/Q5KCoopmat`
+  would close that gap if it matters for these quants.
+
 ## v0.3.1 — CLI + auto-detection + sampling polish (2026-05-02)
 
 ### Headline
