@@ -48,6 +48,11 @@ use super::pipeline_registry::PipelineRegistry;
 use super::profiler::{ShaderProfiler, TimingSample};
 use super::shaders::ShaderId;
 
+// Sprint 24-Inline DEBUG — per-channel FP8 GEMV variant SPV. Compiled
+// by build.rs from `vk_shaders/mul_mat_vec_fp8_perchannel.comp`.
+const MUL_MAT_VEC_FP8_PERCHANNEL: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_fp8_perchannel.spv"));
+
 // ---- Phase 5A-2 Stage 2D: descriptor-set cache key ----
 //
 // We cache a `vk::DescriptorSet` per unique binding signature to avoid
@@ -318,6 +323,16 @@ pub struct Forward {
     set_cache: HashMap<BindingSignature, vk::DescriptorSet>,
     cache_enabled: bool,
     pub profiler: Option<ShaderProfiler>,
+
+    // Sprint 24-Inline — Step 0: harness-style FP8 GEMV per-channel
+    // resources, freshly created at Forward construction with the
+    // perchannel SPV variant + null pipeline cache + dedicated
+    // descriptor pool. Used for FP8 GEMV when scale_buffer is Some.
+    fp8pc_shader_module: vk::ShaderModule,
+    fp8pc_dsl: vk::DescriptorSetLayout,
+    fp8pc_pipeline_layout: vk::PipelineLayout,
+    fp8pc_pipeline: vk::Pipeline,
+    fp8pc_pool: vk::DescriptorPool,
 
     rope_theta_scale: f32,
     attn_scale: f32,
@@ -923,6 +938,98 @@ impl Forward {
         let rope_theta_scale =
             (1.0_f32 / config.rope_freq_base).powf(2.0 / config.head_dim as f32);
 
+        // Sprint 24-Inline Step 0 — harness-style FP8 GEMV resources,
+        // built fresh here with PipelineCache::null and a dedicated
+        // descriptor pool. EXACTLY mirrors the layout in
+        // examples/fp8_gemv_standalone.rs that's known to PASS.
+        let (
+            fp8pc_shader_module,
+            fp8pc_dsl,
+            fp8pc_pipeline_layout,
+            fp8pc_pipeline,
+            fp8pc_pool,
+        ) = unsafe {
+            let words: Vec<u32> = MUL_MAT_VEC_FP8_PERCHANNEL
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let module = device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&words),
+                None,
+            )?;
+
+            let dsl_bindings = [
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(0).descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(1).descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(2).descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(3).descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
+            ];
+            let dsl = device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&dsl_bindings),
+                None,
+            )?;
+
+            let push_range = vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .offset(0)
+                .size(std::mem::size_of::<MatVecPushConstants>() as u32);
+            let layouts_arr = [dsl];
+            let push_ranges = [push_range];
+            let pipeline_layout = device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&layouts_arr)
+                    .push_constant_ranges(&push_ranges),
+                None,
+            )?;
+
+            let block_size: u32 = 64;
+            let spec_entries = [vk::SpecializationMapEntry { constant_id: 0, offset: 0, size: 4 }];
+            let spec_data = bytemuck::bytes_of(&block_size);
+            let spec_info = vk::SpecializationInfo::default()
+                .map_entries(&spec_entries)
+                .data(spec_data);
+            let mut subgroup_info = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+                .required_subgroup_size(64);
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(module)
+                .name(c"main")
+                .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
+                .specialization_info(&spec_info)
+                .push_next(&mut subgroup_info);
+            let pipeline = device.create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[vk::ComputePipelineCreateInfo::default()
+                    .stage(stage)
+                    .layout(pipeline_layout)],
+                None,
+            ).map_err(|(_, e)| e)?[0];
+
+            // Pool sized for a full chat: 32 layers * 7 GEMVs * 1024
+            // tokens worst case = 229k sets, way overkill. Pick a more
+            // moderate cap; reset between forwards covers chat use.
+            let pool = device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(8192)
+                    .pool_sizes(&[vk::DescriptorPoolSize {
+                        ty: vk::DescriptorType::STORAGE_BUFFER,
+                        descriptor_count: 8192 * 4,
+                    }])
+                    .flags(vk::DescriptorPoolCreateFlags::empty()),
+                None,
+            )?;
+
+            (module, dsl, pipeline_layout, pipeline, pool)
+        };
+
         Ok(Self {
             slots: [slot0, slot1],
             current_slot: 0,
@@ -965,6 +1072,11 @@ impl Forward {
                 .unwrap_or(false),
             barrier_stats_checked: 0,
             barrier_stats_issued: 0,
+            fp8pc_shader_module,
+            fp8pc_dsl,
+            fp8pc_pipeline_layout,
+            fp8pc_pipeline,
+            fp8pc_pool,
         })
     }
 
@@ -1386,15 +1498,36 @@ impl Forward {
         let scale_q = layer_weight_scale_scalar(model, layer, "attn_q.weight");
         let scale_k = layer_weight_scale_scalar(model, layer, "attn_k.weight");
         let scale_v = layer_weight_scale_scalar(model, layer, "attn_v.weight");
-        self.run_gemv(dev, registry, cmd, sq,
-                      wq, self.cur().hidden_norm.handle, self.cur().q_buf.handle,
-                      cfg.hidden_dim, cfg.n_heads * cfg.head_dim, scale_q, "gemv_q");
-        self.run_gemv(dev, registry, cmd, sk,
-                      wk, self.cur().hidden_norm.handle, self.cur().k_buf.handle,
-                      cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, scale_k, "gemv_k");
-        self.run_gemv(dev, registry, cmd, sv,
-                      wv, self.cur().hidden_norm.handle, self.cur().v_buf.handle,
-                      cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, scale_v, "gemv_v");
+        // Sprint 24-Inline Step 0 — route FP8 weights through the
+        // harness-style per-channel path when a scale buffer exists.
+        let sb_q = layer_weight_scale_buf(model, layer, "attn_q.weight");
+        let sb_k = layer_weight_scale_buf(model, layer, "attn_k.weight");
+        let sb_v = layer_weight_scale_buf(model, layer, "attn_v.weight");
+        let q_h = self.cur().q_buf.handle;
+        let k_h = self.cur().k_buf.handle;
+        let v_h = self.cur().v_buf.handle;
+        let in_h = self.cur().hidden_norm.handle;
+        if let Some(s) = sb_q {
+            self.run_gemv_fp8_perchannel(dev, cmd, wq, s, in_h, q_h,
+                cfg.hidden_dim, cfg.n_heads * cfg.head_dim, "gemv_q");
+        } else {
+            self.run_gemv(dev, registry, cmd, sq, wq, in_h, q_h,
+                cfg.hidden_dim, cfg.n_heads * cfg.head_dim, scale_q, "gemv_q");
+        }
+        if let Some(s) = sb_k {
+            self.run_gemv_fp8_perchannel(dev, cmd, wk, s, in_h, k_h,
+                cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, "gemv_k");
+        } else {
+            self.run_gemv(dev, registry, cmd, sk, wk, in_h, k_h,
+                cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, scale_k, "gemv_k");
+        }
+        if let Some(s) = sb_v {
+            self.run_gemv_fp8_perchannel(dev, cmd, wv, s, in_h, v_h,
+                cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, "gemv_v");
+        } else {
+            self.run_gemv(dev, registry, cmd, sv, wv, in_h, v_h,
+                cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, scale_v, "gemv_v");
+        }
         if matches!(halt, DebugTarget::QProj | DebugTarget::KProj | DebugTarget::VProj) {
             return;
         }
@@ -1625,6 +1758,12 @@ impl Forward {
 
     pub fn destroy(self, device: &ash::Device, allocator: &mut Allocator) {
         unsafe {
+            // Sprint 24-Inline cleanup
+            device.destroy_descriptor_pool(self.fp8pc_pool, None);
+            device.destroy_pipeline(self.fp8pc_pipeline, None);
+            device.destroy_pipeline_layout(self.fp8pc_pipeline_layout, None);
+            device.destroy_descriptor_set_layout(self.fp8pc_dsl, None);
+            device.destroy_shader_module(self.fp8pc_shader_module, None);
             device.destroy_descriptor_pool(self.descriptor_pool, None);
             // Sprint 15E — async CB pool + fences.
             for f in self.async_fences {
@@ -1730,15 +1869,30 @@ impl Forward {
         let scale_q = layer_weight_scale_scalar(model, layer, "attn_q.weight");
         let scale_k = layer_weight_scale_scalar(model, layer, "attn_k.weight");
         let scale_v = layer_weight_scale_scalar(model, layer, "attn_v.weight");
-        self.run_gemv(dev, registry, cmd, sq,
-                      wq, hidden_norm, q_buf,
-                      cfg.hidden_dim, cfg.n_heads * cfg.head_dim, scale_q, "gemv_q");
-        self.run_gemv(dev, registry, cmd, sk,
-                      wk, hidden_norm, k_buf,
-                      cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, scale_k, "gemv_k");
-        self.run_gemv(dev, registry, cmd, sv,
-                      wv, hidden_norm, v_buf,
-                      cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, scale_v, "gemv_v");
+        let sb_q = layer_weight_scale_buf(model, layer, "attn_q.weight");
+        let sb_k = layer_weight_scale_buf(model, layer, "attn_k.weight");
+        let sb_v = layer_weight_scale_buf(model, layer, "attn_v.weight");
+        if let Some(s) = sb_q {
+            self.run_gemv_fp8_perchannel(dev, cmd, wq, s, hidden_norm, q_buf,
+                cfg.hidden_dim, cfg.n_heads * cfg.head_dim, "gemv_q");
+        } else {
+            self.run_gemv(dev, registry, cmd, sq, wq, hidden_norm, q_buf,
+                cfg.hidden_dim, cfg.n_heads * cfg.head_dim, scale_q, "gemv_q");
+        }
+        if let Some(s) = sb_k {
+            self.run_gemv_fp8_perchannel(dev, cmd, wk, s, hidden_norm, k_buf,
+                cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, "gemv_k");
+        } else {
+            self.run_gemv(dev, registry, cmd, sk, wk, hidden_norm, k_buf,
+                cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, scale_k, "gemv_k");
+        }
+        if let Some(s) = sb_v {
+            self.run_gemv_fp8_perchannel(dev, cmd, wv, s, hidden_norm, v_buf,
+                cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, "gemv_v");
+        } else {
+            self.run_gemv(dev, registry, cmd, sv, wv, hidden_norm, v_buf,
+                cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, scale_v, "gemv_v");
+        }
         self.mark_written(&[q_buf, k_buf, v_buf]);
         // Next: (c) reads q_buf, k_buf (or (d) RoPE if no qk_norm).
         self.maybe_compute_barrier(dev, cmd, &[q_buf, k_buf]);
@@ -1840,9 +1994,14 @@ impl Forward {
         let wo = layer_weight(model, layer, "attn_output.weight");
         let so = layer_weight_shader(model, layer, "attn_output.weight", self.mul_mat_vec_subgroup_enabled);
         let scale_o = layer_weight_scale_scalar(model, layer, "attn_output.weight");
-        self.run_gemv(dev, registry, cmd, so,
-                      wo, attn_out, o_buf,
-                      cfg.n_heads * cfg.head_dim, cfg.hidden_dim, scale_o, "gemv_o");
+        let sb_o = layer_weight_scale_buf(model, layer, "attn_output.weight");
+        if let Some(s) = sb_o {
+            self.run_gemv_fp8_perchannel(dev, cmd, wo, s, attn_out, o_buf,
+                cfg.n_heads * cfg.head_dim, cfg.hidden_dim, "gemv_o");
+        } else {
+            self.run_gemv(dev, registry, cmd, so, wo, attn_out, o_buf,
+                cfg.n_heads * cfg.head_dim, cfg.hidden_dim, scale_o, "gemv_o");
+        }
         self.mark_written(&[o_buf]);
         // Next: (h+i) reads input + o_buf.
         self.maybe_compute_barrier(dev, cmd, &[input, o_buf]);
@@ -1870,12 +2029,22 @@ impl Forward {
         let su = layer_weight_shader(model, layer, "ffn_up.weight", self.mul_mat_vec_subgroup_enabled);
         let scale_g = layer_weight_scale_scalar(model, layer, "ffn_gate.weight");
         let scale_u = layer_weight_scale_scalar(model, layer, "ffn_up.weight");
-        self.run_gemv(dev, registry, cmd, sg,
-                      wg, hidden_norm, gate_buf,
-                      cfg.hidden_dim, cfg.ffn_dim, scale_g, "gemv_gate");
-        self.run_gemv(dev, registry, cmd, su,
-                      wu, hidden_norm, up_buf,
-                      cfg.hidden_dim, cfg.ffn_dim, scale_u, "gemv_up");
+        let sb_g = layer_weight_scale_buf(model, layer, "ffn_gate.weight");
+        let sb_u = layer_weight_scale_buf(model, layer, "ffn_up.weight");
+        if let Some(s) = sb_g {
+            self.run_gemv_fp8_perchannel(dev, cmd, wg, s, hidden_norm, gate_buf,
+                cfg.hidden_dim, cfg.ffn_dim, "gemv_gate");
+        } else {
+            self.run_gemv(dev, registry, cmd, sg, wg, hidden_norm, gate_buf,
+                cfg.hidden_dim, cfg.ffn_dim, scale_g, "gemv_gate");
+        }
+        if let Some(s) = sb_u {
+            self.run_gemv_fp8_perchannel(dev, cmd, wu, s, hidden_norm, up_buf,
+                cfg.hidden_dim, cfg.ffn_dim, "gemv_up");
+        } else {
+            self.run_gemv(dev, registry, cmd, su, wu, hidden_norm, up_buf,
+                cfg.hidden_dim, cfg.ffn_dim, scale_u, "gemv_up");
+        }
         self.mark_written(&[gate_buf, up_buf]);
         // Next: (k+l) swiglu reads gate_buf + up_buf.
         self.maybe_compute_barrier(dev, cmd, &[gate_buf, up_buf]);
@@ -1896,9 +2065,14 @@ impl Forward {
         let wd = layer_weight(model, layer, "ffn_down.weight");
         let sd = layer_weight_shader(model, layer, "ffn_down.weight", self.mul_mat_vec_subgroup_enabled);
         let scale_d = layer_weight_scale_scalar(model, layer, "ffn_down.weight");
-        self.run_gemv(dev, registry, cmd, sd,
-                      wd, ffn_hidden, ffn_out,
-                      cfg.ffn_dim, cfg.hidden_dim, scale_d, "gemv_down");
+        let sb_d = layer_weight_scale_buf(model, layer, "ffn_down.weight");
+        if let Some(s) = sb_d {
+            self.run_gemv_fp8_perchannel(dev, cmd, wd, s, ffn_hidden, ffn_out,
+                cfg.ffn_dim, cfg.hidden_dim, "gemv_down");
+        } else {
+            self.run_gemv(dev, registry, cmd, sd, wd, ffn_hidden, ffn_out,
+                cfg.ffn_dim, cfg.hidden_dim, scale_d, "gemv_down");
+        }
         self.mark_written(&[ffn_out]);
         // Next: (n) residual2 reads res1 + ffn_out.
         self.maybe_compute_barrier(dev, cmd, &[res1, ffn_out]);
@@ -2067,6 +2241,13 @@ impl Forward {
                 self.descriptor_pool,
                 vk::DescriptorPoolResetFlags::empty(),
             )?;
+            // Sprint 24-Inline — reset the dedicated FP8 per-channel pool
+            // alongside the main one. Sets allocated last forward become
+            // free again.
+            dev.device.reset_descriptor_pool(
+                self.fp8pc_pool,
+                vk::DescriptorPoolResetFlags::empty(),
+            )?;
         }
         self.set_cache.clear();
         // Sprint 12D — also reset the barrier-elision tracker so the
@@ -2180,6 +2361,69 @@ impl Forward {
         if let (Some(p), Some(t)) = (self.profiler.as_mut(), token) {
             p.end(&dev.device, cmd, t);
         }
+    }
+
+    /// Sprint 24-Inline Step 0 — harness-style FP8 per-channel GEMV
+    /// dispatch, using the dedicated `fp8pc_*` resources created in
+    /// `Forward::new` with `PipelineCache::null` and a 4-binding DSL.
+    /// Allocates a fresh descriptor set per call from the dedicated
+    /// pool (no caching, no sharing with other shaders).
+    #[allow(clippy::too_many_arguments)]
+    fn run_gemv_fp8_perchannel(
+        &mut self,
+        dev: &VulkanDevice,
+        cmd: vk::CommandBuffer,
+        weights: vk::Buffer,
+        scale: vk::Buffer,
+        input: vk::Buffer,
+        output: vk::Buffer,
+        k: u32,
+        m: u32,
+        label: &str,
+    ) {
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.fp8pc_pool)
+            .set_layouts(std::slice::from_ref(&self.fp8pc_dsl));
+        let set = unsafe { dev.device.allocate_descriptor_sets(&alloc_info) }
+            .expect("fp8pc descriptor set alloc")[0];
+
+        let infos = [
+            vk::DescriptorBufferInfo::default().buffer(weights).offset(0).range(vk::WHOLE_SIZE),
+            vk::DescriptorBufferInfo::default().buffer(input).offset(0).range(vk::WHOLE_SIZE),
+            vk::DescriptorBufferInfo::default().buffer(output).offset(0).range(vk::WHOLE_SIZE),
+            vk::DescriptorBufferInfo::default().buffer(scale).offset(0).range(vk::WHOLE_SIZE),
+        ];
+        let writes: Vec<vk::WriteDescriptorSet> = (0..4)
+            .map(|i| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(i as u32)
+                    .descriptor_count(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(&infos[i]))
+            })
+            .collect();
+        unsafe { dev.device.update_descriptor_sets(&writes, &[]) };
+
+        let pc = MatVecPushConstants {
+            ncols: k, stride_a: k, stride_b: k, stride_d: m,
+            batch_stride_a: k * m, batch_stride_b: k, batch_stride_d: m,
+            fusion_flags: 0, base_work_group_y: 0,
+            ne02: 1, ne12: 1, broadcast2: 1,
+            broadcast3: 1u32,
+        };
+        let pipeline = self.fp8pc_pipeline;
+        let layout = self.fp8pc_pipeline_layout;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, m, 1, 1);
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
