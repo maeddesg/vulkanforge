@@ -3249,7 +3249,21 @@ impl Forward {
         k: u32,
         label: &'static str,
     ) {
-        let kernel = registry.get(ShaderId::MulCoopmatFp8Naive);
+        // Sprint 21B — multi-WG kernel (BM=64, 4 subgroups share
+        // the activation tile in LDS). Wins on big-prefill shapes
+        // (~+6% at pp=406) but the larger workgroup hurts at very
+        // small N where the dispatch is already small enough that
+        // 4× fewer WGs starves the GPU. Empirical crossover lands
+        // around N=64; gating on `m >= 64 && n >= 64` keeps the
+        // single-tile kernel for short prompts and decode-style
+        // batches that ever route through prefill.
+        let multi_wg = m >= 64 && n >= 64;
+        let shader = if multi_wg {
+            ShaderId::MulCoopmatFp8MultiWg
+        } else {
+            ShaderId::MulCoopmatFp8Naive
+        };
+        let kernel = registry.get(shader);
         let set = self.alloc_or_get_set(
             dev, kernel.descriptor_set_layout,
             &[
@@ -3265,7 +3279,8 @@ impl Forward {
             stride_c: m,
             weight_scale_bits: weight_scale.to_bits(),
         };
-        let groups_x = (m + 15) / 16;
+        let bm = if multi_wg { 64u32 } else { 16u32 };
+        let groups_x = (m + bm - 1) / bm;
         let groups_y = (n + 15) / 16;
         let layout = kernel.pipeline_layout;
         let pipeline = kernel.pipeline;

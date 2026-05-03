@@ -61,6 +61,12 @@ pub enum ShaderId {
     /// FP8-FP8-FP32 path gave the same 1.18× ceiling but with
     /// activation-clipping risk).
     MulCoopmatFp8Naive,
+    /// Sprint 21B — multi-WG FP8 GEMM. 4 Wave64 subgroups per
+    /// workgroup share one 16×16 activation tile in LDS, each
+    /// running one 16×16 WMMA along the M axis → 64×16 output
+    /// tile per WG. Same numerics as `MulCoopmatFp8Naive`,
+    /// dispatched whenever `pc.m >= 64`.
+    MulCoopmatFp8MultiWg,
     RmsNorm,
     RopeNorm,
     RopeNeox,
@@ -330,6 +336,7 @@ impl ShaderId {
             ShaderId::MulMatVecFp8 => "mul_mat_vec_fp8",
             ShaderId::MulMatVecF32 => "mul_mat_vec_f32",
             ShaderId::MulCoopmatFp8Naive => "mul_coopmat_fp8_naive",
+            ShaderId::MulCoopmatFp8MultiWg => "mul_coopmat_fp8_multi_wg",
             ShaderId::RmsNorm => "rms_norm_f32",
             ShaderId::RopeNorm => "rope_norm_f32",
             ShaderId::RopeNeox => "rope_neox_f32",
@@ -436,6 +443,7 @@ impl ShaderId {
             ShaderId::MulMatVecFp8 => MUL_MAT_VEC_FP8,
             ShaderId::MulMatVecF32 => MUL_MAT_VEC_F32,
             ShaderId::MulCoopmatFp8Naive => MUL_COOPMAT_FP8_NAIVE,
+            ShaderId::MulCoopmatFp8MultiWg => MUL_COOPMAT_FP8_MULTI_WG,
             ShaderId::RmsNorm => RMS_NORM_F32,
             ShaderId::RopeNorm => ROPE_NORM_F32,
             ShaderId::RopeNeox => ROPE_NEOX_F32,
@@ -549,6 +557,7 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::MulMatVecFp8,
     ShaderId::MulMatVecF32,
     ShaderId::MulCoopmatFp8Naive,
+    ShaderId::MulCoopmatFp8MultiWg,
     ShaderId::RmsNorm,
     ShaderId::RopeNorm,
     ShaderId::RopeNeox,
@@ -685,6 +694,8 @@ pub const MUL_MAT_VEC_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_f32.spv"));
 pub const MUL_COOPMAT_FP8_NAIVE: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_fp8_naive.spv"));
+pub const MUL_COOPMAT_FP8_MULTI_WG: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_fp8_multi_wg.spv"));
 pub const RMS_NORM_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm_f32.spv"));
 pub const ROPE_NORM_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope_norm_f32.spv"));
 pub const ROPE_NEOX_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope_neox_f32.spv"));

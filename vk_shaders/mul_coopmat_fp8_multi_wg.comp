@@ -1,0 +1,191 @@
+#version 460
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_float_e4m3 : require
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_bfloat16 : enable
+
+// Sprint 21B — multi-WG FP8 GEMM. 4 subgroups × 16×16 WMMA each =
+// 64×16 output tile per workgroup. The activation (B) tile is
+// loaded **once per K-step** and reused by all four subgroups —
+// this is the lever Sprint 12M used on Q4_K (~+30-50% extra over
+// the aligned-load baseline).
+//
+// Shape:
+//   BM = 64     (output rows per WG)
+//   BN = 16     (output cols per WG)
+//   BK = 16     (K-step granularity = WMMA K)
+//   BLOCK_SIZE = 256 = 4 × Wave64
+//   Subgroup grid: SG_M = 4 (along M), SG_N = 1
+//
+// Layouts (matches `Forward::run_gemm_fp8_naive` push constants):
+//   A : FP8 weights        [M × K] row-major, 1 byte / elem,
+//                          uint-packed (4 FP8 / uint32) in BufA
+//   B : FP32 activations   [N × K] row-major
+//   C : FP32 output        [N × M] row-major, stride_c = M
+//
+// Numerics: same BF16-narrow path as the single-tile kernel
+// (FP8 → FP32 → BF16 in LDS, BF16 × BF16 → FP32 WMMA), per-tensor
+// `weight_scale` applied post-WMMA in the LDS-staged store loop.
+//
+// Routing: `Forward::run_gemm_fp8_naive` picks this kernel when
+// pc.m >= 64. For pc.m < 64 the single-tile kernel
+// (`MulCoopmatFp8Naive`) is still required.
+#define ELEM_TYPE bfloat16_t
+
+const uint BLOCK_SIZE = 256;
+const uint BM         = 64;
+const uint BN         = 16;
+const uint BK         = 16;
+const uint TM         = 16;   // WMMA M
+const uint TN         = 16;   // WMMA N
+const uint TK         = 16;   // WMMA K
+const uint NUM_SG     = BLOCK_SIZE / 64; // 4
+
+// LDS strides — +1 element per row to break bank-conflict
+// patterns for the BF16 staging.
+const uint A_STRIDE = BK + 1;
+const uint B_STRIDE = BN + 1;
+const uint C_STRIDE = BN + 1;   // staged FP32 store buffer
+
+shared ELEM_TYPE buf_a[BM * A_STRIDE];   //  64 * 17 = 1088 bf16 ≈ 2.1 KB
+shared ELEM_TYPE buf_b[BK * B_STRIDE];   //  16 * 17 =  272 bf16 ≈ 0.5 KB
+shared float     buf_c[BM * C_STRIDE];   //  64 * 17 = 1088 f32  ≈ 4.3 KB
+//                                          total LDS ≈ 6.9 KB; fits in
+//                                          one CU's 64 KiB LDS budget
+//                                          with plenty of headroom.
+
+layout(local_size_x = BLOCK_SIZE) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufA { uint  data_a[]; };
+layout(set = 0, binding = 1) readonly  buffer BufB { float b[]; };
+layout(set = 0, binding = 2) writeonly buffer BufC { float c[]; };
+
+layout(push_constant) uniform PC {
+    uint m;
+    uint n;
+    uint k;
+    uint stride_a;
+    uint stride_b;
+    uint stride_c;
+    uint weight_scale_bits;
+} pc;
+
+void main() {
+    const uint wg_m = gl_WorkGroupID.x * BM;
+    const uint wg_n = gl_WorkGroupID.y * BN;
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint sg   = gl_SubgroupID;          // 0..3, 4 SGs along M
+    const uint sg_m_base = sg * TM;            // sub-tile row offset in BM
+
+    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> acc =
+        coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
+
+    // A-load thread mapping: 256 threads cover BM × (BK/4) = 64 × 4
+    // (each thread loads 1 uint32 = 4 contiguous FP8 bytes).
+    const uint a_row    = tid >> 2;            // 0..63
+    const uint a_k_base = (tid & 3u) * 4u;     // 0, 4, 8, 12
+
+    // B-load uses only the first 64 threads (BK*BN = 16*16 = 256 / 4).
+    const uint b_n      = tid >> 2;            // 0..15 when tid<64
+    const uint b_k_base = (tid & 3u) * 4u;
+
+    for (uint kk = 0; kk < pc.k; kk += BK) {
+        // ---- A: 256 threads × 1 uint32 each = 256 reads = 1024 FP8 → BF16 ----
+        const uint global_row    = wg_m + a_row;
+        const uint a_gk_base     = kk + a_k_base;
+        const bool row_in_bounds = global_row < pc.m;
+        const bool a_word_full   = row_in_bounds && (a_gk_base + 3u < pc.k);
+        uint word = 0u;
+        if (a_word_full) {
+            const uint elem_idx = global_row * pc.stride_a + a_gk_base;
+            word = data_a[elem_idx >> 2u];
+        } else if (row_in_bounds) {
+            // Tail (pc.k % 4 != 0) — defensive; real model shapes are
+            // multiples of 4 in K so this branch is never taken.
+            for (uint w = 0u; w < 4u; w++) {
+                const uint gk = a_gk_base + w;
+                if (gk < pc.k) {
+                    const uint ei = global_row * pc.stride_a + gk;
+                    const uint sh = (ei & 3u) * 8u;
+                    word |= (data_a[ei >> 2u] & (0xFFu << sh));
+                }
+            }
+        }
+        [[unroll]] for (uint w = 0u; w < 4u; w++) {
+            const uint8_t byte = uint8_t((word >> (w * 8u)) & 0xFFu);
+            buf_a[a_row * A_STRIDE + a_k_base + w] =
+                ELEM_TYPE(float(uintBitsToFloate4m3EXT(byte)));
+        }
+
+        // ---- B: first 64 threads × 1 vec4 = 64 reads × 4 = 256 FP32 → BF16 ----
+        // The activation tile (16×16) is shared across all 4
+        // subgroups → 4× fewer global reads than the single-tile
+        // kernel.
+        if (tid < 64u) {
+            const uint b_gn      = wg_n + b_n;
+            const uint b_gk_base = kk + b_k_base;
+            const bool b_full    = b_gn < pc.n && (b_gk_base + 3u < pc.k);
+            vec4 act4 = vec4(0.0);
+            if (b_full) {
+                const uint base = b_gn * pc.stride_b + b_gk_base;
+                act4 = vec4(b[base + 0u], b[base + 1u], b[base + 2u], b[base + 3u]);
+            } else if (b_gn < pc.n) {
+                for (uint w = 0u; w < 4u; w++) {
+                    const uint gk = b_gk_base + w;
+                    if (gk < pc.k) {
+                        act4[w] = b[b_gn * pc.stride_b + gk];
+                    }
+                }
+            }
+            buf_b[(b_k_base + 0u) * B_STRIDE + b_n] = ELEM_TYPE(act4.x);
+            buf_b[(b_k_base + 1u) * B_STRIDE + b_n] = ELEM_TYPE(act4.y);
+            buf_b[(b_k_base + 2u) * B_STRIDE + b_n] = ELEM_TYPE(act4.z);
+            buf_b[(b_k_base + 3u) * B_STRIDE + b_n] = ELEM_TYPE(act4.w);
+        }
+
+        barrier();
+
+        // ---- WMMA: each subgroup runs ONE 16×16 MulAdd ----
+        coopmat<ELEM_TYPE, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> matA;
+        coopmat<ELEM_TYPE, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> matB;
+        coopMatLoad(matA, buf_a, sg_m_base * A_STRIDE, A_STRIDE,
+                    gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB, buf_b, 0u, B_STRIDE,
+                    gl_CooperativeMatrixLayoutRowMajor);
+        acc = coopMatMulAdd(matA, matB, acc);
+
+        barrier();
+    }
+
+    // ---- Stage acc to LDS, then per-thread bounds-checked write ----
+    // [N × M] global layout (matches the single-tile kernel and the
+    // run_gemm_fp8_naive contract): each subgroup stores its 16×16
+    // tile into its sub-region of buf_c, then 256 threads cooperate
+    // to drain buf_c (64 × 16 = 1024 elements / 256 threads = 4 each).
+    coopMatStore(acc, buf_c, sg_m_base * C_STRIDE, C_STRIDE,
+                 gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+
+    const float weight_scale = uintBitsToFloat(pc.weight_scale_bits);
+    [[unroll]] for (uint w = 0u; w < 4u; w++) {
+        const uint fidx    = w * BLOCK_SIZE + tid;   // 0..1023
+        const uint m_local = fidx / BN;              // 0..63
+        const uint n_local = fidx & (BN - 1u);       // 0..15
+        const uint gm      = wg_m + m_local;
+        const uint gn      = wg_n + n_local;
+        if (gm < pc.m && gn < pc.n) {
+            c[gn * pc.stride_c + gm] =
+                buf_c[m_local * C_STRIDE + n_local] * weight_scale;
+        }
+    }
+}

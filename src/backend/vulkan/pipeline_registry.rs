@@ -591,7 +591,8 @@ impl PipelineRegistry {
                 | ShaderId::MulCoopmatQ4KNaiveBf16
                 | ShaderId::MulCoopmatQ4KNaivePaddedBf16
                 | ShaderId::MulCoopmatQ4KNaivePaddedFp8
-                | ShaderId::MulCoopmatFp8Naive => {
+                | ShaderId::MulCoopmatFp8Naive
+                | ShaderId::MulCoopmatFp8MultiWg => {
                     // No spec constants; BLOCK_SIZE=64, TILE=16
                     // are `const uint` in the shader source. The
                     // requiredSubgroupSize=64 pin matches the

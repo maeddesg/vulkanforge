@@ -1082,6 +1082,15 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "mul_coopmat_fp8_naive.comp",
         defines: &[],
     },
+    // Sprint 21B — multi-WG FP8 GEMM. 4 Wave64 subgroups share an
+    // activation tile in LDS (Sprint 12M analogue: 4× fewer B-side
+    // global reads than the single-tile kernel). 64×16 output tile
+    // per workgroup, BF16-narrow WMMA, FP32 accumulator.
+    ShaderJob {
+        out_name: "mul_coopmat_fp8_multi_wg.spv",
+        entry_source: "mul_coopmat_fp8_multi_wg.comp",
+        defines: &[],
+    },
     // Sprint 19A — Q3_K mul_mm.comp variants (FP16 WMMA prefill).
     // Mirror the Q4_K/Q6_K coopmat coverage so Q3_K_M GGUFs no longer
     // fall back to integer-MMQ for prefill GEMM. The Q3_K branch in
