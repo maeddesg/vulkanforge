@@ -1383,9 +1383,9 @@ impl Forward {
         let sq = layer_weight_shader(model, layer, "attn_q.weight", self.mul_mat_vec_subgroup_enabled);
         let sk = layer_weight_shader(model, layer, "attn_k.weight", self.mul_mat_vec_subgroup_enabled);
         let sv = layer_weight_shader(model, layer, "attn_v.weight", self.mul_mat_vec_subgroup_enabled);
-        let scale_q = layer_weight_scale(model, layer, "attn_q.weight");
-        let scale_k = layer_weight_scale(model, layer, "attn_k.weight");
-        let scale_v = layer_weight_scale(model, layer, "attn_v.weight");
+        let scale_q = layer_weight_scale_scalar(model, layer, "attn_q.weight");
+        let scale_k = layer_weight_scale_scalar(model, layer, "attn_k.weight");
+        let scale_v = layer_weight_scale_scalar(model, layer, "attn_v.weight");
         self.run_gemv(dev, registry, cmd, sq,
                       wq, self.cur().hidden_norm.handle, self.cur().q_buf.handle,
                       cfg.hidden_dim, cfg.n_heads * cfg.head_dim, scale_q, "gemv_q");
@@ -1727,9 +1727,9 @@ impl Forward {
         let sq = layer_weight_shader(model, layer, "attn_q.weight", self.mul_mat_vec_subgroup_enabled);
         let sk = layer_weight_shader(model, layer, "attn_k.weight", self.mul_mat_vec_subgroup_enabled);
         let sv = layer_weight_shader(model, layer, "attn_v.weight", self.mul_mat_vec_subgroup_enabled);
-        let scale_q = layer_weight_scale(model, layer, "attn_q.weight");
-        let scale_k = layer_weight_scale(model, layer, "attn_k.weight");
-        let scale_v = layer_weight_scale(model, layer, "attn_v.weight");
+        let scale_q = layer_weight_scale_scalar(model, layer, "attn_q.weight");
+        let scale_k = layer_weight_scale_scalar(model, layer, "attn_k.weight");
+        let scale_v = layer_weight_scale_scalar(model, layer, "attn_v.weight");
         self.run_gemv(dev, registry, cmd, sq,
                       wq, hidden_norm, q_buf,
                       cfg.hidden_dim, cfg.n_heads * cfg.head_dim, scale_q, "gemv_q");
@@ -1839,7 +1839,7 @@ impl Forward {
         // (g) Output projection.
         let wo = layer_weight(model, layer, "attn_output.weight");
         let so = layer_weight_shader(model, layer, "attn_output.weight", self.mul_mat_vec_subgroup_enabled);
-        let scale_o = layer_weight_scale(model, layer, "attn_output.weight");
+        let scale_o = layer_weight_scale_scalar(model, layer, "attn_output.weight");
         self.run_gemv(dev, registry, cmd, so,
                       wo, attn_out, o_buf,
                       cfg.n_heads * cfg.head_dim, cfg.hidden_dim, scale_o, "gemv_o");
@@ -1868,8 +1868,8 @@ impl Forward {
         let wu = layer_weight(model, layer, "ffn_up.weight");
         let sg = layer_weight_shader(model, layer, "ffn_gate.weight", self.mul_mat_vec_subgroup_enabled);
         let su = layer_weight_shader(model, layer, "ffn_up.weight", self.mul_mat_vec_subgroup_enabled);
-        let scale_g = layer_weight_scale(model, layer, "ffn_gate.weight");
-        let scale_u = layer_weight_scale(model, layer, "ffn_up.weight");
+        let scale_g = layer_weight_scale_scalar(model, layer, "ffn_gate.weight");
+        let scale_u = layer_weight_scale_scalar(model, layer, "ffn_up.weight");
         self.run_gemv(dev, registry, cmd, sg,
                       wg, hidden_norm, gate_buf,
                       cfg.hidden_dim, cfg.ffn_dim, scale_g, "gemv_gate");
@@ -1895,7 +1895,7 @@ impl Forward {
         // (m) FFN down — Q6_K in Q4_K_M, Q4_K otherwise.
         let wd = layer_weight(model, layer, "ffn_down.weight");
         let sd = layer_weight_shader(model, layer, "ffn_down.weight", self.mul_mat_vec_subgroup_enabled);
-        let scale_d = layer_weight_scale(model, layer, "ffn_down.weight");
+        let scale_d = layer_weight_scale_scalar(model, layer, "ffn_down.weight");
         self.run_gemv(dev, registry, cmd, sd,
                       wd, ffn_hidden, ffn_out,
                       cfg.ffn_dim, cfg.hidden_dim, scale_d, "gemv_down");
@@ -2198,11 +2198,6 @@ impl Forward {
         label: &str,
     ) {
         let kernel = registry.get(shader);
-        // Sprint 20-M3 — `MulMatVecFp8` and `MulMatVecF32` declare
-        // only 3 bindings (weight/input/output); their fuse dummies
-        // get dead-stripped by spirv-opt because nothing reads them.
-        // The K-quant GEMVs keep all 5 bindings live because their
-        // fusion-mask dispatcher actually reads `fuse0`/`fuse1`.
         let one_per_row = matches!(
             shader,
             ShaderId::MulMatVecFp8 | ShaderId::MulMatVecF32 | ShaderId::MulMatVecF16,
@@ -2228,9 +2223,8 @@ impl Forward {
                 ],
             )
         };
-        // Sprint 20-M3 — `broadcast3` is repurposed as the
-        // per-tensor weight scale (FP8 / F32 GEMVs read it; K-quant
-        // GEMVs ignore it).
+        // FP8 GEMV reads `weight_scale` from `broadcast3` as float;
+        // F32/F16/K-quant ignore the slot.
         let pc = MatVecPushConstants {
             ncols: k, stride_a: k, stride_b: k, stride_d: m,
             batch_stride_a: k * m, batch_stride_b: k, batch_stride_d: m,
@@ -4812,7 +4806,12 @@ fn layer_weight_opt(model: &LoadedModel, layer: u32, suffix: &str) -> Option<vk:
     model.tensor(&key).map(|t| t.buffer.handle)
 }
 
-fn layer_weight_scale(model: &LoadedModel, layer: u32, suffix: &str) -> f32 {
+/// Sprint 24A — Returns the per-tensor weight_scale scalar (1.0 for
+/// per-channel models, GGUF tensors, and unquantized SafeTensors).
+/// Consumed by the FP8 GEMV decode path via push-constant.
+/// Per-channel decode coherence requires the GEMM path (binding 3
+/// scale buffer) — Sprint 25 follow-up.
+fn layer_weight_scale_scalar(model: &LoadedModel, layer: u32, suffix: &str) -> f32 {
     let key = format!("blk.{layer}.{suffix}");
     model
         .tensor(&key)
@@ -4822,8 +4821,10 @@ fn layer_weight_scale(model: &LoadedModel, layer: u32, suffix: &str) -> f32 {
 
 /// Sprint 24A — Returns the weight_scale buffer handle for an FP8
 /// layer weight. `None` for unquantized tensors and for GGUF models;
-/// the FP8 GEMM dispatch sites bind it to descriptor slot 3 of the
-/// `MulCoopmatFp8*` kernels.
+/// the FP8 GEMM dispatch sites bind it to descriptor slot 3 of
+/// the `MulCoopmatFp8*` kernels. Per-tensor models have the on-disk
+/// scalar pre-broadcast to `[out_dim]` at upload time so the kernel
+/// always indexes `scale[row]`.
 fn layer_weight_scale_buf(model: &LoadedModel, layer: u32, suffix: &str) -> Option<vk::Buffer> {
     let key = format!("blk.{layer}.{suffix}");
     model

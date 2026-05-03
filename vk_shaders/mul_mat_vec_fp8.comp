@@ -41,9 +41,7 @@ layout (binding = 4) readonly buffer Fuse1Dummy { uint _fuse1_dummy[]; };
 
 // Layout matches `MatVecPushConstants` (13 × u32 = 52 B). The last
 // slot — `broadcast3` in the GGUF struct — is repurposed as the FP8
-// per-tensor scale (the GGUF GEMV always passes 1 there). Caller is
-// `Forward::run_gemv_fp8`, which writes `weight_scale.to_bits()` into
-// that field at dispatch time.
+// per-tensor scale (the GGUF GEMV always passes 1 there).
 layout (push_constant) uniform parameter {
     uint  ncols;
     uint  stride_a;
