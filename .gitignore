@@ -4,3 +4,4 @@ captures/
 .claude/
 VP_VULKANINFO_*.json
 docs/
+results/
