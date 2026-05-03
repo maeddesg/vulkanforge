@@ -1,0 +1,159 @@
+#version 460
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_float_e4m3 : require
+#extension GL_EXT_scalar_block_layout : enable
+
+// Sprint 20-GEMM — native FP8 E4M3 GEMM prefill kernel.
+//
+// Cloned from `mul_coopmat_q4k_naive.comp` (Sprint 1B / 3C). Only the
+// weight load + dequant section was replaced; the WMMA shape, LDS
+// staging, K-loop, and store path are byte-identical to the BF16
+// template (with the narrow type swapped to floate4m3_t).
+//
+// Memory layout matches the Q4_K naive kernel so it slots into a
+// parallel `Forward::run_gemm_fp8_naive` dispatcher with the same
+// (M, N, K, stride_a, stride_b, stride_c) push constants:
+//   * A : FP8 weights        [M × K] row-major, 1 byte / element
+//                            (uint-packed into BufA — 4 FP8 / uint)
+//   * B : FP32 activations   [N × K] row-major (= batch_norm)
+//   * C : FP32 output        [N × M] row-major (= mul_mmq layout)
+//
+// Per-tensor `weight_scale` (FP32) lives in `pc.weight_scale_bits`
+// (read via `uintBitsToFloat`). It is applied during the LDS-staged
+// store loop — one scalar multiply per element, free.
+//
+// The brief considered FP8-FP8 → FP32 native WMMA (the "1.18×"
+// option from Sprint 18B). We follow the safer route used by the
+// Q4_K naive kernel: convert FP8 → BF16 (sufficient mantissa to
+// preserve a 36-layer transformer) and run BF16 × BF16 → FP32 WMMA.
+// FP8-FP8 WMMA with FP32 accumulator gave the same 1.18× ceiling
+// in Sprint 18B but adds activation-clipping risk (FP8 max = 448).
+// The BF16 narrow path keeps numerics matching M3's per-token GEMV.
+#define ELEM_TYPE bfloat16_t
+#extension GL_EXT_bfloat16 : enable
+
+const uint BLOCK_SIZE = 64;       // 1 Wave64 = 1 Subgroup
+const uint TILE       = 16;       // WMMA M = N = K = 16
+const uint A_STRIDE   = TILE + 1; // 17 elem (bank-conflict break)
+const uint B_STRIDE   = TILE + 1;
+
+shared ELEM_TYPE buf_a[TILE * A_STRIDE];
+shared ELEM_TYPE buf_b[TILE * B_STRIDE];
+shared float     buf_c[TILE * (TILE + 1)];   // 1088 B; safe-path store
+
+layout(local_size_x = BLOCK_SIZE) in;
+
+// FP8 weights — packed 4 per uint32 to match the SafeTensors loader's
+// raw upload (no row stride padding; row k starts at byte k*K).
+layout(set = 0, binding = 0) readonly  buffer BufA { uint  data_a[]; };
+layout(set = 0, binding = 1) readonly  buffer BufB { float b[]; };
+layout(set = 0, binding = 2) writeonly buffer BufC { float c[]; };
+
+layout(push_constant) uniform PC {
+    uint m;                  // output rows (= hidden_dim or ffn_dim)
+    uint n;                  // batch tokens (= seq_len during prefill)
+    uint k;                  // input cols   (= hidden_dim or ffn_dim)
+    uint stride_a;           // = K (logical row stride of weights, in elements)
+    uint stride_b;           // = K (B is [N, K] row-major)
+    uint stride_c;           // = M (C is [N, M] row-major)
+    uint weight_scale_bits;  // f32::to_bits(weight_scale) per-tensor
+} pc;
+
+// Read a single FP8 byte from the packed uint32 weight buffer and
+// convert to FP32. Stride_a is in *elements*, so byte offset matches
+// element offset.
+float fp8_load(uint global_row, uint global_col) {
+    const uint elem_idx = global_row * pc.stride_a + global_col;
+    const uint word     = data_a[elem_idx >> 2u];
+    const uint shift    = (elem_idx & 3u) * 8u;
+    const uint8_t byte  = uint8_t((word >> shift) & 0xFFu);
+    return float(uintBitsToFloate4m3EXT(byte));
+}
+
+void main() {
+    const uint wg_m = gl_WorkGroupID.x * TILE;
+    const uint wg_n = gl_WorkGroupID.y * TILE;
+    const uint tid  = gl_LocalInvocationID.x;
+
+    coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> acc =
+        coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
+
+    // A-side thread mapping (matches the Q4_K naive template):
+    // 4 threads per row × 16 rows = 64. Each thread covers
+    // PER_THREAD_K = 4 contiguous K positions per K-step.
+    const uint a_row    = tid / 4u;          // 0..15
+    const uint a_k_base = (tid & 3u) * 4u;   // 0, 4, 8, 12
+
+    const uint global_row    = wg_m + a_row;
+    const bool row_in_bounds = global_row < pc.m;
+
+    for (uint kk = 0; kk < pc.k; kk += TILE) {
+        // ---- A load: FP8 → FP32 → BF16 → LDS ----
+        [[unroll]] for (uint w = 0; w < 4u; w++) {
+            const uint k_idx = a_k_base + w;
+            const uint gk    = kk + k_idx;
+            float val_f32 = 0.0;
+            if (row_in_bounds && gk < pc.k) {
+                val_f32 = fp8_load(global_row, gk);
+            }
+            buf_a[a_row * A_STRIDE + k_idx] = ELEM_TYPE(val_f32);
+        }
+
+        // ---- B load: FP32 → BF16 → LDS ----
+        // Same shape as the Q4_K template: 64 threads × 4 elements
+        // per K-step = 256 elements (TILE × TILE).
+        [[unroll]] for (uint w = 0; w < 4u; w++) {
+            const uint fidx  = w * BLOCK_SIZE + tid;
+            const uint k_idx = fidx / TILE;
+            const uint n_idx = fidx & (TILE - 1u);
+            const uint gk    = kk + k_idx;
+            const uint gn    = wg_n + n_idx;
+            const bool ok    = gk < pc.k && gn < pc.n;
+            const float vf   = ok ? b[gn * pc.stride_b + gk] : 0.0;
+            buf_b[k_idx * B_STRIDE + n_idx] = ELEM_TYPE(vf);
+        }
+
+        barrier();
+
+        coopmat<ELEM_TYPE, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> matA;
+        coopmat<ELEM_TYPE, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> matB;
+        coopMatLoad(matA, buf_a, 0u, A_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB, buf_b, 0u, B_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        acc = coopMatMulAdd(matA, matB, acc);
+
+        barrier();
+    }
+
+    // ---- Store: 16×16 tile → output [N, M] row-major, scaled ----
+    // Stage acc into LDS RowMajor, then per-thread bounds-checked
+    // write while applying weight_scale. The Q4_K template's
+    // PADDED_OUTPUT fast path is omitted for now — the SafeTensors
+    // prefill driver doesn't pad N to multiples of 16 yet.
+    const uint C_STRIDE = TILE + 1u;
+    coopMatStore(acc, buf_c, 0u, C_STRIDE,
+                 gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+
+    const float weight_scale = uintBitsToFloat(pc.weight_scale_bits);
+    [[unroll]] for (uint w = 0; w < 4u; w++) {
+        const uint fidx    = w * BLOCK_SIZE + tid;
+        const uint m_local = fidx / TILE;
+        const uint n_local = fidx & (TILE - 1u);
+        const uint gm      = wg_m + m_local;
+        const uint gn      = wg_n + n_local;
+        if (gm < pc.m && gn < pc.n) {
+            c[gn * pc.stride_c + gm] =
+                buf_c[m_local * C_STRIDE + n_local] * weight_scale;
+        }
+    }
+}

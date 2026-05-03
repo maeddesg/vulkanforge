@@ -590,7 +590,12 @@ impl PipelineRegistry {
                 | ShaderId::MulCoopmatQ4KFwdBn16
                 | ShaderId::MulCoopmatQ4KNaiveBf16
                 | ShaderId::MulCoopmatQ4KNaivePaddedBf16
-                | ShaderId::MulCoopmatQ4KNaivePaddedFp8 => {
+                | ShaderId::MulCoopmatQ4KNaivePaddedFp8
+                | ShaderId::MulCoopmatFp8Naive => {
+                    // No spec constants; BLOCK_SIZE=64, TILE=16
+                    // are `const uint` in the shader source. The
+                    // requiredSubgroupSize=64 pin matches the
+                    // Q4_K naive kernel's wave assumption.
                     ComputeKernel::from_spv(device, &words, cache)
                 }
             };

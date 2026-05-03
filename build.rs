@@ -1072,6 +1072,16 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "mul_mat_vec_f32.comp",
         defines: &[],
     },
+    // Sprint 20-GEMM — native FP8 GEMM prefill kernel for
+    // SafeTensors models. Cloned from `mul_coopmat_q4k_naive.comp`
+    // (Sprint 1B / 3C); only the weight load is FP8-aware. Targets
+    // pp ≤ 256 prefill (one Wave64 per 16×16 output tile, naive
+    // geometry — no aligned / large-tile SPV variants in this sprint).
+    ShaderJob {
+        out_name: "mul_coopmat_fp8_naive.spv",
+        entry_source: "mul_coopmat_fp8_naive.comp",
+        defines: &[],
+    },
     // Sprint 19A — Q3_K mul_mm.comp variants (FP16 WMMA prefill).
     // Mirror the Q4_K/Q6_K coopmat coverage so Q3_K_M GGUFs no longer
     // fall back to integer-MMQ for prefill GEMM. The Q3_K branch in
