@@ -1,5 +1,176 @@
 # Changelog
 
+## v0.3.4 — native FP8 LLM, multi-submit prefill, Q3_K coopmat (2026-05-03)
+
+### Headline
+
+**First Vulkan engine to run a complete FP8 LLM end-to-end.**
+`Meta-Llama-3.1-8B-Instruct-FP8` (HuggingFace SafeTensors,
+`compressed-tensors` per-tensor) loads natively without
+unpacking, runs greedy-coherent chat, and fits a 16 GiB
+consumer GPU at:
+
+| Metric                | Value     |
+|-----------------------|----------:|
+| GPU footprint         | 7.48 GiB  |
+| Decode                | 68.5 t/s  |
+| Prefill @ pp=512      | 695 t/s   |
+| Coherence (greedy)    | "The answer to 2+2 is 4." (bit-identical across sprints) |
+
+Carries forward all v0.3.3 GGUF Q4_K_M / Q3_K_M decode wins —
+VulkanForge still beats llama.cpp Vulkan decode on 4 / 5 configs
+(FP16 KV) and 5 / 5 configs (FP8 KV).
+
+### Sprint 19A — Q3_K + Q5_K coopmat prefill
+
+Ported the Q4_K coopmat shader pattern (`mul_coopmat_q4k_naive` +
+the dequant scaffolding in `dequant_head.glsl`) to Q3_K and Q5_K.
+Q3_K_M GGUFs now hit the WMMA prefill path instead of falling
+back to scalar mmq, and Q5_K_M is wired for any future model
+that ships in that quant.
+
+### Sprint 19A correctness fix — example binary rebuild
+
+`cargo build --release` does not relink `target/release/examples/*`
+after a `src/` edit. Bench numbers were 2 274 → 3 536 tok/s after
+adding `--examples` to the build command. Captured as a memory
+note for future sprints.
+
+### Sprint 19B — compute-graph plan analysis (research)
+
+Read llama.cpp's `ggml-vulkan.cpp` (~17 000 LOC) to identify the
+remaining levers behind its prefill lead. Conclusion: buffer
+aliasing is **not** the gap; the levers are **multi-submit
+pacing** (split the prefill graph into sub-submits) and **fusion**
+(KV-write fusion, post-attn-add+norm fusion). Multi-submit became
+Sprint 19B-A; KV-write fusion was tested in 19B-B.
+
+### Sprint 19B-A — multi-submit prefill pacing
+
+Mirrored llama.cpp's "submit every 100 graph nodes" pattern. The
+prefill `Forward::prefill_batch` path now allocates a small
+`prefill_pool` of command buffers + a `prefill_fence`, builds
+`layers_per_submit` chunks of layers per CB, submits, lets the
+GPU start, builds the next chunk in parallel. **Neutral on
+Q4_K_M prefill** (already CPU-record-hidden for that quant), but
+the infrastructure is the prerequisite for any future graph-level
+fusion work.
+
+### Sprint 19B-B — KV-write fusion (honest negative)
+
+Tried to fuse `kv_copy_fp16` (or `kv_store_fp8`) into the QKV-proj
+GEMM dispatch. Negative result on RDNA4: the KV-write is already
+~0.1 % of prefill wall-time; fusion adds shader-source
+complexity for unmeasurable gain. Branch reverted, report
+preserved (`results/v034_sprint19b_b_kv_fusion.md`).
+
+### Sprint 20 — Native FP8 LLM Support (3 milestones)
+
+End-to-end FP8 SafeTensors → native FP8 GEMV → end-to-end FP8
+chat:
+
+- **20-M1** — HuggingFace SafeTensors loader. Single-file +
+  sharded (`*.safetensors.index.json`); `compressed-tensors`
+  quantization config support; per-tensor scale extraction;
+  `hf_to_vf_name()` mapping. Supports F8E4M3, F8E5M2, F16, BF16,
+  F32 dtypes. New: `src/safetensors.rs` (~310 LOC), new:
+  `src/hf_config.rs` (~150 LOC).
+- **20-M2** — `mul_mat_vec_fp8.comp` GEMV decode kernel. Reads
+  weights as `floate4m3_t` via `uintBitsToFloate4m3EXT`, accumulates
+  into FP32, post-multiplies by `weight_scale` push-constant.
+  Same dispatch shape as the F32 GEMV; binding count matches the
+  FP32 / FP16 GEMVs after spirv-opt strips unused fuse dummies.
+- **20-M3** — End-to-end FP8 chat for
+  `Meta-Llama-3.1-8B-Instruct-FP8`. `vulkanforge chat
+  --tokenizer-from <gguf-or-hf-repo>` borrows the tokenizer from
+  a sibling GGUF or HF repo (the FP8 SafeTensors release ships
+  weights without `tokenizer.json`). Greedy output: "The answer
+  to 2+2 is 4."
+
+### Sprint 20-GEMM + 20-Wire — FP8 GEMM prefill
+
+`mul_coopmat_fp8_naive.comp` does the FP8 GEMM prefill via
+the BF16-narrow-fragment WMMA path
+(`VK_KHR_cooperative_matrix` 16×16×16 BF16, FP32 accumulator).
+Layout: A = `[M×K]` row-major FP8, B = `[N×K]` row-major FP32,
+C = `[N×M]` row-major FP32. Sprint 20-Wire wired this kernel
+into `dispatch_layer_batch` with an `is_fp8_layer_weight`
+branch; FP8 prefill went from 8.7 s (FP8→FP32 dequant +
+F32 GEMM fallback) to 695 tok/s @ pp=512.
+
+### Sprint 21A — Aligned-load FP8 GEMM
+
+Reshaped the inner loop to read 4 contiguous FP8 bytes per A-side
+thread (1 uint32 / thread) and 4 contiguous K-positions per B-side
+thread (vec4 / thread). Cuts memory-instruction count, raising
+single-tile FP8 GEMM throughput at typical prefill shapes.
+
+### Sprint 21B — Multi-WG FP8 GEMM
+
+`mul_coopmat_fp8_multi_wg.comp` — 4 Wave64 subgroups per WG, 64×16
+output tile, adapted from the BF16 `mul_coopmat_bf16` BN=16 mode.
+Gated on `m ≥ 64 && n ≥ 64` to prevent regression at small pp
+(first run regressed −10 % at pp=28 when ungated).
+
+### Sprint 21C — bench --tokenizer-from
+
+`vulkanforge bench --tokenizer-from <hf-or-gguf>` borrows a
+tokenizer for a SafeTensors model so the bench harness can run
+pp-sweeps on FP8 builds with no on-disk `tokenizer.json`.
+
+### Sprint 22 — --max-context CLI flag
+
+`--max-context <N>` on `chat` and `bench` overrides the model's
+default KV-cache capacity, so long-context prefill (pp > 4096) is
+selectable from the CLI without source edits.
+
+### Sprint 22B — Skip embed_tokens GPU upload (−1.96 GiB)
+
+When `output.weight` (`lm_head`) is present in the SafeTensors
+map and the config does not tie embeddings, the `token_embd.weight`
+GPU upload is skipped — the embedding lookup runs from the
+host-side Vec<f32> already loaded for the prefill warm-up. Saves
+1.96 GiB on Llama-3.1-FP8 (10.42 → 8.46 GiB).
+
+### Sprint 22C — FP16 lm_head (−0.98 GiB, +9 % decode)
+
+`lm_head.weight` is now narrowed BF16 → FP16 at load time (was
+BF16 → FP32 expansion). New shader `mul_mat_vec_f16.comp` reads
+weights as `uint[]`, decodes via `unpackHalf2x16`. Halves
+lm_head GEMV's VRAM bandwidth and yields a free **+9 % decode**
+on top of the −0.98 GiB VRAM win. lm_head bit-identical greedy
+output before / after.
+
+Cumulative VRAM saved by Sprints 22B + 22C: **−2.94 GiB
+(−28.2 %)** on Llama-3.1-FP8.
+
+### Sprint 23 — Qwen2.5-14B FP8 (honest negative)
+
+Pre-check stopped this sprint. `larryvrh/Qwen2.5-14B-Instruct-FP8`
+uses **per-channel** weight scaling (`strategy: "channel"`),
+incompatible with VF's per-tensor FP8 GEMV/GEMM kernels. Bias-add
+without per-channel support would land an unusable loader path.
+No code committed; model preserved at
+`~/models/Qwen2.5-14B-Instruct-FP8/` for a future per-channel
+sprint. Full report in
+`results/v034_sprint23_qwen25_14b_fp8.md`.
+
+VRAM viability for 14B FP8 confirmed: ~14.5 GiB total fits 16 GiB
+once per-channel scale buffers + bias-add land.
+
+### Stats
+
+- **102 SPIR-V pipelines** (was 87 in v0.3.3; +15 in v0.3.4:
+  FP8 GEMV + 3 FP8 GEMM variants + Q3_K/Q5_K coopmat S/M/L tiles
+  + FP16 lm_head GEMV + supporting variants)
+- **37 lib tests** + 40+ GPU correctness tests (was 32 lib in
+  v0.3.3; +5 SafeTensors / hf_config / FP8 GEMM helper tests)
+- ~1 800 LOC net delta over v0.3.3 across the 19A / 19B-A / 20
+  (M1+M2+M3+GEMM+Wire) / 21A / 21B / 21C / 22 / 22B / 22C
+  sprints (Sprint 23 added 0 LOC; only an honest-negative report)
+- Llama-3.1-8B-FP8: **7.48 GiB GPU, 68.5 tok/s decode,
+  695 tok/s prefill @ pp=512**
+
 ## v0.3.3 — native FP8 KV cache + benchmark dominance (2026-05-03)
 
 ### Headline

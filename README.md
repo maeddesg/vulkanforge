@@ -4,16 +4,32 @@ A Vulkan-based LLM inference engine in Rust, targeting AMD RDNA 4 (`gfx1201`).
 Compute-only — no swapchain, no graphics queues — built directly on `ash 0.38`
 (Vulkan 1.3) rather than a higher-level wrapper.
 
+> This project builds on the foundational work of
+> [oldnordic](https://github.com/oldnordic/ROCmForge).
+> Without his original ROCmForge implementation — the model
+> loader, the CPU inference path, the GGUF parser, and the
+> overall architecture — none of the WMMA matrix-core
+> optimisations, the multi-model support, or the interactive
+> chat CLI would have been possible. Thank you for making
+> this project a reality.
+
 ## Status
 
-**v0.3.3 — faster than llama.cpp on every tested config, native
-FP8 KV cache.** Decode wins on 5 / 5 model+quant combinations
-with `VULKANFORGE_KV_FP8=1`, and 4 / 5 with the default FP16-KV
-path. Best absolute decode: **133.7 tok/s on Qwen3-8B-Q3_K_M with
-FP8 KV** (1.04 × llama.cpp Vulkan). FP8 KV halves cache VRAM
-(Qwen3-8B: 288 MB → 144 MB) with 15 / 15 prompts coherent on the
-regression suite — quality indistinguishable from FP16 in spot
-checks.
+**v0.3.4 — native FP8 LLM end-to-end, multi-submit prefill,
+Q3_K / Q5_K coopmat, 14B-class headroom on 16 GiB.** First
+Vulkan engine to run a full FP8 chat:
+`Meta-Llama-3.1-8B-Instruct-FP8` lands at **7.48 GiB GPU
+footprint, 68.5 tok/s decode, 695 tok/s prefill @ pp=512**
+with greedy-coherent output. Adds native FP8 SafeTensors
+loading (compressed-tensors per-tensor), an FP8 GEMV decode
+kernel, three FP8 GEMM prefill kernels (naive + aligned +
+multi-WG), Q3_K / Q5_K coopmat prefill, multi-submit prefill
+pacing, a `--max-context` CLI flag, and two VRAM optimisations
+that together cut Llama-3.1-FP8's footprint by **−2.94 GiB
+(−28.2 %)** and yield a free **+9 % decode**. All v0.3.3 GGUF
+Q4_K_M / Q3_K_M decode wins carry forward — VulkanForge still
+beats llama.cpp Vulkan decode on 4 / 5 configs (FP16 KV) and
+5 / 5 configs (FP8 KV).
 
 ### Decode performance (tok/s, higher is better)
 
@@ -64,23 +80,63 @@ Enable: `VULKANFORGE_KV_FP8=1`. Quality indistinguishable from
 FP16: 15 / 15 coherent on `run_15prompt_bench`, multi-turn KV
 recall verified end-to-end.
 
+### Native FP8 LLM (SafeTensors, v0.3.4)
+
+VulkanForge runs `compressed-tensors` per-tensor FP8 LLMs end-to-end
+without unpacking to FP16/BF16. The reference model is
+`neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8`:
+
+| Model + quant                          | VRAM (GPU) | Decode    | Prefill @ pp=512 |
+|----------------------------------------|-----------:|----------:|-----------------:|
+| Meta-Llama-3.1-8B-Instruct-FP8         |  7.48 GiB  | 68.5 t/s  |   695 t/s        |
+
+Components:
+
+- HuggingFace SafeTensors loader (`compressed-tensors` per-tensor
+  format) — single-file or sharded (`*.safetensors.index.json`)
+- FP8 GEMV decode kernel (`mul_mat_vec_fp8.comp`, Sprint 20-M2)
+- FP8 GEMM prefill kernels (naive + aligned + multi-WG variants,
+  Sprints 20-GEMM / 21A / 21B); multi-WG path gates on `m ≥ 64
+  && n ≥ 64` to avoid pp ≤ 32 regression
+- BF16 → FP16 narrow-load `lm_head` GEMV (`mul_mat_vec_f16.comp`,
+  Sprint 22C) — halves the lm_head GEMV's VRAM bandwidth and
+  yields the +9 % decode bonus
+
+Run an FP8 chat:
+
+```bash
+vulkanforge chat --model ~/models/Meta-Llama-3.1-8B-Instruct-FP8 \
+                 --tokenizer-from ~/models/Meta-Llama-3.1-8B-Instruct
+```
+
+Per-channel FP8 (`strategy: "channel"` — used by Qwen2.5-14B-FP8
+community builds) is **not yet supported**: it requires per-row
+scale buffers in the GEMV/GEMM kernels (Sprint 23 honest-negative
+report — `results/v034_sprint23_qwen25_14b_fp8.md`). 14B FP8 fits
+the 16 GiB VRAM budget (~14.5 GiB total) once that lands.
+
 ### Multi-architecture support
 
-| Model                                | Arch    | Tokenizer        | Chat template | Status      |
-|--------------------------------------|---------|------------------|---------------|-------------|
-| Qwen3-8B Q3_K_M / Q4_K_M             | qwen3   | gpt2 / qwen2     | ChatML        | ✅ reference |
-| Qwen2.5-{0.5B, 7B, 14B} Q4_K_M       | qwen2   | gpt2 / qwen2     | ChatML        | ✅           |
-| Meta-Llama-3.1-8B-Instruct Q4_K_M    | llama   | gpt2 / llama-bpe | Llama3        | ✅           |
-| DeepSeek-R1-Distill-Llama-8B Q4_K_M  | llama   | gpt2 / llama-bpe | DeepSeek-R1   | ✅           |
-| Mistral-7B-Instruct-v0.3 Q4_K_M      | llama   | llama (SPM)      | Mistral       | ✅           |
-| Qwen2.5-* Q4_0                       | qwen2   | gpt2 / qwen2     | ChatML        | infra ready, gated (Qwen2.5 needs bias-add) |
+| Model                                  | Arch / format       | Tokenizer        | Chat template | Status      |
+|----------------------------------------|---------------------|------------------|---------------|-------------|
+| Qwen3-8B Q3_K_M / Q4_K_M               | qwen3 / GGUF        | gpt2 / qwen2     | ChatML        | ✅ reference |
+| Qwen2.5-{0.5B, 7B, 14B} Q4_K_M         | qwen2 / GGUF        | gpt2 / qwen2     | ChatML        | ✅           |
+| Meta-Llama-3.1-8B-Instruct Q4_K_M      | llama / GGUF        | gpt2 / llama-bpe | Llama3        | ✅           |
+| Meta-Llama-3.1-8B-Instruct-FP8         | llama / SafeTensors | gpt2 / llama-bpe | Llama3        | ✅ native FP8 |
+| DeepSeek-R1-Distill-Llama-8B Q4_K_M    | llama / GGUF        | gpt2 / llama-bpe | DeepSeek-R1   | ✅           |
+| Mistral-7B-Instruct-v0.3 Q4_K_M        | llama / GGUF        | llama (SPM)      | Mistral       | ✅           |
+| Qwen2.5-14B-Instruct-FP8 (per-channel) | qwen2 / SafeTensors | gpt2 / qwen2     | ChatML        | infra ready, gated (per-channel scale + bias-add — Sprint 23 honest-negative) |
 
-**87 SPIR-V pipelines, 32 lib tests + 40+ GPU correctness tests,
+**102 SPIR-V pipelines, 37 lib tests + 40+ GPU correctness tests,
 15 / 15 prompts coherent on Qwen3-8B Q4_K_M.** See
 `INSTALL.md` for setup; sprint reports are in `results/`.
 
 ### What VulkanForge does that llama.cpp Vulkan doesn't
 
+- **Native FP8 LLM end-to-end** (v0.3.4) — load HuggingFace
+  SafeTensors with `compressed-tensors` per-tensor FP8, run chat
+  on a single 16 GiB consumer GPU at 7.48 GiB VRAM /
+  68.5 tok/s decode. No FP8→BF16 unpack at load time.
 - **Native FP8 E4M3 KV cache** via `VK_EXT_shader_float8` — half
   the cache VRAM, +1–4 % decode, equal coherence (Sprint 18A).
 - **3-stage async-pipelined decode** — CPU command-recording
@@ -88,16 +144,6 @@ recall verified end-to-end.
   put VulkanForge over the llama.cpp line).
 - **Single-binary deployment** — one `vulkanforge` binary,
   ~10 MB, no external dependencies beyond Mesa.
-
-### The journey
-
-| Version | Date       | Decode (Qwen3-8B Q4_K_M) | Prefill pp=512 | vs llama.cpp |
-|---------|------------|-------------------------:|---------------:|-------------:|
-| v0.2.0  | 2026-04-29 |   90.5 tok/s             |  2 255 tok/s   |   0.79 / 0.52 × |
-| v0.2.2  | 2026-05-01 |   91.0                   |  3 863         |   0.80 / 0.89 × |
-| v0.3.0  | 2026-05-02 |  109.0                   |  3 865         |   0.95 / 0.89 × |
-| v0.3.2  | 2026-05-03 |  109.0 (Q4) / 131.1 (Q3) |  3 865         |   0.95 / 1.15 × |
-| v0.3.3  | 2026-05-03 | **118.5** (Q4) / **133.7** (Q3) | **3 778** | **1.05 / 1.04 ×** |
 
 ### CLI surface (v0.3.1+)
 
@@ -222,9 +268,10 @@ cargo run --release               # Phase 0 device-init smoke
 cargo test --release              # 176 tests across 7 binaries (27 lib, 149 integration)
 ```
 
-The build compiles 72 SPIR-V binaries (53 in v0.2.0, 65 in v0.2.1,
-68 in v0.2.2, 70 in v0.2.3 with f16-accumulator coopmat, +2 in
-v0.2.4: Q4_K and Q6_K subgroup GEMV variants).
+The build compiles 102 SPIR-V binaries (53 in v0.2.0, 65 in v0.2.1,
+68 in v0.2.2, 70 in v0.2.3, 72 in v0.2.4, 87 in v0.3.3, +15 in
+v0.3.4: FP8 GEMV + 3 FP8 GEMM variants + Q3_K/Q5_K coopmat S/M/L
+tiles + FP16 lm_head GEMV).
 
 MSRV is **Rust 1.85** (edition 2024). Build dependencies require a working
 `shaderc` install (the `shaderc-sys` crate); on Arch / CachyOS this is
@@ -281,6 +328,8 @@ vulkanforge chat --model ~/models/Qwen3-8B-Q4_K_M.gguf \
 | `--repetition-penalty` | 1.0     | `>1.0` discourages repeating prior tokens     |
 | `--seed`               | clock   | RNG seed; explicit value pins reproducibility |
 | `--no-think-filter`    | (on)    | Disable the `<think>…</think>` filter         |
+| `--tokenizer-from`     | —       | Borrow `tokenizer.json` from a sibling repo (FP8 SafeTensors only, v0.3.4) |
+| `--max-context`        | model default | Override KV-cache capacity for long-context chat (v0.3.4) |
 
 Each flag has a `VF_*` env-var fallback (`VF_TEMPERATURE`, `VF_SEED`,
 …) so containerised setups don't need argv plumbing.
