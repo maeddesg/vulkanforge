@@ -1400,6 +1400,23 @@ impl Forward {
         }
         compute_barrier(dev, cmd);
 
+        // Sprint 24B — Q/K/V bias-add (Qwen2 attention biases). Skipped
+        // for architectures without biases (Llama, Qwen3, Mistral).
+        let q_dim = cfg.n_heads * cfg.head_dim;
+        let kv_dim = cfg.n_kv_heads * cfg.head_dim;
+        let q_bias = layer_weight_opt(model, layer, "attn_q.bias");
+        let k_bias = layer_weight_opt(model, layer, "attn_k.bias");
+        let v_bias = layer_weight_opt(model, layer, "attn_v.bias");
+        if q_bias.is_some() || k_bias.is_some() || v_bias.is_some() {
+            let q_buf = self.cur().q_buf.handle;
+            let k_buf = self.cur().k_buf.handle;
+            let v_buf = self.cur().v_buf.handle;
+            if let Some(b) = q_bias { self.run_bias_add(dev, registry, cmd, q_buf, b, q_buf, q_dim, 1, "bias_q"); }
+            if let Some(b) = k_bias { self.run_bias_add(dev, registry, cmd, k_buf, b, k_buf, kv_dim, 1, "bias_k"); }
+            if let Some(b) = v_bias { self.run_bias_add(dev, registry, cmd, v_buf, b, v_buf, kv_dim, 1, "bias_v"); }
+            compute_barrier(dev, cmd);
+        }
+
         // Q/K norm — Qwen-only (Phase 4D: gated on cfg.has_qk_norm).
         if cfg.has_qk_norm {
             let wqn = layer_weight(model, layer, "attn_q_norm.weight");
@@ -2828,6 +2845,60 @@ impl Forward {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Sprint 24B — Broadcast-aware bias-add. Computes `d = a + b`
+    /// where `a` is `[rows × dim]` and `b` is `[dim]`. Used for the
+    /// Q/K/V projection biases on Qwen2-style architectures. Decode
+    /// passes `rows = 1` (single-token), prefill passes `rows = seq_len`.
+    /// Llama-style models without biases skip this dispatch entirely.
+    #[allow(clippy::too_many_arguments)]
+    fn run_bias_add(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        a: vk::Buffer,
+        b: vk::Buffer,
+        d: vk::Buffer,
+        dim: u32,
+        rows: u32,
+        label: &str,
+    ) {
+        let kernel = registry.get(ShaderId::Add);
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[(0, a, 0, 0), (1, b, 0, 0), (2, d, 0, 0)],
+        );
+        let total = dim * rows;
+        // Broadcast pattern: a is [dim × rows] (4D shape: [dim, rows, 1, 1]);
+        // b is [dim] (4D shape: [dim, 1, 1, 1]). The shader's `fastmod`
+        // path on `src1_idx` clamps i01 to 0 when ne11 == 1, giving
+        // bias[i00] for every row.
+        let pc = GenericBinaryPushConstants {
+            ne: total,
+            ne00: dim, ne01: rows, ne02: 1, ne03: 1,
+            nb00: 1, nb01: dim, nb02: total, nb03: total,
+            ne10: dim, ne11: 1, ne12: 1, ne13: 1,
+            nb10: 1, nb11: dim, nb12: dim, nb13: dim,
+            ne20: dim, ne21: rows, ne22: 1, ne23: 1,
+            nb20: 1, nb21: dim, nb22: total, nb23: total,
+            misalign_offsets: 0,
+            param1: 0.0, param2: 0.0, param3: 0,
+        };
+        let dispatch_y = (total + 511) / 512;
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, 1, dispatch_y, 1);
+        });
+    }
+
     fn run_binary(
         &mut self,
         dev: &VulkanDevice,
@@ -3985,6 +4056,22 @@ impl Forward {
         }
         compute_barrier(dev, cmd);
 
+        // Sprint 24B — Q/K/V bias-add (Qwen2 attention biases). Skipped
+        // for architectures without biases (Llama / Qwen3 / Mistral).
+        // Broadcasts the [dim] bias over the seq_len rows in batch_q/k/v.
+        let q_bias_b = layer_weight_opt(model, layer, "attn_q.bias");
+        let k_bias_b = layer_weight_opt(model, layer, "attn_k.bias");
+        let v_bias_b = layer_weight_opt(model, layer, "attn_v.bias");
+        if q_bias_b.is_some() || k_bias_b.is_some() || v_bias_b.is_some() {
+            let bq = self.batch_q.handle;
+            let bk = self.batch_k.handle;
+            let bv = self.batch_v.handle;
+            if let Some(b) = q_bias_b { self.run_bias_add(dev, registry, cmd, bq, b, bq, q_dim, seq_len, "bias_q_b"); }
+            if let Some(b) = k_bias_b { self.run_bias_add(dev, registry, cmd, bk, b, bk, kv_dim, seq_len, "bias_k_b"); }
+            if let Some(b) = v_bias_b { self.run_bias_add(dev, registry, cmd, bv, b, bv, kv_dim, seq_len, "bias_v_b"); }
+            compute_barrier(dev, cmd);
+        }
+
         // ---- (d) Q/K-norm + RoPE + KV-cache write ----
         //
         // Two paths:
@@ -4717,6 +4804,14 @@ fn layer_weight(model: &LoadedModel, layer: u32, suffix: &str) -> vk::Buffer {
 /// scale for SafeTensors FP8 tensors. `run_gemv` always writes this
 /// value into push-constant `broadcast3`; only the FP8/F32 shaders
 /// read the slot.
+/// Sprint 24B — Optional layer weight (returns `None` if absent).
+/// Used for the Qwen2 attention biases that don't appear on Llama /
+/// Qwen3 / Mistral models.
+fn layer_weight_opt(model: &LoadedModel, layer: u32, suffix: &str) -> Option<vk::Buffer> {
+    let key = format!("blk.{layer}.{suffix}");
+    model.tensor(&key).map(|t| t.buffer.handle)
+}
+
 fn layer_weight_scale(model: &LoadedModel, layer: u32, suffix: &str) -> f32 {
     let key = format!("blk.{layer}.{suffix}");
     model

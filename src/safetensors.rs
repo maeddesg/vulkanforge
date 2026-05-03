@@ -274,6 +274,11 @@ pub fn hf_to_vf_name(hf: &str) -> Option<String> {
         // Llama-3 doesn't carry these.
         "self_attn.q_norm.weight" => "attn_q_norm.weight",
         "self_attn.k_norm.weight" => "attn_k_norm.weight",
+        // Sprint 24B — Qwen2-style attention biases. Expanded to FP32
+        // at load time and applied after Q/K/V GEMV/GEMM, before RoPE.
+        "self_attn.q_proj.bias" => "attn_q.bias",
+        "self_attn.k_proj.bias" => "attn_k.bias",
+        "self_attn.v_proj.bias" => "attn_v.bias",
         _ => return None,
     };
     Some(format!("blk.{layer}.{vf_suffix}"))
