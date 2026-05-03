@@ -1,0 +1,88 @@
+#version 450
+
+// Sprint 24-Harness — per-channel FP8 E4M3 GEMV variant.
+//
+// Same dispatch shape and reduction as `mul_mat_vec_fp8.comp` (the
+// production per-tensor decode kernel) but with `scale[row]` read from
+// a length-`M` FP32 SSBO at binding 3 instead of from a push-constant
+// scalar. Per-tensor models populate the buffer by broadcasting the
+// on-disk scalar to all M positions; per-channel models load the
+// `[out_dim]` scale tensor directly.
+//
+// This variant is *not* used by `Forward` today — Sprint 24-Harness
+// uses it only via `examples/fp8_gemv_standalone.rs` to prove the
+// 4-binding scheme is correct in isolation. Wiring it through the
+// runtime is the open follow-up sprint.
+
+#extension GL_EXT_float_e4m3 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer WeightBuf { uint w_packed[]; };
+layout (binding = 1) readonly buffer InputBuf  { float data_b[]; };
+layout (binding = 2) writeonly buffer OutputBuf { float data_d[]; };
+layout (binding = 3) readonly buffer ScaleBuf  { float scale[]; };
+
+layout (push_constant) uniform parameter {
+    uint  ncols;
+    uint  stride_a;
+    uint  stride_b;
+    uint  stride_d;
+    uint  batch_stride_a;
+    uint  batch_stride_b;
+    uint  batch_stride_d;
+    uint  _fusion_flags;
+    uint  _base_work_group_y;
+    uint  _ne02;
+    uint  _ne12;
+    uint  _broadcast2;
+    uint  _broadcast3_unused;
+} p;
+
+shared float lds_partial[1024];
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    if (row >= p.stride_d) return;
+
+    const uint tid    = gl_LocalInvocationID.x;
+    const uint nthr   = gl_WorkGroupSize.x;
+    const uint K      = p.ncols;
+    const uint K4     = K / 4;
+    const uint row_u  = row * (p.stride_a / 4);
+
+    float partial = 0.0;
+    [[unroll(1)]] for (uint i = tid; i < K4; i += nthr) {
+        const uint w4 = w_packed[row_u + i];
+        const uint k0 = i * 4;
+        const float a0 = float(uintBitsToFloate4m3EXT(uint8_t( w4        & 0xFFu)));
+        const float a1 = float(uintBitsToFloate4m3EXT(uint8_t((w4 >>  8) & 0xFFu)));
+        const float a2 = float(uintBitsToFloate4m3EXT(uint8_t((w4 >> 16) & 0xFFu)));
+        const float a3 = float(uintBitsToFloate4m3EXT(uint8_t((w4 >> 24) & 0xFFu)));
+        partial = fma(a0, data_b[k0 + 0], partial);
+        partial = fma(a1, data_b[k0 + 1], partial);
+        partial = fma(a2, data_b[k0 + 2], partial);
+        partial = fma(a3, data_b[k0 + 3], partial);
+    }
+    if (tid == 0 && (K & 3u) != 0u) {
+        const uint last = w_packed[row_u + K4];
+        for (uint t = 0; t < (K & 3u); t++) {
+            const float a = float(uintBitsToFloate4m3EXT(uint8_t((last >> (t * 8u)) & 0xFFu)));
+            partial = fma(a, data_b[K4 * 4 + t], partial);
+        }
+    }
+
+    lds_partial[tid] = partial;
+    barrier();
+    for (uint stride = nthr / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            lds_partial[tid] += lds_partial[tid + stride];
+        }
+        barrier();
+    }
+    if (tid == 0) {
+        data_d[row] = lds_partial[0] * scale[row];
+    }
+}

@@ -2223,8 +2223,8 @@ impl Forward {
                 ],
             )
         };
-        // FP8 GEMV reads `weight_scale` from `broadcast3` as float;
-        // F32/F16/K-quant ignore the slot.
+        // FP8 GEMV reads `weight_scale` from `broadcast3` (the last
+        // u32 slot is `float weight_scale` in the GLSL push block).
         let pc = MatVecPushConstants {
             ncols: k, stride_a: k, stride_b: k, stride_d: m,
             batch_stride_a: k * m, batch_stride_b: k, batch_stride_d: m,

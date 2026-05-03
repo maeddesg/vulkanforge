@@ -32,10 +32,11 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 layout (binding = 0) readonly buffer WeightBuf { uint w_packed[]; };
 layout (binding = 1) readonly buffer InputBuf  { float data_b[]; };
 layout (binding = 2) writeonly buffer OutputBuf { float data_d[]; };
-// Sprint 20-M2 — bindings 3 & 4 are kept compatible with the GGUF
-// GEMV's 5-binding descriptor-set layout (fuse0/fuse1 placeholders).
-// They are never read; declaring them keeps `run_gemv` reusable
-// without a separate fp8-specific dispatch helper.
+// Sprint 20-M2 — bindings 3 & 4 fuse-buffer placeholders (stripped
+// by spirv-opt). Sprint 24-Harness proved a per-channel ScaleBuf
+// version of this shader works in isolation against real Llama
+// weights (examples/fp8_gemv_standalone.rs); the Forward integration
+// is the open sprint.
 layout (binding = 3) readonly buffer Fuse0Dummy { uint _fuse0_dummy[]; };
 layout (binding = 4) readonly buffer Fuse1Dummy { uint _fuse1_dummy[]; };
 

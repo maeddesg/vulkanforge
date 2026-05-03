@@ -1062,6 +1062,14 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "mul_mat_vec_fp8.comp",
         defines: &[],
     },
+    // Sprint 24-Harness — per-channel scale variant. Used only by
+    // examples/fp8_gemv_standalone.rs as a proof that the 4-binding
+    // scheme works in isolation against real Llama-3.1-FP8 weights.
+    ShaderJob {
+        out_name: "mul_mat_vec_fp8_perchannel.spv",
+        entry_source: "mul_mat_vec_fp8_perchannel.comp",
+        defines: &[],
+    },
     // Sprint 20-M3 — FP32 weight GEMV. Used for lm_head on SafeTensors
     // FP8 models (lm_head is excluded from FP8 quantization on
     // neuralmagic / naive-quantized models, so it carries through
