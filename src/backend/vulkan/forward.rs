@@ -3176,14 +3176,23 @@ impl Forward {
             | ShaderId::MulMmQ4KCoopmat | ShaderId::MulMmQ6KCoopmat
             | ShaderId::MulMmQ4KAlignedCoopmat | ShaderId::MulMmQ6KAlignedCoopmat
             | ShaderId::MulMmQ4KAlignedCoopmatF16Acc
-            | ShaderId::MulMmQ6KAlignedCoopmatF16Acc => (128, 128),
+            | ShaderId::MulMmQ6KAlignedCoopmatF16Acc
+            // Sprint 19A — Q3_K + Q5_K coopmat L-tile share BM=BN=128.
+            | ShaderId::MulMmQ3KCoopmat | ShaderId::MulMmQ5KCoopmat
+            | ShaderId::MulMmQ3KAlignedCoopmat | ShaderId::MulMmQ5KAlignedCoopmat
+            | ShaderId::MulMmQ3KAlignedCoopmatF16Acc
+            | ShaderId::MulMmQ5KAlignedCoopmatF16Acc => (128, 128),
             // Sprint 12M — M-tile coopmat: BM=BN=64, same shape as the
             // S-tile mul_mmq variants. Used when seq_len ≤ 64.
             ShaderId::MulMmQ4KCoopmatM | ShaderId::MulMmQ6KCoopmatM
-            | ShaderId::MulMmQ4KAlignedCoopmatM | ShaderId::MulMmQ6KAlignedCoopmatM => (64, 64),
+            | ShaderId::MulMmQ4KAlignedCoopmatM | ShaderId::MulMmQ6KAlignedCoopmatM
+            | ShaderId::MulMmQ3KCoopmatM | ShaderId::MulMmQ5KCoopmatM
+            | ShaderId::MulMmQ3KAlignedCoopmatM | ShaderId::MulMmQ5KAlignedCoopmatM => (64, 64),
             // Sprint 13A — S-tile coopmat: BM=BN=32. Used when seq_len ≤ 32.
             ShaderId::MulMmQ4KCoopmatS | ShaderId::MulMmQ6KCoopmatS
-            | ShaderId::MulMmQ4KAlignedCoopmatS | ShaderId::MulMmQ6KAlignedCoopmatS => (32, 32),
+            | ShaderId::MulMmQ4KAlignedCoopmatS | ShaderId::MulMmQ6KAlignedCoopmatS
+            | ShaderId::MulMmQ3KCoopmatS | ShaderId::MulMmQ5KCoopmatS
+            | ShaderId::MulMmQ3KAlignedCoopmatS | ShaderId::MulMmQ5KAlignedCoopmatS => (32, 32),
             _ => (64, 64),
         };
         let groups_x = (m + bm - 1) / bm;
@@ -3564,13 +3573,19 @@ impl Forward {
         // Q5_K_M / Q5_K_S; used as attn_v + ffn_down in Q3_K_M, but
         // attn_q in Q3_K_M is Q3_K so the Q3_K check already catches
         // those models). Sprint 17D — same applies to Q4_0 (Qwen2.5
-        // Q4_0 GGUFs). All three route through Mmq only.
+        // Q4_0 GGUFs).
+        // Sprint 19A — Q3_K and Q5_K now ship the full MulMm
+        // coopmat coverage (mul_mm_{q3_k,q5_k}_f32{,_aligned,_coopmat,
+        // _aligned_coopmat,_aligned_coopmat_f16acc}.spv) and route
+        // through layer_weight_shader_gemm just like Q4_K/Q6_K. Q4_0
+        // is the only quant that still falls back to Mmq because
+        // mul_mm_funcs.glsl has no Q4_0 dequant branch (only Q-K).
         let attn_q_type = model
             .tensor(&format!("blk.{}.attn_q.weight", layer))
             .map(|t| t.ggml_type);
         let force_mmq = matches!(
             attn_q_type,
-            Some(GgmlType::Q3K | GgmlType::Q5K | GgmlType::Q4_0),
+            Some(GgmlType::Q4_0),
         );
         let gemm_kind = if force_mmq {
             GemmKind::Mmq
@@ -4234,6 +4249,40 @@ fn layer_weight_shader_gemm(
     //   pp=32  L-tile = 1.5 WG/CU,  M-tile = 3 WG/CU,  S-tile = 6 WG/CU
     let coopmat_s_tile = coopmat_q4k_mm && n <= 32;
     let coopmat_m_tile = coopmat_q4k_mm && n <= 64 && !coopmat_s_tile;
+    // Sprint 19A — Q3_K + Q5_K MulMm coopmat coverage. Each quant has
+    // its own SPV family (DATA_A is baked at SPIR-V build time), so we
+    // branch by ggml_type first. The Q4_K / Q6_K / Q4_0 fallthrough
+    // match below handles every other layout.
+    if q3 {
+        return match (gemm_kind, coopmat_q4k_mm, coopmat_aligned, coopmat_m_tile, coopmat_s_tile) {
+            (GemmKind::MulMmAligned, _,     _,     _,     _    ) => ShaderId::MulMmQ3KAligned,
+            (GemmKind::MulMm,        false, _,     _,     _    ) => ShaderId::MulMmQ3K,
+            (GemmKind::MulMm,        true,  false, false, false) => ShaderId::MulMmQ3KCoopmat,
+            (GemmKind::MulMm,        true,  true,  false, false) if coopmat_f16acc => ShaderId::MulMmQ3KAlignedCoopmatF16Acc,
+            (GemmKind::MulMm,        true,  true,  false, false) => ShaderId::MulMmQ3KAlignedCoopmat,
+            (GemmKind::MulMm,        true,  false, true,  false) => ShaderId::MulMmQ3KCoopmatM,
+            (GemmKind::MulMm,        true,  true,  true,  false) => ShaderId::MulMmQ3KAlignedCoopmatM,
+            (GemmKind::MulMm,        true,  false, false, true ) => ShaderId::MulMmQ3KCoopmatS,
+            (GemmKind::MulMm,        true,  true,  false, true ) => ShaderId::MulMmQ3KAlignedCoopmatS,
+            (GemmKind::MulMm,        true,  _,     true,  true ) => unreachable!("s_tile and m_tile are mutually exclusive"),
+            (GemmKind::Mmq,          _,     _,     _,     _    ) => if prefer_l { ShaderId::MulMmqQ3KL } else { ShaderId::MulMmqQ3K },
+        };
+    }
+    if q5 {
+        return match (gemm_kind, coopmat_q4k_mm, coopmat_aligned, coopmat_m_tile, coopmat_s_tile) {
+            (GemmKind::MulMmAligned, _,     _,     _,     _    ) => ShaderId::MulMmQ5KAligned,
+            (GemmKind::MulMm,        false, _,     _,     _    ) => ShaderId::MulMmQ5K,
+            (GemmKind::MulMm,        true,  false, false, false) => ShaderId::MulMmQ5KCoopmat,
+            (GemmKind::MulMm,        true,  true,  false, false) if coopmat_f16acc => ShaderId::MulMmQ5KAlignedCoopmatF16Acc,
+            (GemmKind::MulMm,        true,  true,  false, false) => ShaderId::MulMmQ5KAlignedCoopmat,
+            (GemmKind::MulMm,        true,  false, true,  false) => ShaderId::MulMmQ5KCoopmatM,
+            (GemmKind::MulMm,        true,  true,  true,  false) => ShaderId::MulMmQ5KAlignedCoopmatM,
+            (GemmKind::MulMm,        true,  false, false, true ) => ShaderId::MulMmQ5KCoopmatS,
+            (GemmKind::MulMm,        true,  true,  false, true ) => ShaderId::MulMmQ5KAlignedCoopmatS,
+            (GemmKind::MulMm,        true,  _,     true,  true ) => unreachable!("s_tile and m_tile are mutually exclusive"),
+            (GemmKind::Mmq,          _,     _,     _,     _    ) => if prefer_l { ShaderId::MulMmqQ5KL } else { ShaderId::MulMmqQ5K },
+        };
+    }
     match (gemm_kind, q6) {
         (GemmKind::MulMmAligned, true)  => ShaderId::MulMmQ6KAligned,
         (GemmKind::MulMmAligned, false) => ShaderId::MulMmQ4KAligned,
@@ -4280,8 +4329,8 @@ fn layer_weight_shader_gemm(
         // generic Q4_K fall-through; without this Q5_K weights would
         // be read with the wrong block stride (176 B vs 144 B).
         (GemmKind::Mmq,          true)  => if prefer_l { ShaderId::MulMmqQ6KL } else { ShaderId::MulMmqQ6K },
-        (GemmKind::Mmq,          false) if q3 => if prefer_l { ShaderId::MulMmqQ3KL } else { ShaderId::MulMmqQ3K },
-        (GemmKind::Mmq,          false) if q5 => if prefer_l { ShaderId::MulMmqQ5KL } else { ShaderId::MulMmqQ5K },
+        // Q3_K / Q5_K early-returned above (Sprint 19A); only Q4_0 + Q4_K
+        // reach this fallthrough on the false-q6 side.
         (GemmKind::Mmq,          false) if q40 => if prefer_l { ShaderId::MulMmqQ4_0L } else { ShaderId::MulMmqQ4_0 },
         (GemmKind::Mmq,          false) => if prefer_l { ShaderId::MulMmqQ4KL } else { ShaderId::MulMmqQ4K },
     }

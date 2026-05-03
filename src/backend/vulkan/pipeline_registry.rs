@@ -352,7 +352,9 @@ impl PipelineRegistry {
                     ComputeKernel::from_spv(device, &words, cache)
                 }
                 ShaderId::MulMmQ4K | ShaderId::MulMmQ6K
-                | ShaderId::MulMmQ4KAligned | ShaderId::MulMmQ6KAligned => {
+                | ShaderId::MulMmQ4KAligned | ShaderId::MulMmQ6KAligned
+                | ShaderId::MulMmQ3K | ShaderId::MulMmQ3KAligned
+                | ShaderId::MulMmQ5K | ShaderId::MulMmQ5KAligned => {
                     // Phase 6 v0.1.2 — mul_mm.comp port. Same spec-
                     // constant layout as MulMmqQ4K/Q6K but no
                     // ACC_TYPEV2 (the build defines that as `vec2` —
@@ -422,7 +424,18 @@ impl PipelineRegistry {
                 | ShaderId::MulMmQ4KCoopmatS | ShaderId::MulMmQ6KCoopmatS
                 | ShaderId::MulMmQ4KAlignedCoopmatS | ShaderId::MulMmQ6KAlignedCoopmatS
                 | ShaderId::MulMmQ4KAlignedCoopmatF16Acc
-                | ShaderId::MulMmQ6KAlignedCoopmatF16Acc => {
+                | ShaderId::MulMmQ6KAlignedCoopmatF16Acc
+                // Sprint 19A — Q3_K + Q5_K share the same warptile / spec
+                // constants per tile size as Q4_K / Q6_K (DATA_A / LOAD_VEC_A
+                // are baked at SPV build time; only the SPV binary differs).
+                | ShaderId::MulMmQ3KCoopmat | ShaderId::MulMmQ5KCoopmat
+                | ShaderId::MulMmQ3KAlignedCoopmat | ShaderId::MulMmQ5KAlignedCoopmat
+                | ShaderId::MulMmQ3KCoopmatM | ShaderId::MulMmQ5KCoopmatM
+                | ShaderId::MulMmQ3KAlignedCoopmatM | ShaderId::MulMmQ5KAlignedCoopmatM
+                | ShaderId::MulMmQ3KCoopmatS | ShaderId::MulMmQ5KCoopmatS
+                | ShaderId::MulMmQ3KAlignedCoopmatS | ShaderId::MulMmQ5KAlignedCoopmatS
+                | ShaderId::MulMmQ3KAlignedCoopmatF16Acc
+                | ShaderId::MulMmQ5KAlignedCoopmatF16Acc => {
                     // Sprint 11E (Q4_K) / Sprint 12K (Q6_K) / Sprint 12L
                     // (aligned) / Sprint 12M (M-tile) / Sprint 13A (S-tile)
                     // — mul_mm.comp + COOPMAT, KHR coopmat 16x16x16
@@ -452,6 +465,10 @@ impl PipelineRegistry {
                             | ShaderId::MulMmQ6KCoopmatS
                             | ShaderId::MulMmQ4KAlignedCoopmatS
                             | ShaderId::MulMmQ6KAlignedCoopmatS
+                            | ShaderId::MulMmQ3KCoopmatS
+                            | ShaderId::MulMmQ5KCoopmatS
+                            | ShaderId::MulMmQ3KAlignedCoopmatS
+                            | ShaderId::MulMmQ5KAlignedCoopmatS
                     );
                     let m_tile = matches!(
                         id,
@@ -459,6 +476,10 @@ impl PipelineRegistry {
                             | ShaderId::MulMmQ6KCoopmatM
                             | ShaderId::MulMmQ4KAlignedCoopmatM
                             | ShaderId::MulMmQ6KAlignedCoopmatM
+                            | ShaderId::MulMmQ3KCoopmatM
+                            | ShaderId::MulMmQ5KCoopmatM
+                            | ShaderId::MulMmQ3KAlignedCoopmatM
+                            | ShaderId::MulMmQ5KAlignedCoopmatM
                     );
                     let entries = [
                         entry(0, 0, 4),
