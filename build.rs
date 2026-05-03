@@ -1054,6 +1054,14 @@ const JOBS: &[ShaderJob] = &[
             ("COOPMAT", "1"),
         ],
     },
+    // Sprint 20-M2 — FP8 E4M3 GEMV (decode). One shader, single SPV.
+    // No subgroup variant in M2 (LDS tree-reduce only); a subgroupAdd
+    // version can land later if/when a Wave64 baseline shows headroom.
+    ShaderJob {
+        out_name: "mul_mat_vec_fp8.spv",
+        entry_source: "mul_mat_vec_fp8.comp",
+        defines: &[],
+    },
     // Sprint 19A — Q3_K mul_mm.comp variants (FP16 WMMA prefill).
     // Mirror the Q4_K/Q6_K coopmat coverage so Q3_K_M GGUFs no longer
     // fall back to integer-MMQ for prefill GEMM. The Q3_K branch in

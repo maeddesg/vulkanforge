@@ -1,0 +1,117 @@
+#version 450
+
+// Sprint 20-M2 — FP8 E4M3 GEMV (decode path).
+//
+// Output[row] = scale * sum_k( float(W[row, k]) * input[k] )
+// where W is row-major FP8 E4M3 (1 byte/elem), input is FP32, scale is
+// a per-tensor FP32 scalar passed via push constant.
+//
+// llama.cpp has no equivalent — GGUF doesn't carry FP8 weights, so
+// nothing upstream to mirror. The closest analogue is the per-block
+// Q4_0/Q5_0 GEMV, but FP8's per-*tensor* scale is far simpler than the
+// per-block scale machinery in `mul_mat_vec.comp` / `dequant_funcs.glsl`.
+//
+// One workgroup per row (NUM_ROWS=1 for M2 simplicity); LDS-tree-reduce
+// across BLOCK_SIZE threads. NUM_COLS=1 (single batch — decode). The
+// subgroupAdd "Path A" reduction (Sprint 14B's default-on for K-quants)
+// is the natural follow-up; M2 keeps the LDS variant for clarity.
+//
+// Native FP8 conversion via VK_EXT_shader_float8 / GL_EXT_float_e4m3.
+// Requires `VULKANFORGE_ENABLE_FP8=1` at device-init time.
+
+#extension GL_EXT_float_e4m3 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+// uint-packed FP8 weights: 4 bytes per uint, row-major. Each output
+// row is `K` consecutive bytes = K/4 consecutive uints.
+layout (binding = 0) readonly buffer WeightBuf { uint w_packed[]; };
+layout (binding = 1) readonly buffer InputBuf  { float data_b[]; };
+layout (binding = 2) writeonly buffer OutputBuf { float data_d[]; };
+// Sprint 20-M2 — bindings 3 & 4 are kept compatible with the GGUF
+// GEMV's 5-binding descriptor-set layout (fuse0/fuse1 placeholders).
+// They are never read; declaring them keeps `run_gemv` reusable
+// without a separate fp8-specific dispatch helper.
+layout (binding = 3) readonly buffer Fuse0Dummy { uint _fuse0_dummy[]; };
+layout (binding = 4) readonly buffer Fuse1Dummy { uint _fuse1_dummy[]; };
+
+// Layout matches `MatVecPushConstants` (13 × u32 = 52 B). The last
+// slot — `broadcast3` in the GGUF struct — is repurposed as the FP8
+// per-tensor scale (the GGUF GEMV always passes 1 there). Caller is
+// `Forward::run_gemv_fp8`, which writes `weight_scale.to_bits()` into
+// that field at dispatch time.
+layout (push_constant) uniform parameter {
+    uint  ncols;
+    uint  stride_a;
+    uint  stride_b;
+    uint  stride_d;
+    uint  batch_stride_a;
+    uint  batch_stride_b;
+    uint  batch_stride_d;
+    uint  _fusion_flags;
+    uint  _base_work_group_y;
+    uint  _ne02;
+    uint  _ne12;
+    uint  _broadcast2;
+    float weight_scale;
+} p;
+
+shared float lds_partial[1024];
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    if (row >= p.stride_d) return;
+
+    const uint tid    = gl_LocalInvocationID.x;
+    const uint nthr   = gl_WorkGroupSize.x;
+    const uint K      = p.ncols;
+    const uint K4     = K / 4;
+    const uint row_u  = row * (p.stride_a / 4); // first uint of this row
+
+    // Each thread accumulates a partial sum over a strided slice of K.
+    float partial = 0.0;
+    [[unroll(1)]] for (uint i = tid; i < K4; i += nthr) {
+        const uint w4 = w_packed[row_u + i];
+        const uint k0 = i * 4;
+        // Decode 4 FP8 bytes via the native extension. `uint8_t(w4 >> ...)`
+        // lops off the high bits before `uintBitsToFloate4m3EXT` casts the
+        // 8-bit value to the FP8 type, which `float()` then dequantises in
+        // a single VALU op (per VK_EXT_shader_float8 spec).
+        const float a0 = float(uintBitsToFloate4m3EXT(uint8_t( w4        & 0xFFu)));
+        const float a1 = float(uintBitsToFloate4m3EXT(uint8_t((w4 >>  8) & 0xFFu)));
+        const float a2 = float(uintBitsToFloate4m3EXT(uint8_t((w4 >> 16) & 0xFFu)));
+        const float a3 = float(uintBitsToFloate4m3EXT(uint8_t((w4 >> 24) & 0xFFu)));
+        const float b0 = data_b[k0 + 0];
+        const float b1 = data_b[k0 + 1];
+        const float b2 = data_b[k0 + 2];
+        const float b3 = data_b[k0 + 3];
+        partial = fma(a0, b0, partial);
+        partial = fma(a1, b1, partial);
+        partial = fma(a2, b2, partial);
+        partial = fma(a3, b3, partial);
+    }
+    // Tail: handle K not divisible by 4. Row stride is in *elements*,
+    // so the row's last (K%4) bytes still live in the row's last uint.
+    if (tid == 0 && (K & 3u) != 0u) {
+        const uint last = w_packed[row_u + K4];
+        for (uint t = 0; t < (K & 3u); t++) {
+            const float a = float(uintBitsToFloate4m3EXT(uint8_t((last >> (t * 8u)) & 0xFFu)));
+            partial = fma(a, data_b[K4 * 4 + t], partial);
+        }
+    }
+
+    // LDS tree reduction.
+    lds_partial[tid] = partial;
+    barrier();
+    for (uint stride = nthr / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            lds_partial[tid] += lds_partial[tid + stride];
+        }
+        barrier();
+    }
+    if (tid == 0) {
+        data_d[row] = lds_partial[0] * p.weight_scale;
+    }
+}

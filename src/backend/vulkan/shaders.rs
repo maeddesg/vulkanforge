@@ -42,6 +42,12 @@ pub enum ShaderId {
     /// / Q8_0 / IQ-quants).
     MulMatVecQ4_0,
     MulMatVecQ4_0Subgroup,
+    /// Sprint 20-M2 — FP8 E4M3 decode GEMV. Native conversion via
+    /// VK_EXT_shader_float8 / GL_EXT_float_e4m3 (`uintBitsToFloate4m3EXT`).
+    /// Per-tensor FP32 dequant scale is in the push-constant block;
+    /// row stride / column count match the existing `MatVecPushConstants`
+    /// surface so the shader plugs into `Forward::run_gemv`.
+    MulMatVecFp8,
     RmsNorm,
     RopeNorm,
     RopeNeox,
@@ -308,6 +314,7 @@ impl ShaderId {
             ShaderId::MulMatVecQ5KSubgroup => "mul_mat_vec_q5_k_f32_f32_subgroup",
             ShaderId::MulMatVecQ4_0 => "mul_mat_vec_q4_0_f32_f32",
             ShaderId::MulMatVecQ4_0Subgroup => "mul_mat_vec_q4_0_f32_f32_subgroup",
+            ShaderId::MulMatVecFp8 => "mul_mat_vec_fp8",
             ShaderId::RmsNorm => "rms_norm_f32",
             ShaderId::RopeNorm => "rope_norm_f32",
             ShaderId::RopeNeox => "rope_neox_f32",
@@ -411,6 +418,7 @@ impl ShaderId {
             ShaderId::MulMatVecQ5KSubgroup => MUL_MAT_VEC_Q5_K_F32_F32_SUBGROUP,
             ShaderId::MulMatVecQ4_0 => MUL_MAT_VEC_Q4_0_F32_F32,
             ShaderId::MulMatVecQ4_0Subgroup => MUL_MAT_VEC_Q4_0_F32_F32_SUBGROUP,
+            ShaderId::MulMatVecFp8 => MUL_MAT_VEC_FP8,
             ShaderId::RmsNorm => RMS_NORM_F32,
             ShaderId::RopeNorm => ROPE_NORM_F32,
             ShaderId::RopeNeox => ROPE_NEOX_F32,
@@ -521,6 +529,7 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::MulMatVecQ5KSubgroup,
     ShaderId::MulMatVecQ4_0,
     ShaderId::MulMatVecQ4_0Subgroup,
+    ShaderId::MulMatVecFp8,
     ShaderId::RmsNorm,
     ShaderId::RopeNorm,
     ShaderId::RopeNeox,
@@ -651,6 +660,8 @@ pub const MUL_MAT_VEC_Q4_0_F32_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q4_0_f32_f32.spv"));
 pub const MUL_MAT_VEC_Q4_0_F32_F32_SUBGROUP: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q4_0_f32_f32_subgroup.spv"));
+pub const MUL_MAT_VEC_FP8: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_fp8.spv"));
 pub const RMS_NORM_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm_f32.spv"));
 pub const ROPE_NORM_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope_norm_f32.spv"));
 pub const ROPE_NEOX_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope_neox_f32.spv"));

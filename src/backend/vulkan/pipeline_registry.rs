@@ -128,6 +128,19 @@ impl PipelineRegistry {
             // prompt §6 — is to pin every spec const a shader exposes
             // rather than trust the default path.
             let result = match id {
+                ShaderId::MulMatVecFp8 => {
+                    // Sprint 20-M2 — pin BLOCK_SIZE = 64 (one Wave64),
+                    // matches the LDS-tree-reduction in
+                    // `mul_mat_vec_fp8.comp` and keeps the workgroup at
+                    // exactly one subgroup so the cross-thread reduction
+                    // never spans waves. No NUM_COLS / NUM_ROWS spec
+                    // consts (the FP8 shader hard-codes one batch
+                    // and one row per workgroup).
+                    let data: [u32; 1] = [64];
+                    let entries = [entry(0, 0, 4)];
+                    let bytes = bytemuck::bytes_of(&data);
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes, Some(64))
+                }
                 ShaderId::MulMatVecQ4K | ShaderId::MulMatVecQ6K
                 | ShaderId::MulMatVecQ4KSubgroup | ShaderId::MulMatVecQ6KSubgroup
                 | ShaderId::MulMatVecQ3K | ShaderId::MulMatVecQ3KSubgroup

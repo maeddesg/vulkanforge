@@ -2147,6 +2147,59 @@ impl Forward {
         }
     }
 
+    /// Sprint 20-M2 — FP8 E4M3 GEMV dispatch helper. Same descriptor
+    /// layout as `run_gemv` (5 bindings; `fuse0`/`fuse1` are dummies
+    /// for the FP8 shader); the per-tensor dequant scale rides in the
+    /// last slot of `MatVecPushConstants` (the `broadcast3` field, repurposed
+    /// as `f32::to_bits` — see `mul_mat_vec_fp8.comp`).
+    #[allow(clippy::too_many_arguments)]
+    fn run_gemv_fp8(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        weights: vk::Buffer,
+        input: vk::Buffer,
+        output: vk::Buffer,
+        k: u32,
+        m: u32,
+        weight_scale: f32,
+        label: &str,
+    ) {
+        let kernel = registry.get(ShaderId::MulMatVecFp8);
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[
+                (0, weights, 0, 0),
+                (1, input, 0, 0),
+                (2, output, 0, 0),
+                (3, self.fuse0.handle, 0, 0),
+                (4, self.fuse1.handle, 0, 0),
+            ],
+        );
+        let pc = MatVecPushConstants {
+            ncols: k, stride_a: k, stride_b: k, stride_d: m,
+            batch_stride_a: k * m, batch_stride_b: k, batch_stride_d: m,
+            fusion_flags: 0, base_work_group_y: 0,
+            ne02: 1, ne12: 1, broadcast2: 1,
+            // Reinterpreted as f32 in the shader.
+            broadcast3: weight_scale.to_bits(),
+        };
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            // One workgroup per output row (NUM_ROWS=1 baked in).
+            dev.device.cmd_dispatch(cmd, m, 1, 1);
+        });
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_gemv(
         &mut self,
