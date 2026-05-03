@@ -3224,6 +3224,63 @@ impl Forward {
     ///   A = weights, M×K row-major, `stride_a = K`
     ///   B = activations, Q8_1 packed, virtual stride_b = K (in elements)
     ///   D = output, N×M row-major, `stride_d = M`
+    /// Sprint 20-Wire — dispatch the native FP8 prefill GEMM
+    /// (`MulCoopmatFp8Naive`). Same output layout as `run_gemm`
+    /// (`[N × M]` row-major, `stride_d = M`) so the rest of the
+    /// prefill pipeline plugs in unchanged. Activation buffer must
+    /// be FP32 (the kernel does FP32→BF16 narrow in LDS, mirroring
+    /// the Q4_K naive coopmat path); SafeTensors prefill always
+    /// reaches this with `gemm_input_* = batch_norm.handle` because
+    /// `force_mmq` only fires for Q4_0 — FP8 routes through `MulMm`.
+    /// Per-tensor `weight_scale` rides in the last push-constant
+    /// slot (`f32::to_bits()`).
+    #[allow(clippy::too_many_arguments)]
+    fn run_gemm_fp8_naive(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        weight_buf: vk::Buffer,
+        weight_scale: f32,
+        activations_fp32: vk::Buffer,
+        output: vk::Buffer,
+        m: u32,
+        n: u32,
+        k: u32,
+        label: &'static str,
+    ) {
+        let kernel = registry.get(ShaderId::MulCoopmatFp8Naive);
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[
+                (0, weight_buf, 0, 0),
+                (1, activations_fp32, 0, 0),
+                (2, output, 0, 0),
+            ],
+        );
+        let pc = super::pipeline::Fp8GemmPushConstants {
+            m, n, k,
+            stride_a: k,
+            stride_b: k,
+            stride_c: m,
+            weight_scale_bits: weight_scale.to_bits(),
+        };
+        let groups_x = (m + 15) / 16;
+        let groups_y = (n + 15) / 16;
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, groups_x, groups_y, 1);
+        });
+    }
+
     /// Each output row holds one token's `M`-dim projection.
     #[allow(clippy::too_many_arguments)]
     fn run_gemm(
@@ -3870,6 +3927,29 @@ impl Forward {
                 gemm_input_attn, self.batch_v.handle,
                 kv_dim, seq_len, hidden, "gemm_v",
             );
+        } else if is_fp8_layer_weight(model, layer, "attn_q.weight") {
+            // Sprint 20-Wire — SafeTensors FP8 path. Routes Q/K/V
+            // through `mul_coopmat_fp8_naive.comp`. Activation buffer
+            // is `gemm_input_attn = batch_norm.handle` (FP32, set
+            // above because gemm_kind = MulMm for FP8).
+            let scale_q = layer_weight_scale(model, layer, "attn_q.weight");
+            let scale_k = layer_weight_scale(model, layer, "attn_k.weight");
+            let scale_v = layer_weight_scale(model, layer, "attn_v.weight");
+            self.run_gemm_fp8_naive(
+                dev, registry, cmd, wq, scale_q,
+                gemm_input_attn, self.batch_q.handle,
+                q_dim, seq_len, hidden, "gemm_q_fp8",
+            );
+            self.run_gemm_fp8_naive(
+                dev, registry, cmd, wk, scale_k,
+                gemm_input_attn, self.batch_k.handle,
+                kv_dim, seq_len, hidden, "gemm_k_fp8",
+            );
+            self.run_gemm_fp8_naive(
+                dev, registry, cmd, wv, scale_v,
+                gemm_input_attn, self.batch_v.handle,
+                kv_dim, seq_len, hidden, "gemm_v_fp8",
+            );
         } else {
             self.run_gemm(
                 dev, registry, cmd, sq, wq,
@@ -4232,11 +4312,20 @@ impl Forward {
                 self.batch_q8.handle
             };
             let so = layer_weight_shader_gemm(model, layer, "attn_output.weight", gemm_kind, hidden, seq_len, self.mul_mm_coopmat_enabled, self.mul_mm_coopmat_f16acc_enabled);
-            self.run_gemm(
-                dev, registry, cmd, so, wo,
-                gemm_input_o, self.batch_o.handle,
-                hidden, seq_len, q_dim, "gemm_o",
-            );
+            if is_fp8_layer_weight(model, layer, "attn_output.weight") {
+                let scale_o = layer_weight_scale(model, layer, "attn_output.weight");
+                self.run_gemm_fp8_naive(
+                    dev, registry, cmd, wo, scale_o,
+                    gemm_input_o, self.batch_o.handle,
+                    hidden, seq_len, q_dim, "gemm_o_fp8",
+                );
+            } else {
+                self.run_gemm(
+                    dev, registry, cmd, so, wo,
+                    gemm_input_o, self.batch_o.handle,
+                    hidden, seq_len, q_dim, "gemm_o",
+                );
+            }
         }
         compute_barrier(dev, cmd);
 
@@ -4301,6 +4390,20 @@ impl Forward {
                 self.batch_norm.handle, self.batch_up.handle,
                 ffn, n_padded, hidden, gu_bm, gu_bn, "gemm_up_coopmat",
             );
+        } else if is_fp8_layer_weight(model, layer, "ffn_gate.weight") {
+            // Sprint 20-Wire — SafeTensors FP8 path for gate + up.
+            let scale_g = layer_weight_scale(model, layer, "ffn_gate.weight");
+            let scale_u = layer_weight_scale(model, layer, "ffn_up.weight");
+            self.run_gemm_fp8_naive(
+                dev, registry, cmd, wg, scale_g,
+                gemm_input_ffn, self.batch_gate.handle,
+                ffn, seq_len, hidden, "gemm_gate_fp8",
+            );
+            self.run_gemm_fp8_naive(
+                dev, registry, cmd, wu, scale_u,
+                gemm_input_ffn, self.batch_up.handle,
+                ffn, seq_len, hidden, "gemm_up_fp8",
+            );
         } else {
             let sg = layer_weight_shader_gemm(model, layer, "ffn_gate.weight", gemm_kind, ffn, seq_len, self.mul_mm_coopmat_enabled, self.mul_mm_coopmat_f16acc_enabled);
             let su = layer_weight_shader_gemm(model, layer, "ffn_up.weight", gemm_kind, ffn, seq_len, self.mul_mm_coopmat_enabled, self.mul_mm_coopmat_f16acc_enabled);
@@ -4347,11 +4450,20 @@ impl Forward {
         };
         let wd = layer_weight(model, layer, "ffn_down.weight");
         let sd = layer_weight_shader_gemm(model, layer, "ffn_down.weight", gemm_kind, hidden, seq_len, self.mul_mm_coopmat_enabled, self.mul_mm_coopmat_f16acc_enabled);
-        self.run_gemm(
-            dev, registry, cmd, sd, wd,
-            gemm_input_down, self.batch_ffn_out.handle,
-            hidden, seq_len, ffn, "gemm_down",
-        );
+        if is_fp8_layer_weight(model, layer, "ffn_down.weight") {
+            let scale_d = layer_weight_scale(model, layer, "ffn_down.weight");
+            self.run_gemm_fp8_naive(
+                dev, registry, cmd, wd, scale_d,
+                gemm_input_down, self.batch_ffn_out.handle,
+                hidden, seq_len, ffn, "gemm_down_fp8",
+            );
+        } else {
+            self.run_gemm(
+                dev, registry, cmd, sd, wd,
+                gemm_input_down, self.batch_ffn_out.handle,
+                hidden, seq_len, ffn, "gemm_down",
+            );
+        }
         compute_barrier(dev, cmd);
 
         // ---- (l) Residual2 = residual + ffn_out + (cross-layer fuse). ----
@@ -4591,6 +4703,18 @@ fn layer_weight_scale(model: &LoadedModel, layer: u32, suffix: &str) -> f32 {
         .tensor(&key)
         .and_then(|t| t.weight_scale)
         .unwrap_or(1.0)
+}
+
+/// Sprint 20-Wire — `true` iff a layer's weight tensor is FP8 E4M3.
+/// Used at the 7 GEMM call sites in `dispatch_layer_batch` to route
+/// SafeTensors FP8 weights through `run_gemm_fp8_naive` instead of
+/// the K-quant `run_gemm`. GGUF models always return `false`.
+fn is_fp8_layer_weight(model: &LoadedModel, layer: u32, suffix: &str) -> bool {
+    let key = format!("blk.{layer}.{suffix}");
+    model
+        .tensor(&key)
+        .map(|t| t.ggml_type == GgmlType::F8E4M3)
+        .unwrap_or(false)
 }
 
 /// Q4_K_M mixes quant types — `attn_v.weight` and `ffn_down.weight`

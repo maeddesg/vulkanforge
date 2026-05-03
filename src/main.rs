@@ -503,12 +503,21 @@ fn run_chat_safetensors(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>
         let _ = std::io::stdout().flush();
     };
     forward.kv_cache.reset();
+    // Sprint 20-Wire — FP8 GEMM is now wired through
+    // `dispatch_layer_batch` (the 7 layer GEMM call sites branch on
+    // `is_fp8_layer_weight`), so SafeTensors prefill no longer needs
+    // the per-token GEMV fallback. Override via
+    // `VULKANFORGE_FORCE_PER_TOKEN=1` if a regression bisect needs
+    // to re-test the M3 reference path.
+    let force_per_token_prefill = std::env::var("VULKANFORGE_FORCE_PER_TOKEN")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let r = generate_from_tokens(
         &mut forward, &dev, &registry, &cmd_ctx, &model,
         EmbeddingSource::Host(&host_embed),
         &cfg, &tokenizer,
         &prompt_tokens, 0, &cfg_g,
-        true,
+        force_per_token_prefill,
         &mut on_token,
     )?;
     println!();

@@ -43,6 +43,23 @@ pub struct MatVecPushConstants {
 const _: () =
     assert!(std::mem::size_of::<MatVecPushConstants>() == PUSH_CONSTANT_BYTES as usize);
 
+/// Sprint 20-Wire — push constants for `mul_coopmat_fp8_naive.comp`
+/// (the FP8 prefill GEMM). 7 × u32 = 28 B. The kernel expects
+/// `weight_scale_bits = f32::to_bits(scale)` so the same descriptor
+/// layout drives both the `MulCoopmatFp8Naive` path and the unit
+/// test in `tests/fp8_gemm_correctness.rs`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Fp8GemmPushConstants {
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    pub stride_a: u32,
+    pub stride_b: u32,
+    pub stride_c: u32,
+    pub weight_scale_bits: u32,
+}
+
 // ---- Phase-2B: per-shader push-constant structs ----------------------
 //
 // One `#[repr(C)]` struct per GLSL push-constant block, with the field
