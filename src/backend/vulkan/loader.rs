@@ -72,12 +72,21 @@ pub struct GpuTensor {
     pub shape: Vec<u64>,
     pub ggml_type: GgmlType,
     pub byte_size: u64,
-    /// Sprint 20 — per-tensor FP32 dequantization scale for FP8 weights
-    /// loaded via SafeTensors `naive-quantized` schema. `None` for GGUF
-    /// tensors and for unquantized SafeTensors (norms, embeddings,
-    /// `lm_head`). When present, GEMV/GEMM consumers must multiply
-    /// the FP8 dequant result by this scalar.
+    /// Sprint 20 — per-tensor FP32 dequantization scale for FP8 weights.
+    /// `Some` for per-tensor models (Llama-3.1-FP8, `strategy: "tensor"`)
+    /// and `None` for per-channel models (which use `scale_buffer` only).
+    /// The FP8 GEMV decode path consumes this scalar via push constant;
+    /// the FP8 GEMM prefill path uses `scale_buffer` regardless.
     pub weight_scale: Option<f32>,
+    /// Sprint 24A — per-output-row FP32 dequantization scale for FP8
+    /// weights, bound to descriptor slot 3 of the FP8 GEMM pipelines.
+    /// Length equals `shape[0]` (= output dim). Per-tensor models
+    /// populate the buffer by broadcasting the on-disk scalar to all
+    /// M positions; per-channel models (Qwen2.5-14B-FP8) load the
+    /// file's `[out_dim]` scale tensor directly. `None` for
+    /// unquantized tensors (norms, embeddings, `lm_head`) and for GGUF
+    /// tensors.
+    pub scale_buffer: Option<GpuBuffer>,
 }
 
 pub struct LoadedModel {
@@ -200,6 +209,7 @@ impl LoadedModel {
                     ggml_type: info.ggml_type,
                     byte_size: size,
                     weight_scale: None,
+                    scale_buffer: None,
                 },
             );
         }
@@ -262,6 +272,9 @@ impl LoadedModel {
     pub fn destroy(mut self, device: &ash::Device, allocator: &mut Allocator) {
         for (_, t) in self.tensors.drain() {
             t.buffer.destroy(device, allocator);
+            if let Some(s) = t.scale_buffer {
+                s.destroy(device, allocator);
+            }
         }
     }
 
@@ -300,18 +313,22 @@ impl LoadedModel {
             .map_err(LoaderError::Buffer)?;
         let config = hf_to_model_config(&hf)?;
 
-        // Pre-pass: collect FP32 weight_scale values keyed by the
-        // *VF tensor name* (so the upload pass can pin them
-        // cheaply). The on-disk representation is BF16 scalar.
-        let mut weight_scales: HashMap<String, f32> =
+        // Sprint 24A — pre-pass collects FP32 weight_scale *vectors*
+        // keyed by the VF tensor name. On-disk representation is BF16,
+        // either a single scalar (`strategy: "tensor"`, Llama-3.1-FP8)
+        // or a per-output-row vector (`strategy: "channel"`,
+        // Qwen2.5-14B-FP8). Stored as `Vec<f32>` so the upload pass
+        // can broadcast scalars to `[out_dim]` and copy vectors as-is
+        // through a single per-tensor scale buffer alloc.
+        let mut weight_scales: HashMap<String, Vec<f32>> =
             HashMap::with_capacity(256);
         for (hf_name, info) in &st.tensors {
             let Some(stem) = hf_name.strip_suffix(".weight_scale") else { continue; };
             let weight_hf_name = format!("{stem}.weight");
             let Some(vf_weight_name) = hf_to_vf_name(&weight_hf_name) else { continue; };
             let bytes = st.tensor_bytes(info);
-            let scalar = bf16_scalar(bytes, &weight_hf_name)?;
-            weight_scales.insert(vf_weight_name, scalar);
+            let vec = bf16_scale_to_f32_vec(bytes, &weight_hf_name)?;
+            weight_scales.insert(vf_weight_name, vec);
         }
 
         // Plan the upload list: (vf_name, source_dtype, source_bytes,
@@ -335,7 +352,12 @@ impl LoadedModel {
             shape: Vec<u64>,
             target_dtype: GgmlType,
             bytes: Source<'a>,
-            weight_scale: Option<f32>,
+            /// Sprint 20 — per-tensor scalar (None for per-channel models).
+            /// Used by the FP8 GEMV decode path via push constant.
+            weight_scale_scalar: Option<f32>,
+            /// Sprint 24A — Pre-built `[out_dim]` FP32 scale vector,
+            /// ready for per-row indexing in the FP8 GEMM kernel.
+            scale_vec: Option<Vec<f32>>,
         }
         // Sprint 22B — VRAM saver: when `output.weight` (the lm_head)
         // is present, the GPU copy of `model.embed_tokens.weight` is
@@ -392,12 +414,40 @@ impl LoadedModel {
                 }
             };
             let shape: Vec<u64> = info.shape.iter().map(|&s| s as u64).collect();
+            // Sprint 24A — build the per-output-row scale vector. The
+            // scale is stored either as a scalar (`strategy: "tensor"`)
+            // or as a `[out_dim]` vector (`strategy: "channel"`). For
+            // FP8 weights the GEMV/GEMM kernels index `scale[row]`,
+            // so scalars are broadcast to `[out_dim]` here.
+            let out_dim = shape.first().copied().unwrap_or(0) as usize;
+            let raw_scale = weight_scales.get(&hf_name_to_vf(hf_name));
+            let (weight_scale_scalar, scale_vec) = match raw_scale {
+                None => (None, None),
+                Some(v) if v.len() == 1 && out_dim > 0 => {
+                    // Per-tensor: keep the scalar for GEMV's push-constant
+                    // path AND broadcast it to [out_dim] for the GEMM
+                    // path's per-row scale buffer.
+                    (Some(v[0]), Some(vec![v[0]; out_dim]))
+                }
+                Some(v) if v.len() == out_dim => {
+                    // Per-channel: no single scalar; only the buffer.
+                    (None, Some(v.clone()))
+                }
+                Some(v) => {
+                    return Err(LoaderError::Buffer(format!(
+                        "tensor '{hf_name}': weight_scale length {} does not match \
+                         output dim {} (expected scalar or [out_dim] vector)",
+                        v.len(), out_dim,
+                    )));
+                }
+            };
             plans.push(Plan {
                 vf_name,
                 shape,
                 target_dtype,
                 bytes,
-                weight_scale: weight_scales.get(&hf_name_to_vf(hf_name)).copied(),
+                weight_scale_scalar,
+                scale_vec,
             });
         }
         // Deterministic upload order — easier to read panics.
@@ -481,6 +531,54 @@ impl LoadedModel {
             ));
             staging_off += size;
             bytes_uploaded += size;
+
+            // Sprint 24A — upload the per-output-row scale alongside
+            // the weight tensor. Scale is FP32; size = `out_dim * 4`.
+            // Total VRAM budget for scales is tiny — Llama-3.1-8B FP8
+            // is ~3 MiB and Qwen2.5-14B FP8 is ~5 MiB across all linears.
+            let scale_buffer = if let Some(svec) = &plan.scale_vec {
+                let scale_bytes_size = (svec.len() * std::mem::size_of::<f32>()) as u64;
+                if staging_off + scale_bytes_size > STAGING_BYTES {
+                    if let Err(e) = Self::flush_batch(dev, &cmd_ctx, &staging, &pending) {
+                        staging.destroy(&dev.device, allocator);
+                        cmd_ctx.destroy(&dev.device);
+                        for (_, t) in tensors.drain() {
+                            t.buffer.destroy(&dev.device, allocator);
+                            if let Some(s) = t.scale_buffer { s.destroy(&dev.device, allocator); }
+                        }
+                        return Err(e);
+                    }
+                    pending.clear();
+                    staging_off = 0;
+                }
+                let scale_buf = GpuBuffer::new(
+                    &dev.device,
+                    allocator,
+                    scale_bytes_size,
+                    vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                    MemoryLocation::GpuOnly,
+                    &format!("{}.weight_scale", plan.vf_name),
+                ).map_err(|e| LoaderError::Buffer(format!(
+                    "scale buffer alloc for '{}': {e}", plan.vf_name,
+                )))?;
+                let scale_bytes: &[u8] = bytemuck::cast_slice(svec);
+                staging
+                    .write_bytes_at(staging_off, scale_bytes)
+                    .map_err(|e| LoaderError::Buffer(e.to_string()))?;
+                pending.push((
+                    scale_buf.handle,
+                    vk::BufferCopy::default()
+                        .src_offset(staging_off)
+                        .dst_offset(0)
+                        .size(scale_bytes_size),
+                ));
+                staging_off += scale_bytes_size;
+                bytes_uploaded += scale_bytes_size;
+                Some(scale_buf)
+            } else {
+                None
+            };
+
             tensors.insert(
                 plan.vf_name.clone(),
                 GpuTensor {
@@ -488,7 +586,8 @@ impl LoadedModel {
                     shape: plan.shape.clone(),
                     ggml_type: plan.target_dtype,
                     byte_size: size,
-                    weight_scale: plan.weight_scale,
+                    weight_scale: plan.weight_scale_scalar,
+                    scale_buffer,
                 },
             );
         }
@@ -590,17 +689,26 @@ fn bf16_to_f32(bf: u16) -> f32 {
     f32::from_bits((bf as u32) << 16)
 }
 
-/// Read a single BF16 scalar (used for `weight_scale` and per-tensor
-/// metadata in the FP8 quantization schema). Returns the FP32 value.
-fn bf16_scalar(bytes: &[u8], context: &str) -> Result<f32, LoaderError> {
-    if bytes.len() != 2 {
+/// Sprint 24A — Convert a `weight_scale` BF16 byte slice (either a
+/// single scalar for `strategy: "tensor"` models or an `[out_dim]`
+/// vector for `strategy: "channel"` models) into an FP32 `Vec<f32>`.
+/// The caller decides whether to broadcast a length-1 result up to
+/// `out_dim` (per-tensor case) or pass the vector through unchanged
+/// (per-channel case).
+fn bf16_scale_to_f32_vec(bytes: &[u8], context: &str) -> Result<Vec<f32>, LoaderError> {
+    if bytes.is_empty() || bytes.len() % 2 != 0 {
         return Err(LoaderError::Buffer(format!(
-            "BF16 scalar '{context}': expected 2 bytes, got {}",
+            "BF16 weight_scale '{context}': byte length {} is not a non-zero multiple of 2",
             bytes.len(),
         )));
     }
-    let bf = u16::from_le_bytes([bytes[0], bytes[1]]);
-    Ok(bf16_to_f32(bf))
+    let n = bytes.len() / 2;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let bf = u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]);
+        out.push(bf16_to_f32(bf));
+    }
+    Ok(out)
 }
 
 /// Expand a BF16 byte slice to FP32 on the host. Used at load time

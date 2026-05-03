@@ -105,7 +105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         let total = model.tensors.len();
         let with_scale = model.tensors.values()
-            .filter(|t| t.weight_scale.is_some())
+            .filter(|t| t.scale_buffer.is_some())
             .count();
         println!("  GpuTensors: {total} (with weight_scale: {with_scale})");
 
@@ -120,7 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ] {
             match model.tensor(name) {
                 Some(t) => {
-                    let scale = t.weight_scale.map(|s| format!("{s:.4}")).unwrap_or("-".into());
+                    let scale = if t.scale_buffer.is_some() { "buf".to_string() } else { "-".to_string() };
                     println!(
                         "  {name:<28} {:?} {:?} {:>10} B  scale={}",
                         t.ggml_type, t.shape, t.byte_size, scale,

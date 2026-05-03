@@ -2213,10 +2213,7 @@ impl Forward {
         };
         // Sprint 20-M3 — `broadcast3` is repurposed as the
         // per-tensor weight scale (FP8 / F32 GEMVs read it; K-quant
-        // GEMVs ignore it, so passing `1.0_f32.to_bits()` instead of
-        // the previous `1u32` is bit-identical for them — both happen
-        // to encode 0x3F800000 / 0x00000001 respectively, but the
-        // shader doesn't read the slot, so neither value matters).
+        // GEMVs ignore it).
         let pc = MatVecPushConstants {
             ncols: k, stride_a: k, stride_b: k, stride_d: m,
             batch_stride_a: k * m, batch_stride_b: k, batch_stride_d: m,
@@ -2226,10 +2223,6 @@ impl Forward {
         };
         let layout = kernel.pipeline_layout;
         let pipeline = kernel.pipeline;
-        // `one_per_row` (declared above) also drives the dispatch
-        // geometry: FP8 + FP32 GEMVs run one WG per output row;
-        // the K-quant GEMVs use the Phase-3C 2-rows-per-WG layout
-        // (MMV_NUM_ROWS).
         self.profile(label, dev, cmd, |dev, cmd| unsafe {
             dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             dev.device.cmd_bind_descriptor_sets(
@@ -3245,7 +3238,7 @@ impl Forward {
         registry: &PipelineRegistry,
         cmd: vk::CommandBuffer,
         weight_buf: vk::Buffer,
-        weight_scale: f32,
+        scale_buf: vk::Buffer,
         activations_fp32: vk::Buffer,
         output: vk::Buffer,
         m: u32,
@@ -3274,6 +3267,7 @@ impl Forward {
                 (0, weight_buf, 0, 0),
                 (1, activations_fp32, 0, 0),
                 (2, output, 0, 0),
+                (3, scale_buf, 0, 0),
             ],
         );
         let pc = super::pipeline::Fp8GemmPushConstants {
@@ -3281,7 +3275,7 @@ impl Forward {
             stride_a: k,
             stride_b: k,
             stride_c: m,
-            weight_scale_bits: weight_scale.to_bits(),
+            weight_scale_bits: 0,
         };
         let bm = if multi_wg { 64u32 } else { 16u32 };
         let groups_x = (m + bm - 1) / bm;
@@ -3951,9 +3945,12 @@ impl Forward {
             // through `mul_coopmat_fp8_naive.comp`. Activation buffer
             // is `gemm_input_attn = batch_norm.handle` (FP32, set
             // above because gemm_kind = MulMm for FP8).
-            let scale_q = layer_weight_scale(model, layer, "attn_q.weight");
-            let scale_k = layer_weight_scale(model, layer, "attn_k.weight");
-            let scale_v = layer_weight_scale(model, layer, "attn_v.weight");
+            let scale_q = layer_weight_scale_buf(model, layer, "attn_q.weight")
+                .expect("FP8 GEMM Q requires a scale buffer");
+            let scale_k = layer_weight_scale_buf(model, layer, "attn_k.weight")
+                .expect("FP8 GEMM K requires a scale buffer");
+            let scale_v = layer_weight_scale_buf(model, layer, "attn_v.weight")
+                .expect("FP8 GEMM V requires a scale buffer");
             self.run_gemm_fp8_naive(
                 dev, registry, cmd, wq, scale_q,
                 gemm_input_attn, self.batch_q.handle,
@@ -4332,7 +4329,8 @@ impl Forward {
             };
             let so = layer_weight_shader_gemm(model, layer, "attn_output.weight", gemm_kind, hidden, seq_len, self.mul_mm_coopmat_enabled, self.mul_mm_coopmat_f16acc_enabled);
             if is_fp8_layer_weight(model, layer, "attn_output.weight") {
-                let scale_o = layer_weight_scale(model, layer, "attn_output.weight");
+                let scale_o = layer_weight_scale_buf(model, layer, "attn_output.weight")
+                    .expect("FP8 GEMM O requires a scale buffer");
                 self.run_gemm_fp8_naive(
                     dev, registry, cmd, wo, scale_o,
                     gemm_input_o, self.batch_o.handle,
@@ -4411,8 +4409,10 @@ impl Forward {
             );
         } else if is_fp8_layer_weight(model, layer, "ffn_gate.weight") {
             // Sprint 20-Wire — SafeTensors FP8 path for gate + up.
-            let scale_g = layer_weight_scale(model, layer, "ffn_gate.weight");
-            let scale_u = layer_weight_scale(model, layer, "ffn_up.weight");
+            let scale_g = layer_weight_scale_buf(model, layer, "ffn_gate.weight")
+                .expect("FP8 GEMM gate requires a scale buffer");
+            let scale_u = layer_weight_scale_buf(model, layer, "ffn_up.weight")
+                .expect("FP8 GEMM up requires a scale buffer");
             self.run_gemm_fp8_naive(
                 dev, registry, cmd, wg, scale_g,
                 gemm_input_ffn, self.batch_gate.handle,
@@ -4470,7 +4470,8 @@ impl Forward {
         let wd = layer_weight(model, layer, "ffn_down.weight");
         let sd = layer_weight_shader_gemm(model, layer, "ffn_down.weight", gemm_kind, hidden, seq_len, self.mul_mm_coopmat_enabled, self.mul_mm_coopmat_f16acc_enabled);
         if is_fp8_layer_weight(model, layer, "ffn_down.weight") {
-            let scale_d = layer_weight_scale(model, layer, "ffn_down.weight");
+            let scale_d = layer_weight_scale_buf(model, layer, "ffn_down.weight")
+                .expect("FP8 GEMM down requires a scale buffer");
             self.run_gemm_fp8_naive(
                 dev, registry, cmd, wd, scale_d,
                 gemm_input_down, self.batch_ffn_out.handle,
@@ -4722,6 +4723,17 @@ fn layer_weight_scale(model: &LoadedModel, layer: u32, suffix: &str) -> f32 {
         .tensor(&key)
         .and_then(|t| t.weight_scale)
         .unwrap_or(1.0)
+}
+
+/// Sprint 24A — Returns the weight_scale buffer handle for an FP8
+/// layer weight. `None` for unquantized tensors and for GGUF models;
+/// the FP8 GEMM dispatch sites bind it to descriptor slot 3 of the
+/// `MulCoopmatFp8*` kernels.
+fn layer_weight_scale_buf(model: &LoadedModel, layer: u32, suffix: &str) -> Option<vk::Buffer> {
+    let key = format!("blk.{layer}.{suffix}");
+    model
+        .tensor(&key)
+        .and_then(|t| t.scale_buffer.as_ref().map(|b| b.handle))
 }
 
 /// Sprint 20-Wire — `true` iff a layer's weight tensor is FP8 E4M3.

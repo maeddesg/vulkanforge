@@ -140,11 +140,21 @@ fn fp8_gemm_matches_cpu_reference() {
         MemoryLocation::GpuToCpu,
         "fp8_gemm_C",
     ).expect("alloc C");
+    // Sprint 24A — per-output-row scale at binding 3.
+    let scale_vec: Vec<f32> = vec![weight_scale; M];
+    let mut scale_buf = GpuBuffer::new(
+        &dev.device, &mut allocator,
+        (M * 4) as u64,
+        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+        MemoryLocation::CpuToGpu,
+        "fp8_gemm_scale",
+    ).expect("alloc scale");
+    scale_buf.write_bytes(bytemuck::cast_slice(&scale_vec)).expect("upload scale");
 
     let kernel = registry.get(ShaderId::MulCoopmatFp8Naive);
     let pool_sizes = [vk::DescriptorPoolSize::default()
         .ty(vk::DescriptorType::STORAGE_BUFFER)
-        .descriptor_count(3)];
+        .descriptor_count(4)];
     let pool_info = vk::DescriptorPoolCreateInfo::default()
         .max_sets(1)
         .pool_sizes(&pool_sizes);
@@ -162,6 +172,7 @@ fn fp8_gemm_matches_cpu_reference() {
         (0, w_buf.handle),
         (1, b_buf.handle),
         (2, out_buf.handle),
+        (3, scale_buf.handle),
     ];
     let infos: Vec<vk::DescriptorBufferInfo> = bindings.iter()
         .map(|(_, h)| vk::DescriptorBufferInfo::default()
@@ -185,7 +196,7 @@ fn fp8_gemm_matches_cpu_reference() {
         stride_a: K as u32,
         stride_b: K as u32,
         stride_c: M as u32,
-        weight_scale_bits: weight_scale.to_bits(),
+        weight_scale_bits: 0,  // Sprint 24A: scale moved to binding 3
     };
     let groups_x = (M as u32 + 15) / 16;
     let groups_y = (N as u32 + 15) / 16;
@@ -240,6 +251,7 @@ fn fp8_gemm_matches_cpu_reference() {
 
     unsafe { dev.device.destroy_descriptor_pool(pool, None); }
     out_buf.destroy(&dev.device, &mut allocator);
+    scale_buf.destroy(&dev.device, &mut allocator);
     b_buf.destroy(&dev.device, &mut allocator);
     w_buf.destroy(&dev.device, &mut allocator);
     cmd_ctx.destroy(&dev.device);

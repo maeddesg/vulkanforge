@@ -58,6 +58,10 @@ layout(local_size_x = BLOCK_SIZE) in;
 layout(set = 0, binding = 0) readonly  buffer BufA { uint  data_a[]; };
 layout(set = 0, binding = 1) readonly  buffer BufB { float b[]; };
 layout(set = 0, binding = 2) writeonly buffer BufC { float c[]; };
+// Sprint 24A — per-output-row weight_scale (length M). Per-tensor
+// models populate via load-time scalar broadcast; per-channel models
+// load [out_dim] directly from the SafeTensors `weight_scale` tensor.
+layout(set = 0, binding = 3) readonly  buffer ScaleBuf { float scale[]; };
 
 layout(push_constant) uniform PC {
     uint m;                  // output rows (= hidden_dim or ffn_dim)
@@ -66,7 +70,7 @@ layout(push_constant) uniform PC {
     uint stride_a;           // = K (logical row stride of weights, in elements)
     uint stride_b;           // = K (B is [N, K] row-major)
     uint stride_c;           // = M (C is [N, M] row-major)
-    uint weight_scale_bits;  // f32::to_bits(weight_scale) per-tensor
+    uint _weight_scale_unused;  // Sprint 24A: scale moved to binding 3
 } pc;
 
 void main() {
@@ -173,7 +177,6 @@ void main() {
                  gl_CooperativeMatrixLayoutRowMajor);
     barrier();
 
-    const float weight_scale = uintBitsToFloat(pc.weight_scale_bits);
     [[unroll]] for (uint w = 0; w < 4u; w++) {
         const uint fidx    = w * BLOCK_SIZE + tid;
         const uint m_local = fidx / TILE;
@@ -182,7 +185,7 @@ void main() {
         const uint gn      = wg_n + n_local;
         if (gm < pc.m && gn < pc.n) {
             c[gn * pc.stride_c + gm] =
-                buf_c[m_local * C_STRIDE + n_local] * weight_scale;
+                buf_c[m_local * C_STRIDE + n_local] * scale[gm];
         }
     }
 }

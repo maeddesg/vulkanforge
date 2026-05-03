@@ -69,6 +69,8 @@ layout(local_size_x = BLOCK_SIZE) in;
 layout(set = 0, binding = 0) readonly  buffer BufA { uint  data_a[]; };
 layout(set = 0, binding = 1) readonly  buffer BufB { float b[]; };
 layout(set = 0, binding = 2) writeonly buffer BufC { float c[]; };
+// Sprint 24A — per-output-row weight_scale (length M).
+layout(set = 0, binding = 3) readonly  buffer ScaleBuf { float scale[]; };
 
 layout(push_constant) uniform PC {
     uint m;
@@ -77,7 +79,7 @@ layout(push_constant) uniform PC {
     uint stride_a;
     uint stride_b;
     uint stride_c;
-    uint weight_scale_bits;
+    uint _weight_scale_unused;  // Sprint 24A: scale moved to binding 3
 } pc;
 
 void main() {
@@ -176,7 +178,6 @@ void main() {
                  gl_CooperativeMatrixLayoutRowMajor);
     barrier();
 
-    const float weight_scale = uintBitsToFloat(pc.weight_scale_bits);
     [[unroll]] for (uint w = 0u; w < 4u; w++) {
         const uint fidx    = w * BLOCK_SIZE + tid;   // 0..1023
         const uint m_local = fidx / BN;              // 0..63
@@ -185,7 +186,7 @@ void main() {
         const uint gn      = wg_n + n_local;
         if (gm < pc.m && gn < pc.n) {
             c[gn * pc.stride_c + gm] =
-                buf_c[m_local * C_STRIDE + n_local] * weight_scale;
+                buf_c[m_local * C_STRIDE + n_local] * scale[gm];
         }
     }
 }
