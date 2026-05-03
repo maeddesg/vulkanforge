@@ -127,6 +127,12 @@ enum Commands {
         /// Disable the <think>...</think> filter (Qwen3 thinking mode).
         #[arg(long)]
         no_think_filter: bool,
+        /// Sprint 22 — maximum KV-cache context length in tokens.
+        /// Default 2048. Larger values increase VRAM proportionally
+        /// (FP16 KV: 144 B/layer/token; FP8 KV: 72 B/layer/token).
+        /// Pinned at startup; pin once vs the model's `ctx_max`.
+        #[arg(long)]
+        max_context: Option<u32>,
     },
     /// Run a small bench: 5-prompt decode + 4-point pp sweep. For the
     /// full 15-prompt and full pp-sweep, use `cargo run --release
@@ -147,6 +153,10 @@ enum Commands {
         /// Repetitions per pp value (default 3).
         #[arg(long, default_value_t = 3)]
         runs: u32,
+        /// Sprint 22 — maximum KV-cache context length. Default 2048;
+        /// caps the largest pp the bench can sweep.
+        #[arg(long)]
+        max_context: Option<u32>,
     },
     /// Show GGUF model metadata + GPU/Vulkan information.
     Info {
@@ -160,10 +170,11 @@ fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
         Commands::Chat { model, tokenizer_from, system, max_tokens, temperature, top_k, top_p,
-                         repetition_penalty, seed, no_think_filter } => {
+                         repetition_penalty, seed, no_think_filter, max_context } => {
             run_chat(ChatArgs {
                 model: model.unwrap_or_else(default_model_path),
                 tokenizer_from,
+                max_context,
                 system: system
                     .or_else(|| std::env::var("VF_SYSTEM").ok())
                     .unwrap_or_else(|| DEFAULT_SYSTEM.to_string()),
@@ -206,12 +217,13 @@ fn main() {
                 think_filter: !no_think_filter && std::env::var("VF_NO_THINK_FILTER").is_err(),
             })
         }
-        Commands::Bench { model, tokenizer_from, pp_list, runs } => {
+        Commands::Bench { model, tokenizer_from, pp_list, runs, max_context } => {
             run_bench(
                 model.unwrap_or_else(default_model_path),
                 tokenizer_from,
                 &pp_list,
                 runs,
+                max_context,
             )
         }
         Commands::Info { model } => {
@@ -227,6 +239,7 @@ fn main() {
 struct ChatArgs {
     model: PathBuf,
     tokenizer_from: Option<PathBuf>,
+    max_context: Option<u32>,
     system: String,
     max_tokens: u32,
     temperature: f32,
@@ -259,9 +272,15 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
         buffer_device_address: false,
         allocation_sizes: gpu_allocator::AllocationSizes::default(),
     })?;
+    // Sprint 22 — `--max-context N` overrides the legacy
+    // `MAX_SEQ_LEN = 2048` default. Pinned at startup; we don't
+    // know the model's `cfg.context_length` until after load, so a
+    // post-load warning surfaces if the user asked for more than
+    // the model can position-encode.
+    let max_context = args.max_context.unwrap_or(MAX_SEQ_LEN);
     let cache_path = default_cache_path();
     let (registry, pipelines_loaded) =
-        PipelineRegistry::new(&dev.device, cache_path.as_deref())?;
+        PipelineRegistry::new_with_max_seq(&dev.device, cache_path.as_deref(), max_context)?;
     let cmd_ctx = CommandContext::new(&dev.device, dev.queue_family_index)?;
 
     let model_path = args.model;
@@ -286,6 +305,13 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = ModelConfig::from_gguf(&gguf)?;
     let model = LoadedModel::load(&dev, &mut allocator, &gguf)?;
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
+    if max_context > cfg.context_length {
+        eprintln!(
+            "VulkanForge: --max-context {} exceeds model's reported context_length {} — \
+             generation past the model's training horizon may produce nonsense.",
+            max_context, cfg.context_length,
+        );
+    }
     let kv_cache = KvCache::new(
         &dev.device,
         &mut allocator,
@@ -293,7 +319,7 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
             n_layers: cfg.n_layers,
             n_kv_heads: cfg.n_kv_heads,
             head_dim: cfg.head_dim,
-            max_seq_len: MAX_SEQ_LEN,
+            max_seq_len: max_context,
         },
     )?;
     let forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;
@@ -432,6 +458,8 @@ fn run_chat_safetensors(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>
     let tokenizer_gguf = args.tokenizer_from.ok_or_else(|| -> Box<dyn std::error::Error> {
         "--tokenizer-from <gguf> is required when --model points at a SafeTensors directory".into()
     })?;
+    // Sprint 22 — `--max-context N` plumbed.
+    let max_context = args.max_context.unwrap_or(MAX_SEQ_LEN);
 
     let dev = VulkanDevice::new()?;
     let mut allocator = Allocator::new(&AllocatorCreateDesc {
@@ -444,7 +472,7 @@ fn run_chat_safetensors(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>
     })?;
     let cache_path = default_cache_path();
     let (registry, _pipelines_loaded) =
-        PipelineRegistry::new(&dev.device, cache_path.as_deref())?;
+        PipelineRegistry::new_with_max_seq(&dev.device, cache_path.as_deref(), max_context)?;
     let cmd_ctx = CommandContext::new(&dev.device, dev.queue_family_index)?;
 
     let load_start = Instant::now();
@@ -458,6 +486,13 @@ fn run_chat_safetensors(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>
         &tok_gguf, &tokenizer,
     );
 
+    if max_context > cfg.context_length {
+        eprintln!(
+            "VulkanForge: --max-context {} exceeds model's reported context_length {} — \
+             generation past the model's training horizon may produce nonsense.",
+            max_context, cfg.context_length,
+        );
+    }
     let kv_cache = KvCache::new(
         &dev.device,
         &mut allocator,
@@ -465,7 +500,7 @@ fn run_chat_safetensors(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>
             n_layers: cfg.n_layers,
             n_kv_heads: cfg.n_kv_heads,
             head_dim: cfg.head_dim,
-            max_seq_len: MAX_SEQ_LEN,
+            max_seq_len: max_context,
         },
     )?;
     let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;
@@ -883,6 +918,7 @@ fn run_bench(
     tokenizer_from: Option<PathBuf>,
     pp_list: &str,
     runs: u32,
+    max_context: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use vulkanforge::backend::vulkan::decode::{embedding_row, EmbeddingSource, GenerateConfig, Sampling, generate_from_tokens};
     // Sprint 21C — SafeTensors directory routing. When `--model`
@@ -890,7 +926,7 @@ fn run_bench(
     // model and require `--tokenizer-from <gguf>` to provide the
     // BPE (the SafeTensors loader doesn't carry a tokenizer).
     if model_path.is_dir() {
-        return run_bench_safetensors(model_path, tokenizer_from, pp_list, runs);
+        return run_bench_safetensors(model_path, tokenizer_from, pp_list, runs, max_context);
     }
     let _ = tokenizer_from; // unused on the GGUF path
     preflight_supported(&model_path, "bench")?;
@@ -912,8 +948,13 @@ fn run_bench(
         allocation_sizes: gpu_allocator::AllocationSizes::default(),
     })?;
     let cache_path = default_cache_path();
+    // Sprint 22 — `--max-context N` plumbed.
+    let max_pp_local_pre = pp_sizes.iter().copied().max().unwrap_or(64);
+    let bench_max_seq = max_context
+        .unwrap_or(MAX_SEQ_LEN)
+        .max(max_pp_local_pre + 64);
     let (registry, _pipelines_loaded) =
-        PipelineRegistry::new(&dev.device, cache_path.as_deref())?;
+        PipelineRegistry::new_with_max_seq(&dev.device, cache_path.as_deref(), bench_max_seq)?;
     let cmd_ctx = CommandContext::new(&dev.device, dev.queue_family_index)?;
     let gguf = GgufFile::open(&model_path)?;
     let cfg = ModelConfig::from_gguf(&gguf)?;
@@ -926,7 +967,8 @@ fn run_bench(
             n_layers: cfg.n_layers, n_kv_heads: cfg.n_kv_heads,
             head_dim: cfg.head_dim,
             // Bench needs to fit prefill + decode_max in the kv cache.
-            max_seq_len: (max_pp_local + 64).max(MAX_SEQ_LEN),
+            // Sprint 22 — also respects `--max-context`.
+            max_seq_len: bench_max_seq.max(max_pp_local + 64),
         },
     )?;
     let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;
@@ -1031,6 +1073,7 @@ fn run_bench_safetensors(
     tokenizer_from: Option<PathBuf>,
     pp_list: &str,
     runs: u32,
+    max_context: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use vulkanforge::backend::vulkan::decode::{
         EmbeddingSource, GenerateConfig, Sampling, generate_from_tokens,
@@ -1056,8 +1099,13 @@ fn run_bench_safetensors(
         allocation_sizes: gpu_allocator::AllocationSizes::default(),
     })?;
     let cache_path = default_cache_path();
+    // Sprint 22 — `--max-context N` plumbed (SafeTensors bench).
+    let max_pp_local_pre = pp_sizes.iter().copied().max().unwrap_or(64);
+    let bench_max_seq = max_context
+        .unwrap_or(MAX_SEQ_LEN)
+        .max(max_pp_local_pre + 64);
     let (registry, _pipelines_loaded) =
-        PipelineRegistry::new(&dev.device, cache_path.as_deref())?;
+        PipelineRegistry::new_with_max_seq(&dev.device, cache_path.as_deref(), bench_max_seq)?;
     let cmd_ctx = CommandContext::new(&dev.device, dev.queue_family_index)?;
 
     let (model, host_embed, _hf) =
@@ -1074,7 +1122,8 @@ fn run_bench_safetensors(
             n_layers: cfg.n_layers,
             n_kv_heads: cfg.n_kv_heads,
             head_dim: cfg.head_dim,
-            max_seq_len: (max_pp_local + 64).max(MAX_SEQ_LEN),
+            // Sprint 22 — also respects `--max-context`.
+            max_seq_len: bench_max_seq.max(max_pp_local + 64),
         },
     )?;
     let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;

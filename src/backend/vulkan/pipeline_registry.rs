@@ -79,10 +79,31 @@ pub struct CacheStats {
 impl PipelineRegistry {
     /// Build the registry, loading a pipeline cache from `cache_path`
     /// when present. Returns the registry plus stats describing how
-    /// many bytes were loaded.
+    /// many bytes were loaded. Uses the legacy `MAX_SEQ = 2048`
+    /// spec-constant that pre-Sprint-22 callsites assume; new
+    /// callsites that want a larger context window should use
+    /// `new_with_max_seq` instead.
     pub fn new(
         device: &ash::Device,
         cache_path: Option<&Path>,
+    ) -> Result<(Self, usize), Box<dyn std::error::Error>> {
+        Self::new_with_max_seq(device, cache_path, 2048)
+    }
+
+    /// Sprint 22 — registry build with a configurable `MAX_SEQ`
+    /// spec constant. Plumbed into the four attention pipelines
+    /// (`ScalarAttn`, `FlashAttn` family, `FlashAttnBatch`).
+    /// `max_seq` only directly sizes LDS in `scalar_attn.comp`
+    /// (`shared float scores[MAX_SEQ]` — RDNA4 LDS budget is 64 KB
+    /// per CU, so e.g. 8192 → 32 KB → still loadable but with
+    /// reduced occupancy). `scalar_attn` is not on the production
+    /// dispatch path; the flash-attention shaders carry the spec
+    /// const for binary compat only — their LDS depends on TILE,
+    /// not MAX_SEQ, and is fixed.
+    pub fn new_with_max_seq(
+        device: &ash::Device,
+        cache_path: Option<&Path>,
+        max_seq: u32,
     ) -> Result<(Self, usize), Box<dyn std::error::Error>> {
         // 1) Load cache blob if any.
         let cache_blob: Vec<u8> = match cache_path {
@@ -191,9 +212,10 @@ impl PipelineRegistry {
                 }
                 ShaderId::ScalarAttn => {
                     // SpecId 0 = MAX_SEQ — sets the size of the
-                    // shared `scores[]` buffer. 2048 covers Phase-2
-                    // contexts; bump in Phase 3 for longer windows.
-                    let data: [u32; 1] = [2048];
+                    // shared `scores[]` buffer. Sprint 22 — wired
+                    // to the constructor's `max_seq` parameter so
+                    // `--max-context N` flows through.
+                    let data: [u32; 1] = [max_seq];
                     let entries = [entry(0, 0, 4)];
                     let bytes = bytemuck::bytes_of(&data);
                     ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes, None)
@@ -348,12 +370,11 @@ impl PipelineRegistry {
                 | ShaderId::FlashAttnFp16Kv
                 | ShaderId::FlashAttnFp8Kv => {
                     // SpecId 0 = MAX_SEQ — same convention as scalar_attn.
-                    // 2048 covers the Phase-2 contexts; bump in Phase 4 if
-                    // we go past 2048 tokens of context.
-                    // Sprint 9d.3 — FlashAttnFp16Kv shares the same
-                    // spec layout (FP16_KV is a build-time #define,
-                    // not a spec const).
-                    let data: [u32; 1] = [2048];
+                    // Sprint 22 — wired to the constructor's `max_seq`
+                    // parameter so `--max-context N` flows through.
+                    // The flash-attention shaders' LDS depends on TILE,
+                    // not MAX_SEQ; this spec const is binary-compat only.
+                    let data: [u32; 1] = [max_seq];
                     let entries = [entry(0, 0, 4)];
                     let bytes = bytemuck::bytes_of(&data);
                     ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes, None)
@@ -419,8 +440,8 @@ impl PipelineRegistry {
                 ShaderId::FlashAttnBatch => {
                     // SpecId 0 = MAX_SEQ — kept for parity with FlashAttn
                     // even though the runtime path uses push-constant
-                    // dimensions only.
-                    let data: [u32; 1] = [2048];
+                    // dimensions only. Sprint 22 — `max_seq` plumbed.
+                    let data: [u32; 1] = [max_seq];
                     let entries = [entry(0, 0, 4)];
                     let bytes = bytemuck::bytes_of(&data);
                     ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes, None)
