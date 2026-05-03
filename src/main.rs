@@ -132,9 +132,15 @@ enum Commands {
     /// full 15-prompt and full pp-sweep, use `cargo run --release
     /// --example run_15prompt_bench` and `--example run_pp_bench`.
     Bench {
-        /// Path to GGUF model file.
+        /// Path to GGUF model file (or SafeTensors model directory
+        /// when `--tokenizer-from <gguf>` is also set).
         #[arg(short, long)]
         model: Option<PathBuf>,
+        /// Sprint 21C — load tokenizer from this GGUF when `--model`
+        /// points at a SafeTensors directory; ignored otherwise.
+        /// Required for FP8 SafeTensors bench sweeps.
+        #[arg(long)]
+        tokenizer_from: Option<PathBuf>,
         /// Prompt-length sweep (comma-separated; default 64,128,512,1024).
         #[arg(long, default_value = "64,128,512,1024")]
         pp_list: String,
@@ -200,8 +206,13 @@ fn main() {
                 think_filter: !no_think_filter && std::env::var("VF_NO_THINK_FILTER").is_err(),
             })
         }
-        Commands::Bench { model, pp_list, runs } => {
-            run_bench(model.unwrap_or_else(default_model_path), &pp_list, runs)
+        Commands::Bench { model, tokenizer_from, pp_list, runs } => {
+            run_bench(
+                model.unwrap_or_else(default_model_path),
+                tokenizer_from,
+                &pp_list,
+                runs,
+            )
         }
         Commands::Info { model } => {
             run_info(&model.unwrap_or_else(default_model_path))
@@ -869,10 +880,19 @@ fn preflight_supported(
 
 fn run_bench(
     model_path: PathBuf,
+    tokenizer_from: Option<PathBuf>,
     pp_list: &str,
     runs: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use vulkanforge::backend::vulkan::decode::{embedding_row, EmbeddingSource, GenerateConfig, Sampling, generate_from_tokens};
+    // Sprint 21C — SafeTensors directory routing. When `--model`
+    // points at a directory, treat it as a HuggingFace SafeTensors
+    // model and require `--tokenizer-from <gguf>` to provide the
+    // BPE (the SafeTensors loader doesn't carry a tokenizer).
+    if model_path.is_dir() {
+        return run_bench_safetensors(model_path, tokenizer_from, pp_list, runs);
+    }
+    let _ = tokenizer_from; // unused on the GGUF path
     preflight_supported(&model_path, "bench")?;
 
     let pp_sizes: Vec<u32> = pp_list
@@ -997,5 +1017,136 @@ fn run_bench(
     // (it's used by the example benches, kept in scope here in case the
     // bench grows a streaming-decode variant later).
     let _ = embedding_row;
+    Ok(())
+}
+
+/// Sprint 21C — bench entry point for SafeTensors FP8 models.
+/// Mirrors `run_bench`'s decode + pp-sweep loop but loads weights
+/// via `LoadedModel::load_safetensors`, the tokenizer via the
+/// supplied `--tokenizer-from <gguf>`, and feeds prefill through
+/// `EmbeddingSource::Host` so the pp-sweep actually exercises the
+/// FP8 GEMM prefill path.
+fn run_bench_safetensors(
+    model_dir: PathBuf,
+    tokenizer_from: Option<PathBuf>,
+    pp_list: &str,
+    runs: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use vulkanforge::backend::vulkan::decode::{
+        EmbeddingSource, GenerateConfig, Sampling, generate_from_tokens,
+    };
+
+    let tokenizer_gguf = tokenizer_from.ok_or_else(|| -> Box<dyn std::error::Error> {
+        "--tokenizer-from <gguf> is required when --model points at a SafeTensors directory".into()
+    })?;
+
+    let pp_sizes: Vec<u32> = pp_list
+        .split(',')
+        .map(|s| s.trim().parse::<u32>())
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("invalid --pp-list (must be comma-separated u32): {e}"))?;
+
+    let dev = VulkanDevice::new()?;
+    let mut allocator = Allocator::new(&AllocatorCreateDesc {
+        instance: dev.instance.clone(),
+        device: dev.device.clone(),
+        physical_device: dev.physical_device,
+        debug_settings: gpu_allocator::AllocatorDebugSettings::default(),
+        buffer_device_address: false,
+        allocation_sizes: gpu_allocator::AllocationSizes::default(),
+    })?;
+    let cache_path = default_cache_path();
+    let (registry, _pipelines_loaded) =
+        PipelineRegistry::new(&dev.device, cache_path.as_deref())?;
+    let cmd_ctx = CommandContext::new(&dev.device, dev.queue_family_index)?;
+
+    let (model, host_embed, _hf) =
+        LoadedModel::load_safetensors(&dev, &mut allocator, &model_dir)?;
+    let cfg = model.config.clone();
+
+    let tok_gguf = GgufFile::open(&tokenizer_gguf)?;
+    let tokenizer = Tokenizer::from_gguf(&tok_gguf)?;
+
+    let max_pp_local = pp_sizes.iter().copied().max().unwrap_or(64);
+    let kv_cache = KvCache::new(
+        &dev.device, &mut allocator,
+        KvCacheConfig {
+            n_layers: cfg.n_layers,
+            n_kv_heads: cfg.n_kv_heads,
+            head_dim: cfg.head_dim,
+            max_seq_len: (max_pp_local + 64).max(MAX_SEQ_LEN),
+        },
+    )?;
+    let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;
+
+    println!();
+    println!("  vulkanforge bench (SafeTensors FP8) — {} runs/sample", runs);
+    println!("    Model:     {}", model_dir.display());
+    println!("    Tokenizer: {}", tokenizer_gguf.display());
+    println!();
+
+    // ---- 1. Decode benchmark ----
+    let decode_max = 32u32;
+    let cfg_g = GenerateConfig {
+        max_tokens: decode_max,
+        print_stream: false,
+        think_filter: false,
+        sampling: Sampling { temperature: 0.0, top_k: 0, top_p: 1.0, repetition_penalty: 1.0, seed: 0 },
+    };
+    let prefill_tok = vec![tokenizer.bos_id.unwrap_or(1)];
+    let mut decode_samples = Vec::new();
+    for _ in 0..runs {
+        forward.kv_cache.reset();
+        let r = generate_from_tokens(
+            &mut forward, &dev, &registry, &cmd_ctx, &model,
+            EmbeddingSource::Host(&host_embed),
+            &cfg, &tokenizer,
+            &prefill_tok, 0, &cfg_g, false, &mut |_, _| {},
+        )?;
+        if r.generated_tokens > 0 {
+            decode_samples.push(r.decode_time.as_secs_f64() / r.generated_tokens as f64);
+        }
+    }
+    decode_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let med_decode_s_per_tok = decode_samples[decode_samples.len() / 2];
+    let decode_tok_s = 1.0 / med_decode_s_per_tok;
+    println!("  Decode (1-tok prompt + {} gen)", decode_max);
+    println!("    {:>6.1} tok/s  (median over {} runs)", decode_tok_s, runs);
+
+    // ---- 2. Prefill sweep ----
+    println!();
+    println!("  Prefill sweep");
+    println!("    {:>6}  {:>10}  {:>10}", "pp", "ms (med)", "tok/s");
+    let cfg_pp = GenerateConfig {
+        max_tokens: 1,
+        print_stream: false,
+        think_filter: false,
+        sampling: Sampling { temperature: 0.0, top_k: 0, top_p: 1.0, repetition_penalty: 1.0, seed: 0 },
+    };
+    for &pp in &pp_sizes {
+        let toks: Vec<u32> = (0..pp).map(|_| tokenizer.bos_id.unwrap_or(1)).collect();
+        let mut samples_ms = Vec::new();
+        for _ in 0..runs {
+            forward.kv_cache.reset();
+            let r = generate_from_tokens(
+                &mut forward, &dev, &registry, &cmd_ctx, &model,
+                EmbeddingSource::Host(&host_embed),
+                &cfg, &tokenizer,
+                &toks, 0, &cfg_pp, false, &mut |_, _| {},
+            )?;
+            samples_ms.push(r.prefill_time.as_secs_f64() * 1000.0);
+        }
+        samples_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med = samples_ms[samples_ms.len() / 2];
+        let tok_s = (pp as f64) / (med / 1000.0);
+        println!("    {:>6}  {:>10.1}  {:>10.1}", pp, med, tok_s);
+    }
+    println!();
+
+    forward.destroy(&dev.device, &mut allocator);
+    cmd_ctx.destroy(&dev.device);
+    model.destroy(&dev.device, &mut allocator);
+    registry.destroy(&dev.device);
+    drop(allocator);
     Ok(())
 }
