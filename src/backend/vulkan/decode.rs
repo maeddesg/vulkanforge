@@ -367,8 +367,8 @@ pub fn generate(
             }
         };
         let mut r = generate_from_tokens(
-            forward, dev, registry, cmd_ctx, model, gguf, cfg, tokenizer,
-            &prompt_tokens, 0, config, &mut on_token,
+            forward, dev, registry, cmd_ctx, model, EmbeddingSource::Gguf(gguf),
+            cfg, tokenizer, &prompt_tokens, 0, config, false, &mut on_token,
         )?;
         // Flush any tail still buffered in the filter.
         // We can't borrow the closure-local filter back here, so
@@ -381,9 +381,37 @@ pub fn generate(
     } else {
         let mut on_token = |_: u32, _: &str| {};
         generate_from_tokens(
-            forward, dev, registry, cmd_ctx, model, gguf, cfg, tokenizer,
-            &prompt_tokens, 0, config, &mut on_token,
+            forward, dev, registry, cmd_ctx, model, EmbeddingSource::Gguf(gguf),
+            cfg, tokenizer, &prompt_tokens, 0, config, false, &mut on_token,
         )
+    }
+}
+
+/// Sprint 20-M3 — abstract source for token-embedding rows. GGUF
+/// models dequantize on the fly from the file mmap; SafeTensors FP8
+/// models keep an FP32 host cache (BF16 → FP32 expanded at load
+/// time) because the GPU buffer isn't host-readable.
+pub enum EmbeddingSource<'a> {
+    Gguf(&'a GgufFile),
+    /// Pre-expanded FP32 vocab × hidden_dim, row-major.
+    Host(&'a [f32]),
+}
+
+fn embed_lookup(
+    src: &EmbeddingSource<'_>,
+    cfg: &ModelConfig,
+    tid: u32,
+) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    match src {
+        EmbeddingSource::Gguf(gguf) => embedding_row(gguf, cfg, tid),
+        EmbeddingSource::Host(cache) => {
+            let hidden = cfg.hidden_dim as usize;
+            let start = (tid as usize) * hidden;
+            if start + hidden > cache.len() {
+                return Err(format!("token_id {tid} out of range").into());
+            }
+            Ok(cache[start..start + hidden].to_vec())
+        }
     }
 }
 
@@ -391,6 +419,12 @@ pub fn generate(
 /// `start_pos` (does NOT reset the KV cache), then runs greedy decode
 /// up to `config.max_tokens` or EOS. Streams each generated token
 /// through `on_token(id, decoded_text)`.
+///
+/// `force_per_token_prefill = true` (Sprint 20-M3) bypasses
+/// `prefill_batch` and feeds each prompt token through `forward_token`
+/// instead. Used by SafeTensors FP8 models, which don't (yet) ship
+/// an FP8 GEMM prefill kernel — the per-token GEMV path works because
+/// `run_gemv` is already FP8-aware.
 ///
 /// Returns the elapsed prefill / decode timings and the raw +
 /// think-filtered concatenated text.
@@ -401,12 +435,13 @@ pub fn generate_from_tokens(
     registry: &PipelineRegistry,
     cmd_ctx: &CommandContext,
     model: &LoadedModel,
-    gguf: &GgufFile,
+    embed_src: EmbeddingSource<'_>,
     cfg: &ModelConfig,
     tokenizer: &Tokenizer,
     prefill_tokens: &[u32],
     start_pos: u32,
     config: &GenerateConfig,
+    force_per_token_prefill: bool,
     on_token: &mut dyn FnMut(u32, &str),
 ) -> Result<GenerateResult, Box<dyn std::error::Error>> {
     let max_seq = forward.kv_cache.config.max_seq_len;
@@ -440,18 +475,32 @@ pub fn generate_from_tokens(
         // already covers the multi-tile-within-one-prefill case;
         // chunked prefill is the same shape extended across multiple
         // prefill_batch submits.
-        let chunk_size = forward.max_prefill_tokens.max(1) as usize;
-        for chunk in prefill_tokens.chunks(chunk_size) {
-            let chunk_len = chunk.len() as u32;
-            let mut chunk_embeds: Vec<f32> =
-                Vec::with_capacity(chunk.len() * cfg.hidden_dim as usize);
-            for &tid in chunk {
-                chunk_embeds.extend(embedding_row(gguf, cfg, tid)?);
+        if force_per_token_prefill {
+            // Sprint 20-M3 — SafeTensors FP8 models reach this branch:
+            // batched prefill would hit the (FP16) `mul_mm.comp` GEMM
+            // which has no `DATA_A_FP8` variant, so we fall back to
+            // the per-token GEMV path. That's slow at long pp but
+            // proves the end-to-end pipeline; an FP8 GEMM port is
+            // future work (Sprint 19A-style coopmat coverage).
+            for &tid in prefill_tokens {
+                let embd = embed_lookup(&embed_src, cfg, tid)?;
+                forward.forward_token(dev, registry, cmd_ctx, model, &embd, pos)?;
+                pos += 1;
             }
-            forward.prefill_batch(
-                dev, registry, cmd_ctx, model, &chunk_embeds, chunk_len, pos,
-            )?;
-            pos += chunk_len;
+        } else {
+            let chunk_size = forward.max_prefill_tokens.max(1) as usize;
+            for chunk in prefill_tokens.chunks(chunk_size) {
+                let chunk_len = chunk.len() as u32;
+                let mut chunk_embeds: Vec<f32> =
+                    Vec::with_capacity(chunk.len() * cfg.hidden_dim as usize);
+                for &tid in chunk {
+                    chunk_embeds.extend(embed_lookup(&embed_src, cfg, tid)?);
+                }
+                forward.prefill_batch(
+                    dev, registry, cmd_ctx, model, &chunk_embeds, chunk_len, pos,
+                )?;
+                pos += chunk_len;
+            }
         }
     }
     let mut last_logits = forward.logits()?;
@@ -514,7 +563,7 @@ pub fn generate_from_tokens(
             emit(first_id, on_token, &mut utf8_buf, &bytes);
             generated.push(first_id);
 
-            let embd = embedding_row(gguf, cfg, first_id)?;
+            let embd = embed_lookup(&embed_src, cfg, first_id)?;
             forward.pre_record(dev, registry, model, 0, pos)?;
             forward.fill_embed_and_submit(dev, 0, &embd, pos)?;
             let mut cur_slot = 1usize;
@@ -547,7 +596,7 @@ pub fn generate_from_tokens(
                 generated.push(next_id);
 
                 // Stage 3: write embedding + submit.
-                let embd = embedding_row(gguf, cfg, next_id)?;
+                let embd = embed_lookup(&embed_src, cfg, next_id)?;
                 forward.fill_embed_and_submit(dev, cur_slot, &embd, pos)?;
 
                 cur_slot = 1 - cur_slot;
@@ -575,7 +624,7 @@ pub fn generate_from_tokens(
             emit(next_id, on_token, &mut utf8_buf, &bytes);
             generated.push(next_id);
 
-            let embd = embedding_row(gguf, cfg, next_id)?;
+            let embd = embed_lookup(&embed_src, cfg, next_id)?;
             forward.forward_token(dev, registry, cmd_ctx, model, &embd, pos)?;
             last_logits = forward.logits()?;
             pos += 1;

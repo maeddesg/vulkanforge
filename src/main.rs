@@ -92,10 +92,17 @@ struct Cli {
 enum Commands {
     /// Interactive multi-turn chat REPL (single-turn via VF_PROMPT="...").
     Chat {
-        /// Path to GGUF model file. Defaults to $VF_MODEL_PATH or
-        /// ~/models/Qwen3-8B-Q4_K_M.gguf.
+        /// Path to GGUF model file (or SafeTensors model directory
+        /// when `--tokenizer-from <gguf>` is also set).
+        /// Defaults to $VF_MODEL_PATH or ~/models/Qwen3-8B-Q4_K_M.gguf.
         #[arg(short, long)]
         model: Option<PathBuf>,
+        /// Sprint 20-M3 — SafeTensors models don't carry an embedded
+        /// tokenizer, so VF reuses the BPE from a matching GGUF.
+        /// Required when `--model` points at a directory; ignored
+        /// otherwise.
+        #[arg(long)]
+        tokenizer_from: Option<PathBuf>,
         /// System prompt (default: "You are a helpful assistant.").
         #[arg(long)]
         system: Option<String>,
@@ -146,10 +153,11 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
-        Commands::Chat { model, system, max_tokens, temperature, top_k, top_p,
+        Commands::Chat { model, tokenizer_from, system, max_tokens, temperature, top_k, top_p,
                          repetition_penalty, seed, no_think_filter } => {
             run_chat(ChatArgs {
                 model: model.unwrap_or_else(default_model_path),
+                tokenizer_from,
                 system: system
                     .or_else(|| std::env::var("VF_SYSTEM").ok())
                     .unwrap_or_else(|| DEFAULT_SYSTEM.to_string()),
@@ -207,6 +215,7 @@ fn main() {
 
 struct ChatArgs {
     model: PathBuf,
+    tokenizer_from: Option<PathBuf>,
     system: String,
     max_tokens: u32,
     temperature: f32,
@@ -219,6 +228,16 @@ struct ChatArgs {
 }
 
 fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Sprint 20-M3 — SafeTensors directory routing. When `--model`
+    // points at a directory, treat it as a HuggingFace SafeTensors
+    // model and require `--tokenizer-from <gguf>` to provide the
+    // BPE (we don't ship the `tokenizers` crate). The dispatcher
+    // takes a different path (load_safetensors + per-token prefill
+    // + EmbeddingSource::Host) and skips `preflight_supported`,
+    // which is GGUF-only.
+    if args.model.is_dir() {
+        return run_chat_safetensors(args);
+    }
     preflight_supported(&args.model, "chat")?;
     let dev = VulkanDevice::new()?;
     let mut allocator = Allocator::new(&AllocatorCreateDesc {
@@ -385,6 +404,130 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
     registry.destroy(&dev.device);
     drop(allocator);
     let _ = vk::Buffer::null();
+    Ok(())
+}
+
+/// Sprint 20-M3 — chat entry point for SafeTensors FP8 models.
+/// Single-turn (`VF_PROMPT="..."` or first stdin line). Uses
+/// `LoadedModel::load_safetensors` for weights, the GGUF supplied
+/// via `--tokenizer-from` for the tokenizer + chat template, and
+/// `EmbeddingSource::Host` + `force_per_token_prefill=true` to drive
+/// generation through the FP8 GEMV path (no FP8 GEMM yet).
+fn run_chat_safetensors(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use vulkanforge::backend::vulkan::decode::{
+        generate_from_tokens, EmbeddingSource, GenerateConfig,
+    };
+
+    let tokenizer_gguf = args.tokenizer_from.ok_or_else(|| -> Box<dyn std::error::Error> {
+        "--tokenizer-from <gguf> is required when --model points at a SafeTensors directory".into()
+    })?;
+
+    let dev = VulkanDevice::new()?;
+    let mut allocator = Allocator::new(&AllocatorCreateDesc {
+        instance: dev.instance.clone(),
+        device: dev.device.clone(),
+        physical_device: dev.physical_device,
+        debug_settings: gpu_allocator::AllocatorDebugSettings::default(),
+        buffer_device_address: false,
+        allocation_sizes: gpu_allocator::AllocationSizes::default(),
+    })?;
+    let cache_path = default_cache_path();
+    let (registry, _pipelines_loaded) =
+        PipelineRegistry::new(&dev.device, cache_path.as_deref())?;
+    let cmd_ctx = CommandContext::new(&dev.device, dev.queue_family_index)?;
+
+    let load_start = Instant::now();
+    let (model, host_embed, _hf) =
+        LoadedModel::load_safetensors(&dev, &mut allocator, &args.model)?;
+    let cfg = model.config.clone();
+
+    let tok_gguf = GgufFile::open(&tokenizer_gguf)?;
+    let tokenizer = Tokenizer::from_gguf(&tok_gguf)?;
+    let template = vulkanforge::backend::vulkan::chat_template::ChatTemplate::detect(
+        &tok_gguf, &tokenizer,
+    );
+
+    let kv_cache = KvCache::new(
+        &dev.device,
+        &mut allocator,
+        KvCacheConfig {
+            n_layers: cfg.n_layers,
+            n_kv_heads: cfg.n_kv_heads,
+            head_dim: cfg.head_dim,
+            max_seq_len: MAX_SEQ_LEN,
+        },
+    )?;
+    let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;
+
+    println!();
+    println!("VulkanForge — native FP8 chat (Sprint 20-M3)");
+    println!("  Model:       {}", args.model.display());
+    println!("  Tokenizer:   {}", tokenizer_gguf.display());
+    println!(
+        "    {:.2} GiB · {} layers · hidden={} · heads={} · kv_heads={} · ctx_max={}",
+        model.bytes_uploaded as f64 / (1024.0 * 1024.0 * 1024.0),
+        cfg.n_layers, cfg.hidden_dim, cfg.n_heads, cfg.n_kv_heads, cfg.context_length,
+    );
+    println!("  Loaded in {:.1} s", load_start.elapsed().as_secs_f64());
+    println!("  Pipelines: {}", registry.count());
+    println!();
+
+    let user_prompt = std::env::var("VF_PROMPT").ok().unwrap_or_else(|| {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).ok();
+        line.trim().to_string()
+    });
+    if user_prompt.is_empty() {
+        return Err("empty prompt — set VF_PROMPT or pipe a line".into());
+    }
+    println!("> {user_prompt}");
+    println!();
+
+    let prompt_tokens = template.render_first_turn(&tokenizer, &args.system, &user_prompt);
+
+    let cfg_g = GenerateConfig {
+        max_tokens: args.max_tokens,
+        print_stream: false,
+        think_filter: args.think_filter,
+        sampling: Sampling {
+            temperature: args.temperature,
+            top_k: args.top_k,
+            top_p: args.top_p,
+            repetition_penalty: args.repetition_penalty,
+            seed: args.seed,
+        },
+    };
+
+    let mut on_token = |_id: u32, raw: &str| {
+        print!("{raw}");
+        let _ = std::io::stdout().flush();
+    };
+    forward.kv_cache.reset();
+    let r = generate_from_tokens(
+        &mut forward, &dev, &registry, &cmd_ctx, &model,
+        EmbeddingSource::Host(&host_embed),
+        &cfg, &tokenizer,
+        &prompt_tokens, 0, &cfg_g,
+        true,
+        &mut on_token,
+    )?;
+    println!();
+    println!();
+    println!(
+        "  [{} prompt, {} gen, prefill {:.1} ms ({:.1} tok/s), decode {:.1} tok/s{}]",
+        r.prompt_tokens,
+        r.generated_tokens,
+        r.prefill_time.as_secs_f64() * 1000.0,
+        r.prompt_tokens as f64 / r.prefill_time.as_secs_f64().max(1e-6),
+        r.generated_tokens as f64 / r.decode_time.as_secs_f64().max(1e-6),
+        if r.stopped_on_eos { "" } else { ", capped" },
+    );
+
+    forward.destroy(&dev.device, &mut allocator);
+    cmd_ctx.destroy(&dev.device);
+    model.destroy(&dev.device, &mut allocator);
+    registry.destroy(&dev.device);
+    drop(allocator);
     Ok(())
 }
 
@@ -720,7 +863,7 @@ fn run_bench(
     pp_list: &str,
     runs: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use vulkanforge::backend::vulkan::decode::{embedding_row, GenerateConfig, Sampling, generate_from_tokens};
+    use vulkanforge::backend::vulkan::decode::{embedding_row, EmbeddingSource, GenerateConfig, Sampling, generate_from_tokens};
     preflight_supported(&model_path, "bench")?;
 
     let pp_sizes: Vec<u32> = pp_list
@@ -778,8 +921,10 @@ fn run_bench(
         forward.kv_cache.reset();
         let t0 = Instant::now();
         let r = generate_from_tokens(
-            &mut forward, &dev, &registry, &cmd_ctx, &model, &gguf, &cfg, &tokenizer,
-            &prefill_tok, 0, &cfg_g, &mut |_, _| {},
+            &mut forward, &dev, &registry, &cmd_ctx, &model,
+            EmbeddingSource::Gguf(&gguf),
+            &cfg, &tokenizer,
+            &prefill_tok, 0, &cfg_g, false, &mut |_, _| {},
         )?;
         let _ = t0; // (timings live inside r)
         if r.generated_tokens > 0 {
@@ -816,8 +961,10 @@ fn run_bench(
             forward.kv_cache.reset();
             let t0 = Instant::now();
             let r = generate_from_tokens(
-                &mut forward, &dev, &registry, &cmd_ctx, &model, &gguf, &cfg, &tokenizer,
-                &toks, 0, &cfg_pp, &mut |_, _| {},
+                &mut forward, &dev, &registry, &cmd_ctx, &model,
+                EmbeddingSource::Gguf(&gguf),
+                &cfg, &tokenizer,
+                &toks, 0, &cfg_pp, false, &mut |_, _| {},
             )?;
             let _ = t0;
             samples_ms.push(r.prefill_time.as_secs_f64() * 1000.0);

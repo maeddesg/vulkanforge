@@ -48,6 +48,11 @@ pub enum ShaderId {
     /// row stride / column count match the existing `MatVecPushConstants`
     /// surface so the shader plugs into `Forward::run_gemv`.
     MulMatVecFp8,
+    /// Sprint 20-M3 — FP32 weight GEMV (lm_head on SafeTensors FP8
+    /// models, where lm_head is excluded from quantization and lands
+    /// as BF16-expanded FP32). Same 5-binding descriptor layout as
+    /// MulMatVecFp8 so a single helper drives both.
+    MulMatVecF32,
     RmsNorm,
     RopeNorm,
     RopeNeox,
@@ -315,6 +320,7 @@ impl ShaderId {
             ShaderId::MulMatVecQ4_0 => "mul_mat_vec_q4_0_f32_f32",
             ShaderId::MulMatVecQ4_0Subgroup => "mul_mat_vec_q4_0_f32_f32_subgroup",
             ShaderId::MulMatVecFp8 => "mul_mat_vec_fp8",
+            ShaderId::MulMatVecF32 => "mul_mat_vec_f32",
             ShaderId::RmsNorm => "rms_norm_f32",
             ShaderId::RopeNorm => "rope_norm_f32",
             ShaderId::RopeNeox => "rope_neox_f32",
@@ -419,6 +425,7 @@ impl ShaderId {
             ShaderId::MulMatVecQ4_0 => MUL_MAT_VEC_Q4_0_F32_F32,
             ShaderId::MulMatVecQ4_0Subgroup => MUL_MAT_VEC_Q4_0_F32_F32_SUBGROUP,
             ShaderId::MulMatVecFp8 => MUL_MAT_VEC_FP8,
+            ShaderId::MulMatVecF32 => MUL_MAT_VEC_F32,
             ShaderId::RmsNorm => RMS_NORM_F32,
             ShaderId::RopeNorm => ROPE_NORM_F32,
             ShaderId::RopeNeox => ROPE_NEOX_F32,
@@ -530,6 +537,7 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::MulMatVecQ4_0,
     ShaderId::MulMatVecQ4_0Subgroup,
     ShaderId::MulMatVecFp8,
+    ShaderId::MulMatVecF32,
     ShaderId::RmsNorm,
     ShaderId::RopeNorm,
     ShaderId::RopeNeox,
@@ -662,6 +670,8 @@ pub const MUL_MAT_VEC_Q4_0_F32_F32_SUBGROUP: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q4_0_f32_f32_subgroup.spv"));
 pub const MUL_MAT_VEC_FP8: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_fp8.spv"));
+pub const MUL_MAT_VEC_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_f32.spv"));
 pub const RMS_NORM_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm_f32.spv"));
 pub const ROPE_NORM_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope_norm_f32.spv"));
 pub const ROPE_NEOX_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope_neox_f32.spv"));

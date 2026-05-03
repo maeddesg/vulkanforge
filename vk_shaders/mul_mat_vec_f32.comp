@@ -1,0 +1,72 @@
+#version 450
+
+// Sprint 20-M3 — FP32 weight GEMV. Used for the lm_head of SafeTensors
+// FP8 models (lm_head is in the compressed-tensors `ignore` list, so it
+// stays BF16 → expanded to FP32 at load time). Same descriptor-set
+// layout as `mul_mat_vec_fp8.comp` and the GGUF K-quant GEMVs (5
+// bindings: weight, input, output, fuse0, fuse1) so a single
+// `run_gemv_with_scale` helper can drive all of them.
+//
+// Output[row] = scale * sum_k( W[row, k] * input[k] )
+// Scale is read from the last slot of `MatVecPushConstants` via
+// `f32::to_bits()` reinterpretation; the loader writes `Some(scale)`
+// for FP8 weights and `None → 1.0` for everything else.
+//
+// One workgroup per output row, 64-thread Wave64 LDS-tree reduction.
+// Same shape as the FP8 GEMV — only the weight read differs.
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer WeightBuf { float data_a[]; };
+layout (binding = 1) readonly buffer InputBuf  { float data_b[]; };
+layout (binding = 2) writeonly buffer OutputBuf { float data_d[]; };
+layout (binding = 3) readonly buffer Fuse0Dummy { uint _fuse0_dummy[]; };
+layout (binding = 4) readonly buffer Fuse1Dummy { uint _fuse1_dummy[]; };
+
+// Layout matches MatVecPushConstants (13 × u32 = 52 B). The last slot
+// is reinterpreted as the per-tensor scale (1.0 for non-FP8 weights).
+layout (push_constant) uniform parameter {
+    uint  ncols;
+    uint  stride_a;
+    uint  stride_b;
+    uint  stride_d;
+    uint  batch_stride_a;
+    uint  batch_stride_b;
+    uint  batch_stride_d;
+    uint  _fusion_flags;
+    uint  _base_work_group_y;
+    uint  _ne02;
+    uint  _ne12;
+    uint  _broadcast2;
+    float weight_scale;
+} p;
+
+shared float lds_partial[1024];
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    if (row >= p.stride_d) return;
+
+    const uint tid    = gl_LocalInvocationID.x;
+    const uint nthr   = gl_WorkGroupSize.x;
+    const uint K      = p.ncols;
+    const uint row_o  = row * p.stride_a; // first element of this row
+
+    float partial = 0.0;
+    [[unroll(1)]] for (uint k = tid; k < K; k += nthr) {
+        partial = fma(data_a[row_o + k], data_b[k], partial);
+    }
+    lds_partial[tid] = partial;
+    barrier();
+    for (uint stride = nthr / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            lds_partial[tid] += lds_partial[tid + stride];
+        }
+        barrier();
+    }
+    if (tid == 0) {
+        data_d[row] = lds_partial[0] * p.weight_scale;
+    }
+}

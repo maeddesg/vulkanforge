@@ -97,7 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             buffer_device_address: false,
             allocation_sizes: gpu_allocator::AllocationSizes::default(),
         })?;
-        let model = LoadedModel::load_safetensors(&dev, &mut allocator, &dir)?;
+        let (model, _embed_cache, _hf) = LoadedModel::load_safetensors(&dev, &mut allocator, &dir)?;
         println!(
             "  loaded in {:.2} s, {:.2} GiB uploaded",
             model.upload_duration.as_secs_f64(),

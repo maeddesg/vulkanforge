@@ -1383,15 +1383,18 @@ impl Forward {
         let sq = layer_weight_shader(model, layer, "attn_q.weight", self.mul_mat_vec_subgroup_enabled);
         let sk = layer_weight_shader(model, layer, "attn_k.weight", self.mul_mat_vec_subgroup_enabled);
         let sv = layer_weight_shader(model, layer, "attn_v.weight", self.mul_mat_vec_subgroup_enabled);
+        let scale_q = layer_weight_scale(model, layer, "attn_q.weight");
+        let scale_k = layer_weight_scale(model, layer, "attn_k.weight");
+        let scale_v = layer_weight_scale(model, layer, "attn_v.weight");
         self.run_gemv(dev, registry, cmd, sq,
                       wq, self.cur().hidden_norm.handle, self.cur().q_buf.handle,
-                      cfg.hidden_dim, cfg.n_heads * cfg.head_dim, "gemv_q");
+                      cfg.hidden_dim, cfg.n_heads * cfg.head_dim, scale_q, "gemv_q");
         self.run_gemv(dev, registry, cmd, sk,
                       wk, self.cur().hidden_norm.handle, self.cur().k_buf.handle,
-                      cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, "gemv_k");
+                      cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, scale_k, "gemv_k");
         self.run_gemv(dev, registry, cmd, sv,
                       wv, self.cur().hidden_norm.handle, self.cur().v_buf.handle,
-                      cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, "gemv_v");
+                      cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, scale_v, "gemv_v");
         if matches!(halt, DebugTarget::QProj | DebugTarget::KProj | DebugTarget::VProj) {
             return;
         }
@@ -1707,15 +1710,18 @@ impl Forward {
         let sq = layer_weight_shader(model, layer, "attn_q.weight", self.mul_mat_vec_subgroup_enabled);
         let sk = layer_weight_shader(model, layer, "attn_k.weight", self.mul_mat_vec_subgroup_enabled);
         let sv = layer_weight_shader(model, layer, "attn_v.weight", self.mul_mat_vec_subgroup_enabled);
+        let scale_q = layer_weight_scale(model, layer, "attn_q.weight");
+        let scale_k = layer_weight_scale(model, layer, "attn_k.weight");
+        let scale_v = layer_weight_scale(model, layer, "attn_v.weight");
         self.run_gemv(dev, registry, cmd, sq,
                       wq, hidden_norm, q_buf,
-                      cfg.hidden_dim, cfg.n_heads * cfg.head_dim, "gemv_q");
+                      cfg.hidden_dim, cfg.n_heads * cfg.head_dim, scale_q, "gemv_q");
         self.run_gemv(dev, registry, cmd, sk,
                       wk, hidden_norm, k_buf,
-                      cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, "gemv_k");
+                      cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, scale_k, "gemv_k");
         self.run_gemv(dev, registry, cmd, sv,
                       wv, hidden_norm, v_buf,
-                      cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, "gemv_v");
+                      cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, scale_v, "gemv_v");
         self.mark_written(&[q_buf, k_buf, v_buf]);
         // Next: (c) reads q_buf, k_buf (or (d) RoPE if no qk_norm).
         self.maybe_compute_barrier(dev, cmd, &[q_buf, k_buf]);
@@ -1816,9 +1822,10 @@ impl Forward {
         // (g) Output projection.
         let wo = layer_weight(model, layer, "attn_output.weight");
         let so = layer_weight_shader(model, layer, "attn_output.weight", self.mul_mat_vec_subgroup_enabled);
+        let scale_o = layer_weight_scale(model, layer, "attn_output.weight");
         self.run_gemv(dev, registry, cmd, so,
                       wo, attn_out, o_buf,
-                      cfg.n_heads * cfg.head_dim, cfg.hidden_dim, "gemv_o");
+                      cfg.n_heads * cfg.head_dim, cfg.hidden_dim, scale_o, "gemv_o");
         self.mark_written(&[o_buf]);
         // Next: (h+i) reads input + o_buf.
         self.maybe_compute_barrier(dev, cmd, &[input, o_buf]);
@@ -1844,12 +1851,14 @@ impl Forward {
         let wu = layer_weight(model, layer, "ffn_up.weight");
         let sg = layer_weight_shader(model, layer, "ffn_gate.weight", self.mul_mat_vec_subgroup_enabled);
         let su = layer_weight_shader(model, layer, "ffn_up.weight", self.mul_mat_vec_subgroup_enabled);
+        let scale_g = layer_weight_scale(model, layer, "ffn_gate.weight");
+        let scale_u = layer_weight_scale(model, layer, "ffn_up.weight");
         self.run_gemv(dev, registry, cmd, sg,
                       wg, hidden_norm, gate_buf,
-                      cfg.hidden_dim, cfg.ffn_dim, "gemv_gate");
+                      cfg.hidden_dim, cfg.ffn_dim, scale_g, "gemv_gate");
         self.run_gemv(dev, registry, cmd, su,
                       wu, hidden_norm, up_buf,
-                      cfg.hidden_dim, cfg.ffn_dim, "gemv_up");
+                      cfg.hidden_dim, cfg.ffn_dim, scale_u, "gemv_up");
         self.mark_written(&[gate_buf, up_buf]);
         // Next: (k+l) swiglu reads gate_buf + up_buf.
         self.maybe_compute_barrier(dev, cmd, &[gate_buf, up_buf]);
@@ -1869,9 +1878,10 @@ impl Forward {
         // (m) FFN down — Q6_K in Q4_K_M, Q4_K otherwise.
         let wd = layer_weight(model, layer, "ffn_down.weight");
         let sd = layer_weight_shader(model, layer, "ffn_down.weight", self.mul_mat_vec_subgroup_enabled);
+        let scale_d = layer_weight_scale(model, layer, "ffn_down.weight");
         self.run_gemv(dev, registry, cmd, sd,
                       wd, ffn_hidden, ffn_out,
-                      cfg.ffn_dim, cfg.hidden_dim, "gemv_down");
+                      cfg.ffn_dim, cfg.hidden_dim, scale_d, "gemv_down");
         self.mark_written(&[ffn_out]);
         // Next: (n) residual2 reads res1 + ffn_out.
         self.maybe_compute_barrier(dev, cmd, &[res1, ffn_out]);
@@ -1907,12 +1917,19 @@ impl Forward {
             .or_else(|| model.tensor("token_embd.weight"))
             .expect("LM head present");
         let w_lm = lm.buffer.handle;
+        // Sprint 20-M3 — lm_head can be F32 (SafeTensors FP8 models
+        // exclude lm_head from quantization) or F8E4M3 (some FP8
+        // builds also quantize lm_head). Both route through the
+        // dedicated 1-WG-per-row shaders introduced in Sprint 20.
         let lm_shader = match (lm.ggml_type, self.mul_mat_vec_subgroup_enabled) {
+            (GgmlType::F8E4M3, _) => ShaderId::MulMatVecFp8,
+            (GgmlType::F32,    _) => ShaderId::MulMatVecF32,
             (GgmlType::Q6K, true ) => ShaderId::MulMatVecQ6KSubgroup,
             (GgmlType::Q6K, false) => ShaderId::MulMatVecQ6K,
             (_,             true ) => ShaderId::MulMatVecQ4KSubgroup,
             (_,             false) => ShaderId::MulMatVecQ4K,
         };
+        let lm_scale = lm.weight_scale.unwrap_or(1.0);
 
         let hidden_norm = self.cur().hidden_norm.handle;
         self.run_rms_norm(
@@ -1926,7 +1943,7 @@ impl Forward {
         self.run_gemv(
             dev, registry, cmd, lm_shader,
             w_lm, hidden_norm, self.logits_buf.handle,
-            self.config.hidden_dim, self.config.vocab_size, "lm_head",
+            self.config.hidden_dim, self.config.vocab_size, lm_scale, "lm_head",
         );
         self.mark_written(&[self.logits_buf.handle]);
     }
@@ -2147,59 +2164,6 @@ impl Forward {
         }
     }
 
-    /// Sprint 20-M2 — FP8 E4M3 GEMV dispatch helper. Same descriptor
-    /// layout as `run_gemv` (5 bindings; `fuse0`/`fuse1` are dummies
-    /// for the FP8 shader); the per-tensor dequant scale rides in the
-    /// last slot of `MatVecPushConstants` (the `broadcast3` field, repurposed
-    /// as `f32::to_bits` — see `mul_mat_vec_fp8.comp`).
-    #[allow(clippy::too_many_arguments)]
-    fn run_gemv_fp8(
-        &mut self,
-        dev: &VulkanDevice,
-        registry: &PipelineRegistry,
-        cmd: vk::CommandBuffer,
-        weights: vk::Buffer,
-        input: vk::Buffer,
-        output: vk::Buffer,
-        k: u32,
-        m: u32,
-        weight_scale: f32,
-        label: &str,
-    ) {
-        let kernel = registry.get(ShaderId::MulMatVecFp8);
-        let set = self.alloc_or_get_set(
-            dev, kernel.descriptor_set_layout,
-            &[
-                (0, weights, 0, 0),
-                (1, input, 0, 0),
-                (2, output, 0, 0),
-                (3, self.fuse0.handle, 0, 0),
-                (4, self.fuse1.handle, 0, 0),
-            ],
-        );
-        let pc = MatVecPushConstants {
-            ncols: k, stride_a: k, stride_b: k, stride_d: m,
-            batch_stride_a: k * m, batch_stride_b: k, batch_stride_d: m,
-            fusion_flags: 0, base_work_group_y: 0,
-            ne02: 1, ne12: 1, broadcast2: 1,
-            // Reinterpreted as f32 in the shader.
-            broadcast3: weight_scale.to_bits(),
-        };
-        let layout = kernel.pipeline_layout;
-        let pipeline = kernel.pipeline;
-        self.profile(label, dev, cmd, |dev, cmd| unsafe {
-            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
-            dev.device.cmd_bind_descriptor_sets(
-                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
-            );
-            dev.device.cmd_push_constants(
-                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
-            );
-            // One workgroup per output row (NUM_ROWS=1 baked in).
-            dev.device.cmd_dispatch(cmd, m, 1, 1);
-        });
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn run_gemv(
         &mut self,
@@ -2212,27 +2176,56 @@ impl Forward {
         output: vk::Buffer,
         k: u32,
         m: u32,
+        weight_scale: f32,
         label: &str,
     ) {
         let kernel = registry.get(shader);
-        let set = self.alloc_or_get_set(
-            dev, kernel.descriptor_set_layout,
-            &[
-                (0, weights, 0, 0),
-                (1, input, 0, 0),
-                (2, output, 0, 0),
-                (3, self.fuse0.handle, 0, 0),
-                (4, self.fuse1.handle, 0, 0),
-            ],
-        );
+        // Sprint 20-M3 — `MulMatVecFp8` and `MulMatVecF32` declare
+        // only 3 bindings (weight/input/output); their fuse dummies
+        // get dead-stripped by spirv-opt because nothing reads them.
+        // The K-quant GEMVs keep all 5 bindings live because their
+        // fusion-mask dispatcher actually reads `fuse0`/`fuse1`.
+        let one_per_row = matches!(shader, ShaderId::MulMatVecFp8 | ShaderId::MulMatVecF32);
+        let set = if one_per_row {
+            self.alloc_or_get_set(
+                dev, kernel.descriptor_set_layout,
+                &[
+                    (0, weights, 0, 0),
+                    (1, input, 0, 0),
+                    (2, output, 0, 0),
+                ],
+            )
+        } else {
+            self.alloc_or_get_set(
+                dev, kernel.descriptor_set_layout,
+                &[
+                    (0, weights, 0, 0),
+                    (1, input, 0, 0),
+                    (2, output, 0, 0),
+                    (3, self.fuse0.handle, 0, 0),
+                    (4, self.fuse1.handle, 0, 0),
+                ],
+            )
+        };
+        // Sprint 20-M3 — `broadcast3` is repurposed as the
+        // per-tensor weight scale (FP8 / F32 GEMVs read it; K-quant
+        // GEMVs ignore it, so passing `1.0_f32.to_bits()` instead of
+        // the previous `1u32` is bit-identical for them — both happen
+        // to encode 0x3F800000 / 0x00000001 respectively, but the
+        // shader doesn't read the slot, so neither value matters).
         let pc = MatVecPushConstants {
             ncols: k, stride_a: k, stride_b: k, stride_d: m,
             batch_stride_a: k * m, batch_stride_b: k, batch_stride_d: m,
             fusion_flags: 0, base_work_group_y: 0,
-            ne02: 1, ne12: 1, broadcast2: 1, broadcast3: 1,
+            ne02: 1, ne12: 1, broadcast2: 1,
+            broadcast3: weight_scale.to_bits(),
         };
         let layout = kernel.pipeline_layout;
         let pipeline = kernel.pipeline;
+        // `one_per_row` (declared above) also drives the dispatch
+        // geometry: FP8 + FP32 GEMVs run one WG per output row;
+        // the K-quant GEMVs use the Phase-3C 2-rows-per-WG layout
+        // (MMV_NUM_ROWS).
         self.profile(label, dev, cmd, |dev, cmd| unsafe {
             dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             dev.device.cmd_bind_descriptor_sets(
@@ -2241,13 +2234,12 @@ impl Forward {
             dev.device.cmd_push_constants(
                 cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
             );
-            // Phase-3C: GEMV pipeline is now built with NUM_ROWS = MMV_NUM_ROWS
-            // (= 2). Each workgroup writes NUM_ROWS output rows, so the
-            // dispatch count divides — ceiling-div to handle a tail
-            // workgroup when m isn't a multiple of NUM_ROWS (the shader
-            // bounds-checks via `first_row + NUM_ROWS <= stride_d`).
-            let n_rows = super::pipeline_registry::MMV_NUM_ROWS;
-            let groups = (m + n_rows - 1) / n_rows;
+            let groups = if one_per_row {
+                m
+            } else {
+                let n_rows = super::pipeline_registry::MMV_NUM_ROWS;
+                (m + n_rows - 1) / n_rows
+            };
             dev.device.cmd_dispatch(cmd, groups, 1, 1);
         });
     }
@@ -4587,6 +4579,20 @@ fn layer_weight(model: &LoadedModel, layer: u32, suffix: &str) -> vk::Buffer {
         .handle
 }
 
+/// Sprint 20-M3 — per-tensor dequant scale lookup. Returns 1.0 for
+/// GGUF tensors (which carry no per-tensor scale; their per-block
+/// scales live in the weight bytes themselves) and the actual FP32
+/// scale for SafeTensors FP8 tensors. `run_gemv` always writes this
+/// value into push-constant `broadcast3`; only the FP8/F32 shaders
+/// read the slot.
+fn layer_weight_scale(model: &LoadedModel, layer: u32, suffix: &str) -> f32 {
+    let key = format!("blk.{layer}.{suffix}");
+    model
+        .tensor(&key)
+        .and_then(|t| t.weight_scale)
+        .unwrap_or(1.0)
+}
+
 /// Q4_K_M mixes quant types — `attn_v.weight` and `ffn_down.weight`
 /// are Q6_K, the rest are Q4_K. Pick the matching GEMV pipeline.
 ///
@@ -4606,7 +4612,14 @@ fn layer_weight_shader(model: &LoadedModel, layer: u32, suffix: &str, subgroup: 
     // smaller block size than the K-quants). Falling through to
     // Q4_K reads the wrong block stride and produces garbage —
     // the Sprint 17B-debug bug.
+    // Sprint 20-M3 — F8E4M3 / F32 routing for SafeTensors models.
+    // F8E4M3 → native FP8 GEMV; F32 → unquantized GEMV (used for
+    // lm_head when the model excludes it from FP8 quantization).
+    // F8/F32 paths are subgroup-agnostic (they hard-code one Wave64
+    // workgroup per row).
     match (ggml_type, subgroup) {
+        (GgmlType::F8E4M3, _) => ShaderId::MulMatVecFp8,
+        (GgmlType::F32,    _) => ShaderId::MulMatVecF32,
         (GgmlType::Q6K, true ) => ShaderId::MulMatVecQ6KSubgroup,
         (GgmlType::Q6K, false) => ShaderId::MulMatVecQ6K,
         (GgmlType::Q3K, true ) => ShaderId::MulMatVecQ3KSubgroup,

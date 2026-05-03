@@ -283,11 +283,17 @@ impl LoadedModel {
     /// * `F16` / `F32` tensors → uploaded raw.
     /// * `*.input_scale` tensors are skipped (vLLM activation
     ///   quantization metadata; VF runs activations in FP32 / FP16).
+    /// Returns `(model, host_embed_cache, hf_config)` — the host
+    /// cache holds the BF16→FP32-expanded token_embd row-major so
+    /// `EmbeddingSource::Host` can look up rows without GPU readback.
+    /// The HfConfig is returned alongside so the caller can apply
+    /// quirks (Llama-3 RoPE scaling, chat-template selection) that
+    /// VF's `ModelConfig` doesn't capture.
     pub fn load_safetensors(
         dev: &VulkanDevice,
         allocator: &mut Allocator,
         dir: &Path,
-    ) -> Result<Self, LoaderError> {
+    ) -> Result<(Self, Vec<f32>, HfConfig), LoaderError> {
         let st = SafeTensorsFile::open(dir)
             .map_err(LoaderError::Buffer)?;
         let hf = HfConfig::from_dir(dir)
@@ -486,12 +492,57 @@ impl LoadedModel {
             );
         }
 
-        Ok(Self {
-            config,
-            tensors,
-            bytes_uploaded,
-            upload_duration,
-        })
+        // Pull the embedding cache out of the SafeTensors mmap one
+        // more time. It's small enough (vocab × hidden × 4 B ≈ 2 GiB
+        // for an 8B Llama vocab) to keep on host alongside the GPU
+        // copy, and EmbeddingSource::Host avoids a per-token GPU
+        // readback during decode.
+        let host_embed = {
+            let info = st.tensor("model.embed_tokens.weight")
+                .ok_or_else(|| LoaderError::Buffer(
+                    "model.embed_tokens.weight not present in SafeTensors".into()
+                ))?;
+            let raw = st.tensor_bytes(info);
+            match info.dtype {
+                TensorDtype::F32 => {
+                    let mut out = vec![0.0_f32; info.n_elements()];
+                    out.copy_from_slice(bytemuck::cast_slice(raw));
+                    out
+                }
+                TensorDtype::F16 => {
+                    let n = info.n_elements();
+                    let mut out = vec![0.0_f32; n];
+                    for i in 0..n {
+                        let h = u16::from_le_bytes([raw[2*i], raw[2*i+1]]);
+                        out[i] = half::f16::from_bits(h).to_f32();
+                    }
+                    out
+                }
+                TensorDtype::BF16 => {
+                    let n = info.n_elements();
+                    let mut out = vec![0.0_f32; n];
+                    for i in 0..n {
+                        let bf = u16::from_le_bytes([raw[2*i], raw[2*i+1]]);
+                        out[i] = bf16_to_f32(bf);
+                    }
+                    out
+                }
+                other => return Err(LoaderError::Buffer(format!(
+                    "unsupported embedding dtype {:?}", other
+                ))),
+            }
+        };
+
+        Ok((
+            Self {
+                config,
+                tensors,
+                bytes_uploaded,
+                upload_duration,
+            },
+            host_embed,
+            hf,
+        ))
     }
 }
 

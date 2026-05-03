@@ -1062,6 +1062,16 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "mul_mat_vec_fp8.comp",
         defines: &[],
     },
+    // Sprint 20-M3 — FP32 weight GEMV. Used for lm_head on SafeTensors
+    // FP8 models (lm_head is excluded from FP8 quantization on
+    // neuralmagic / naive-quantized models, so it carries through
+    // BF16 → FP32 expanded). Same descriptor-set layout as
+    // `mul_mat_vec_fp8.comp` so a single dispatch helper drives both.
+    ShaderJob {
+        out_name: "mul_mat_vec_f32.spv",
+        entry_source: "mul_mat_vec_f32.comp",
+        defines: &[],
+    },
     // Sprint 19A — Q3_K mul_mm.comp variants (FP16 WMMA prefill).
     // Mirror the Q4_K/Q6_K coopmat coverage so Q3_K_M GGUFs no longer
     // fall back to integer-MMQ for prefill GEMM. The Q3_K branch in

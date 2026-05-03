@@ -177,8 +177,10 @@ impl ChatSession {
 
         let result = generate_from_tokens(
             &mut self.forward,
-            dev, registry, cmd_ctx, model, gguf, cfg, tokenizer,
-            &prefill, self.current_pos, config, &mut on_token,
+            dev, registry, cmd_ctx, model,
+            super::decode::EmbeddingSource::Gguf(gguf),
+            cfg, tokenizer,
+            &prefill, self.current_pos, config, false, &mut on_token,
         )
         .map_err(ChatError::Generation)?;
 
