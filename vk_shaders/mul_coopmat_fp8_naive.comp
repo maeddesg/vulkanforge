@@ -69,17 +69,6 @@ layout(push_constant) uniform PC {
     uint weight_scale_bits;  // f32::to_bits(weight_scale) per-tensor
 } pc;
 
-// Read a single FP8 byte from the packed uint32 weight buffer and
-// convert to FP32. Stride_a is in *elements*, so byte offset matches
-// element offset.
-float fp8_load(uint global_row, uint global_col) {
-    const uint elem_idx = global_row * pc.stride_a + global_col;
-    const uint word     = data_a[elem_idx >> 2u];
-    const uint shift    = (elem_idx & 3u) * 8u;
-    const uint8_t byte  = uint8_t((word >> shift) & 0xFFu);
-    return float(uintBitsToFloate4m3EXT(byte));
-}
-
 void main() {
     const uint wg_m = gl_WorkGroupID.x * TILE;
     const uint wg_n = gl_WorkGroupID.y * TILE;
@@ -97,31 +86,71 @@ void main() {
     const uint global_row    = wg_m + a_row;
     const bool row_in_bounds = global_row < pc.m;
 
+    // Sprint 21A — B-side thread mapping. Mirrors the A-side
+    // (4 threads / N-row × 16 N-rows = 64). Each thread loads
+    // 4 *contiguous* K-positions from one row of B in a single
+    // vec4 read — the compiler coalesces 4 consecutive `b[i+0..3]`
+    // accesses into one 16-byte transaction on RDNA4 when the
+    // start offset is 16-byte aligned. Replaces the prior
+    // (k_idx = fidx/16, n_idx = fidx%16) layout where each
+    // thread's 4 reads were strided by 4 in K — un-coalescable.
+    const uint b_n        = tid / 4u;          // 0..15 (N axis)
+    const uint b_k_base   = (tid & 3u) * 4u;   // 0, 4, 8, 12 (K axis)
+
     for (uint kk = 0; kk < pc.k; kk += TILE) {
-        // ---- A load: FP8 → FP32 → BF16 → LDS ----
-        [[unroll]] for (uint w = 0; w < 4u; w++) {
-            const uint k_idx = a_k_base + w;
-            const uint gk    = kk + k_idx;
-            float val_f32 = 0.0;
-            if (row_in_bounds && gk < pc.k) {
-                val_f32 = fp8_load(global_row, gk);
+        // ---- A load: 1 uint32 = 4 FP8 bytes per thread per K-step ----
+        // The Q4_K-template layout has each thread's 4 K-positions
+        // contiguous; for FP8 those 4 bytes always live in the
+        // same uint32 word, so one explicit `data_a[idx>>2]` read
+        // beats four `fp8_load()` calls (where the compiler may
+        // or may not CSE).
+        const uint a_gk_base   = kk + a_k_base;
+        const uint a_elem_idx  = global_row * pc.stride_a + a_gk_base;
+        const bool a_word_full = row_in_bounds && (a_gk_base + 3u < pc.k);
+        uint word = 0u;
+        if (a_word_full) {
+            word = data_a[a_elem_idx >> 2u];
+        } else if (row_in_bounds) {
+            // Tail — only fires when pc.k isn't a multiple of 4
+            // (none of the model GEMM shapes hit this on the
+            // production path; left in for robustness).
+            for (uint w = 0u; w < 4u; w++) {
+                const uint gk = a_gk_base + w;
+                if (gk < pc.k) {
+                    const uint ei  = global_row * pc.stride_a + gk;
+                    const uint sh  = (ei & 3u) * 8u;
+                    word |= (data_a[ei >> 2u] & (0xFFu << sh));
+                }
             }
-            buf_a[a_row * A_STRIDE + k_idx] = ELEM_TYPE(val_f32);
+        }
+        [[unroll]] for (uint w = 0u; w < 4u; w++) {
+            const uint8_t byte = uint8_t((word >> (w * 8u)) & 0xFFu);
+            const float   val  = float(uintBitsToFloate4m3EXT(byte));
+            buf_a[a_row * A_STRIDE + a_k_base + w] = ELEM_TYPE(val);
         }
 
-        // ---- B load: FP32 → BF16 → LDS ----
-        // Same shape as the Q4_K template: 64 threads × 4 elements
-        // per K-step = 256 elements (TILE × TILE).
-        [[unroll]] for (uint w = 0; w < 4u; w++) {
-            const uint fidx  = w * BLOCK_SIZE + tid;
-            const uint k_idx = fidx / TILE;
-            const uint n_idx = fidx & (TILE - 1u);
-            const uint gk    = kk + k_idx;
-            const uint gn    = wg_n + n_idx;
-            const bool ok    = gk < pc.k && gn < pc.n;
-            const float vf   = ok ? b[gn * pc.stride_b + gk] : 0.0;
-            buf_b[k_idx * B_STRIDE + n_idx] = ELEM_TYPE(vf);
+        // ---- B load: 4 contiguous K-positions per thread per K-step ----
+        // Same 64-thread budget, 256 LDS elements; new mapping
+        // turns the access pattern into 16-byte coalesced bursts.
+        const uint b_gn       = wg_n + b_n;
+        const uint b_gk_base  = kk + b_k_base;
+        const bool b_full     = b_gn < pc.n && (b_gk_base + 3u < pc.k);
+        vec4 act4 = vec4(0.0);
+        if (b_full) {
+            const uint base = b_gn * pc.stride_b + b_gk_base;
+            act4 = vec4(b[base + 0u], b[base + 1u], b[base + 2u], b[base + 3u]);
+        } else if (b_gn < pc.n) {
+            for (uint w = 0u; w < 4u; w++) {
+                const uint gk = b_gk_base + w;
+                if (gk < pc.k) {
+                    act4[w] = b[b_gn * pc.stride_b + gk];
+                }
+            }
         }
+        buf_b[(b_k_base + 0u) * B_STRIDE + b_n] = ELEM_TYPE(act4.x);
+        buf_b[(b_k_base + 1u) * B_STRIDE + b_n] = ELEM_TYPE(act4.y);
+        buf_b[(b_k_base + 2u) * B_STRIDE + b_n] = ELEM_TYPE(act4.z);
+        buf_b[(b_k_base + 3u) * B_STRIDE + b_n] = ELEM_TYPE(act4.w);
 
         barrier();
 
