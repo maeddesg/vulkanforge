@@ -337,10 +337,26 @@ impl LoadedModel {
             bytes: Source<'a>,
             weight_scale: Option<f32>,
         }
+        // Sprint 22B — VRAM saver: when `output.weight` (the lm_head)
+        // is present, the GPU copy of `model.embed_tokens.weight` is
+        // dead weight. The chat / bench paths read the embedding from
+        // the host cache (`EmbeddingSource::Host`), and `dispatch_final`
+        // only falls through to `token_embd.weight` for tied-weight
+        // models (`tie_word_embeddings: true`). neuralmagic's
+        // Llama-3.1-FP8 sets `tie_word_embeddings: false`, so skipping
+        // the GPU upload here saves ~2 GiB on an 8B vocab without any
+        // shader change.
+        let has_lm_head = st.tensors.contains_key("lm_head.weight");
+        let skip_embed_gpu = has_lm_head && !hf.tie_word_embeddings;
         let mut plans: Vec<Plan> = Vec::with_capacity(st.tensors.len());
         for (hf_name, info) in &st.tensors {
             // Skip scale metadata — already harvested above.
             if hf_name.ends_with(".weight_scale") || hf_name.ends_with(".input_scale") {
+                continue;
+            }
+            // Sprint 22B — skip the embedding GPU upload (host cache
+            // covers all reads).
+            if skip_embed_gpu && hf_name == "model.embed_tokens.weight" {
                 continue;
             }
             let Some(vf_name) = hf_to_vf_name(hf_name) else {
