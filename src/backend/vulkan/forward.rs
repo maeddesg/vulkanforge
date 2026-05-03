@@ -209,6 +209,20 @@ pub struct Forward {
     /// submitted (for the rare `start_async` then EOS-cancel path).
     /// `None` means no CB is currently pre-recorded.
     async_pending_record: Option<usize>,
+    /// Sprint 19B-A — multi-submit prefill pacing. When
+    /// `layers_per_submit < n_layers`, `prefill_batch` records the
+    /// per-layer dispatches into N separate command buffers (drawn
+    /// from `prefill_pool`) and submits them in sequence — only the
+    /// last carrying `prefill_fence`. Queue-ordering on the same
+    /// compute queue makes the in-between submits implicitly
+    /// barrier-equivalent at queue boundaries, so no explicit
+    /// inter-CB synchronization is required. Empty `prefill_cbs`
+    /// (the default when no env override is set) means single-submit
+    /// legacy path through `cmd_ctx.one_shot`.
+    prefill_pool: vk::CommandPool,
+    prefill_cbs: Vec<vk::CommandBuffer>,
+    prefill_fence: vk::Fence,
+    layers_per_submit: u32,
     logits_buf: GpuBuffer,
     // Always-bound dummies for unused descriptor slots.
     fuse0: GpuBuffer,
@@ -722,6 +736,40 @@ impl Forward {
             unsafe { device.create_fence(&fence_info, None)? },
         ];
 
+        // Sprint 19B-A — multi-submit prefill pacing. Default-on at
+        // interval=4 (i.e. submit every 4 layers, ~9 submits for a
+        // 36-layer Qwen3). Sweep on Q4_K_M and Q3_K_M:
+        //   pp=32   +7-8%   pp=64   +7-9%   pp=128  +5-5.4%
+        //   pp=256  +3-3.5% pp=512  +1-1.4% pp=1024 +0.6%
+        // Bit-exact output, decode untouched (forward_token doesn't go
+        // through prefill_batch). Override:
+        //   VULKANFORGE_PREFILL_SUBMIT_INTERVAL=0  → legacy single submit
+        //   VULKANFORGE_PREFILL_SUBMIT_INTERVAL=N  → custom interval
+        // If N >= n_layers we also fall back to single-submit because
+        // the chunk count would be 1.
+        let layers_per_submit = std::env::var("VULKANFORGE_PREFILL_SUBMIT_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(4);
+        let prefill_pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(dev.queue_family_index)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let prefill_pool = unsafe { device.create_command_pool(&prefill_pool_info, None)? };
+        let prefill_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None)? };
+        let prefill_cbs = if layers_per_submit > 0 && layers_per_submit < config.n_layers {
+            // ceil(n_layers / layers_per_submit) chunks for the layer
+            // loop; the last chunk also carries the final-norm + lm_head
+            // tail, so no extra CB is needed.
+            let n_chunks = config.n_layers.div_ceil(layers_per_submit);
+            let alloc = vk::CommandBufferAllocateInfo::default()
+                .command_pool(prefill_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(n_chunks);
+            unsafe { device.allocate_command_buffers(&alloc)? }
+        } else {
+            Vec::new()
+        };
+
         // Phase 5A-3: descriptor-set cache is now ON by default.
         // `VULKANFORGE_CB_REUSE=0` (or `false`) opts back out for
         // debugging or A/B comparisons; any other value (or unset)
@@ -882,6 +930,10 @@ impl Forward {
             async_cbs,
             async_fences,
             async_pending_record: None,
+            prefill_pool,
+            prefill_cbs,
+            prefill_fence,
+            layers_per_submit,
             logits_buf,
             fuse0, fuse1,
             rope_ff_buf, rope_idx_buf,
@@ -1560,6 +1612,9 @@ impl Forward {
             }
             // CBs are freed implicitly with the pool.
             device.destroy_command_pool(self.async_pool, None);
+            // Sprint 19B-A — multi-submit prefill pool + fence.
+            device.destroy_fence(self.prefill_fence, None);
+            device.destroy_command_pool(self.prefill_pool, None);
         }
         // Sprint 15D — destroy both intermediate slots in turn.
         let [slot0, slot1] = self.slots;
@@ -3415,48 +3470,54 @@ impl Forward {
         // can't be reused. Drop them up-front.
         self.reset_descriptor_pool_and_cache(dev)?;
 
-        cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
-            // Seed residual chain from the embedded inputs. A single
-            // device-side copy is cheaper than a host re-write.
-            let total_bytes = (seq_len as u64) * hidden_bytes;
-            let copy = vk::BufferCopy::default()
-                .src_offset(0).dst_offset(0).size(total_bytes);
-            unsafe {
-                dev.device.cmd_copy_buffer(
-                    cmd, self.batch_input.handle, self.batch_residual.handle,
-                    std::slice::from_ref(&copy),
-                );
-            }
-            let bar = vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ);
-            unsafe {
-                dev.device.cmd_pipeline_barrier(
-                    cmd,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::DependencyFlags::empty(),
-                    std::slice::from_ref(&bar), &[], &[],
-                );
-            }
+        // Sprint 19B-A — branch on multi-submit pacing. When
+        // `prefill_cbs` is non-empty, we record the same dispatches
+        // into N separate command buffers (chunked at every
+        // `layers_per_submit` layer) and submit them sequentially.
+        // Queue-ordering on the same compute queue makes the
+        // intermediate submits implicitly act as full memory
+        // barriers — no explicit cross-CB synchronization is needed.
+        // Only the final submit carries `prefill_fence`; we wait
+        // once at the end. The legacy branch goes through
+        // `cmd_ctx.one_shot` exactly as it did pre-19B-A.
+        let multi = !self.prefill_cbs.is_empty();
+        if !multi {
+            cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
+                self.record_prefill_seed(dev, registry, cmd, model, &cfg, seq_len, hidden, hidden_bytes);
+                for layer in 0..cfg.n_layers {
+                    let next_w = if layer + 1 < cfg.n_layers {
+                        Some(layer_weight(model, layer + 1, "attn_norm.weight"))
+                    } else {
+                        None
+                    };
+                    self.dispatch_layer_batch(
+                        dev, registry, cmd, model, layer, seq_len, base_pos,
+                        next_w,
+                    );
+                }
+                self.record_prefill_finalize(dev, registry, cmd, model, seq_len, hidden_bytes);
+                let _ = (kv_bytes, q_bytes, ffn);
+            })?;
+        } else {
+            let interval = self.layers_per_submit;
+            let n_chunks = self.prefill_cbs.len();
+            debug_assert!(n_chunks > 0);
 
-            // Sprint 9b.2 — seed `batch_norm` for layer 0. Subsequent
-            // layers inherit `batch_norm` from the previous layer's
-            // end-of-layer cross-layer fusion (multi_add_rms with
-            // `next_attn_norm_weight = Some(...)`).
-            let w_attn_norm_0 = layer_weight(model, 0, "attn_norm.weight");
-            self.run_rms_norm(
-                dev, registry, cmd,
-                self.batch_residual.handle, w_attn_norm_0, self.batch_norm.handle,
-                hidden, seq_len, cfg.rms_norm_eps, "rms_norm_attn_b_seed",
-            );
-            compute_barrier(dev, cmd);
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
+            // Begin chunk 0 + record seed.
+            let cb0 = self.prefill_cbs[0];
+            unsafe {
+                dev.device.reset_command_buffer(cb0, vk::CommandBufferResetFlags::empty())?;
+                dev.device.begin_command_buffer(cb0, &begin_info)?;
+            }
+            self.record_prefill_seed(dev, registry, cb0, model, &cfg, seq_len, hidden, hidden_bytes);
+
+            // Layer loop with chunk boundaries.
+            let mut chunk: usize = 0;
             for layer in 0..cfg.n_layers {
-                // Pass the *next* layer's attn_norm weight so the
-                // end-of-layer fusion can pre-populate batch_norm for
-                // the next iteration. None on the final layer falls
-                // back to a plain add_res2.
+                let cmd = self.prefill_cbs[chunk];
                 let next_w = if layer + 1 < cfg.n_layers {
                     Some(layer_weight(model, layer + 1, "attn_norm.weight"))
                 } else {
@@ -3466,53 +3527,148 @@ impl Forward {
                     dev, registry, cmd, model, layer, seq_len, base_pos,
                     next_w,
                 );
+                // Submit boundary: end & submit current CB, begin next.
+                // Only between chunks — never after the very last layer
+                // (that's the last-chunk path with the finalize tail).
+                let crossed_boundary = (layer + 1) % interval == 0;
+                let last_layer = layer + 1 == cfg.n_layers;
+                if crossed_boundary && !last_layer {
+                    unsafe {
+                        dev.device.end_command_buffer(cmd)?;
+                        let cmds_arr = [cmd];
+                        let submit = vk::SubmitInfo::default().command_buffers(&cmds_arr);
+                        dev.device.queue_submit(
+                            dev.compute_queue,
+                            std::slice::from_ref(&submit),
+                            vk::Fence::null(),
+                        )?;
+                    }
+                    chunk += 1;
+                    let next_cb = self.prefill_cbs[chunk];
+                    unsafe {
+                        dev.device.reset_command_buffer(next_cb, vk::CommandBufferResetFlags::empty())?;
+                        dev.device.begin_command_buffer(next_cb, &begin_info)?;
+                    }
+                }
             }
 
-            // Final norm + LM head — only the LAST token needs logits.
-            // Copy the last row of batch_residual into scratch_a and
-            // run the existing per-token final path.
-            let last_off = ((seq_len - 1) as u64) * hidden_bytes;
-            self.copy_batch_row(
-                dev, cmd, self.batch_residual.handle, last_off,
-                self.cur().scratch_a.handle, hidden_bytes,
-            );
-            let bar = vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            // Finalize tail in the last chunk's CB.
+            let last_cb = self.prefill_cbs[chunk];
+            self.record_prefill_finalize(dev, registry, last_cb, model, seq_len, hidden_bytes);
             unsafe {
-                dev.device.cmd_pipeline_barrier(
-                    cmd,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::DependencyFlags::empty(),
-                    std::slice::from_ref(&bar), &[], &[],
-                );
+                dev.device.end_command_buffer(last_cb)?;
+                dev.device.reset_fences(std::slice::from_ref(&self.prefill_fence))?;
+                let cmds_arr = [last_cb];
+                let submit = vk::SubmitInfo::default().command_buffers(&cmds_arr);
+                dev.device.queue_submit(
+                    dev.compute_queue,
+                    std::slice::from_ref(&submit),
+                    self.prefill_fence,
+                )?;
+                dev.device.wait_for_fences(&[self.prefill_fence], true, u64::MAX)?;
             }
-            self.dispatch_final(dev, registry, cmd, model, self.cur().scratch_a.handle);
-
-            // Logits → host.
-            let post = vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.logits_buf.handle)
-                .offset(0).size(vk::WHOLE_SIZE);
-            unsafe {
-                dev.device.cmd_pipeline_barrier(
-                    cmd,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::PipelineStageFlags::HOST,
-                    vk::DependencyFlags::empty(),
-                    &[], &[post], &[],
-                );
-            }
-            // Silence unused locals.
             let _ = (kv_bytes, q_bytes, ffn);
-        })?;
+        }
 
         self.kv_cache.current_seq_len = base_pos + seq_len;
         Ok(())
+    }
+
+    /// Sprint 19B-A — phase-1 of `prefill_batch`: copy batch_input into
+    /// batch_residual, barrier, then seed `batch_norm` with layer 0's
+    /// attn_norm output (Sprint 9b.2 cross-layer-fusion contract). Same
+    /// dispatches as the legacy single-CB body — extracted so the
+    /// multi-submit path can record this phase into chunk 0.
+    fn record_prefill_seed(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        model: &LoadedModel,
+        cfg: &ModelConfig,
+        seq_len: u32,
+        hidden: u32,
+        hidden_bytes: u64,
+    ) {
+        let total_bytes = (seq_len as u64) * hidden_bytes;
+        let copy = vk::BufferCopy::default()
+            .src_offset(0).dst_offset(0).size(total_bytes);
+        unsafe {
+            dev.device.cmd_copy_buffer(
+                cmd, self.batch_input.handle, self.batch_residual.handle,
+                std::slice::from_ref(&copy),
+            );
+        }
+        let bar = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ);
+        unsafe {
+            dev.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                std::slice::from_ref(&bar), &[], &[],
+            );
+        }
+        let w_attn_norm_0 = layer_weight(model, 0, "attn_norm.weight");
+        self.run_rms_norm(
+            dev, registry, cmd,
+            self.batch_residual.handle, w_attn_norm_0, self.batch_norm.handle,
+            hidden, seq_len, cfg.rms_norm_eps, "rms_norm_attn_b_seed",
+        );
+        compute_barrier(dev, cmd);
+    }
+
+    /// Sprint 19B-A — phase-3 of `prefill_batch`: copy the last token's
+    /// row of `batch_residual` into `scratch_a`, then run final norm +
+    /// LM head + the host-read barrier on `logits_buf`. Extracted from
+    /// the legacy single-CB body for the multi-submit path's last
+    /// chunk.
+    fn record_prefill_finalize(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        model: &LoadedModel,
+        seq_len: u32,
+        hidden_bytes: u64,
+    ) {
+        let last_off = ((seq_len - 1) as u64) * hidden_bytes;
+        self.copy_batch_row(
+            dev, cmd, self.batch_residual.handle, last_off,
+            self.cur().scratch_a.handle, hidden_bytes,
+        );
+        let bar = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ);
+        unsafe {
+            dev.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                std::slice::from_ref(&bar), &[], &[],
+            );
+        }
+        self.dispatch_final(dev, registry, cmd, model, self.cur().scratch_a.handle);
+
+        let post = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.logits_buf.handle)
+            .offset(0).size(vk::WHOLE_SIZE);
+        unsafe {
+            dev.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[], &[post], &[],
+            );
+        }
     }
 
     /// One layer's worth of batched dispatches, recorded into `cmd`.
