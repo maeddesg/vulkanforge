@@ -2,11 +2,11 @@
 
 // Sprint 20-M2 — FP8 E4M3 GEMV (decode path).
 //
-// Output[row] = scale[row] * sum_k( float(W[row, k]) * input[k] )
-// where W is row-major FP8 E4M3 (1 byte/elem), input is FP32, scale
-// is a per-output-row FP32 vector bound at descriptor slot 3.
-// Sprint 24A: per-tensor models pre-expand the scalar to an [M] vector
-// at load time, so the kernel always reads `scale[row]`.
+// Output[row] = weight_scale * sum_k( float(W[row, k]) * input[k] )
+// where W is row-major FP8 E4M3 (1 byte/elem), input is FP32, and
+// weight_scale is a per-tensor FP32 scalar passed via push constant.
+// Per-channel models (Qwen2.5-FP8) are not yet routed through this
+// path — Sprint 24-Fix follow-up pending.
 //
 // llama.cpp has no equivalent — GGUF doesn't carry FP8 weights, so
 // nothing upstream to mirror. The closest analogue is the per-block
