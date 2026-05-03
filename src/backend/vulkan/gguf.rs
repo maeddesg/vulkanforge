@@ -75,6 +75,13 @@ pub enum GgmlType {
     Q5K = 13,
     Q6K = 14,
     Q8K = 15,
+    /// Sprint 20 — native FP8 E4M3 (1 byte / element). Not a GGUF
+    /// type number (GGUF stops at 35); we use 100 as an internal
+    /// sentinel so SafeTensors models can flow through the same
+    /// `LoadedModel` / shader-routing infrastructure as GGUF
+    /// quants. `from_u32` will not return this — only the
+    /// `LoadedModel::load_safetensors` constructor sets it.
+    F8E4M3 = 100,
 }
 
 impl GgmlType {
@@ -101,7 +108,7 @@ impl GgmlType {
     /// Number of elements per quantisation block. 1 for non-quant types.
     pub fn block_size(self) -> u64 {
         match self {
-            GgmlType::F32 | GgmlType::F16 => 1,
+            GgmlType::F32 | GgmlType::F16 | GgmlType::F8E4M3 => 1,
             GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q5_0 | GgmlType::Q5_1 |
             GgmlType::Q8_0 | GgmlType::Q8_1 => 32,
             GgmlType::Q2K | GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q5K |
@@ -114,6 +121,7 @@ impl GgmlType {
         match self {
             GgmlType::F32 => 4,
             GgmlType::F16 => 2,
+            GgmlType::F8E4M3 => 1,
             GgmlType::Q4_0 => 18,
             GgmlType::Q4_1 => 20,
             GgmlType::Q5_0 => 22,

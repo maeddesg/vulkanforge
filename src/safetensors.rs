@@ -1,0 +1,319 @@
+//! HuggingFace SafeTensors loader (Sprint 20-M1).
+//!
+//! Supports single-file (`model.safetensors`) and sharded multi-file
+//! (`model.safetensors.index.json` + `model-NNNNN-of-MMMMM.safetensors`)
+//! layouts. Tensor data is memory-mapped — `tensor_bytes` returns a
+//! `&[u8]` view into the mmap, no copies.
+//!
+//! Format reference (HuggingFace, MIT-licensed):
+//!   [u64 LE: header_size][header_size bytes: JSON][raw tensor data]
+//!
+//! The JSON header is a flat `Map<String, TensorEntry>` plus an optional
+//! `__metadata__` key. Each entry has `dtype`, `shape`, and
+//! `data_offsets: [start, end]` in bytes relative to the start of the
+//! raw-data block (i.e. byte offset 8 + header_size into the file).
+//!
+//! Multi-file: `model.safetensors.index.json` carries `weight_map:
+//! {"tensor": "model-00001-of-00002.safetensors"}` to route each tensor
+//! to its host shard. Each shard has its own header + offsets.
+
+use std::collections::HashMap;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+
+use memmap2::Mmap;
+use serde::Deserialize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TensorDtype {
+    /// FP8 E4M3 (1 byte/elem, 4 exp + 3 mantissa). Native target dtype
+    /// for Sprint 20.
+    F8E4M3,
+    /// FP8 E5M2 (1 byte/elem, 5 exp + 2 mantissa). Recognized but not
+    /// yet routed to a shader; SafeTensors models seen in the wild
+    /// typically use E4M3 for weights.
+    F8E5M2,
+    F16,
+    BF16,
+    F32,
+}
+
+impl TensorDtype {
+    fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "F8_E4M3" => TensorDtype::F8E4M3,
+            "F8_E5M2" => TensorDtype::F8E5M2,
+            "F16" => TensorDtype::F16,
+            "BF16" => TensorDtype::BF16,
+            "F32" => TensorDtype::F32,
+            _ => return None,
+        })
+    }
+
+    pub fn bytes_per_elem(self) -> usize {
+        match self {
+            TensorDtype::F8E4M3 | TensorDtype::F8E5M2 => 1,
+            TensorDtype::F16 | TensorDtype::BF16 => 2,
+            TensorDtype::F32 => 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TensorInfo {
+    pub dtype: TensorDtype,
+    pub shape: Vec<usize>,
+    /// Index into `SafeTensorsFile::shards` where the bytes live.
+    pub shard_idx: usize,
+    /// Byte offset of the first element relative to the shard's
+    /// raw-data block (i.e. into `Shard::data`).
+    pub start: usize,
+    /// Byte offset one past the last element.
+    pub end: usize,
+}
+
+impl TensorInfo {
+    pub fn n_elements(&self) -> usize {
+        self.shape.iter().product()
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.end - self.start
+    }
+}
+
+#[derive(Deserialize)]
+struct RawHeaderEntry {
+    dtype: String,
+    shape: Vec<usize>,
+    data_offsets: [usize; 2],
+}
+
+/// One memory-mapped `.safetensors` shard. The raw tensor bytes start
+/// at `8 + header_size` into the file; we carve that suffix once and
+/// keep just the data slice's offset for cheap lookups.
+struct Shard {
+    mmap: Mmap,
+    data_start: usize,
+}
+
+impl Shard {
+    fn open(path: &Path) -> Result<(Self, HashMap<String, RawHeaderEntry>), String> {
+        let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let mmap = unsafe { Mmap::map(&file) }
+            .map_err(|e| format!("mmap {}: {e}", path.display()))?;
+        if mmap.len() < 8 {
+            return Err(format!("safetensors {}: file shorter than 8-byte header", path.display()));
+        }
+        let header_size = u64::from_le_bytes(mmap[0..8].try_into().unwrap()) as usize;
+        if mmap.len() < 8 + header_size {
+            return Err(format!(
+                "safetensors {}: declared header_size {header_size} exceeds file length {}",
+                path.display(), mmap.len(),
+            ));
+        }
+        let header_slice = &mmap[8..8 + header_size];
+        let raw: HashMap<String, serde_json::Value> = serde_json::from_slice(header_slice)
+            .map_err(|e| format!("safetensors {}: header JSON parse: {e}", path.display()))?;
+        let mut entries = HashMap::with_capacity(raw.len());
+        for (name, value) in raw {
+            if name == "__metadata__" {
+                continue;
+            }
+            let parsed: RawHeaderEntry = serde_json::from_value(value)
+                .map_err(|e| format!("safetensors {}: tensor '{name}' header malformed: {e}", path.display()))?;
+            entries.insert(name, parsed);
+        }
+        let shard = Shard {
+            mmap,
+            data_start: 8 + header_size,
+        };
+        Ok((shard, entries))
+    }
+
+    fn slice(&self, start: usize, end: usize) -> &[u8] {
+        &self.mmap[self.data_start + start .. self.data_start + end]
+    }
+}
+
+pub struct SafeTensorsFile {
+    /// Tensor name → metadata (including which shard hosts it).
+    pub tensors: HashMap<String, TensorInfo>,
+    shards: Vec<Shard>,
+}
+
+impl SafeTensorsFile {
+    /// Open a SafeTensors model from a directory. Auto-detects:
+    /// * `<dir>/model.safetensors` (single-file)
+    /// * `<dir>/model.safetensors.index.json` + shard files
+    ///   (multi-file)
+    pub fn open(dir: &Path) -> Result<Self, String> {
+        let single = dir.join("model.safetensors");
+        let index = dir.join("model.safetensors.index.json");
+        if index.exists() {
+            Self::open_multi_file(dir, &index)
+        } else if single.exists() {
+            Self::open_single_file(&single)
+        } else {
+            Err(format!(
+                "no model.safetensors or model.safetensors.index.json in {}",
+                dir.display(),
+            ))
+        }
+    }
+
+    fn open_single_file(path: &Path) -> Result<Self, String> {
+        let (shard, entries) = Shard::open(path)?;
+        let mut tensors = HashMap::with_capacity(entries.len());
+        for (name, raw) in entries {
+            let dtype = TensorDtype::from_str(&raw.dtype)
+                .ok_or_else(|| format!("safetensors {}: unsupported dtype {} for tensor '{name}'", path.display(), raw.dtype))?;
+            tensors.insert(name, TensorInfo {
+                dtype,
+                shape: raw.shape,
+                shard_idx: 0,
+                start: raw.data_offsets[0],
+                end: raw.data_offsets[1],
+            });
+        }
+        Ok(Self { tensors, shards: vec![shard] })
+    }
+
+    fn open_multi_file(dir: &Path, index_path: &Path) -> Result<Self, String> {
+        #[derive(Deserialize)]
+        struct Index {
+            weight_map: HashMap<String, String>,
+        }
+        let index_bytes = std::fs::read(index_path)
+            .map_err(|e| format!("read {}: {e}", index_path.display()))?;
+        let index: Index = serde_json::from_slice(&index_bytes)
+            .map_err(|e| format!("parse {}: {e}", index_path.display()))?;
+
+        // Collect distinct shard filenames preserving first-seen order.
+        let mut shard_paths: Vec<PathBuf> = Vec::new();
+        let mut shard_idx_for: HashMap<String, usize> = HashMap::new();
+        for shard_name in index.weight_map.values() {
+            if !shard_idx_for.contains_key(shard_name) {
+                shard_idx_for.insert(shard_name.clone(), shard_paths.len());
+                shard_paths.push(dir.join(shard_name));
+            }
+        }
+
+        // Open each shard, gather raw entries.
+        let mut shards = Vec::with_capacity(shard_paths.len());
+        let mut per_shard_entries: Vec<HashMap<String, RawHeaderEntry>> =
+            Vec::with_capacity(shard_paths.len());
+        for path in &shard_paths {
+            let (shard, entries) = Shard::open(path)?;
+            shards.push(shard);
+            per_shard_entries.push(entries);
+        }
+
+        // Build tensors, cross-checking that the index's claimed shard
+        // matches the shard whose header actually carries the entry.
+        let mut tensors = HashMap::with_capacity(index.weight_map.len());
+        for (name, shard_name) in index.weight_map {
+            let idx = *shard_idx_for.get(&shard_name).unwrap();
+            let raw = per_shard_entries[idx].get(&name).ok_or_else(|| {
+                format!("safetensors index claims '{name}' lives in {shard_name}, but its header doesn't list it")
+            })?;
+            let dtype = TensorDtype::from_str(&raw.dtype).ok_or_else(|| {
+                format!("safetensors '{name}': unsupported dtype {}", raw.dtype)
+            })?;
+            tensors.insert(name, TensorInfo {
+                dtype,
+                shape: raw.shape.clone(),
+                shard_idx: idx,
+                start: raw.data_offsets[0],
+                end: raw.data_offsets[1],
+            });
+        }
+
+        Ok(Self { tensors, shards })
+    }
+
+    pub fn tensor(&self, name: &str) -> Option<&TensorInfo> {
+        self.tensors.get(name)
+    }
+
+    pub fn tensor_bytes(&self, info: &TensorInfo) -> &[u8] {
+        self.shards[info.shard_idx].slice(info.start, info.end)
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.tensors.keys().map(|s| s.as_str())
+    }
+}
+
+/// Map a HuggingFace transformer tensor name to VulkanForge's internal
+/// `blk.N.foo` / `output_norm` / `output` / `token_embd` schema. Returns
+/// `None` for tensors we don't (yet) consume — most notably FP8
+/// `*_scale_inv` / `*_scale` calibration tensors that vLLM emits but
+/// VulkanForge ignores in M1.
+pub fn hf_to_vf_name(hf: &str) -> Option<String> {
+    match hf {
+        "model.embed_tokens.weight" => return Some("token_embd.weight".into()),
+        "model.norm.weight" => return Some("output_norm.weight".into()),
+        "lm_head.weight" => return Some("output.weight".into()),
+        _ => {}
+    }
+    let rest = hf.strip_prefix("model.layers.")?;
+    let (layer_str, suffix) = rest.split_once('.')?;
+    let layer: u32 = layer_str.parse().ok()?;
+    let vf_suffix = match suffix {
+        "self_attn.q_proj.weight" => "attn_q.weight",
+        "self_attn.k_proj.weight" => "attn_k.weight",
+        "self_attn.v_proj.weight" => "attn_v.weight",
+        "self_attn.o_proj.weight" => "attn_output.weight",
+        "mlp.gate_proj.weight" => "ffn_gate.weight",
+        "mlp.up_proj.weight" => "ffn_up.weight",
+        "mlp.down_proj.weight" => "ffn_down.weight",
+        "input_layernorm.weight" => "attn_norm.weight",
+        "post_attention_layernorm.weight" => "ffn_norm.weight",
+        // Optional Q/K-norm (Qwen3-style models). Emit if they appear;
+        // Llama-3 doesn't carry these.
+        "self_attn.q_norm.weight" => "attn_q_norm.weight",
+        "self_attn.k_norm.weight" => "attn_k_norm.weight",
+        _ => return None,
+    };
+    Some(format!("blk.{layer}.{vf_suffix}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dtype_round_trip() {
+        assert_eq!(TensorDtype::from_str("F8_E4M3"), Some(TensorDtype::F8E4M3));
+        assert_eq!(TensorDtype::from_str("F8_E5M2"), Some(TensorDtype::F8E5M2));
+        assert_eq!(TensorDtype::from_str("F16"), Some(TensorDtype::F16));
+        assert_eq!(TensorDtype::from_str("BF16"), Some(TensorDtype::BF16));
+        assert_eq!(TensorDtype::from_str("F32"), Some(TensorDtype::F32));
+        assert_eq!(TensorDtype::from_str("nonsense"), None);
+        assert_eq!(TensorDtype::F8E4M3.bytes_per_elem(), 1);
+        assert_eq!(TensorDtype::F32.bytes_per_elem(), 4);
+    }
+
+    #[test]
+    fn name_mapping_basics() {
+        assert_eq!(
+            hf_to_vf_name("model.embed_tokens.weight").as_deref(),
+            Some("token_embd.weight"),
+        );
+        assert_eq!(
+            hf_to_vf_name("model.layers.0.self_attn.q_proj.weight").as_deref(),
+            Some("blk.0.attn_q.weight"),
+        );
+        assert_eq!(
+            hf_to_vf_name("model.layers.31.mlp.down_proj.weight").as_deref(),
+            Some("blk.31.ffn_down.weight"),
+        );
+        assert_eq!(
+            hf_to_vf_name("model.layers.5.input_layernorm.weight").as_deref(),
+            Some("blk.5.attn_norm.weight"),
+        );
+        assert_eq!(hf_to_vf_name("model.layers.0.self_attn.q_proj.weight_scale"), None);
+        assert_eq!(hf_to_vf_name("lm_head.weight").as_deref(), Some("output.weight"));
+    }
+}

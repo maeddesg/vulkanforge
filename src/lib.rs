@@ -27,3 +27,5 @@
 )]
 
 pub mod backend;
+pub mod safetensors;
+pub mod hf_config;
