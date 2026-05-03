@@ -57,9 +57,7 @@ RX 9070 XT (gfx1201, RDNA4), RADV Mesa 26.0.6, llama.cpp build
 
 Q4_K_M family hits 0.89–0.95 × of llama.cpp's prefill. Q3_K_M is
 the outlier — Sprint 17B shipped Mmq-only Q3_K (no coopmat
-coverage); coopmat-Q3_K is a follow-up. Full pp-sweep table and
-per-config breakdowns in
-[`results/v033_comprehensive_benchmark.md`](results/v033_comprehensive_benchmark.md).
+coverage); coopmat-Q3_K is a follow-up.
 
 ### Native FP8 E4M3 KV cache
 
@@ -111,9 +109,9 @@ vulkanforge chat --model ~/models/Meta-Llama-3.1-8B-Instruct-FP8 \
 
 Per-channel FP8 (`strategy: "channel"` — used by Qwen2.5-14B-FP8
 community builds) is **not yet supported**: it requires per-row
-scale buffers in the GEMV/GEMM kernels (Sprint 23 honest-negative
-report — `results/v034_sprint23_qwen25_14b_fp8.md`). 14B FP8 fits
-the 16 GiB VRAM budget (~14.5 GiB total) once that lands.
+scale buffers in the GEMV/GEMM kernels (Sprint 23 honest-negative).
+14B FP8 fits the 16 GiB VRAM budget (~14.5 GiB total) once that
+lands.
 
 ### Multi-architecture support
 
@@ -129,7 +127,7 @@ the 16 GiB VRAM budget (~14.5 GiB total) once that lands.
 
 **102 SPIR-V pipelines, 37 lib tests + 40+ GPU correctness tests,
 15 / 15 prompts coherent on Qwen3-8B Q4_K_M.** See
-`INSTALL.md` for setup; sprint reports are in `results/`.
+`INSTALL.md` for setup.
 
 ### What VulkanForge does that llama.cpp Vulkan doesn't
 
@@ -406,11 +404,9 @@ tile sweeps without rebuilding SPV.
   tiles, aligned/unaligned, and the f16acc opt-in path.
 * `src/backend/vulkan/pipeline_registry.rs` — pipeline-layout +
   spec-constants, including the `mul_mm` S/M/L tile warptile blocks
-  and the GEMV `MMV_NUM_ROWS` (= 1 — see
-  `results/v023_sprint13e_mmv_numrows.md` and
-  `results/v024_sprint14c_numrows2_redux.md` for why NUM_ROWS=2
-  was tested with both LDS and subgroupAdd reductions and reverted
-  in both cases).
+  and the GEMV `MMV_NUM_ROWS` (= 1; NUM_ROWS=2 was tested with
+  both LDS and subgroupAdd reductions and reverted in both cases
+  on RDNA4).
 
 ## Conventions
 
@@ -424,26 +420,6 @@ tile sweeps without rebuilding SPV.
   upstream HEAD. Performance differences are resolved through
   build-defines, spec-constants, SPV variants, and runtime routing
   rather than shader-source forks.
-
-## Reports
-
-Phase write-ups live in `results/`. Notable v0.2 series:
-
-* `v02_sprint10c_coopmat_qk.md` — coopmat QK attention bring-up.
-* `v021_sprint12c_gap_analysis.md` — pre-coopmat-GEMM gap analysis.
-* `v021_sprint12gc_rgp_profiling.md` — per-dispatch GPU profiling.
-* `v022_sprint12i_prefill_rgp.md` — prefill bottleneck root cause.
-* `v022_sprint12k_q6k_coopmat.md` — Q6_K coopmat shader port.
-* `v022_sprint12l_sml_tiles.md` — aligned LOAD_VEC_B=8 mat2x4.
-* `v022_sprint12m_mtile.md` — M-tile + coopmat default-on.
-* `v023_sprint13a_stile.md` — S-tile coopmat (BM=32) for pp ≤ 32.
-* `v023_sprint13b_mesa26.1_test.md` — Mesa 26.1-rc3 driver test (neutral).
-* `v023_sprint13c_f16acc.md` — f16-accumulator coopmat (opt-in, RDNA4-neutral).
-* `v023_sprint13d_wave32_probe.md` — Wave32 / VOPD probe (neutral).
-* `v023_sprint13e_mmv_numrows.md` — `MMV_NUM_ROWS=2` GEMV (slight regression).
-* `v024_sprint14a_subgroup_size.md` — `requiredSubgroupSize=64` plumbing.
-* `v024_sprint14b_subgroup_gemv.md` — subgroupAdd GEMV (Path A, default-on).
-* `v024_sprint14c_numrows2_redux.md` — `MMV_NUM_ROWS=2` re-tested with Path A (still regresses, reverted).
 
 ## Limitations
 
