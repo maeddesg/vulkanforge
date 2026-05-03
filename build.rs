@@ -1072,6 +1072,17 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "mul_mat_vec_f32.comp",
         defines: &[],
     },
+    // Sprint 22C — FP16 weight GEMV. Used for lm_head on SafeTensors
+    // FP8 models when the loader expands BF16 → FP16 instead of
+    // → FP32 (Llama-3.1 lm_head: 2.1 GiB FP32 → 1.0 GiB FP16).
+    // Same shape as the F32 variant; the only delta is reading
+    // weights as `uint[]` and unpacking two FP16 values per word
+    // via `unpackHalf2x16`.
+    ShaderJob {
+        out_name: "mul_mat_vec_f16.spv",
+        entry_source: "mul_mat_vec_f16.comp",
+        defines: &[],
+    },
     // Sprint 20-GEMM — native FP8 GEMM prefill kernel for
     // SafeTensors models. Cloned from `mul_coopmat_q4k_naive.comp`
     // (Sprint 1B / 3C); only the weight load is FP8-aware. Targets

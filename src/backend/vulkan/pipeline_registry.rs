@@ -149,7 +149,7 @@ impl PipelineRegistry {
             // prompt §6 — is to pin every spec const a shader exposes
             // rather than trust the default path.
             let result = match id {
-                ShaderId::MulMatVecFp8 | ShaderId::MulMatVecF32 => {
+                ShaderId::MulMatVecFp8 | ShaderId::MulMatVecF32 | ShaderId::MulMatVecF16 => {
                     // Sprint 20-M2 — pin BLOCK_SIZE = 64 (one Wave64),
                     // matches the LDS-tree-reduction in
                     // `mul_mat_vec_fp8.comp` and keeps the workgroup at

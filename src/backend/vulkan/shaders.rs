@@ -53,6 +53,10 @@ pub enum ShaderId {
     /// as BF16-expanded FP32). Same 5-binding descriptor layout as
     /// MulMatVecFp8 so a single helper drives both.
     MulMatVecF32,
+    /// Sprint 22C — FP16 weight GEMV. Drop-in for `MulMatVecF32`
+    /// when the loader expands BF16 → FP16 instead of FP32 (halves
+    /// the lm_head VRAM cost on Llama-3.1-class models).
+    MulMatVecF16,
     /// Sprint 20-GEMM — native FP8 prefill GEMM. Cloned from
     /// `mul_coopmat_q4k_naive.comp` with the Q4_K weight load swapped
     /// for FP8 byte → float, plus a per-tensor `weight_scale`
@@ -335,6 +339,7 @@ impl ShaderId {
             ShaderId::MulMatVecQ4_0Subgroup => "mul_mat_vec_q4_0_f32_f32_subgroup",
             ShaderId::MulMatVecFp8 => "mul_mat_vec_fp8",
             ShaderId::MulMatVecF32 => "mul_mat_vec_f32",
+            ShaderId::MulMatVecF16 => "mul_mat_vec_f16",
             ShaderId::MulCoopmatFp8Naive => "mul_coopmat_fp8_naive",
             ShaderId::MulCoopmatFp8MultiWg => "mul_coopmat_fp8_multi_wg",
             ShaderId::RmsNorm => "rms_norm_f32",
@@ -442,6 +447,7 @@ impl ShaderId {
             ShaderId::MulMatVecQ4_0Subgroup => MUL_MAT_VEC_Q4_0_F32_F32_SUBGROUP,
             ShaderId::MulMatVecFp8 => MUL_MAT_VEC_FP8,
             ShaderId::MulMatVecF32 => MUL_MAT_VEC_F32,
+            ShaderId::MulMatVecF16 => MUL_MAT_VEC_F16,
             ShaderId::MulCoopmatFp8Naive => MUL_COOPMAT_FP8_NAIVE,
             ShaderId::MulCoopmatFp8MultiWg => MUL_COOPMAT_FP8_MULTI_WG,
             ShaderId::RmsNorm => RMS_NORM_F32,
@@ -556,6 +562,7 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::MulMatVecQ4_0Subgroup,
     ShaderId::MulMatVecFp8,
     ShaderId::MulMatVecF32,
+    ShaderId::MulMatVecF16,
     ShaderId::MulCoopmatFp8Naive,
     ShaderId::MulCoopmatFp8MultiWg,
     ShaderId::RmsNorm,
@@ -692,6 +699,8 @@ pub const MUL_MAT_VEC_FP8: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_fp8.spv"));
 pub const MUL_MAT_VEC_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_f32.spv"));
+pub const MUL_MAT_VEC_F16: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_f16.spv"));
 pub const MUL_COOPMAT_FP8_NAIVE: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_fp8_naive.spv"));
 pub const MUL_COOPMAT_FP8_MULTI_WG: &[u8] =

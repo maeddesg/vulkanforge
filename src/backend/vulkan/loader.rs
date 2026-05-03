@@ -366,10 +366,21 @@ impl LoadedModel {
             };
 
             let raw = st.tensor_bytes(info);
+            // Sprint 22C — narrow BF16 lm_head to FP16 instead of
+            // expanding to FP32 (saves ~1.1 GiB on Llama-3.1's
+            // 128 256 × 4 096 lm_head). Other BF16 tensors (the
+            // 32 input/output layernorms, ~1 MiB total) stay FP32
+            // because RmsNorm consumes FP32 weights and the shader
+            // change isn't worth a few hundred KiB.
+            let is_lm_head = hf_name == "lm_head.weight";
             let (target_dtype, bytes) = match info.dtype {
                 TensorDtype::F8E4M3 => (GgmlType::F8E4M3, Source::Borrowed(raw)),
                 TensorDtype::F16 => (GgmlType::F16, Source::Borrowed(raw)),
                 TensorDtype::F32 => (GgmlType::F32, Source::Borrowed(raw)),
+                TensorDtype::BF16 if is_lm_head => {
+                    let fp16 = bf16_to_f16_vec(raw, info, hf_name)?;
+                    (GgmlType::F16, Source::Owned(fp16))
+                }
                 TensorDtype::BF16 => {
                     let fp32 = bf16_to_f32_vec(raw, info, hf_name)?;
                     (GgmlType::F32, Source::Owned(fp32))
@@ -618,6 +629,41 @@ fn bf16_to_f32_vec(
         let bf = u16::from_le_bytes([raw[2 * i], raw[2 * i + 1]]);
         let f = bf16_to_f32(bf);
         out[4 * i .. 4 * i + 4].copy_from_slice(&f.to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// Sprint 22C — narrow a BF16 byte slice to FP16 on the host.
+/// Used at load time to halve `lm_head`'s GPU footprint (Llama-3.1
+/// 128 256 × 4 096 = 2.1 GiB FP32 → 1.0 GiB FP16). FP16's range
+/// (±65 504) covers normal LLM weight magnitudes; the BF16 → FP32
+/// → FP16 round-trip via the `half` crate handles NaN / Inf /
+/// subnormal correctly. Norms (≪ 1 MiB total) stay FP32 — no
+/// VRAM payoff for the extra shader work.
+fn bf16_to_f16_vec(
+    raw: &[u8],
+    info: &TensorInfo,
+    name: &str,
+) -> Result<Vec<u8>, LoaderError> {
+    if raw.len() % 2 != 0 {
+        return Err(LoaderError::Buffer(format!(
+            "BF16 tensor '{name}': byte length {} is not a multiple of 2",
+            raw.len(),
+        )));
+    }
+    let n = raw.len() / 2;
+    let expected = info.n_elements();
+    if n != expected {
+        return Err(LoaderError::Buffer(format!(
+            "BF16 tensor '{name}': byte length implies {n} elements, shape implies {expected}"
+        )));
+    }
+    let mut out = vec![0u8; n * 2];
+    for i in 0..n {
+        let bf_bits = u16::from_le_bytes([raw[2 * i], raw[2 * i + 1]]);
+        let f32_val = half::bf16::from_bits(bf_bits).to_f32();
+        let f16_bits = half::f16::from_f32(f32_val).to_bits();
+        out[2 * i .. 2 * i + 2].copy_from_slice(&f16_bits.to_le_bytes());
     }
     Ok(out)
 }

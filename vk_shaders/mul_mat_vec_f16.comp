@@ -1,0 +1,90 @@
+#version 450
+
+// Sprint 22C — FP16 weight GEMV. Drop-in replacement for
+// `mul_mat_vec_f32.comp` when the lm_head (or any unquantized
+// SafeTensors weight) lands as BF16 → FP16-narrow on upload
+// instead of BF16 → FP32. Halves the weight VRAM (Llama-3.1
+// lm_head: 2.1 GiB FP32 → 1.0 GiB FP16) at no measurable
+// throughput cost — the GEMV is bandwidth-bound on weight reads,
+// so 2× narrower elements ≈ 2× fewer VRAM bytes per step.
+//
+// Output[row] = scale * sum_k( W[row, k] * input[k] )
+//
+// Same dispatch shape, push-constant layout, and 5-binding
+// descriptor as `mul_mat_vec_f32.comp` so `Forward::run_gemv`
+// drives both with the same helper. Reads weights as `uint[]`
+// and unpacks two FP16 values per word via `unpackHalf2x16` —
+// avoids the `GL_EXT_shader_16bit_storage` extension and matches
+// the FP8 GEMV's storage pattern.
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer WeightBuf { uint data_a[]; };  // 2 FP16 / uint
+layout (binding = 1) readonly buffer InputBuf  { float data_b[]; };
+layout (binding = 2) writeonly buffer OutputBuf { float data_d[]; };
+layout (binding = 3) readonly buffer Fuse0Dummy { uint _fuse0_dummy[]; };
+layout (binding = 4) readonly buffer Fuse1Dummy { uint _fuse1_dummy[]; };
+
+// Layout matches MatVecPushConstants (13 × u32 = 52 B). The last slot
+// carries `weight_scale.to_bits()` (1.0 for unquantized lm_head).
+layout (push_constant) uniform parameter {
+    uint  ncols;
+    uint  stride_a;
+    uint  stride_b;
+    uint  stride_d;
+    uint  batch_stride_a;
+    uint  batch_stride_b;
+    uint  batch_stride_d;
+    uint  _fusion_flags;
+    uint  _base_work_group_y;
+    uint  _ne02;
+    uint  _ne12;
+    uint  _broadcast2;
+    float weight_scale;
+} p;
+
+shared float lds_partial[1024];
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    if (row >= p.stride_d) return;
+
+    const uint tid    = gl_LocalInvocationID.x;
+    const uint nthr   = gl_WorkGroupSize.x;
+    const uint K      = p.ncols;
+    // Each thread strides `nthr` *pairs* of FP16 weights per step
+    // (one `unpackHalf2x16` consumes one uint = two FP16 elements).
+    const uint K_pairs    = K >> 1u;
+    const uint row_u_base = row * (p.stride_a >> 1u); // first uint of this row
+
+    float partial = 0.0;
+    [[unroll(1)]] for (uint p_idx = tid; p_idx < K_pairs; p_idx += nthr) {
+        const uint  word = data_a[row_u_base + p_idx];
+        const vec2  pair = unpackHalf2x16(word);
+        const uint  k0   = p_idx * 2u;
+        partial = fma(pair.x, data_b[k0    ], partial);
+        partial = fma(pair.y, data_b[k0 + 1], partial);
+    }
+    // Tail (K odd) — only the row-leader thread handles it. Llama-3
+    // and Qwen3 hidden_dims are powers of 2, so this branch is dead
+    // on the production path; defensive against future shapes.
+    if (tid == 0u && (K & 1u) != 0u) {
+        const uint last_word = data_a[row_u_base + K_pairs];
+        const vec2 pair = unpackHalf2x16(last_word);
+        partial = fma(pair.x, data_b[K - 1u], partial);
+    }
+
+    lds_partial[tid] = partial;
+    barrier();
+    for (uint stride = nthr / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            lds_partial[tid] += lds_partial[tid + stride];
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        data_d[row] = lds_partial[0] * p.weight_scale;
+    }
+}

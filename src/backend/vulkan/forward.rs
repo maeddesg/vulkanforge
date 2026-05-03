@@ -1924,6 +1924,7 @@ impl Forward {
         let lm_shader = match (lm.ggml_type, self.mul_mat_vec_subgroup_enabled) {
             (GgmlType::F8E4M3, _) => ShaderId::MulMatVecFp8,
             (GgmlType::F32,    _) => ShaderId::MulMatVecF32,
+            (GgmlType::F16,    _) => ShaderId::MulMatVecF16,
             (GgmlType::Q6K, true ) => ShaderId::MulMatVecQ6KSubgroup,
             (GgmlType::Q6K, false) => ShaderId::MulMatVecQ6K,
             (_,             true ) => ShaderId::MulMatVecQ4KSubgroup,
@@ -2185,7 +2186,10 @@ impl Forward {
         // get dead-stripped by spirv-opt because nothing reads them.
         // The K-quant GEMVs keep all 5 bindings live because their
         // fusion-mask dispatcher actually reads `fuse0`/`fuse1`.
-        let one_per_row = matches!(shader, ShaderId::MulMatVecFp8 | ShaderId::MulMatVecF32);
+        let one_per_row = matches!(
+            shader,
+            ShaderId::MulMatVecFp8 | ShaderId::MulMatVecF32 | ShaderId::MulMatVecF16,
+        );
         let set = if one_per_row {
             self.alloc_or_get_set(
                 dev, kernel.descriptor_set_layout,
@@ -4759,6 +4763,7 @@ fn layer_weight_shader(model: &LoadedModel, layer: u32, suffix: &str, subgroup: 
     match (ggml_type, subgroup) {
         (GgmlType::F8E4M3, _) => ShaderId::MulMatVecFp8,
         (GgmlType::F32,    _) => ShaderId::MulMatVecF32,
+        (GgmlType::F16,    _) => ShaderId::MulMatVecF16,
         (GgmlType::Q6K, true ) => ShaderId::MulMatVecQ6KSubgroup,
         (GgmlType::Q6K, false) => ShaderId::MulMatVecQ6K,
         (GgmlType::Q3K, true ) => ShaderId::MulMatVecQ3KSubgroup,
