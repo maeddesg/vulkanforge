@@ -780,12 +780,23 @@ fn bf16_to_f16_vec(
 /// `ModelConfig`. Sprint 20-M1 scope: enough fields to drive the
 /// existing forward pass on a Llama-style architecture.
 fn hf_to_model_config(hf: &HfConfig) -> Result<ModelConfig, LoaderError> {
-    if hf.model_type != "llama" {
-        return Err(LoaderError::Buffer(format!(
-            "SafeTensors model_type '{}' not supported in M1 (only 'llama')",
-            hf.model_type,
-        )));
-    }
+    // Sprint 24C — accept Llama-style and Qwen2-style architectures.
+    // Both use the same forward-pass scaffolding; the only behavioural
+    // differences are (a) Qwen2 carries Q/K/V projection biases that
+    // Llama omits, handled by Sprint 24B's bias-add dispatch, and (b)
+    // a different rope_theta default (1e6 for Qwen2.5 vs 5e5 for
+    // Llama-3) — both read from `config.json` directly, so no code
+    // branch needed.
+    let arch = match hf.model_type.as_str() {
+        "llama" => "llama",
+        "qwen2" => "qwen2",
+        other => {
+            return Err(LoaderError::Buffer(format!(
+                "SafeTensors model_type '{other}' not yet supported \
+                 (have: 'llama', 'qwen2')"
+            )));
+        }
+    };
     use super::gguf::RopeVariant;
     // Important: SafeTensors / PyTorch carries Q/K weights in the
     // *un-permuted* HuggingFace layout, where RoPE rotates the
@@ -796,7 +807,7 @@ fn hf_to_model_config(hf: &HfConfig) -> Result<ModelConfig, LoaderError> {
     // `RopeVariant::Neox` (the existing `rope_neox.comp` shader) so
     // the math matches HF semantics on the raw weights.
     Ok(ModelConfig {
-        architecture: "llama".to_string(),
+        architecture: arch.to_string(),
         hidden_dim: hf.hidden_size,
         ffn_dim: hf.intermediate_size,
         n_heads: hf.num_attention_heads,
