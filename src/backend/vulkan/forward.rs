@@ -229,6 +229,12 @@ pub struct Forward {
     prefill_fence: vk::Fence,
     layers_per_submit: u32,
     logits_buf: GpuBuffer,
+    /// Sprint 27 — host-readable staging copy of `logits_buf`.
+    /// `logits_buf` is now `GpuOnly` (fast GPU-local writes from
+    /// `lm_head`); after each forward the CB ends with a tiny
+    /// `cmd_copy_buffer` into this staging buffer, which is the one
+    /// the host actually reads.
+    logits_staging: GpuBuffer,
     // Always-bound dummies for unused descriptor slots.
     fuse0: GpuBuffer,
     fuse1: GpuBuffer,
@@ -429,26 +435,9 @@ impl Forward {
         }
         self.dispatch_final(dev, registry, cmd, model, input);
 
-        // Make logits visible to the host.
-        let post = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::HOST_READ)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.logits_buf.handle)
-            .offset(0)
-            .size(vk::WHOLE_SIZE);
-        unsafe {
-            dev.device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::HOST,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[post],
-                &[],
-            );
-        }
+        // Sprint 27 — copy logits from GpuOnly logits_buf to host-mapped
+        // logits_staging, with surrounding compute→transfer→host barriers.
+        self.record_logits_readback(dev, cmd);
 
         self.current_slot = saved;
     }
@@ -532,7 +521,8 @@ impl Forward {
     ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         let fence = self.async_fences[slot];
         unsafe { dev.device.wait_for_fences(&[fence], true, u64::MAX)?; }
-        let bytes = self.logits_buf.read_bytes()?;
+        // Sprint 27 — read from host-mapped staging copy.
+        let bytes = self.logits_staging.read_bytes()?;
         Ok(bytemuck::cast_slice::<u8, f32>(
             &bytes[..(self.config.vocab_size as usize) * 4],
         ).to_vec())
@@ -663,7 +653,18 @@ impl Forward {
         };
         let slot0 = alloc_slot(0)?;
         let slot1 = alloc_slot(1)?;
-        let logits_buf = mk_storage(logits_bytes, MemoryLocation::GpuToCpu, "logits_buf")?;
+        // Sprint 27 — `logits_buf` was `GpuToCpu` (host-mapped) for
+        // direct CPU readback. On 14B-FP8 (vocab=152064) the lm_head
+        // GEMV dispatched 152k scattered 4-byte writes through PCIe
+        // and the BOTTOM_OF_PIPE fence stalled until they drained,
+        // inflating per-token decode time by ~30 ms (vs 2.7 ms
+        // BW-limited in the standalone shape bench).
+        // Fix: keep lm_head's writes in fast GPU-local memory, then
+        // copy the (small) logits buffer to a host-visible staging
+        // buffer at end-of-forward.
+        let logits_buf = mk_storage(logits_bytes, MemoryLocation::GpuOnly, "logits_buf")?;
+        let logits_staging =
+            mk_storage(logits_bytes, MemoryLocation::GpuToCpu, "logits_staging")?;
         let fuse0 = mk_storage(16, MemoryLocation::GpuOnly, "fuse0_dummy")?;
         let fuse1 = mk_storage(16, MemoryLocation::GpuOnly, "fuse1_dummy")?;
 
@@ -1052,6 +1053,7 @@ impl Forward {
             prefill_fence,
             layers_per_submit,
             logits_buf,
+            logits_staging,
             fuse0, fuse1,
             rope_ff_buf, rope_idx_buf,
             kv_cache, config,
@@ -1152,28 +1154,13 @@ impl Forward {
             }
             let t = Instant::now();
             self.dispatch_final(dev, registry, cmd, model, input);
-            let post = vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.logits_buf.handle)
-                .offset(0)
-                .size(vk::WHOLE_SIZE);
-            unsafe {
-                dev.device.cmd_pipeline_barrier(
-                    cmd,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::PipelineStageFlags::HOST,
-                    vk::DependencyFlags::empty(),
-                    &[], &[post], &[],
-                );
-            }
+            // Sprint 27 — copy logits to host-mapped staging.
+            self.record_logits_readback(dev, cmd);
             final_dispatch = t.elapsed();
         })?;
 
         let read_start = Instant::now();
-        let bytes = self.logits_buf.read_bytes()?;
+        let bytes = self.logits_staging.read_bytes()?;
         let _logits = bytemuck::cast_slice::<u8, f32>(
             &bytes[..(self.config.vocab_size as usize) * 4],
         )
@@ -1248,27 +1235,12 @@ impl Forward {
                 std::mem::swap(&mut input, &mut output);
             }
             self.dispatch_final(dev, registry, cmd, model, input);
-            let post = vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.logits_buf.handle)
-                .offset(0)
-                .size(vk::WHOLE_SIZE);
-            unsafe {
-                dev.device.cmd_pipeline_barrier(
-                    cmd,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::PipelineStageFlags::HOST,
-                    vk::DependencyFlags::empty(),
-                    &[], &[post], &[],
-                );
-            }
+            // Sprint 27 — copy logits to host-mapped staging.
+            self.record_logits_readback(dev, cmd);
         })?;
 
         let read_start = Instant::now();
-        let bytes = self.logits_buf.read_bytes()?;
+        let bytes = self.logits_staging.read_bytes()?;
         let _logits = bytemuck::cast_slice::<u8, f32>(
             &bytes[..(self.config.vocab_size as usize) * 4],
         )
@@ -1354,8 +1326,8 @@ impl Forward {
             self.record_decode_dispatches(dev, registry, cmd, model, cur_slot, position);
         })?;
 
-        // Logits readback.
-        let bytes = self.logits_buf.read_bytes()?;
+        // Logits readback (Sprint 27 — from host-mapped staging).
+        let bytes = self.logits_staging.read_bytes()?;
         let _logits: Vec<f32> = bytemuck::cast_slice::<u8, f32>(
             &bytes[..(self.config.vocab_size as usize) * 4],
         )
@@ -1781,7 +1753,8 @@ impl Forward {
     /// Read the most recently written logits — call after
     /// `forward_token` returns successfully.
     pub fn logits(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-        let bytes = self.logits_buf.read_bytes()?;
+        // Sprint 27 — read from host-mapped staging copy.
+        let bytes = self.logits_staging.read_bytes()?;
         Ok(bytemuck::cast_slice::<u8, f32>(
             &bytes[..(self.config.vocab_size as usize) * 4],
         )
@@ -1829,6 +1802,7 @@ impl Forward {
             s.fa_scratch_sum.destroy(device, allocator);
         }
         self.logits_buf.destroy(device, allocator);
+        self.logits_staging.destroy(device, allocator);
         self.fuse0.destroy(device, allocator);
         self.fuse1.destroy(device, allocator);
         self.rope_ff_buf.destroy(device, allocator);
@@ -2290,6 +2264,62 @@ impl Forward {
         self.write_bindings(dev, set, bindings);
         self.set_cache.insert(key, set);
         set
+    }
+
+    /// Sprint 27 — copy `logits_buf` (GpuOnly) to `logits_staging`
+    /// (GpuToCpu) inside `cmd`, with the surrounding barriers. Replaces
+    /// the previous `SHADER_WRITE → HOST_READ` barrier on the
+    /// host-mapped `logits_buf`. Tiny GPU work (vocab × 4 bytes), but
+    /// removes the scattered-host-write stall that inflated lm_head's
+    /// timestamp by ~27 ms on 14B-FP8 (Sprint 27 finding).
+    fn record_logits_readback(&self, dev: &VulkanDevice, cmd: vk::CommandBuffer) {
+        let logits_bytes = (self.config.vocab_size as u64) * 4;
+        // (1) make lm_head's SHADER_WRITE visible to the upcoming
+        // TRANSFER_READ — execution + memory dependency.
+        let pre = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.logits_buf.handle)
+            .offset(0).size(vk::WHOLE_SIZE);
+        unsafe {
+            dev.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[], &[pre], &[],
+            );
+        }
+        // (2) cmd_copy_buffer logits_buf → logits_staging.
+        let copy = vk::BufferCopy::default().size(logits_bytes);
+        unsafe {
+            dev.device.cmd_copy_buffer(
+                cmd,
+                self.logits_buf.handle,
+                self.logits_staging.handle,
+                std::slice::from_ref(&copy),
+            );
+        }
+        // (3) make the TRANSFER_WRITE visible to HOST_READ on the
+        // staging buffer.
+        let post = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.logits_staging.handle)
+            .offset(0).size(vk::WHOLE_SIZE);
+        unsafe {
+            dev.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[], &[post], &[],
+            );
+        }
     }
 
     /// Reset the descriptor pool *and* clear the cache. Used by
@@ -4137,23 +4167,8 @@ impl Forward {
             );
         }
         self.dispatch_final(dev, registry, cmd, model, self.cur().scratch_a.handle);
-
-        let post = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::HOST_READ)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.logits_buf.handle)
-            .offset(0).size(vk::WHOLE_SIZE);
-        unsafe {
-            dev.device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::HOST,
-                vk::DependencyFlags::empty(),
-                &[], &[post], &[],
-            );
-        }
+        // Sprint 27 — copy logits to host-mapped staging.
+        self.record_logits_readback(dev, cmd);
     }
 
     /// One layer's worth of batched dispatches, recorded into `cmd`.

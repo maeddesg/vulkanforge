@@ -122,6 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ---- Profile N decode tokens, accumulate per-shader totals ----
     let mut totals: BTreeMap<String, (Duration, u32)> = BTreeMap::new();
     let mut token_totals: Vec<Duration> = Vec::new();
+    let mut wall_totals: Vec<Duration> = Vec::new();
     for _ in 0..n_profile_tokens {
         let next_id = argmax(&last_logits) as u32;
         let embd = embedding_row_host(&host_embed, &cfg, next_id);
@@ -138,7 +139,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tok_total += *dur;
         }
         token_totals.push(tok_total);
+        wall_totals.push(stats.total);
     }
+    let avg_wall = wall_totals.iter().sum::<Duration>().as_secs_f64() / wall_totals.len() as f64;
+    println!("\nWall time per forward_token (avg): {:.2} ms", avg_wall * 1000.0);
 
     let n = n_profile_tokens.max(1) as f64;
     let avg_token = token_totals.iter().sum::<Duration>().as_secs_f64() / n;
