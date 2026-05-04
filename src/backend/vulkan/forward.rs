@@ -53,6 +53,14 @@ use super::shaders::ShaderId;
 const MUL_MAT_VEC_FP8_PERCHANNEL: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_fp8_perchannel.spv"));
 
+// Sprint 29 — F16 GEMV SPV for the dedicated lm_head pipeline. Same
+// SPV as the production `MulMatVecF16` registry entry; the harness
+// pattern (PipelineCache::null + dedicated DSL/pool) bypasses the
+// shared `vk::PipelineCache` to test whether cross-pipeline cache
+// state is responsible for lm_head's runtime slowdown vs standalone.
+const MUL_MAT_VEC_F16_LMHEAD: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_f16.spv"));
+
 // ---- Phase 5A-2 Stage 2D: descriptor-set cache key ----
 //
 // We cache a `vk::DescriptorSet` per unique binding signature to avoid
@@ -339,6 +347,23 @@ pub struct Forward {
     fp8pc_pipeline_layout: vk::PipelineLayout,
     fp8pc_pipeline: vk::Pipeline,
     fp8pc_pool: vk::DescriptorPool,
+
+    // Sprint 29 — harness-style dedicated F16 GEMV resources for the
+    // lm_head dispatch (M=152064, K=5120 on Qwen2.5-14B-FP8). Mirrors
+    // the production registry entry's spec / required-subgroup / SPV,
+    // but uses `PipelineCache::null` and a dedicated descriptor pool
+    // so the lm_head pipeline never shares ACO codegen state with the
+    // 102-pipeline shared `vk::PipelineCache`. Runtime measurements
+    // showed lm_head at ~30 ms via the shared registry vs ~3 ms in a
+    // standalone bench (Sprints 26-28B). This path tests whether the
+    // shared cache is the cause; if it is, the harness pattern (same
+    // approach that fixed Sprint 24-Inline's per-channel FP8 GEMV)
+    // closes the gap.
+    lmhead_shader_module: vk::ShaderModule,
+    lmhead_dsl: vk::DescriptorSetLayout,
+    lmhead_pipeline_layout: vk::PipelineLayout,
+    lmhead_pipeline: vk::Pipeline,
+    lmhead_pool: vk::DescriptorPool,
 
     rope_theta_scale: f32,
     attn_scale: f32,
@@ -1041,6 +1066,85 @@ impl Forward {
             (module, dsl, pipeline_layout, pipeline, pool)
         };
 
+        // Sprint 29 — dedicated F16 GEMV pipeline for lm_head. Mirrors
+        // the production registry's MulMatVecF16 entry (BLOCK_SIZE=64
+        // spec, requiredSubgroupSize=64, REQUIRE_FULL_SUBGROUPS, 5
+        // bindings: weight + input + output + 2 fuse dummies) but with
+        // `PipelineCache::null` and a small dedicated pool.
+        let (
+            lmhead_shader_module,
+            lmhead_dsl,
+            lmhead_pipeline_layout,
+            lmhead_pipeline,
+            lmhead_pool,
+        ) = unsafe {
+            let words: Vec<u32> = MUL_MAT_VEC_F16_LMHEAD
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let module = device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&words),
+                None,
+            )?;
+            let dsl_bindings: Vec<_> = (0..5).map(|i| {
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(i).descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE)
+            }).collect();
+            let dsl = device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&dsl_bindings),
+                None,
+            )?;
+            let push_range = vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .offset(0)
+                .size(std::mem::size_of::<MatVecPushConstants>() as u32);
+            let layouts_arr = [dsl];
+            let push_ranges = [push_range];
+            let pipeline_layout = device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&layouts_arr)
+                    .push_constant_ranges(&push_ranges),
+                None,
+            )?;
+            let block_size: u32 = 64;
+            let spec_entries = [vk::SpecializationMapEntry { constant_id: 0, offset: 0, size: 4 }];
+            let spec_data = bytemuck::bytes_of(&block_size);
+            let spec_info = vk::SpecializationInfo::default()
+                .map_entries(&spec_entries)
+                .data(spec_data);
+            let mut subgroup_info = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+                .required_subgroup_size(64);
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(module)
+                .name(c"main")
+                .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
+                .specialization_info(&spec_info)
+                .push_next(&mut subgroup_info);
+            let pipeline = device.create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[vk::ComputePipelineCreateInfo::default()
+                    .stage(stage)
+                    .layout(pipeline_layout)],
+                None,
+            ).map_err(|(_, e)| e)?[0];
+            // Pool: lm_head dispatched once per forward; with the
+            // 2-slot async pipeline that's at most 2 sets in flight,
+            // plus headroom. 32 sets is plenty.
+            let pool = device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(32)
+                    .pool_sizes(&[vk::DescriptorPoolSize {
+                        ty: vk::DescriptorType::STORAGE_BUFFER,
+                        descriptor_count: 32 * 5,
+                    }])
+                    .flags(vk::DescriptorPoolCreateFlags::empty()),
+                None,
+            )?;
+            (module, dsl, pipeline_layout, pipeline, pool)
+        };
+
         Ok(Self {
             slots: [slot0, slot1],
             current_slot: 0,
@@ -1089,6 +1193,11 @@ impl Forward {
             fp8pc_pipeline_layout,
             fp8pc_pipeline,
             fp8pc_pool,
+            lmhead_shader_module,
+            lmhead_dsl,
+            lmhead_pipeline_layout,
+            lmhead_pipeline,
+            lmhead_pool,
         })
     }
 
@@ -1133,6 +1242,10 @@ impl Forward {
         unsafe {
             dev.device.reset_descriptor_pool(
                 self.fp8pc_pool, vk::DescriptorPoolResetFlags::empty(),
+            )?;
+            // Sprint 29 — also reset the lm_head dedicated pool every forward.
+            dev.device.reset_descriptor_pool(
+                self.lmhead_pool, vk::DescriptorPoolResetFlags::empty(),
             )?;
         }
         let pre_setup = pre_start.elapsed();
@@ -1222,6 +1335,10 @@ impl Forward {
             dev.device.reset_descriptor_pool(
                 self.fp8pc_pool, vk::DescriptorPoolResetFlags::empty(),
             )?;
+            // Sprint 29 — also reset the lm_head dedicated pool every forward.
+            dev.device.reset_descriptor_pool(
+                self.lmhead_pool, vk::DescriptorPoolResetFlags::empty(),
+            )?;
         }
         let pre_setup = pre_start.elapsed();
 
@@ -1302,6 +1419,10 @@ impl Forward {
         unsafe {
             dev.device.reset_descriptor_pool(
                 self.fp8pc_pool, vk::DescriptorPoolResetFlags::empty(),
+            )?;
+            // Sprint 29 — also reset the lm_head dedicated pool every forward.
+            dev.device.reset_descriptor_pool(
+                self.lmhead_pool, vk::DescriptorPoolResetFlags::empty(),
             )?;
         }
 
@@ -1769,6 +1890,11 @@ impl Forward {
             device.destroy_pipeline_layout(self.fp8pc_pipeline_layout, None);
             device.destroy_descriptor_set_layout(self.fp8pc_dsl, None);
             device.destroy_shader_module(self.fp8pc_shader_module, None);
+            device.destroy_descriptor_pool(self.lmhead_pool, None);
+            device.destroy_pipeline(self.lmhead_pipeline, None);
+            device.destroy_pipeline_layout(self.lmhead_pipeline_layout, None);
+            device.destroy_descriptor_set_layout(self.lmhead_dsl, None);
+            device.destroy_shader_module(self.lmhead_shader_module, None);
             device.destroy_descriptor_pool(self.descriptor_pool, None);
             // Sprint 15E — async CB pool + fences.
             for f in self.async_fences {
@@ -2167,11 +2293,24 @@ impl Forward {
         self.mark_written(&[hidden_norm]);
         // Next: lm_head GEMV reads hidden_norm.
         self.maybe_compute_barrier(dev, cmd, &[hidden_norm]);
-        self.run_gemv(
-            dev, registry, cmd, lm_shader,
-            w_lm, hidden_norm, self.logits_buf.handle,
-            self.config.hidden_dim, self.config.vocab_size, lm_scale, "lm_head",
-        );
+        // Sprint 29 — F16 lm_head goes through the dedicated harness
+        // pipeline (PipelineCache::null + dedicated pool). Other
+        // dtypes (F8E4M3 / F32 / Q-quants) keep the production
+        // registry path. Toggle via VF_LMHEAD_HARNESS=0 to compare.
+        let use_harness = matches!(lm_shader, ShaderId::MulMatVecF16)
+            && std::env::var("VF_LMHEAD_HARNESS").map(|v| v != "0").unwrap_or(true);
+        if use_harness {
+            self.run_gemv_lmhead_dedicated(
+                dev, cmd, w_lm, hidden_norm, self.logits_buf.handle,
+                self.config.hidden_dim, self.config.vocab_size, lm_scale,
+            );
+        } else {
+            self.run_gemv(
+                dev, registry, cmd, lm_shader,
+                w_lm, hidden_norm, self.logits_buf.handle,
+                self.config.hidden_dim, self.config.vocab_size, lm_scale, "lm_head",
+            );
+        }
         self.mark_written(&[self.logits_buf.handle]);
     }
 
@@ -2337,6 +2476,11 @@ impl Forward {
             // free again.
             dev.device.reset_descriptor_pool(
                 self.fp8pc_pool,
+                vk::DescriptorPoolResetFlags::empty(),
+            )?;
+            // Sprint 29 — same for the lm_head dedicated pool.
+            dev.device.reset_descriptor_pool(
+                self.lmhead_pool,
                 vk::DescriptorPoolResetFlags::empty(),
             )?;
         }
@@ -2506,6 +2650,69 @@ impl Forward {
         let pipeline = self.fp8pc_pipeline;
         let layout = self.fp8pc_pipeline_layout;
         self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, m, 1, 1);
+        });
+    }
+
+    /// Sprint 29 — dedicated F16 GEMV dispatch for lm_head. Mirrors
+    /// the production `run_gemv` for `MulMatVecF16` (same SPV, same
+    /// spec / requiredSubgroupSize, same push-constant struct, same
+    /// 5-binding scheme with fuse0/fuse1 dummies, same one-WG-per-row
+    /// dispatch geometry) but uses the `lmhead_*` resources built
+    /// with `PipelineCache::null` and a dedicated descriptor pool.
+    #[allow(clippy::too_many_arguments)]
+    fn run_gemv_lmhead_dedicated(
+        &mut self,
+        dev: &VulkanDevice,
+        cmd: vk::CommandBuffer,
+        weights: vk::Buffer,
+        input: vk::Buffer,
+        output: vk::Buffer,
+        k: u32,
+        m: u32,
+        weight_scale: f32,
+    ) {
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.lmhead_pool)
+            .set_layouts(std::slice::from_ref(&self.lmhead_dsl));
+        let set = unsafe { dev.device.allocate_descriptor_sets(&alloc_info) }
+            .expect("lmhead descriptor set alloc")[0];
+        let infos = [
+            vk::DescriptorBufferInfo::default().buffer(weights).offset(0).range(vk::WHOLE_SIZE),
+            vk::DescriptorBufferInfo::default().buffer(input).offset(0).range(vk::WHOLE_SIZE),
+            vk::DescriptorBufferInfo::default().buffer(output).offset(0).range(vk::WHOLE_SIZE),
+            vk::DescriptorBufferInfo::default().buffer(self.fuse0.handle).offset(0).range(vk::WHOLE_SIZE),
+            vk::DescriptorBufferInfo::default().buffer(self.fuse1.handle).offset(0).range(vk::WHOLE_SIZE),
+        ];
+        let writes: Vec<vk::WriteDescriptorSet> = (0..5)
+            .map(|i| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(i as u32)
+                    .descriptor_count(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(&infos[i]))
+            })
+            .collect();
+        unsafe { dev.device.update_descriptor_sets(&writes, &[]) };
+
+        let pc = MatVecPushConstants {
+            ncols: k, stride_a: k, stride_b: k, stride_d: m,
+            batch_stride_a: k * m, batch_stride_b: k, batch_stride_d: m,
+            fusion_flags: 0, base_work_group_y: 0,
+            ne02: 1, ne12: 1, broadcast2: 1,
+            broadcast3: weight_scale.to_bits(),
+        };
+        let pipeline = self.lmhead_pipeline;
+        let layout = self.lmhead_pipeline_layout;
+        self.profile("lm_head", dev, cmd, |dev, cmd| unsafe {
             dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             dev.device.cmd_bind_descriptor_sets(
                 cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],

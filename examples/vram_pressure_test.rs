@@ -98,11 +98,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ).map_err(|(_, e)| e)?[0]
     };
 
+    // Sprint 29 — `VF_BALLAST_FIRST=1` swaps the order: ballast
+    // gets allocated FIRST so that the lm_head weight buffer ends
+    // up at a high VRAM offset (mirroring the runtime, where the
+    // SafeTensors loader allocates ~50 tensors before output.weight).
+    let ballast_first = std::env::var("VF_BALLAST_FIRST").is_ok();
+    if ballast_first {
+        eprintln!("VF_BALLAST_FIRST=1 — allocating ballast BEFORE lm_head buffers");
+    }
+
     // Step 1 — allocate the lm_head working set FIRST (1.56 GiB
     // weight + 5KB input + 608KB output + 16B*2 fuse), so it sits
     // near the bottom of VRAM. Then allocate ballast on top to
     // mirror a 14B model's full VRAM occupancy.
+    // If VF_BALLAST_FIRST is set, allocate ballast FIRST so the
+    // lm_head weight buffer ends up at a high VRAM offset.
     let lm_weight_bytes = (LM_M as u64) * (LM_K as u64) * 2;
+    let mut early_ballast: Vec<GpuBuffer> = Vec::new();
+    if ballast_first && ballast_gib > 0 {
+        let chunk_size_gib: u64 = 512 * 1024 * 1024;
+        let total = ballast_gib * 1024 * 1024 * 1024;
+        let mut allocated: u64 = 0;
+        while allocated < total {
+            let remaining = total - allocated;
+            let size = remaining.min(chunk_size_gib);
+            early_ballast.push(GpuBuffer::new(
+                &dev.device, &mut allocator, size,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                MemoryLocation::GpuOnly, "early_ballast",
+            )?);
+            allocated += size;
+        }
+        eprintln!("  early ballast: {} chunks before lm_weight", early_ballast.len());
+    }
+
     eprintln!("Allocating lm_head weight: {:.2} GiB", lm_weight_bytes as f64 / (1024.0_f64.powi(3)));
     let lm_weight = GpuBuffer::new(
         &dev.device, &mut allocator, lm_weight_bytes,
@@ -146,9 +175,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     eprintln!("  lm_head weight filled");
 
-    // Step 2 — allocate ballast.
+    // Step 2 — allocate ballast (skipped if ballast was allocated early).
     let mut ballast_bufs: Vec<GpuBuffer> = Vec::new();
-    if ballast_gib > 0 {
+    if ballast_gib > 0 && !ballast_first {
         eprintln!("Allocating {} GiB of ballast (chunked)...", ballast_gib);
         // gpu_allocator can be fussy about big single allocations.
         // Allocate as multiple 512 MiB chunks.
@@ -292,6 +321,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(fuse0);
     drop(fuse1);
     for b in ballast_bufs {
+        b.destroy(&dev.device, &mut allocator);
+    }
+    for b in early_ballast {
         b.destroy(&dev.device, &mut allocator);
     }
     drop(allocator);
