@@ -347,6 +347,17 @@ pub struct Forward {
     fp8pc_pipeline_layout: vk::PipelineLayout,
     fp8pc_pipeline: vk::Pipeline,
     fp8pc_pool: vk::DescriptorPool,
+    /// Sprint 30 — descriptor-set cache for `run_gemv_fp8_perchannel`.
+    /// Key: (weight, input, output, scale) buffer handles as `u64`.
+    /// Hit  → reuse the cached set (no `vkAllocate` / `vkUpdate` calls).
+    /// Miss → allocate + write + insert.
+    /// Pool is no longer reset per-decode-token, so sets stay valid
+    /// across the whole decode run; cleared on prefill via
+    /// `reset_descriptor_pool_and_cache`. With ~336 unique keys per
+    /// forward × 2 async slots, a pool of 1024 sets covers the
+    /// worst case (vs 524288 in v0.3.5 — that was for the no-cache,
+    /// every-call-fresh-alloc pattern).
+    fp8pc_ds_cache: HashMap<(u64, u64, u64, u64), vk::DescriptorSet>,
 
     // Sprint 29 — harness-style dedicated F16 GEMV resources for the
     // lm_head dispatch (M=152064, K=5120 on Qwen2.5-14B-FP8). Mirrors
@@ -1039,25 +1050,18 @@ impl Forward {
                 None,
             ).map_err(|(_, e)| e)?[0];
 
-            // Sprint 25B — bump pool from 65536 → 524288 sets. The
-            // async decode pipeline (pre_record / fill_embed_and_submit)
-            // records dispatches with two CBs in flight (slot 0 + slot 1),
-            // so sets allocated from either slot's most-recent record stay
-            // pinned until the next reset. Reset happens at prefill start
-            // (reset_descriptor_pool_and_cache from prefill_batch) and at
-            // each sync-forward call site, but NOT between async-decode
-            // tokens. With 48-layer 7-GEMV models (Qwen2.5-14B FP8) that's
-            // 336 sets/token; 524288 covers ~1560 contiguous decoded
-            // tokens — over the 15-prompt suite's worst case (1024).
-            // Memory cost ~33 MB — acceptable. A finer fix (per-slot
-            // sub-pools or vkFreeDescriptorSets after fence-wait) is a
-            // follow-up sprint.
+            // Sprint 30 — pool sized for the *cache*, not for
+            // every-call-fresh-allocation. With ~336 unique
+            // (weight, input, output, scale) keys per forward × 2
+            // async slots, 1024 sets covers worst case with comfortable
+            // headroom. Memory cost ~50 KiB descriptor-set metadata
+            // (down from ~33 MiB at 524288 in v0.3.5).
             let pool = device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(524288)
+                    .max_sets(1024)
                     .pool_sizes(&[vk::DescriptorPoolSize {
                         ty: vk::DescriptorType::STORAGE_BUFFER,
-                        descriptor_count: 524288 * 4,
+                        descriptor_count: 1024 * 4,
                     }])
                     .flags(vk::DescriptorPoolCreateFlags::empty()),
                 None,
@@ -1197,6 +1201,7 @@ impl Forward {
             fp8pc_pipeline_layout,
             fp8pc_pipeline,
             fp8pc_pool,
+            fp8pc_ds_cache: HashMap::new(),
             lmhead_shader_module,
             lmhead_dsl,
             lmhead_pipeline_layout,
@@ -1243,11 +1248,14 @@ impl Forward {
         // forward regardless of cache_enabled. Without this, multi-prompt
         // bench (~336 sets/token × hundreds of tokens) overflows the
         // 8192-set pool from Sprint 24-Inline.
+        // Sprint 30 — fp8pc_pool no longer reset per decode token.
+        // The descriptor-set cache (`fp8pc_ds_cache`) keeps sets warm
+        // across tokens; resetting the pool here would invalidate
+        // them and force fresh allocation every forward. Reset
+        // happens at prefill via `reset_descriptor_pool_and_cache`.
         unsafe {
-            dev.device.reset_descriptor_pool(
-                self.fp8pc_pool, vk::DescriptorPoolResetFlags::empty(),
-            )?;
-            // Sprint 29 — also reset the lm_head dedicated pool every forward.
+            // Sprint 29 — lm_head pool stays per-forward-resetted (its
+            // bindings change with the cur() slot, no caching applied).
             dev.device.reset_descriptor_pool(
                 self.lmhead_pool, vk::DescriptorPoolResetFlags::empty(),
             )?;
@@ -1335,11 +1343,14 @@ impl Forward {
             }
         }
         // Sprint 25 — fp8pc never caches sets; reset its pool every forward.
+        // Sprint 30 — fp8pc_pool no longer reset per decode token.
+        // The descriptor-set cache (`fp8pc_ds_cache`) keeps sets warm
+        // across tokens; resetting the pool here would invalidate
+        // them and force fresh allocation every forward. Reset
+        // happens at prefill via `reset_descriptor_pool_and_cache`.
         unsafe {
-            dev.device.reset_descriptor_pool(
-                self.fp8pc_pool, vk::DescriptorPoolResetFlags::empty(),
-            )?;
-            // Sprint 29 — also reset the lm_head dedicated pool every forward.
+            // Sprint 29 — lm_head pool stays per-forward-resetted (its
+            // bindings change with the cur() slot, no caching applied).
             dev.device.reset_descriptor_pool(
                 self.lmhead_pool, vk::DescriptorPoolResetFlags::empty(),
             )?;
@@ -1420,11 +1431,14 @@ impl Forward {
             }
         }
         // Sprint 25 — fp8pc never caches sets; reset its pool every forward.
+        // Sprint 30 — fp8pc_pool no longer reset per decode token.
+        // The descriptor-set cache (`fp8pc_ds_cache`) keeps sets warm
+        // across tokens; resetting the pool here would invalidate
+        // them and force fresh allocation every forward. Reset
+        // happens at prefill via `reset_descriptor_pool_and_cache`.
         unsafe {
-            dev.device.reset_descriptor_pool(
-                self.fp8pc_pool, vk::DescriptorPoolResetFlags::empty(),
-            )?;
-            // Sprint 29 — also reset the lm_head dedicated pool every forward.
+            // Sprint 29 — lm_head pool stays per-forward-resetted (its
+            // bindings change with the cur() slot, no caching applied).
             dev.device.reset_descriptor_pool(
                 self.lmhead_pool, vk::DescriptorPoolResetFlags::empty(),
             )?;
@@ -2489,6 +2503,9 @@ impl Forward {
             )?;
         }
         self.set_cache.clear();
+        // Sprint 30 — pool reset just invalidated every cached fp8pc
+        // descriptor set; drop the keys.
+        self.fp8pc_ds_cache.clear();
         // Sprint 12D — also reset the barrier-elision tracker so the
         // first dispatch in the next forward can't see stale dirty
         // flags from a previous (already-fence-waited) submit.
@@ -2605,8 +2622,12 @@ impl Forward {
     /// Sprint 24-Inline Step 0 — harness-style FP8 per-channel GEMV
     /// dispatch, using the dedicated `fp8pc_*` resources created in
     /// `Forward::new` with `PipelineCache::null` and a 4-binding DSL.
-    /// Allocates a fresh descriptor set per call from the dedicated
-    /// pool (no caching, no sharing with other shaders).
+    /// Sprint 30 — descriptor sets are now cached by binding tuple,
+    /// so the per-dispatch `vkAllocateDescriptorSets` /
+    /// `vkUpdateDescriptorSets` cost is paid only on the first
+    /// occurrence of a given (weight, input, output, scale) combo.
+    /// Across decode tokens with the same model loaded, every call
+    /// after warm-up is a pure cache hit.
     #[allow(clippy::too_many_arguments)]
     fn run_gemv_fp8_perchannel(
         &mut self,
@@ -2620,29 +2641,40 @@ impl Forward {
         m: u32,
         label: &str,
     ) {
-        let alloc_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.fp8pc_pool)
-            .set_layouts(std::slice::from_ref(&self.fp8pc_dsl));
-        let set = unsafe { dev.device.allocate_descriptor_sets(&alloc_info) }
-            .expect("fp8pc descriptor set alloc")[0];
+        // Sprint 30 — cache lookup. Key = the four bound buffers.
+        // Layout, range, and offset are constant for this dispatch
+        // type (whole-buffer reads from binding 0..3) so they don't
+        // need to factor into the key.
+        let key = (weights.as_raw(), input.as_raw(), output.as_raw(), scale.as_raw());
+        let set = if let Some(&cached) = self.fp8pc_ds_cache.get(&key) {
+            cached
+        } else {
+            let alloc_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(self.fp8pc_pool)
+                .set_layouts(std::slice::from_ref(&self.fp8pc_dsl));
+            let set = unsafe { dev.device.allocate_descriptor_sets(&alloc_info) }
+                .expect("fp8pc descriptor set alloc")[0];
 
-        let infos = [
-            vk::DescriptorBufferInfo::default().buffer(weights).offset(0).range(vk::WHOLE_SIZE),
-            vk::DescriptorBufferInfo::default().buffer(input).offset(0).range(vk::WHOLE_SIZE),
-            vk::DescriptorBufferInfo::default().buffer(output).offset(0).range(vk::WHOLE_SIZE),
-            vk::DescriptorBufferInfo::default().buffer(scale).offset(0).range(vk::WHOLE_SIZE),
-        ];
-        let writes: Vec<vk::WriteDescriptorSet> = (0..4)
-            .map(|i| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(i as u32)
-                    .descriptor_count(1)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(std::slice::from_ref(&infos[i]))
-            })
-            .collect();
-        unsafe { dev.device.update_descriptor_sets(&writes, &[]) };
+            let infos = [
+                vk::DescriptorBufferInfo::default().buffer(weights).offset(0).range(vk::WHOLE_SIZE),
+                vk::DescriptorBufferInfo::default().buffer(input).offset(0).range(vk::WHOLE_SIZE),
+                vk::DescriptorBufferInfo::default().buffer(output).offset(0).range(vk::WHOLE_SIZE),
+                vk::DescriptorBufferInfo::default().buffer(scale).offset(0).range(vk::WHOLE_SIZE),
+            ];
+            let writes: Vec<vk::WriteDescriptorSet> = (0..4)
+                .map(|i| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(i as u32)
+                        .descriptor_count(1)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(std::slice::from_ref(&infos[i]))
+                })
+                .collect();
+            unsafe { dev.device.update_descriptor_sets(&writes, &[]) };
+            self.fp8pc_ds_cache.insert(key, set);
+            set
+        };
 
         let pc = MatVecPushConstants {
             ncols: k, stride_a: k, stride_b: k, stride_d: m,
