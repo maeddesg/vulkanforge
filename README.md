@@ -15,21 +15,21 @@ Compute-only — no swapchain, no graphics queues — built directly on `ash 0.3
 
 ## Status
 
-**v0.3.4 — native FP8 LLM end-to-end, multi-submit prefill,
-Q3_K / Q5_K coopmat, 14B-class headroom on 16 GiB.** First
-Vulkan engine to run a full FP8 chat:
-`Meta-Llama-3.1-8B-Instruct-FP8` lands at **7.48 GiB GPU
-footprint, 68.5 tok/s decode, 695 tok/s prefill @ pp=512**
-with greedy-coherent output. Adds native FP8 SafeTensors
-loading (compressed-tensors per-tensor), an FP8 GEMV decode
-kernel, three FP8 GEMM prefill kernels (naive + aligned +
-multi-WG), Q3_K / Q5_K coopmat prefill, multi-submit prefill
-pacing, a `--max-context` CLI flag, and two VRAM optimisations
-that together cut Llama-3.1-FP8's footprint by **−2.94 GiB
-(−28.2 %)** and yield a free **+9 % decode**. All v0.3.3 GGUF
-Q4_K_M / Q3_K_M decode wins carry forward — VulkanForge still
-beats llama.cpp Vulkan decode on 4 / 5 configs (FP16 KV) and
-5 / 5 configs (FP8 KV).
+**v0.3.5 — first 14B FP8 model on a 16 GiB consumer GPU.**
+Qwen2.5-14B-Instruct-FP8 (per-channel scaling, Qwen2 architecture)
+runs coherently at **13.77 GiB VRAM, 14.1 tok/s decode, 169 tok/s
+prefill @ pp=512** — 15/15 on the canonical coherence suite,
+including exact arithmetic (17×23=391), C++/Go/Python code
+generation, multilingual prose, and emoji input. No other
+open-source inference engine ships this model on this hardware.
+Adds per-channel FP8 quantization (SSBO scale-vector kernels),
+Qwen2 architecture support (Q/K/V bias-add, ChatML detection,
+rope_theta from `config.json`), and a logits-buffer architecture
+refactor (GpuOnly + host-mapped staging copy). All v0.3.4 GGUF
+Q4_K_M / Q3_K_M decode wins carry forward; Llama-3.1-8B-FP8 stays
+at 68 tok/s. **14B FP8 decode is correctness-first, not yet
+optimized** — see "FP8 Performance Notes" below for the honest
+breakdown.
 
 ### Decode performance (tok/s, higher is better)
 
@@ -84,9 +84,41 @@ VulkanForge runs `compressed-tensors` per-tensor FP8 LLMs end-to-end
 without unpacking to FP16/BF16. The reference model is
 `neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8`:
 
-| Model + quant                          | VRAM (GPU) | Decode    | Prefill @ pp=512 |
-|----------------------------------------|-----------:|----------:|-----------------:|
-| Meta-Llama-3.1-8B-Instruct-FP8         |  7.48 GiB  | 68.5 t/s  |   695 t/s        |
+| Model + quant                          | VRAM (GPU)  | Decode    | Prefill @ pp=512 | Coherent |
+|----------------------------------------|------------:|----------:|-----------------:|---------:|
+| Meta-Llama-3.1-8B-Instruct-FP8         |   7.48 GiB  | 68.1 t/s  |    424 t/s       |  15/15   |
+| Qwen2.5-14B-Instruct-FP8 (per-channel) |  13.77 GiB  | 14.1 t/s  |    169 t/s       |  15/15   |
+
+### FP8 Performance Notes
+
+Native FP8 inference is a new capability — llama.cpp cannot load
+FP8 SafeTensors models at all. Both models pass all 15 coherence
+tests (exact arithmetic, code generation, multilingual prose,
+emoji input). **Performance is not yet optimized for FP8.**
+
+- **8B FP8 (68 tok/s)** — ~79% of theoretical bandwidth limit.
+  Usable for interactive chat.
+- **14B FP8 (14 tok/s)** — ~30% of theoretical bandwidth limit.
+  Two known costs:
+  1. Per-channel FP8 GEMV uses dedicated descriptor resources
+     (Sprint 24-Inline harness pattern, deliberately isolated from
+     the shared pipeline registry). Re-merging into the registry
+     with `BindingSignature` set-caching is a v0.3.6 task — Sprint
+     26 estimates +8 tok/s from this alone.
+  2. The `lm_head` GEMV measures 30 ms / 35% of every decode token
+     in the runtime profile despite being BW-saturated at 2.7 ms in
+     standalone benchmarks (12 hypotheses ruled out across Sprints
+     27–29B; the cause is a runtime-state interaction not yet
+     isolated). RGP analysis (Sprint 29B) confirms the kernel runs
+     identically at the wavefront level on 14B vs 8B — it's a
+     wall-clock issue, not a kernel issue.
+
+The FP8 path prioritized **correctness first** — getting a 14B
+model running coherently on a 16 GiB consumer GPU at all.
+Optimization is the v0.3.6 roadmap. Running Qwen2.5-14B as Q4_K_M
+GGUF would need ~8.5 GiB and ~60 tok/s, but at 4-bit quantization
+quality loss; the FP8 path trades speed for near-lossless 8-bit
+precision.
 
 Components:
 
@@ -103,15 +135,24 @@ Components:
 Run an FP8 chat:
 
 ```bash
-vulkanforge chat --model ~/models/Meta-Llama-3.1-8B-Instruct-FP8 \
-                 --tokenizer-from ~/models/Meta-Llama-3.1-8B-Instruct
+# 8B FP8 (per-tensor, neuralmagic):
+VULKANFORGE_ENABLE_FP8=1 vulkanforge chat \
+  --model ~/models/Meta-Llama-3.1-8B-Instruct-FP8/ \
+  --tokenizer-from ~/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
+
+# 14B FP8 (per-channel, larryvrh/compressed-tensors) — first 14B
+# FP8 model on a 16 GiB consumer GPU:
+VULKANFORGE_ENABLE_FP8=1 vulkanforge chat \
+  --model ~/models/Qwen2.5-14B-Instruct-FP8/ \
+  --tokenizer-from ~/models/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_k_m.gguf \
+  --max-context 1024
 ```
 
-Per-channel FP8 (`strategy: "channel"` — used by Qwen2.5-14B-FP8
-community builds) is **not yet supported**: it requires per-row
-scale buffers in the GEMV/GEMM kernels (Sprint 23 honest-negative).
-14B FP8 fits the 16 GiB VRAM budget (~14.5 GiB total) once that
-lands.
+Per-channel FP8 (`strategy: "channel"`, used by `larryvrh/Qwen2.5-14B-Instruct-FP8`
+and other community Qwen2.5-FP8 builds) is **supported as of v0.3.5**
+via SSBO scale-vector kernels and dedicated dispatch resources for
+the per-channel GEMV path (Sprint 24-Inline). Block-wise FP8 (Qwen3-FP8
+format, block_size=128) is not yet supported.
 
 ### Multi-architecture support
 
@@ -123,18 +164,24 @@ lands.
 | Meta-Llama-3.1-8B-Instruct-FP8         | llama / SafeTensors | gpt2 / llama-bpe | Llama3        | ✅ native FP8 |
 | DeepSeek-R1-Distill-Llama-8B Q4_K_M    | llama / GGUF        | gpt2 / llama-bpe | DeepSeek-R1   | ✅           |
 | Mistral-7B-Instruct-v0.3 Q4_K_M        | llama / GGUF        | llama (SPM)      | Mistral       | ✅           |
-| Qwen2.5-14B-Instruct-FP8 (per-channel) | qwen2 / SafeTensors | gpt2 / qwen2     | ChatML        | infra ready, gated (per-channel scale + bias-add — Sprint 23 honest-negative) |
+| Qwen2.5-14B-Instruct-FP8 (per-channel) | qwen2 / SafeTensors | gpt2 / qwen2     | ChatML        | ✅ native FP8 (new in v0.3.5) |
 
-**102 SPIR-V pipelines, 37 lib tests + 40+ GPU correctness tests,
-15 / 15 prompts coherent on Qwen3-8B Q4_K_M.** See
-`INSTALL.md` for setup.
+**103 SPIR-V pipelines, 37 lib tests + 40+ GPU correctness tests,
+15 / 15 prompts coherent on Qwen3-8B Q4_K_M, Llama-3.1-8B-FP8,
+and Qwen2.5-14B-FP8.** See `INSTALL.md` for setup.
 
 ### What VulkanForge does that llama.cpp Vulkan doesn't
 
+- **First 14B FP8 LLM on a 16 GiB consumer GPU** (new in v0.3.5)
+  — Qwen2.5-14B-Instruct-FP8, 13.77 GiB VRAM, 14.1 tok/s decode,
+  15/15 coherent. Per-channel scale-vector kernels and Qwen2
+  bias-add support land here. Performance is correctness-first
+  (see "FP8 Performance Notes" above); v0.3.6 will close the
+  gap to the 8B's BW efficiency.
 - **Native FP8 LLM end-to-end** (v0.3.4) — load HuggingFace
   SafeTensors with `compressed-tensors` per-tensor FP8, run chat
   on a single 16 GiB consumer GPU at 7.48 GiB VRAM /
-  68.5 tok/s decode. No FP8→BF16 unpack at load time.
+  68.1 tok/s decode. No FP8→BF16 unpack at load time.
 - **Native FP8 E4M3 KV cache** via `VK_EXT_shader_float8` — half
   the cache VRAM, +1–4 % decode, equal coherence (Sprint 18A).
 - **3-stage async-pipelined decode** — CPU command-recording

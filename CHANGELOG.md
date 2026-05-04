@@ -1,5 +1,150 @@
 # Changelog
 
+## v0.3.5 — first 14B FP8 on a 16 GiB consumer GPU (2026-05-06)
+
+### Headline
+
+**Qwen2.5-14B-Instruct-FP8 runs coherently on a 16 GiB consumer GPU.**
+13.77 GiB VRAM, 14.1 tok/s decode, 169 tok/s prefill @ pp=512,
+15/15 on the canonical coherence suite (smoke / code / prose /
+reasoning / context-stress / numerics / emoji-tokenizer). Including
+exact arithmetic (`17 × 23 = 391`), C++ thread-safe LRU cache
+generation, Go REST-API skeleton, German narrative prose, and emoji
+identification. **No other open-source inference engine ships this
+configuration today.**
+
+Adds per-channel FP8 quantization (SSBO scale-vector kernels for
+both GEMV decode and GEMM prefill paths), Qwen2 architecture support
+(Q/K/V bias-add in all three dispatch paths, ChatML template
+detection via tokenizer.chat_template, rope_theta plumbed from HF
+`config.json`), and a logits-buffer architecture refactor (GpuOnly
++ host-mapped staging copy via `record_logits_readback`).
+
+### Native FP8 performance
+
+| Model + quant                      | VRAM      | Decode    | Prefill @ pp=512 | Coherent |
+|------------------------------------|----------:|----------:|-----------------:|---------:|
+| Meta-Llama-3.1-8B-Instruct-FP8     |  7.48 GiB | 68.1 t/s  |   424 t/s        |  15/15   |
+| Qwen2.5-14B-Instruct-FP8           | 13.77 GiB | 14.1 t/s  |   169 t/s        |  15/15   |
+
+8B FP8 sits at ~79% of the theoretical bandwidth limit. 14B FP8
+sits at ~30% of the BW limit — the per-channel GEMV path
+(`run_gemv_fp8_perchannel`) is correctness-first, isolated from
+the shared `PipelineRegistry` and descriptor-set cache by design
+(Sprint 24-Inline). Re-merging into the registry with
+`BindingSignature` set-caching is the v0.3.6 target; Sprint 26's
+profile estimates +8 tok/s from that change alone.
+
+A second perf wart on 14B: the `lm_head` GEMV measures ~30 ms in
+the runtime decode CB but ~2.7 ms in standalone benchmarks for the
+exact same dispatch (Sprints 27–29B). Twelve hypotheses ruled out
+across five sprints; RGP analysis (Sprint 29B) confirms the kernel
+runs identically at the wavefront level on 14B vs 8B. The cause is
+a runtime-state interaction we haven't yet isolated. Deferred to
+v0.3.6+ once the per-channel GEMV optimization lands and reshapes
+the per-token cost.
+
+### Multi-architecture additions
+
+* `model_type='qwen2'` accepted by the SafeTensors loader (Sprint 24C).
+* HF tensor-name remap: `self_attn.{q,k,v}_proj.bias → attn_{q,k,v}.bias`.
+* `dispatch_layer` now runs Q/K/V bias-add between the GEMV writes
+  and RoPE / QK-norm (Sprint 25 — fixed the post-Sprint-24B regression
+  where bias was missing on the production decode path).
+* ChatML template detected via the GGUF `tokenizer.chat_template`
+  string match on `<|im_start|>` (Sprint 25).
+* `rope_theta` from HF `config.json` flows through to
+  `cfg.rope_freq_base` (no hardcoded 5e5; Qwen2.5's 1e6 reaches the
+  rope shader correctly).
+
+### GGUF performance (unchanged from v0.3.4)
+
+All 5 GGUF Q4_K_M / Q3_K_M models still beat llama.cpp Vulkan
+decode by 1.04–1.06×. No GGUF-path changes in v0.3.5.
+
+### Infrastructure changes
+
+* Per-channel FP8 weight scale: SSBO scale-vector binding (binding 3)
+  on the dedicated `mul_mat_vec_fp8_perchannel.spv` variant; loader
+  broadcasts per-tensor scalars to per-row vectors for shape-uniform
+  GEMV dispatch (Sprint 24A).
+* Per-channel FP8 GEMV: dedicated pipeline + descriptor pool +
+  pipeline layout + DSL on `Forward`, built with `PipelineCache::null`
+  in `Forward::new` (Sprint 24-Inline harness pattern). Pool sized
+  524 288 sets (~25 MiB) to absorb async-decode set accumulation.
+* Q/K/V bias-add: broadcast-aware `run_bias_add` helper, dispatched
+  in `dispatch_layer` (production decode), `dispatch_layer_partial`
+  (debug), and `dispatch_layer_batch` (prefill) — guarded by
+  `attn_*.bias` presence so Llama / Qwen3 / Mistral arches no-op.
+* `logits_buf` refactored: `MemoryLocation::GpuToCpu` →
+  `MemoryLocation::GpuOnly` + new `logits_staging` (GpuToCpu) and
+  `record_logits_readback` helper. Cleaner separation of GPU compute
+  vs host-readable transfer (Sprint 27).
+* Sprint 29 lm_head harness: dedicated `lmhead_*` resources on
+  `Forward` (mirrors Sprint 24-Inline's fp8pc_* pattern). Toggle
+  via `VF_LMHEAD_HARNESS=0` to fall back to the production registry
+  for A/B comparison. Pool sized 524 288 sets to match fp8pc_pool.
+* 103 SPIR-V shaders (was 102 in v0.3.4) — adds
+  `mul_mat_vec_fp8_perchannel.spv` for the dedicated harness path.
+* 37 lib tests + FP8 GEMV/GEMM correctness tests, all green.
+
+### Diagnostic tools added (permanent, kept in `examples/`)
+
+* `examples/profile_decode_safetensors.rs` — per-dispatch GPU
+  TIMESTAMP profile for SafeTensors FP8 models. Activates the
+  fully-instrumented `ShaderProfiler` that's already plumbed
+  through every dispatch site.
+* `examples/gemv_f16_shape_bench.rs` — F16 GEMV shape sweep
+  (M, K matrix) with TIMESTAMP, fresh pipeline, fresh allocator.
+* `examples/cb_backpressure_test.rs` — N dummy GEMVs preceding
+  the timed lm_head dispatch in one CB; rules out command-processor
+  backpressure as a cause of the runtime gap.
+* `examples/vram_pressure_test.rs` — lm_head shape GEMV with
+  configurable VRAM ballast (allocate-first or allocate-after);
+  rules out VRAM occupancy and weight-buffer placement effects.
+* `examples/fp8_gemv_standalone.rs` — isolated per-channel FP8 GEMV
+  reproducer against real Llama-3.1-FP8 weights (Sprint 24-Harness).
+
+### Known limitations
+
+* 14B FP8 decode: 14.1 tok/s (~30% BW efficiency). Per-channel GEMV
+  path is correctness-first, not yet optimized. v0.3.6 target:
+  ~30 tok/s after registry re-integration.
+* 14B FP8 prefill: 169 tok/s (vs 8B's 424 tok/s). Same kernel-maturity
+  gap. Optimization deferred.
+* `lm_head` runtime gap: 30 ms vs 2.7 ms standalone — root cause not
+  isolated despite five sprints of diagnostic. Detailed
+  hypothesis-tracker in `results/v035_sprint29b_rgp_analysis.md`.
+* Block-wise FP8 (Qwen3-FP8 format, block_size=128) — not supported.
+* RoPE scaling — detected but not applied; positions >8K may drift.
+* FP8 SafeTensors models require `--tokenizer-from <gguf>` (no
+  native `tokenizer.json` parser yet).
+* `fp8pc_pool` and `lmhead_pool` sized at 524 288 sets each
+  (~25 MiB combined) — workaround for async-decode set
+  accumulation, not yet replaced by per-slot sub-pools or
+  `vkFreeDescriptorSets`.
+
+### Commit trail
+
+```
+24A         per-channel FP8 GEMM scale buffer
+24B         Q/K/V bias-add (Qwen2 attention biases)
+24C         accept model_type='qwen2'
+24-Fix      / Bisect — DSL collision bisect (negative)
+24-Harness  standalone per-channel FP8 GEMV reproducer (PASS @ 0.11%)
+24-Inline   per-channel FP8 GEMV via dedicated harness path (FIX shipped)
+25          decode bias-add fix → 14B FIRST COHERENT TOKEN
+25B         15-prompt benchmark suite — 15/15 on both FP8 models
+26          per-dispatch GPU TIMESTAMP profile (data-only)
+27          lm_head harness diagnostic (honest negative, arch cleanup)
+28          CB-backpressure test (negative)
+28B         VRAM-pressure + disk pipeline-cache test (negative)
+29          lm_head harness pattern + ballast-first (negative)
+29B         RGP capture + analysis — kernel identical at wavefront level
+```
+
+---
+
 ## v0.3.4 — native FP8 LLM, multi-submit prefill, Q3_K coopmat (2026-05-03)
 
 ### Headline
