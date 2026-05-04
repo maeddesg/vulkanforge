@@ -1110,6 +1110,17 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "mul_coopmat_fp8_multi_wg.comp",
         defines: &[],
     },
+    // Sprint 32 Phase 1 — BN=32 variant (8 subgroups, 4×2 M×N grid).
+    // Twice the activation reuse per A-tile load vs multi_wg.
+    // Note: name suffix `_v2` to avoid colliding with the dead-code
+    // `mul_coopmat_fp8_bn32.spv` ShaderJob at line 554 (an experimental
+    // FP8 BN variant from an old sprint that no production code refers
+    // to).
+    ShaderJob {
+        out_name: "mul_coopmat_fp8_bn32_v2.spv",
+        entry_source: "mul_coopmat_fp8_bn32.comp",
+        defines: &[],
+    },
     // Sprint 19A — Q3_K mul_mm.comp variants (FP16 WMMA prefill).
     // Mirror the Q4_K/Q6_K coopmat coverage so Q3_K_M GGUFs no longer
     // fall back to integer-MMQ for prefill GEMM. The Q3_K branch in

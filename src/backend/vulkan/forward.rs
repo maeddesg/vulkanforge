@@ -3897,8 +3897,22 @@ impl Forward {
         // around N=64; gating on `m >= 64 && n >= 64` keeps the
         // single-tile kernel for short prompts and decode-style
         // batches that ever route through prefill.
+        // Sprint 32 Phase 1 — BN=32 variant (DEFAULT ON).
+        // Bench (Qwen2.5-14B FP8 prefill): pp=512 158.6 → 338.4 tok/s
+        // (+113%); pp=1024 crash → 339.7 tok/s. 8B FP8: 698.9 →
+        // 756.6 tok/s (+8%) at pp=512. 8 subgroups (4×2 M×N) per
+        // workgroup, 64×32 output tile. Requires m >= 64 (4-tile M
+        // grid) and n >= 64 (≥2 N-tiles worth of cols).
+        // Toggle off via `VF_FP8_GEMM_BN32=0` to fall back to the
+        // BN=16 multi_wg kernel for A/B comparison.
+        let bn32_disabled = std::env::var("VF_FP8_GEMM_BN32")
+            .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false);
+        let use_bn32 = !bn32_disabled && m >= 64 && n >= 64;
         let multi_wg = m >= 64 && n >= 64;
-        let shader = if multi_wg {
+        let shader = if use_bn32 {
+            ShaderId::MulCoopmatFp8Bn32
+        } else if multi_wg {
             ShaderId::MulCoopmatFp8MultiWg
         } else {
             ShaderId::MulCoopmatFp8Naive
@@ -3920,9 +3934,10 @@ impl Forward {
             stride_c: m,
             weight_scale_bits: 0,
         };
-        let bm = if multi_wg { 64u32 } else { 16u32 };
+        let bm = if use_bn32 || multi_wg { 64u32 } else { 16u32 };
+        let bn = if use_bn32 { 32u32 } else { 16u32 };
         let groups_x = (m + bm - 1) / bm;
-        let groups_y = (n + 15) / 16;
+        let groups_y = (n + bn - 1) / bn;
         let layout = kernel.pipeline_layout;
         let pipeline = kernel.pipeline;
         self.profile(label, dev, cmd, |dev, cmd| unsafe {
