@@ -1,5 +1,120 @@
 # Changelog
 
+## v0.3.7 — FP8 prefill +113% (2026-05-07)
+
+### Headline
+
+**14B Qwen2.5-FP8 prefill at pp=512 goes from 159 to 338 tok/s.**
+First real performance sprint since Sprint 25B. The cooperative-
+matrix FP8 GEMM kernel was running at 7-18% TFLOPS efficiency;
+BN=32 tiling doubles the WMMA work per activation read and brings
+efficiency to ~30%. Decode and GGUF unchanged.
+
+### FP8 Prefill Performance (RX 9070 XT, Mesa 26.0.6)
+
+| Model           | pp=64  | pp=128 | pp=512 | pp=1024 |
+|-----------------|-------:|-------:|-------:|--------:|
+| **14B v0.3.7**  | **270**| **313**| **338**| **331** |
+| 14B v0.3.5      | 184    | 186    | 159    | crash*  |
+| **Δ**           | +47%   | +68%   |**+113%**| fixed  |
+| **8B v0.3.7**   | **661**| **702**| **757**| **777** |
+| 8B v0.3.5       | 567    | 620    | 699    | 712     |
+| **Δ**           | +17%   | +13%   | +8%    | +9%     |
+
+\* The pp=1024 crash on the BN=16 baseline was an intermittent Mesa
+26.0.6 ring timeout. BN=32 halves `groups_y` and stays below the
+queue threshold that triggers the timeout.
+
+Decode unchanged (14.6 / 73 tok/s on 14B / 8B FP8). GGUF Qwen3-8B
+Q4_K_M unchanged (118 tok/s decode, 3871 tok/s prefill at pp=512).
+
+### What changed
+
+* `vk_shaders/mul_coopmat_fp8_bn32.comp` (new, ~200 LOC) — BN=32 /
+  BLOCK_SIZE=512 / 4×2 M×N subgroup grid / 64×32 output tile per
+  WG. Same SPV-time FP8 → BF16 narrow as `mul_coopmat_fp8_multi_wg`,
+  same WMMA 16×16×16, same descriptor-set + push-constant layout —
+  just larger tiles and four times more WMMA per loaded activation
+  byte. Default ON for all FP8 prefill GEMMs at `m ≥ 64 && n ≥ 64`.
+  Opt-out via `VF_FP8_GEMM_BN32=0`.
+* `vk_shaders/mul_coopmat_fp8_bn64.comp` (new, Sprint 33) — BN=64 /
+  BLOCK_SIZE=1024 (RDNA4 max workgroup) / 4×4 M×N subgroup grid /
+  64×64 output tile. Honest-negative experiment: ~3% slower than
+  BN=32 at pp=512 due to LDS-occupancy drop (5→3 WGs/CU). Stays in
+  tree as opt-in via `VF_FP8_GEMM_BN=64` for future tuning.
+* Three-way GEMM routing in `forward.rs::run_gemm_fp8_naive`:
+  BN=64 (opt-in via env) → BN=32 (default) → BN=16 multi_wg
+  (legacy fallback) → 16×16 single-tile naive (small-M fallback).
+  Override via `VF_FP8_GEMM_BN={16,32,64}`.
+* `examples/fp8_prefill_shape_bench.rs` (new, Sprint 32 Phase 0) —
+  per-shape per-pp prefill profiler. Loads SafeTensors FP8 model,
+  attaches `ShaderProfiler`, runs `prefill_batch` at varying
+  `seq_len ∈ {64,128,256,512}`, prints per-call wall-time and
+  effective TFLOPS efficiency. Permanent diagnostic tool.
+* +2 SPIR-V shaders (`mul_coopmat_fp8_bn32_v2.spv`,
+  `mul_coopmat_fp8_bn64_v2.spv`).
+
+### RDNA4 ISA Deep-Read (Sprint 32B, no code change)
+
+Read of the AMD RDNA4 ISA reference produced a ranked list of
+hardware features for future FP8 sprints:
+
+* **P0:** Native FP8 WMMA (`V_WMMA_F32_16X16X16_FP8_FP8`,
+  `V_WMMA_F32_16X16X16_BF8_BF8`) — gates on Mesa/RADV exposing the
+  cooperative-matrix FP8 types. Currently FP8 is software-narrowed
+  to BF16 before WMMA, costing throughput.
+* **P1:** `GLOBAL_LOAD_TR_B64` — hardware transpose load. Could
+  remove the LDS staging step for the activation tile.
+* **P2:** WMMA hazard restructuring (V_NOP elimination, reorder of
+  back-to-back WMMA-with-shared-accumulator).
+* Questions filed on AMD Developer Forum and Phoronix Vulkan Forum.
+
+### Why this won where Sprints 27-31 didn't
+
+Three previous optimisation sprints (29B harness, 30 DS-cache,
+31 SubgroupAdd) all landed 0% wall-clock change despite shipping
+real architectural improvements. They each targeted **per-call CPU
+overhead** (descriptor allocation, LDS occupancy ceiling). Sprint 32
+targeted **per-call GPU work** — the amount of compute done per byte
+of activation read. That is the right abstraction layer for a kernel
+that is BW-saturated on weight reads but underutilising the WMMA
+tensor cores: arithmetic intensity is too low. BN=16 → BN=32
+doubles the WMMA work per loaded activation tile; at the previous
+7-18% TFLOPS efficiency there was ample headroom to absorb that.
+
+### Architecture (carries forward from v0.3.6)
+
+v0.3.6 was a cleanup release; all of it is in v0.3.7:
+
+* **SubgroupAdd reduction** in all 4 GEMV shaders (Sprint 31) —
+  per-WG LDS 4096 → 0 B, theoretical occupancy 6/16 → 16/16
+  wavefronts/SIMD, 6 `barrier()` calls eliminated per dispatch.
+* **fp8pc descriptor-set cache** (Sprint 30) — pool 524 288 → 1024
+  sets, −33 MiB descriptor metadata.
+* **lm_head harness pipeline** with `VF_LMHEAD_HARNESS=0` A/B toggle.
+
+### Known limitations
+
+* 14B FP8 decode at 14 tok/s (~30% bandwidth efficiency) — runtime-
+  state interaction confirmed by RGP at the wavefront level. Mesa
+  bug report filed; not addressable at the application layer.
+* 14B FP8 prefill at 338 tok/s — ~30% TFLOPS efficiency. Further
+  gains need native FP8 WMMA + GLOBAL_LOAD_TR support in Mesa/RADV.
+* BN=64 is ~3% slower than BN=32 (occupancy-limited at
+  BLOCK_SIZE=1024 = RDNA4 max). Kept as opt-in.
+* Block-wise FP8 (Qwen3-FP8 format, block_size=128) not yet
+  supported. Per-tensor and per-channel are.
+* FP8 SafeTensors models still require `--tokenizer-from <gguf>`.
+
+### Commit trail
+
+```
+sprint32 phase 0: per-shape FP8 prefill diagnostic
+sprint32 phase 1: BN=32 FP8 GEMM (+113% on 14B pp=512)
+sprint33:         BN=64 FP8 GEMM opt-in (honest-negative, ~3% slower)
+v0.3.7:           release roll-up
+```
+
 ## v0.3.6 — architecture cleanup (2026-05-07)
 
 ### Headline

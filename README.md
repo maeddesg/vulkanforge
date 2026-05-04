@@ -15,6 +15,16 @@ Compute-only — no swapchain, no graphics queues — built directly on `ash 0.3
 
 ## Status
 
+**v0.3.7 — FP8 prefill +113%.** Cooperative-matrix tiling rewrite
+of the FP8 GEMM kernel takes 14B Qwen2.5-FP8 prefill at pp=512 from
+159 to 338 tok/s — the first real performance sprint since
+Sprint 25B. Phase 0 per-shape diagnostics identified FFN GEMMs at
+7-18% TFLOPS efficiency; Phase 1's BN=32 / BLOCK_SIZE=512 / 4×2
+subgroup-grid kernel doubles WMMA work per activation read and
+recovers most of that headroom. A BN=64 follow-up was tested and
+kept as `VF_FP8_GEMM_BN=64` opt-in (occupancy-limited at this
+shape; ~3% slower than BN=32). Decode and GGUF unchanged.
+
 **v0.3.6 — architecture cleanup release.** SubgroupAdd reduction
 in all 4 GEMV shaders (LDS 4096 → 0 B per WG, occupancy ceiling
 6/16 → 16/16 wavefronts/SIMD), fp8pc descriptor-set cache (pool
@@ -96,39 +106,38 @@ without unpacking to FP16/BF16. The reference model is
 
 | Model + quant                          | VRAM (GPU)  | Decode    | Prefill @ pp=512 | Coherent |
 |----------------------------------------|------------:|----------:|-----------------:|---------:|
-| Meta-Llama-3.1-8B-Instruct-FP8         |   7.48 GiB  | 68.1 t/s  |    424 t/s       |  15/15   |
-| Qwen2.5-14B-Instruct-FP8 (per-channel) |  13.77 GiB  | 14.1 t/s  |    169 t/s       |  15/15   |
+| Meta-Llama-3.1-8B-Instruct-FP8         |   7.48 GiB  | 73 t/s    |    757 t/s       |  15/15   |
+| Qwen2.5-14B-Instruct-FP8 (per-channel) |  13.77 GiB  | 14 t/s    |    338 t/s       |  15/15   |
+
+(Mesa RADV 26.0.6, RX 9070 XT. Decode median of 3, prefill median of 3.)
 
 ### FP8 Performance Notes
 
-Native FP8 inference is a new capability — llama.cpp cannot load
-FP8 SafeTensors models at all. Both models pass all 15 coherence
-tests (exact arithmetic, code generation, multilingual prose,
-emoji input). **Performance is not yet optimized for FP8.**
+**Prefill is now 2× faster than v0.3.5** thanks to BN=32 cooperative-
+matrix tiling (v0.3.7). Qwen2.5-14B FP8 went from 159 to 338 tok/s
+at pp=512 — a +113% improvement from one kernel rewrite. llama.cpp
+still cannot load FP8 SafeTensors models at all.
 
-- **8B FP8 (68 tok/s)** — ~79% of theoretical bandwidth limit.
-  Usable for interactive chat.
-- **14B FP8 (14 tok/s)** — ~30% of theoretical bandwidth limit.
-  Two known costs:
-  1. Per-channel FP8 GEMV uses dedicated descriptor resources
-     (Sprint 24-Inline harness pattern, deliberately isolated from
-     the shared pipeline registry). Re-merging into the registry
-     with `BindingSignature` set-caching is a v0.3.6 task — Sprint
-     26 estimates +8 tok/s from this alone.
-  2. The `lm_head` GEMV measures 30 ms / 35% of every decode token
-     in the runtime profile despite being BW-saturated at 2.7 ms in
-     standalone benchmarks (12 hypotheses ruled out across Sprints
-     27–29B; the cause is a runtime-state interaction not yet
-     isolated). RGP analysis (Sprint 29B) confirms the kernel runs
-     identically at the wavefront level on 14B vs 8B — it's a
-     wall-clock issue, not a kernel issue.
+- **8B FP8 prefill (757 tok/s)** — well-optimised, approaching the
+  bandwidth limit of the RX 9070 XT for this kernel shape.
+- **14B FP8 prefill (338 tok/s)** — 2× over v0.3.5. The kernel sits
+  near ~30% TFLOPS efficiency; further gains likely need native FP8
+  WMMA (`V_WMMA_F32_16X16X16_FP8_FP8`) once Mesa/RADV exposes the
+  FP8 cooperative-matrix types, plus the hardware transpose load
+  (`GLOBAL_LOAD_TR_B64`) for the activation tile.
+- **FP8 decode (14-73 tok/s)** — bandwidth-bound. The 14B/8B decode
+  gap is a runtime-state interaction confirmed by RGP analysis at
+  the wavefront level — not fixable at the application layer. A
+  Mesa bug report is filed upstream and the runtime gap is
+  monitored, not chased further here.
+- **BN=64 opt-in** (`VF_FP8_GEMM_BN=64`): tested in Sprint 33,
+  ~3% slower than BN=32 due to occupancy drop (5→3 WGs/CU at
+  BLOCK_SIZE=1024 = RDNA4 max). Kept in tree as opt-in for future
+  tuning on shapes where the trade-off may flip.
 
-The FP8 path prioritized **correctness first** — getting a 14B
-model running coherently on a 16 GiB consumer GPU at all.
-Optimization is the v0.3.6 roadmap. Running Qwen2.5-14B as Q4_K_M
-GGUF would need ~8.5 GiB and ~60 tok/s, but at 4-bit quantization
-quality loss; the FP8 path trades speed for near-lossless 8-bit
-precision.
+For comparison: GGUF Q4_K_M prefill runs at ~3870 tok/s — the
+remaining ~11× gap reflects kernel maturity (GGUF has had months of
+tiling optimisation; FP8 got its first real tiling pass in v0.3.7).
 
 Components:
 
