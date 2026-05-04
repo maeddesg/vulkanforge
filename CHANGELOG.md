@@ -1,5 +1,106 @@
 # Changelog
 
+## v0.3.6 — architecture cleanup (2026-05-07)
+
+### Headline
+
+Cleanup release on top of v0.3.5. Three optimization sprints
+(Sprints 29B / 30 / 31) confirmed that the 14B Qwen2.5-FP8 decode
+gap (14 tok/s, ~30% of theoretical bandwidth) is **not at the
+application layer** — every plausible per-call / per-dispatch
+optimization moves resource usage in the right direction without
+moving the wall clock. RGP analysis (Sprint 29B) showed the kernel
+runs at peak BW at the wavefront level. A Mesa bug report has been
+filed upstream; the runtime gap is monitored, not chased further at
+the application level.
+
+What did ship:
+
+* **SubgroupAdd reduction** replaces LDS-tree in all four GEMV
+  shaders (Sprint 31):
+  - `mul_mat_vec_f16.comp` (lm_head)
+  - `mul_mat_vec_f32.comp` (GGUF lm_head)
+  - `mul_mat_vec_fp8.comp` (8B FP8 per-tensor)
+  - `mul_mat_vec_fp8_perchannel.comp` (14B FP8 per-channel)
+
+  Per-WG LDS: 4096 B → **0 B**.
+  Theoretical occupancy: 6/16 → **16/16** wavefronts/SIMD
+  (now VGPR-limited at maximum).
+  Eliminates 6 `barrier()` calls per dispatch.
+  Wave64 + REQUIRE_FULL_SUBGROUPS + BLOCK_SIZE=64 means one
+  workgroup == one subgroup, so `subgroupAdd` is the workgroup-wide
+  sum; `subgroupElect()` replaces `if (tid == 0)` for the
+  single-writer predicate.
+
+* **fp8pc descriptor-set cache** (Sprint 30): keyed on the
+  `(weight, input, output, scale)` buffer tuple, mirrors the
+  production `alloc_or_get_set` pattern. After a 2-token warmup
+  (one per async slot), every per-channel FP8 GEMV is a 100%
+  cache hit. Sprint 25B's 524 288-set pool was a workaround for
+  the no-cache, every-call-fresh-alloc pattern; with caching the
+  pool only needs to hold unique keys (~672 worst case for
+  Qwen2.5-14B), so it shrinks to **1024 sets**.
+
+  VRAM saved: ~33 MiB → ~50 KiB descriptor metadata.
+
+* **lm_head harness pipeline** stays in the codebase as permanent
+  A/B infrastructure: the dedicated `lmhead_*` resources
+  (PipelineCache::null + dedicated DSL/pool) from Sprint 29 are
+  toggleable via `VF_LMHEAD_HARNESS=0`, useful for any future
+  sprint that needs to attribute a perf delta between the runtime
+  registry path and a fresh harness path.
+
+### Diagnostic tools added
+
+* `examples/cb_backpressure_test.rs` — N dummy GEMVs preceding
+  a timed lm_head dispatch in one CB (Sprint 28).
+* `examples/vram_pressure_test.rs` — lm_head shape GEMV with
+  configurable VRAM ballast, supports `VF_BALLAST_FIRST=1` to test
+  high-VRAM-offset placement (Sprints 28B + 29).
+
+### Performance
+
+No wall-clock change from v0.3.5. Decode rates remain:
+
+| Config | v0.3.5 | v0.3.6 |
+|---|---:|---:|
+| 14B FP8 (Qwen2.5) | 14.1 tok/s | 14.3 tok/s |
+| 8B FP8 (Llama-3.1) | 68.1 tok/s | 70.1 tok/s |
+| 8B GGUF Q4_K_M (Llama-3.1) | ~118 tok/s | 113 tok/s |
+| 8B GGUF Q4_K_M (Qwen3) | ~118 tok/s | 111 tok/s |
+
+All deltas are within run-to-run noise (±2 tok/s). 15/15 coherence
+on every config.
+
+### Known limitations (updated)
+
+* 14B FP8 decode: 14.3 tok/s (~30% BW efficiency). **Bottleneck
+  confirmed below the application layer** by 13 ruled-out
+  hypotheses across Sprints 26-31, including the RGP wavefront
+  analysis. A Mesa bug report covers the most plausible upstream
+  trigger (`results/mesa_bugreport_info.md`); revisit when a
+  fix lands.
+* 14B FP8 prefill at `pp=1024` is intermittent on **Mesa 26.1.0-rc3**
+  (one observed `VK_ERROR_DEVICE_LOST`, recoverable via ring
+  reset). **Mesa 26.0.6 stays the recommended driver.**
+* Block-wise FP8 (Qwen3-FP8 format, block_size=128) — not supported.
+* RoPE scaling — detected but not applied; positions >8K may drift.
+* FP8 SafeTensors models require `--tokenizer-from <gguf>` (no
+  native `tokenizer.json` parser yet).
+
+**Removed from v0.3.5's known-limitations list:**
+* `fp8pc_pool` 524 288-set workaround — replaced by the DS cache
+  (Sprint 30).
+
+### Commit trail
+
+```
+30   fp8pc descriptor-set cache (cleanup, no perf gain)
+31   subgroupAdd replaces LDS-tree reduction (cleanup)
+```
+
+---
+
 ## v0.3.5 — first 14B FP8 on a 16 GiB consumer GPU (2026-05-06)
 
 ### Headline

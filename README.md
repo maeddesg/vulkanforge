@@ -15,6 +15,16 @@ Compute-only — no swapchain, no graphics queues — built directly on `ash 0.3
 
 ## Status
 
+**v0.3.6 — architecture cleanup release.** SubgroupAdd reduction
+in all 4 GEMV shaders (LDS 4096 → 0 B per WG, occupancy ceiling
+6/16 → 16/16 wavefronts/SIMD), fp8pc descriptor-set cache (pool
+524 288 → 1024 sets, −33 MiB descriptor metadata), lm_head harness
+pipeline with `VF_LMHEAD_HARNESS=0` A/B toggle. Three optimization
+sprints (29B, 30, 31) confirmed the 14B FP8 decode bottleneck sits
+below the application layer; a Mesa bug report is filed upstream
+and the runtime gap is monitored, not optimised further at the
+application level.
+
 **v0.3.5 — first 14B FP8 model on a 16 GiB consumer GPU.**
 Qwen2.5-14B-Instruct-FP8 (per-channel scaling, Qwen2 architecture)
 runs coherently at **13.77 GiB VRAM, 14.1 tok/s decode, 169 tok/s
