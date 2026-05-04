@@ -16,6 +16,9 @@
 // Same shape as the FP8 GEMV — only the weight read differs.
 
 #extension GL_EXT_control_flow_attributes : require
+// Sprint 31 — subgroupAdd reduction (was LDS-tree).
+#extension GL_KHR_shader_subgroup_basic      : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -43,8 +46,6 @@ layout (push_constant) uniform parameter {
     float weight_scale;
 } p;
 
-shared float lds_partial[1024];
-
 void main() {
     const uint row = gl_WorkGroupID.x;
     if (row >= p.stride_d) return;
@@ -58,15 +59,9 @@ void main() {
     [[unroll(1)]] for (uint k = tid; k < K; k += nthr) {
         partial = fma(data_a[row_o + k], data_b[k], partial);
     }
-    lds_partial[tid] = partial;
-    barrier();
-    for (uint stride = nthr / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            lds_partial[tid] += lds_partial[tid + stride];
-        }
-        barrier();
-    }
-    if (tid == 0) {
-        data_d[row] = lds_partial[0] * p.weight_scale;
+    // Sprint 31 — wave-level reduction.
+    const float total = subgroupAdd(partial);
+    if (subgroupElect()) {
+        data_d[row] = total * p.weight_scale;
     }
 }

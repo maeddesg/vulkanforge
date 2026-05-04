@@ -18,6 +18,13 @@
 // the FP8 GEMV's storage pattern.
 
 #extension GL_EXT_control_flow_attributes : require
+// Sprint 31 — replace LDS-tree reduction with single-instruction
+// subgroupAdd. Wave64 + REQUIRE_FULL_SUBGROUPS + BLOCK_SIZE=64 means
+// one workgroup == one subgroup, so subgroupAdd is the workgroup
+// reduction. Drops `shared float lds_partial[1024]` (4 KiB LDS) per
+// dispatch, lifting the LDS-limited occupancy ceiling.
+#extension GL_KHR_shader_subgroup_basic      : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -44,8 +51,6 @@ layout (push_constant) uniform parameter {
     uint  _broadcast2;
     float weight_scale;
 } p;
-
-shared float lds_partial[1024];
 
 void main() {
     const uint row = gl_WorkGroupID.x;
@@ -76,15 +81,11 @@ void main() {
         partial = fma(pair.x, data_b[K - 1u], partial);
     }
 
-    lds_partial[tid] = partial;
-    barrier();
-    for (uint stride = nthr / 2u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            lds_partial[tid] += lds_partial[tid + stride];
-        }
-        barrier();
-    }
-    if (tid == 0u) {
-        data_d[row] = lds_partial[0] * p.weight_scale;
+    // Sprint 31 — wave-level reduction. With wave64 +
+    // REQUIRE_FULL_SUBGROUPS + BLOCK_SIZE=64, one workgroup == one
+    // subgroup, so subgroupAdd is the full workgroup sum.
+    const float total = subgroupAdd(partial);
+    if (subgroupElect()) {
+        data_d[row] = total * p.weight_scale;
     }
 }
