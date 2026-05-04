@@ -1013,19 +1013,25 @@ impl Forward {
                 None,
             ).map_err(|(_, e)| e)?[0];
 
-            // Sprint 25 — bump pool from 8192 → 65536 sets. The async
-            // decode pipeline (pre_record / fill_embed_and_submit) records
-            // dispatches without per-slot pool reset, so sets accumulate
-            // across many in-flight tokens. With 48-layer 7-GEMV models
-            // (Qwen2.5-14B FP8) that's 336 sets/token; 65536 covers ~195
-            // queued tokens, well past the bench's per-prompt budget.
-            // Memory cost ~4 MB — negligible.
+            // Sprint 25B — bump pool from 65536 → 524288 sets. The
+            // async decode pipeline (pre_record / fill_embed_and_submit)
+            // records dispatches with two CBs in flight (slot 0 + slot 1),
+            // so sets allocated from either slot's most-recent record stay
+            // pinned until the next reset. Reset happens at prefill start
+            // (reset_descriptor_pool_and_cache from prefill_batch) and at
+            // each sync-forward call site, but NOT between async-decode
+            // tokens. With 48-layer 7-GEMV models (Qwen2.5-14B FP8) that's
+            // 336 sets/token; 524288 covers ~1560 contiguous decoded
+            // tokens — over the 15-prompt suite's worst case (1024).
+            // Memory cost ~33 MB — acceptable. A finer fix (per-slot
+            // sub-pools or vkFreeDescriptorSets after fence-wait) is a
+            // follow-up sprint.
             let pool = device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(65536)
+                    .max_sets(524288)
                     .pool_sizes(&[vk::DescriptorPoolSize {
                         ty: vk::DescriptorType::STORAGE_BUFFER,
-                        descriptor_count: 65536 * 4,
+                        descriptor_count: 524288 * 4,
                     }])
                     .flags(vk::DescriptorPoolCreateFlags::empty()),
                 None,
