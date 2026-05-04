@@ -1013,15 +1013,19 @@ impl Forward {
                 None,
             ).map_err(|(_, e)| e)?[0];
 
-            // Pool sized for a full chat: 32 layers * 7 GEMVs * 1024
-            // tokens worst case = 229k sets, way overkill. Pick a more
-            // moderate cap; reset between forwards covers chat use.
+            // Sprint 25 — bump pool from 8192 → 65536 sets. The async
+            // decode pipeline (pre_record / fill_embed_and_submit) records
+            // dispatches without per-slot pool reset, so sets accumulate
+            // across many in-flight tokens. With 48-layer 7-GEMV models
+            // (Qwen2.5-14B FP8) that's 336 sets/token; 65536 covers ~195
+            // queued tokens, well past the bench's per-prompt budget.
+            // Memory cost ~4 MB — negligible.
             let pool = device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(8192)
+                    .max_sets(65536)
                     .pool_sizes(&[vk::DescriptorPoolSize {
                         ty: vk::DescriptorType::STORAGE_BUFFER,
-                        descriptor_count: 8192 * 4,
+                        descriptor_count: 65536 * 4,
                     }])
                     .flags(vk::DescriptorPoolCreateFlags::empty()),
                 None,
@@ -1112,6 +1116,16 @@ impl Forward {
                     self.descriptor_pool, vk::DescriptorPoolResetFlags::empty(),
                 )?;
             }
+        }
+        // Sprint 25 — fp8pc never caches sets (run_gemv_fp8_perchannel
+        // allocates fresh per call), so its pool must be reset every
+        // forward regardless of cache_enabled. Without this, multi-prompt
+        // bench (~336 sets/token × hundreds of tokens) overflows the
+        // 8192-set pool from Sprint 24-Inline.
+        unsafe {
+            dev.device.reset_descriptor_pool(
+                self.fp8pc_pool, vk::DescriptorPoolResetFlags::empty(),
+            )?;
         }
         let pre_setup = pre_start.elapsed();
 
@@ -1210,6 +1224,12 @@ impl Forward {
                 )?;
             }
         }
+        // Sprint 25 — fp8pc never caches sets; reset its pool every forward.
+        unsafe {
+            dev.device.reset_descriptor_pool(
+                self.fp8pc_pool, vk::DescriptorPoolResetFlags::empty(),
+            )?;
+        }
         let pre_setup = pre_start.elapsed();
 
         // Sprint 12D — fresh barrier-elision state per forward.
@@ -1299,6 +1319,12 @@ impl Forward {
                     self.descriptor_pool, vk::DescriptorPoolResetFlags::empty(),
                 )?;
             }
+        }
+        // Sprint 25 — fp8pc never caches sets; reset its pool every forward.
+        unsafe {
+            dev.device.reset_descriptor_pool(
+                self.fp8pc_pool, vk::DescriptorPoolResetFlags::empty(),
+            )?;
         }
 
         // Pre-snapshot: we'll record per-layer profile boundaries.
@@ -1894,6 +1920,35 @@ impl Forward {
                 cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, scale_v, "gemv_v");
         }
         self.mark_written(&[q_buf, k_buf, v_buf]);
+
+        // Sprint 25 — Q/K/V bias-add (Qwen2 attention biases). MUST run
+        // before RoPE / QK-norm: q_proj.bias is conceptually part of
+        // the q_proj linear, so the bias must be folded into q before
+        // any positional rotation. Mirrors dispatch_layer_partial
+        // (line ~1547) and dispatch_layer_batch (line ~4307); without
+        // this block the production decode path drops the biases and
+        // produces structured-but-incoherent output on Qwen2.5.
+        // Skipped for arches without biases (Llama / Qwen3 / Mistral).
+        let q_dim = cfg.n_heads * cfg.head_dim;
+        let kv_dim = cfg.n_kv_heads * cfg.head_dim;
+        let q_bias = layer_weight_opt(model, layer, "attn_q.bias");
+        let k_bias = layer_weight_opt(model, layer, "attn_k.bias");
+        let v_bias = layer_weight_opt(model, layer, "attn_v.bias");
+        if q_bias.is_some() || k_bias.is_some() || v_bias.is_some() {
+            // GEMV → bias-add hazard: bias reads what GEMV just wrote.
+            self.maybe_compute_barrier(dev, cmd, &[q_buf, k_buf, v_buf]);
+            if let Some(b) = q_bias {
+                self.run_bias_add(dev, registry, cmd, q_buf, b, q_buf, q_dim, 1, "bias_q");
+            }
+            if let Some(b) = k_bias {
+                self.run_bias_add(dev, registry, cmd, k_buf, b, k_buf, kv_dim, 1, "bias_k");
+            }
+            if let Some(b) = v_bias {
+                self.run_bias_add(dev, registry, cmd, v_buf, b, v_buf, kv_dim, 1, "bias_v");
+            }
+            self.mark_written(&[q_buf, k_buf, v_buf]);
+        }
+
         // Next: (c) reads q_buf, k_buf (or (d) RoPE if no qk_norm).
         self.maybe_compute_barrier(dev, cmd, &[q_buf, k_buf]);
 
