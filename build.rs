@@ -1121,6 +1121,14 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "mul_coopmat_fp8_bn32.comp",
         defines: &[],
     },
+    // Sprint 33 — BN=64 variant (16 subgroups, 4×4 M×N grid).
+    // BLOCK_SIZE=1024 = RDNA4 max-WG. Fourth doubling of N-tile
+    // reuse vs naive (BN=16 → 32 → 64).
+    ShaderJob {
+        out_name: "mul_coopmat_fp8_bn64_v2.spv",
+        entry_source: "mul_coopmat_fp8_bn64.comp",
+        defines: &[],
+    },
     // Sprint 19A — Q3_K mul_mm.comp variants (FP16 WMMA prefill).
     // Mirror the Q4_K/Q6_K coopmat coverage so Q3_K_M GGUFs no longer
     // fall back to integer-MMQ for prefill GEMM. The Q3_K branch in

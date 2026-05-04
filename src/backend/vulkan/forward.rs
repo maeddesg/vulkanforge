@@ -3897,20 +3897,32 @@ impl Forward {
         // around N=64; gating on `m >= 64 && n >= 64` keeps the
         // single-tile kernel for short prompts and decode-style
         // batches that ever route through prefill.
-        // Sprint 32 Phase 1 — BN=32 variant (DEFAULT ON).
-        // Bench (Qwen2.5-14B FP8 prefill): pp=512 158.6 → 338.4 tok/s
-        // (+113%); pp=1024 crash → 339.7 tok/s. 8B FP8: 698.9 →
-        // 756.6 tok/s (+8%) at pp=512. 8 subgroups (4×2 M×N) per
-        // workgroup, 64×32 output tile. Requires m >= 64 (4-tile M
-        // grid) and n >= 64 (≥2 N-tiles worth of cols).
-        // Toggle off via `VF_FP8_GEMM_BN32=0` to fall back to the
-        // BN=16 multi_wg kernel for A/B comparison.
+        // Sprint 32 Phase 1 — BN=32 variant (DEFAULT, +113% on 14B pp=512).
+        // Sprint 33 — BN=64 variant available behind `VF_FP8_GEMM_BN=64`
+        // opt-in only. Hypothesis was that another N-tile doubling would
+        // continue the +113% trend, but a clean A/B on Qwen2.5-14B FP8
+        // pp=512 measured BN=64 = 308 t/s mean vs BN=32 = 319 t/s mean
+        // (-3% for BN=64). The larger tile drops occupancy from ~5 WGs/CU
+        // to ~3 WGs/CU and that loses more wall time than the activation
+        // reuse saves at this shape. Honest negative result; the BN=64
+        // shader stays in the tree as opt-in for future tuning (e.g. on
+        // larger models where the FFN GEMM is bigger).
+        //
+        // Override via `VF_FP8_GEMM_BN={16,32,64}`. Legacy
+        // `VF_FP8_GEMM_BN32=0` still respected as opt-out to BN=16.
+        let bn_override = std::env::var("VF_FP8_GEMM_BN")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok());
         let bn32_disabled = std::env::var("VF_FP8_GEMM_BN32")
             .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
             .unwrap_or(false);
-        let use_bn32 = !bn32_disabled && m >= 64 && n >= 64;
+        let bn_target = bn_override.unwrap_or(if bn32_disabled { 16 } else { 32 });
+        let use_bn64 = bn_target >= 64 && m >= 64 && n >= 64;
+        let use_bn32 = !use_bn64 && bn_target >= 32 && m >= 64 && n >= 64;
         let multi_wg = m >= 64 && n >= 64;
-        let shader = if use_bn32 {
+        let shader = if use_bn64 {
+            ShaderId::MulCoopmatFp8Bn64
+        } else if use_bn32 {
             ShaderId::MulCoopmatFp8Bn32
         } else if multi_wg {
             ShaderId::MulCoopmatFp8MultiWg
@@ -3934,8 +3946,8 @@ impl Forward {
             stride_c: m,
             weight_scale_bits: 0,
         };
-        let bm = if use_bn32 || multi_wg { 64u32 } else { 16u32 };
-        let bn = if use_bn32 { 32u32 } else { 16u32 };
+        let bm = if use_bn64 || use_bn32 || multi_wg { 64u32 } else { 16u32 };
+        let bn = if use_bn64 { 64u32 } else if use_bn32 { 32u32 } else { 16u32 };
         let groups_x = (m + bm - 1) / bm;
         let groups_y = (n + bn - 1) / bn;
         let layout = kernel.pipeline_layout;
