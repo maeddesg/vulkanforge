@@ -1129,15 +1129,19 @@ impl Forward {
                     .layout(pipeline_layout)],
                 None,
             ).map_err(|(_, e)| e)?[0];
-            // Pool: lm_head dispatched once per forward; with the
-            // 2-slot async pipeline that's at most 2 sets in flight,
-            // plus headroom. 32 sets is plenty.
+            // Pool: lm_head dispatched once per forward, but the
+            // async-decode pipeline (pre_record / fill_embed_and_submit)
+            // doesn't reset the pool between tokens — same issue as
+            // Sprint 25B's fp8pc_pool. Match that pool's sizing
+            // (524288 sets, ~25 MB) so a long generation can't exhaust
+            // it. Reset happens at all 3 sync forward sites + inside
+            // reset_descriptor_pool_and_cache (prefill).
             let pool = device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(32)
+                    .max_sets(524288)
                     .pool_sizes(&[vk::DescriptorPoolSize {
                         ty: vk::DescriptorType::STORAGE_BUFFER,
-                        descriptor_count: 32 * 5,
+                        descriptor_count: 524288 * 5,
                     }])
                     .flags(vk::DescriptorPoolCreateFlags::empty()),
                 None,
