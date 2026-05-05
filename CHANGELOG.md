@@ -108,6 +108,14 @@ measurement at `results/v038_bench_comparison.md`. Headline: VF wins
 decode `tok/s/W` 1.6–1.9 × across every directly comparable 8B
 configuration, both vs llama.cpp ROCm and vs llama.cpp Vulkan.
 
+* vLLM 0.20.1 ROCm comparison added: VF 2.1× faster on single-user
+  decode (64.5 vs ~30 tok/s) and 5.1× on single-prompt prefill
+  (770 vs ~150 tok/s) on Qwen3-8B-FP8. vLLM lacks tuned kernel
+  configs for gfx1201 ("Using default W8A8 Block FP8 kernel
+  config") and runs `--enforce-eager` (no CUDAGraphs); numbers
+  reflect out-of-the-box experience on RDNA4 consumer hardware,
+  not vLLM's best case.
+
 ### RDNA4 ISA Analysis + Mesa RFEs
 
 * Sprint 32B: RDNA4 ISA deep-read identified native FP8 WMMA and

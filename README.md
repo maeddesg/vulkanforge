@@ -251,6 +251,20 @@ GEMM is hard to beat at this shape); VF block-wise FP8 prefill
 \* Qwen3-FP8 has no llama.cpp equivalent — block-wise FP8 SafeTensors
 loading isn't supported by llama.cpp.
 
+### vs vLLM (Qwen3-8B-FP8, single-user decode)
+
+| Engine                  | Decode      | Notes                                            |
+|-------------------------|------------:|--------------------------------------------------|
+| **VulkanForge v0.3.8**  | **64.5 t/s**| Native block-wise FP8                            |
+| vLLM 0.20.1 ROCm        |   ~30 t/s   | Default kernel configs, untuned for gfx1201      |
+
+vLLM is designed for datacenter batch serving and ships no tuned
+kernel configs for the RX 9070 XT — it warns "Using default W8A8
+Block FP8 kernel config" at startup. With device-specific tuning
+and CUDAGraphs (currently disabled on gfx1201) vLLM would land
+higher. Numbers reflect out-of-the-box experience on consumer
+RDNA4. Methodology in `results/v038_bench_comparison.md`.
+
 ### What VulkanForge does that llama.cpp Vulkan doesn't
 
 - **Block-wise FP8 SafeTensors models** (new in v0.3.8) — Qwen3-FP8 /
