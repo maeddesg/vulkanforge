@@ -1,0 +1,47 @@
+#version 460
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : enable
+
+// Sprint 34 — does ACO emit GLOBAL_LOAD_TR_B64 for ColumnMajor A?
+//
+// Wave64. coopMatLoad(A) with gl_CooperativeMatrixLayoutColumnMajor
+// against a row-major SSBO. This is the exact transpose pattern
+// GLOBAL_LOAD_TR_B128 was designed for.
+//
+// Hardware verdict (gfx1201, Mesa 26.0.6 RADV / ACO):
+//   buffer_load_u16 x 4 + v_perm_b32 x 2 + v_wmma_f32_16x16x16_f16
+//   No *_LOAD_TR_*. No DS ops.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Weights {
+    float16_t data[];
+} weights;
+
+layout(set = 0, binding = 1, std430) writeonly buffer Out {
+    float data[];
+} outbuf;
+
+layout(push_constant) uniform PC {
+    uint stride;
+    uint offset;
+} pc;
+
+void main() {
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    coopMatLoad(matA, weights.data, pc.offset, pc.stride,
+                gl_CooperativeMatrixLayoutColumnMajor);
+    coopMatLoad(matB, weights.data, pc.offset, pc.stride,
+                gl_CooperativeMatrixLayoutRowMajor);
+    acc = coopMatMulAdd(matA, matB, acc);
+    coopMatStore(acc, outbuf.data, 0, 16,
+                 gl_CooperativeMatrixLayoutRowMajor);
+}

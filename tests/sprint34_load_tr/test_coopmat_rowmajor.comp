@@ -1,0 +1,43 @@
+#version 460
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : enable
+
+// Sprint 34 — control variant: RowMajor A from RowMajor SSBO.
+//
+// Wave64. No transpose semantics in the load. If ACO had a generic
+// GLOBAL_LOAD_TR fast-path for any coopMatLoad it would be visible
+// here too. Used to bracket the ColumnMajor result.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Weights {
+    float16_t data[];
+} weights;
+
+layout(set = 0, binding = 1, std430) writeonly buffer Out {
+    float data[];
+} outbuf;
+
+layout(push_constant) uniform PC {
+    uint stride;
+    uint offset;
+} pc;
+
+void main() {
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    coopMatLoad(matA, weights.data, pc.offset, pc.stride,
+                gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(matB, weights.data, pc.offset, pc.stride,
+                gl_CooperativeMatrixLayoutRowMajor);
+    acc = coopMatMulAdd(matA, matB, acc);
+    coopMatStore(acc, outbuf.data, 0, 16,
+                 gl_CooperativeMatrixLayoutRowMajor);
+}

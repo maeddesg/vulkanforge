@@ -1,0 +1,48 @@
+#version 460
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : enable
+
+// Sprint 34 — does ACO gate GLOBAL_LOAD_TR on Wave32?
+//
+// The RDNA4 ISA reference §11.6 says LOAD_TR addresses come "from
+// lanes 0-31 only". That hints ACO might only emit the instruction
+// when the subgroup width is already 32. ColumnMajor A from RowMajor
+// SSBO (same pattern as `direct`), but workgroup size 32 so RADV
+// picks Wave32 as the natural waveform.
+//
+// Result: still buffer_load_u16 + v_perm_b32 software transpose
+// (8x and 4x respectively, since Wave32 doubles per-lane work).
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Weights {
+    float16_t data[];
+} weights;
+
+layout(set = 0, binding = 1, std430) writeonly buffer Out {
+    float data[];
+} outbuf;
+
+layout(push_constant) uniform PC {
+    uint stride;
+    uint offset;
+} pc;
+
+void main() {
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    coopMatLoad(matA, weights.data, pc.offset, pc.stride,
+                gl_CooperativeMatrixLayoutColumnMajor);
+    coopMatLoad(matB, weights.data, pc.offset, pc.stride,
+                gl_CooperativeMatrixLayoutRowMajor);
+    acc = coopMatMulAdd(matA, matB, acc);
+    coopMatStore(acc, outbuf.data, 0, 16,
+                 gl_CooperativeMatrixLayoutRowMajor);
+}

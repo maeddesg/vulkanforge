@@ -1,5 +1,6 @@
 /target/
 *.spv
+!tests/sprint34_load_tr/*.spv
 captures/
 .claude/
 VP_VULKANINFO_*.json
