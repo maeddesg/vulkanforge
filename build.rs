@@ -1070,6 +1070,13 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "mul_mat_vec_fp8_perchannel.comp",
         defines: &[],
     },
+    // Sprint 35 — block-wise [block_n, block_k] FP8 GEMV. Activated for
+    // Qwen3-FP8 / DeepSeek-FP8 models that ship a 2D scale grid.
+    ShaderJob {
+        out_name: "mul_mat_vec_fp8_blockwise.spv",
+        entry_source: "mul_mat_vec_fp8_blockwise.comp",
+        defines: &[],
+    },
     // Sprint 20-M3 — FP32 weight GEMV. Used for lm_head on SafeTensors
     // FP8 models (lm_head is excluded from FP8 quantization on
     // neuralmagic / naive-quantized models, so it carries through

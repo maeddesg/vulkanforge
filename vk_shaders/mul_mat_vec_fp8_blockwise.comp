@@ -1,0 +1,85 @@
+#version 450
+
+// Sprint 35 — block-wise FP8 E4M3 GEMV (decode).
+//
+// Variant of `mul_mat_vec_fp8_perchannel.comp` for block-wise quantized
+// FP8 models (Qwen3-FP8, DeepSeek-V3-FP8). Instead of one scale per
+// output row, weights carry a 2D scale grid `[N/block_n, K/block_k]`:
+// every `block_n × block_k` weight tile shares one FP32 scale.
+//
+// Per-K-block accumulators are scaled and summed inside each thread,
+// so the workgroup-wide reduction at the end is still a single
+// `subgroupAdd`.
+//
+// Bindings + dispatch (1 WG per output row) match the perchannel
+// shader so the runtime descriptor-set scheme can stay identical.
+
+#extension GL_EXT_float_e4m3 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic      : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer WeightBuf { uint w_packed[]; };
+layout (binding = 1) readonly buffer InputBuf  { float data_b[]; };
+layout (binding = 2) writeonly buffer OutputBuf { float data_d[]; };
+layout (binding = 3) readonly buffer ScaleBuf  { float scale[]; };
+
+layout (push_constant) uniform parameter {
+    uint  ncols;             // K (input dim)
+    uint  stride_a;          // = K (FP8 weights, 1 byte/elem; stride_a/4 packed uints/row)
+    uint  stride_d;          // = M (output dim, total rows)
+    uint  block_size_n;      // N-direction block (e.g. 128, or 1 for per-row layouts)
+    uint  block_size_k;      // K-direction block (e.g. 128)
+    uint  num_kblocks;       // K / block_size_k
+    uint  input_off_floats;  // base offset into data_b for token-loop dispatch (multi-token GEMV-loop)
+    uint  output_off_floats; // base offset into data_d for token-loop dispatch
+} p;
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    if (row >= p.stride_d) return;
+
+    const uint tid       = gl_LocalInvocationID.x;
+    const uint nthr      = gl_WorkGroupSize.x;
+    const uint K         = p.ncols;
+    const uint row_u     = row * (p.stride_a / 4);
+    const uint scale_row = row / p.block_size_n;
+    const uint scale_row_off = scale_row * p.num_kblocks;
+
+    // Packed uints per K-block: each uint holds 4 FP8 weights.
+    const uint packed_per_kblock = p.block_size_k / 4;
+
+    float partial = 0.0;
+    [[unroll(1)]] for (uint b = 0; b < p.num_kblocks; b++) {
+        const uint k_base    = b * p.block_size_k;
+        const uint pack_base = b * packed_per_kblock;
+        const float blk_scale = scale[scale_row_off + b];
+
+        float block_acc = 0.0;
+        [[unroll(1)]] for (uint j = tid; j < packed_per_kblock; j += nthr) {
+            const uint w4 = w_packed[row_u + pack_base + j];
+            const uint k0 = k_base + j * 4;
+            const float a0 = float(uintBitsToFloate4m3EXT(uint8_t( w4        & 0xFFu)));
+            const float a1 = float(uintBitsToFloate4m3EXT(uint8_t((w4 >>  8) & 0xFFu)));
+            const float a2 = float(uintBitsToFloate4m3EXT(uint8_t((w4 >> 16) & 0xFFu)));
+            const float a3 = float(uintBitsToFloate4m3EXT(uint8_t((w4 >> 24) & 0xFFu)));
+            const uint kb = k0 + p.input_off_floats;
+            block_acc = fma(a0, data_b[kb + 0], block_acc);
+            block_acc = fma(a1, data_b[kb + 1], block_acc);
+            block_acc = fma(a2, data_b[kb + 2], block_acc);
+            block_acc = fma(a3, data_b[kb + 3], block_acc);
+        }
+        // Apply the per-block scale to this thread's contribution
+        // before accumulating across blocks. subgroupAdd at the end
+        // reduces the row total in one go.
+        partial = fma(block_acc, blk_scale, partial);
+    }
+
+    const float total = subgroupAdd(partial);
+    if (subgroupElect()) {
+        data_d[p.output_off_floats + row] = total;
+    }
+}

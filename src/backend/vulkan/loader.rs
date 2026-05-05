@@ -74,19 +74,26 @@ pub struct GpuTensor {
     pub byte_size: u64,
     /// Sprint 20 — per-tensor FP32 dequantization scale for FP8 weights.
     /// `Some` for per-tensor models (Llama-3.1-FP8, `strategy: "tensor"`)
-    /// and `None` for per-channel models (which use `scale_buffer` only).
-    /// The FP8 GEMV decode path consumes this scalar via push constant;
-    /// the FP8 GEMM prefill path uses `scale_buffer` regardless.
+    /// and `None` for per-channel and block-wise models (which use
+    /// `scale_buffer` only). The FP8 GEMV decode path consumes this
+    /// scalar via push constant; the FP8 GEMM prefill path uses
+    /// `scale_buffer` regardless.
     pub weight_scale: Option<f32>,
-    /// Sprint 24A — per-output-row FP32 dequantization scale for FP8
-    /// weights, bound to descriptor slot 3 of the FP8 GEMM pipelines.
-    /// Length equals `shape[0]` (= output dim). Per-tensor models
-    /// populate the buffer by broadcasting the on-disk scalar to all
-    /// M positions; per-channel models (Qwen2.5-14B-FP8) load the
-    /// file's `[out_dim]` scale tensor directly. `None` for
-    /// unquantized tensors (norms, embeddings, `lm_head`) and for GGUF
-    /// tensors.
+    /// Sprint 24A — FP32 dequantization scale buffer for FP8 weights.
+    /// Per-channel: length = `shape[0]` (= output dim). Per-tensor
+    /// models populate the buffer by broadcasting the on-disk scalar
+    /// to all M positions. Sprint 35: also used for block-wise scales,
+    /// flat row-major `[N/block_n, K/block_k]` (see `scale_block`).
+    /// `None` for unquantized tensors (norms, embeddings, `lm_head`)
+    /// and for GGUF tensors.
     pub scale_buffer: Option<GpuBuffer>,
+    /// Sprint 35 — block dimensions for block-wise FP8 weights
+    /// (Qwen3-FP8, DeepSeek-V3-FP8). `Some((block_n, block_k))` means
+    /// `scale_buffer` is a flat row-major 2D `[N/block_n, K/block_k]`
+    /// FP32 grid; one scale entry covers an entire `block_n × block_k`
+    /// weight tile. `None` for per-tensor / per-channel scales — those
+    /// consumers continue to read `scale_buffer` as a 1D `[N]` vector.
+    pub scale_block: Option<(u32, u32)>,
 }
 
 pub struct LoadedModel {
@@ -210,6 +217,7 @@ impl LoadedModel {
                     byte_size: size,
                     weight_scale: None,
                     scale_buffer: None,
+                    scale_block: None,
                 },
             );
         }
@@ -313,22 +321,75 @@ impl LoadedModel {
             .map_err(LoaderError::Buffer)?;
         let config = hf_to_model_config(&hf)?;
 
-        // Sprint 24A — pre-pass collects FP32 weight_scale *vectors*
-        // keyed by the VF tensor name. On-disk representation is BF16,
-        // either a single scalar (`strategy: "tensor"`, Llama-3.1-FP8)
-        // or a per-output-row vector (`strategy: "channel"`,
-        // Qwen2.5-14B-FP8). Stored as `Vec<f32>` so the upload pass
-        // can broadcast scalars to `[out_dim]` and copy vectors as-is
-        // through a single per-tensor scale buffer alloc.
-        let mut weight_scales: HashMap<String, Vec<f32>> =
+        // Sprint 24A + 35 — pre-pass collects FP32 weight_scale data
+        // keyed by the VF tensor name. The upload-pass classifies the
+        // scale into per-tensor / per-channel / block-wise based on
+        // the parsed shape. Three on-disk encodings are handled:
+        //   * `*.weight_scale`       — `strategy: "tensor"` (scalar)
+        //                              or `"channel"` (`[out_dim]`).
+        //                              BF16 (Llama-3.1-FP8, Qwen2.5-FP8).
+        //   * `*.weight_scale_inv`   — block-wise 2D `[N/bn, K/bk]`
+        //                              (Qwen3-FP8, DeepSeek-V3-FP8).
+        //                              BF16 too on Qwen3.
+        // The dequant math is identical (`weight × scale`) — the `_inv`
+        // suffix is just upstream naming for the precomputed inverse
+        // of the absolute-max-based scale. We record the suffix only
+        // for diagnostics.
+        struct ParsedScale {
+            flat: Vec<f32>,
+            shape: Vec<u32>,
+            #[allow(dead_code)]
+            is_inverse: bool,
+        }
+        let mut weight_scales: HashMap<String, ParsedScale> =
             HashMap::with_capacity(256);
         for (hf_name, info) in &st.tensors {
-            let Some(stem) = hf_name.strip_suffix(".weight_scale") else { continue; };
+            let (stem, is_inverse) = if let Some(s) = hf_name.strip_suffix(".weight_scale_inv") {
+                (s, true)
+            } else if let Some(s) = hf_name.strip_suffix(".weight_scale") {
+                (s, false)
+            } else {
+                continue;
+            };
             let weight_hf_name = format!("{stem}.weight");
             let Some(vf_weight_name) = hf_to_vf_name(&weight_hf_name) else { continue; };
             let bytes = st.tensor_bytes(info);
-            let vec = bf16_scale_to_f32_vec(bytes, &weight_hf_name)?;
-            weight_scales.insert(vf_weight_name, vec);
+            let flat = match info.dtype {
+                TensorDtype::BF16 => bf16_scale_to_f32_vec(bytes, &weight_hf_name)?,
+                TensorDtype::F32 => {
+                    if bytes.len() % 4 != 0 {
+                        return Err(LoaderError::Buffer(format!(
+                            "F32 weight_scale '{weight_hf_name}': byte length {} is not a multiple of 4",
+                            bytes.len(),
+                        )));
+                    }
+                    bytes
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect()
+                }
+                TensorDtype::F16 => {
+                    if bytes.len() % 2 != 0 {
+                        return Err(LoaderError::Buffer(format!(
+                            "F16 weight_scale '{weight_hf_name}': byte length {} is not a multiple of 2",
+                            bytes.len(),
+                        )));
+                    }
+                    bytes
+                        .chunks_exact(2)
+                        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                        .collect()
+                }
+                other => {
+                    return Err(LoaderError::Buffer(format!(
+                        "weight_scale '{weight_hf_name}' has unsupported dtype {:?} \
+                         (expected BF16/F16/F32)",
+                        other,
+                    )));
+                }
+            };
+            let shape: Vec<u32> = info.shape.iter().map(|&s| s as u32).collect();
+            weight_scales.insert(vf_weight_name, ParsedScale { flat, shape, is_inverse });
         }
 
         // Plan the upload list: (vf_name, source_dtype, source_bytes,
@@ -352,12 +413,18 @@ impl LoadedModel {
             shape: Vec<u64>,
             target_dtype: GgmlType,
             bytes: Source<'a>,
-            /// Sprint 20 — per-tensor scalar (None for per-channel models).
-            /// Used by the FP8 GEMV decode path via push constant.
+            /// Sprint 20 — per-tensor scalar (None for per-channel /
+            /// block-wise models). Consumed by the FP8 GEMV decode
+            /// path via push constant.
             weight_scale_scalar: Option<f32>,
-            /// Sprint 24A — Pre-built `[out_dim]` FP32 scale vector,
-            /// ready for per-row indexing in the FP8 GEMM kernel.
+            /// Sprint 24A — Pre-built FP32 scale vector. Length is
+            /// `out_dim` (per-channel / per-tensor-broadcast) or
+            /// `(N/block_n) * (K/block_k)` (block-wise, row-major).
             scale_vec: Option<Vec<f32>>,
+            /// Sprint 35 — block dimensions when the scale is 2D.
+            /// `Some((block_n, block_k))` triggers the block-wise
+            /// FP8 GEMV path; `None` keeps the per-channel route.
+            scale_block: Option<(u32, u32)>,
         }
         // Sprint 22B — VRAM saver: when `output.weight` (the lm_head)
         // is present, the GPU copy of `model.embed_tokens.weight` is
@@ -420,24 +487,76 @@ impl LoadedModel {
             // FP8 weights the GEMV/GEMM kernels index `scale[row]`,
             // so scalars are broadcast to `[out_dim]` here.
             let out_dim = shape.first().copied().unwrap_or(0) as usize;
+            let in_dim = shape.get(1).copied().unwrap_or(0) as usize;
             let raw_scale = weight_scales.get(&hf_name_to_vf(hf_name));
-            let (weight_scale_scalar, scale_vec) = match raw_scale {
-                None => (None, None),
-                Some(v) if v.len() == 1 && out_dim > 0 => {
-                    // Per-tensor: keep the scalar for GEMV's push-constant
-                    // path AND broadcast it to [out_dim] for the GEMM
-                    // path's per-row scale buffer.
-                    (Some(v[0]), Some(vec![v[0]; out_dim]))
+            // Sprint 35 — branch on the parsed scale shape:
+            //   shape=[]  / [1]                  → per-tensor scalar
+            //   shape=[out_dim]                  → per-channel
+            //   shape=[scale_n, scale_k]         → block-wise; block_n
+            //                                      and block_k are inferred
+            //                                      from `weight.shape /
+            //                                      scale.shape`.
+            let (weight_scale_scalar, scale_vec, scale_block) = match raw_scale {
+                None => (None, None, None),
+                Some(ps) if ps.shape.is_empty() || (ps.shape.len() == 1 && ps.flat.len() == 1) => {
+                    if out_dim == 0 {
+                        return Err(LoaderError::Buffer(format!(
+                            "tensor '{hf_name}': scalar weight_scale on a tensor without out_dim"
+                        )));
+                    }
+                    let scalar = ps.flat[0];
+                    (Some(scalar), Some(vec![scalar; out_dim]), None)
                 }
-                Some(v) if v.len() == out_dim => {
-                    // Per-channel: no single scalar; only the buffer.
-                    (None, Some(v.clone()))
+                Some(ps) if ps.shape.len() == 1 && ps.flat.len() == out_dim => {
+                    (None, Some(ps.flat.clone()), None)
                 }
-                Some(v) => {
+                Some(ps) if ps.shape.len() == 2 => {
+                    let scale_n = ps.shape[0] as usize;
+                    let scale_k = ps.shape[1] as usize;
+                    if scale_n == 0 || scale_k == 0 {
+                        return Err(LoaderError::Buffer(format!(
+                            "tensor '{hf_name}': 2D weight_scale has zero dimension {:?}",
+                            ps.shape,
+                        )));
+                    }
+                    if out_dim == 0 || in_dim == 0 {
+                        return Err(LoaderError::Buffer(format!(
+                            "tensor '{hf_name}': 2D weight_scale on tensor without rank-2 shape"
+                        )));
+                    }
+                    if out_dim % scale_n != 0 || in_dim % scale_k != 0 {
+                        return Err(LoaderError::Buffer(format!(
+                            "tensor '{hf_name}': 2D scale shape {:?} does not tile weight shape \
+                             [{out_dim}, {in_dim}] cleanly",
+                            ps.shape,
+                        )));
+                    }
+                    if ps.flat.len() != scale_n * scale_k {
+                        return Err(LoaderError::Buffer(format!(
+                            "tensor '{hf_name}': 2D weight_scale element count {} != \
+                             scale_n*scale_k = {}*{}",
+                            ps.flat.len(), scale_n, scale_k,
+                        )));
+                    }
+                    // Sprint 35 — collapse trivially-2D shapes to per-channel.
+                    // Qwen2.5-14B-FP8 stores per-channel as `[out_dim, 1]`
+                    // (one K-block of size in_dim). That's mathematically
+                    // identical to per-channel, but the per-channel GEMM
+                    // path covers prefill while the block-wise path
+                    // doesn't yet — so we route this case to per-channel.
+                    if scale_k == 1 && scale_n == out_dim {
+                        (None, Some(ps.flat.clone()), None)
+                    } else {
+                        let block_n = (out_dim / scale_n) as u32;
+                        let block_k = (in_dim / scale_k) as u32;
+                        (None, Some(ps.flat.clone()), Some((block_n, block_k)))
+                    }
+                }
+                Some(ps) => {
                     return Err(LoaderError::Buffer(format!(
-                        "tensor '{hf_name}': weight_scale length {} does not match \
-                         output dim {} (expected scalar or [out_dim] vector)",
-                        v.len(), out_dim,
+                        "tensor '{hf_name}': unsupported weight_scale shape {:?} \
+                         (length {}, expected scalar / [out_dim] / [N/bn, K/bk])",
+                        ps.shape, ps.flat.len(),
                     )));
                 }
             };
@@ -448,6 +567,7 @@ impl LoadedModel {
                 bytes,
                 weight_scale_scalar,
                 scale_vec,
+                scale_block,
             });
         }
         // Deterministic upload order — easier to read panics.
@@ -588,6 +708,7 @@ impl LoadedModel {
                     byte_size: size,
                     weight_scale: plan.weight_scale_scalar,
                     scale_buffer,
+                    scale_block: plan.scale_block,
                 },
             );
         }
@@ -790,14 +911,23 @@ fn hf_to_model_config(hf: &HfConfig) -> Result<ModelConfig, LoaderError> {
     let arch = match hf.model_type.as_str() {
         "llama" => "llama",
         "qwen2" => "qwen2",
+        // Sprint 35 — Qwen3 SafeTensors (Qwen3-FP8 family). Uses the
+        // qwen2/qwen3 forward path with q_norm/k_norm enabled; bias is
+        // gated on the actual presence of `attn_*.bias` tensors in the
+        // SafeTensors archive (Qwen3 omits them, Qwen2.5 carries them).
+        "qwen3" => "qwen3",
         other => {
             return Err(LoaderError::Buffer(format!(
                 "SafeTensors model_type '{other}' not yet supported \
-                 (have: 'llama', 'qwen2')"
+                 (have: 'llama', 'qwen2', 'qwen3')"
             )));
         }
     };
     use super::gguf::RopeVariant;
+    // Sprint 35 — Qwen3 ships per-head Q/K norms (`q_norm` / `k_norm`)
+    // that the forward pass dispatches when `has_qk_norm` is true.
+    // Qwen2/Llama set this `false`; Qwen3 keeps it `true`.
+    let has_qk_norm = hf.model_type == "qwen3";
     // Important: SafeTensors / PyTorch carries Q/K weights in the
     // *un-permuted* HuggingFace layout, where RoPE rotates the
     // [i, i + head_dim/2] pairs (NeoX / GPT-NeoX style). llama.cpp's
@@ -820,6 +950,6 @@ fn hf_to_model_config(hf: &HfConfig) -> Result<ModelConfig, LoaderError> {
         rope_dim: hf.head_dim(),
         rope_variant: RopeVariant::Neox,
         context_length: hf.max_position_embeddings.unwrap_or(2048),
-        has_qk_norm: false,
+        has_qk_norm,
     })
 }

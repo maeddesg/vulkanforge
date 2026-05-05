@@ -53,6 +53,13 @@ use super::shaders::ShaderId;
 const MUL_MAT_VEC_FP8_PERCHANNEL: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_fp8_perchannel.spv"));
 
+// Sprint 35 — block-wise FP8 GEMV SPV for Qwen3-FP8 / DeepSeek-V3-FP8.
+// Same 4-binding scheme as the per-channel variant; the difference is
+// a 6 × u32 push-constant block carrying `block_size_n`, `block_size_k`,
+// `num_kblocks`, and the indexing pattern `scale[(row/block_n)*num_kblocks + b]`.
+const MUL_MAT_VEC_FP8_BLOCKWISE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_fp8_blockwise.spv"));
+
 // Sprint 29 — F16 GEMV SPV for the dedicated lm_head pipeline. Same
 // SPV as the production `MulMatVecF16` registry entry; the harness
 // pattern (PipelineCache::null + dedicated DSL/pool) bypasses the
@@ -358,6 +365,19 @@ pub struct Forward {
     /// worst case (vs 524288 in v0.3.5 — that was for the no-cache,
     /// every-call-fresh-alloc pattern).
     fp8pc_ds_cache: HashMap<(u64, u64, u64, u64), vk::DescriptorSet>,
+
+    // Sprint 35 — block-wise FP8 GEMV resources. Mirror of fp8pc_* with
+    // a different SPV (`mul_mat_vec_fp8_blockwise`) and a 6-u32 push
+    // constant block (vs perchannel's 13-u32 MatVecPushConstants).
+    // 4 storage-buffer bindings identical to perchannel so the loader
+    // and the routing wrapper can share the descriptor-set cache key
+    // shape. Activated when a layer weight has `scale_block.is_some()`.
+    fp8bw_shader_module: vk::ShaderModule,
+    fp8bw_dsl: vk::DescriptorSetLayout,
+    fp8bw_pipeline_layout: vk::PipelineLayout,
+    fp8bw_pipeline: vk::Pipeline,
+    fp8bw_pool: vk::DescriptorPool,
+    fp8bw_ds_cache: HashMap<(u64, u64, u64, u64), vk::DescriptorSet>,
 
     // Sprint 29 — harness-style dedicated F16 GEMV resources for the
     // lm_head dispatch (M=152064, K=5120 on Qwen2.5-14B-FP8). Mirrors
@@ -1070,6 +1090,82 @@ impl Forward {
             (module, dsl, pipeline_layout, pipeline, pool)
         };
 
+        // Sprint 35 — block-wise FP8 GEMV pipeline. Identical 4-binding
+        // descriptor layout to fp8pc, different SPV + 6 × u32 push
+        // constants (`Fp8BlockwiseGemvPushConstants`).
+        let (
+            fp8bw_shader_module,
+            fp8bw_dsl,
+            fp8bw_pipeline_layout,
+            fp8bw_pipeline,
+            fp8bw_pool,
+        ) = unsafe {
+            let words: Vec<u32> = MUL_MAT_VEC_FP8_BLOCKWISE
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let module = device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&words),
+                None,
+            )?;
+            let dsl_bindings: Vec<_> = (0..4).map(|i| {
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(i).descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE)
+            }).collect();
+            let dsl = device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&dsl_bindings),
+                None,
+            )?;
+            let push_range = vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .offset(0)
+                .size(std::mem::size_of::<super::pipeline::Fp8BlockwiseGemvPushConstants>() as u32);
+            let layouts_arr = [dsl];
+            let push_ranges = [push_range];
+            let pipeline_layout = device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&layouts_arr)
+                    .push_constant_ranges(&push_ranges),
+                None,
+            )?;
+            let block_size: u32 = 64;
+            let spec_entries = [vk::SpecializationMapEntry { constant_id: 0, offset: 0, size: 4 }];
+            let spec_data = bytemuck::bytes_of(&block_size);
+            let spec_info = vk::SpecializationInfo::default()
+                .map_entries(&spec_entries)
+                .data(spec_data);
+            let mut subgroup_info = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+                .required_subgroup_size(64);
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(module)
+                .name(c"main")
+                .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
+                .specialization_info(&spec_info)
+                .push_next(&mut subgroup_info);
+            let pipeline = device.create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[vk::ComputePipelineCreateInfo::default()
+                    .stage(stage)
+                    .layout(pipeline_layout)],
+                None,
+            ).map_err(|(_, e)| e)?[0];
+            // Pool sized like fp8pc: ~1024 sets cover the cache for
+            // (weight, input, output, scale) keys × async slots.
+            let pool = device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(1024)
+                    .pool_sizes(&[vk::DescriptorPoolSize {
+                        ty: vk::DescriptorType::STORAGE_BUFFER,
+                        descriptor_count: 1024 * 4,
+                    }])
+                    .flags(vk::DescriptorPoolCreateFlags::empty()),
+                None,
+            )?;
+            (module, dsl, pipeline_layout, pipeline, pool)
+        };
+
         // Sprint 29 — dedicated F16 GEMV pipeline for lm_head. Mirrors
         // the production registry's MulMatVecF16 entry (BLOCK_SIZE=64
         // spec, requiredSubgroupSize=64, REQUIRE_FULL_SUBGROUPS, 5
@@ -1202,6 +1298,12 @@ impl Forward {
             fp8pc_pipeline,
             fp8pc_pool,
             fp8pc_ds_cache: HashMap::new(),
+            fp8bw_shader_module,
+            fp8bw_dsl,
+            fp8bw_pipeline_layout,
+            fp8bw_pipeline,
+            fp8bw_pool,
+            fp8bw_ds_cache: HashMap::new(),
             lmhead_shader_module,
             lmhead_dsl,
             lmhead_pipeline_layout,
@@ -1651,22 +1753,25 @@ impl Forward {
         let v_h = self.cur().v_buf.handle;
         let in_h = self.cur().hidden_norm.handle;
         if let Some(s) = sb_q {
-            self.run_gemv_fp8_perchannel(dev, cmd, wq, s, in_h, q_h,
-                cfg.hidden_dim, cfg.n_heads * cfg.head_dim, "gemv_q");
+            self.run_gemv_fp8_dispatch(dev, cmd, wq, s, in_h, q_h,
+                cfg.hidden_dim, cfg.n_heads * cfg.head_dim,
+                layer_weight_scale_block(model, layer, "attn_q.weight"), "gemv_q");
         } else {
             self.run_gemv(dev, registry, cmd, sq, wq, in_h, q_h,
                 cfg.hidden_dim, cfg.n_heads * cfg.head_dim, scale_q, "gemv_q");
         }
         if let Some(s) = sb_k {
-            self.run_gemv_fp8_perchannel(dev, cmd, wk, s, in_h, k_h,
-                cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, "gemv_k");
+            self.run_gemv_fp8_dispatch(dev, cmd, wk, s, in_h, k_h,
+                cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim,
+                layer_weight_scale_block(model, layer, "attn_k.weight"), "gemv_k");
         } else {
             self.run_gemv(dev, registry, cmd, sk, wk, in_h, k_h,
                 cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, scale_k, "gemv_k");
         }
         if let Some(s) = sb_v {
-            self.run_gemv_fp8_perchannel(dev, cmd, wv, s, in_h, v_h,
-                cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, "gemv_v");
+            self.run_gemv_fp8_dispatch(dev, cmd, wv, s, in_h, v_h,
+                cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim,
+                layer_weight_scale_block(model, layer, "attn_v.weight"), "gemv_v");
         } else {
             self.run_gemv(dev, registry, cmd, sv, wv, in_h, v_h,
                 cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, scale_v, "gemv_v");
@@ -1908,6 +2013,12 @@ impl Forward {
             device.destroy_pipeline_layout(self.fp8pc_pipeline_layout, None);
             device.destroy_descriptor_set_layout(self.fp8pc_dsl, None);
             device.destroy_shader_module(self.fp8pc_shader_module, None);
+            // Sprint 35 — block-wise FP8 GEMV cleanup
+            device.destroy_descriptor_pool(self.fp8bw_pool, None);
+            device.destroy_pipeline(self.fp8bw_pipeline, None);
+            device.destroy_pipeline_layout(self.fp8bw_pipeline_layout, None);
+            device.destroy_descriptor_set_layout(self.fp8bw_dsl, None);
+            device.destroy_shader_module(self.fp8bw_shader_module, None);
             device.destroy_descriptor_pool(self.lmhead_pool, None);
             device.destroy_pipeline(self.lmhead_pipeline, None);
             device.destroy_pipeline_layout(self.lmhead_pipeline_layout, None);
@@ -2023,22 +2134,25 @@ impl Forward {
         let sb_k = layer_weight_scale_buf(model, layer, "attn_k.weight");
         let sb_v = layer_weight_scale_buf(model, layer, "attn_v.weight");
         if let Some(s) = sb_q {
-            self.run_gemv_fp8_perchannel(dev, cmd, wq, s, hidden_norm, q_buf,
-                cfg.hidden_dim, cfg.n_heads * cfg.head_dim, "gemv_q");
+            self.run_gemv_fp8_dispatch(dev, cmd, wq, s, hidden_norm, q_buf,
+                cfg.hidden_dim, cfg.n_heads * cfg.head_dim,
+                layer_weight_scale_block(model, layer, "attn_q.weight"), "gemv_q");
         } else {
             self.run_gemv(dev, registry, cmd, sq, wq, hidden_norm, q_buf,
                 cfg.hidden_dim, cfg.n_heads * cfg.head_dim, scale_q, "gemv_q");
         }
         if let Some(s) = sb_k {
-            self.run_gemv_fp8_perchannel(dev, cmd, wk, s, hidden_norm, k_buf,
-                cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, "gemv_k");
+            self.run_gemv_fp8_dispatch(dev, cmd, wk, s, hidden_norm, k_buf,
+                cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim,
+                layer_weight_scale_block(model, layer, "attn_k.weight"), "gemv_k");
         } else {
             self.run_gemv(dev, registry, cmd, sk, wk, hidden_norm, k_buf,
                 cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, scale_k, "gemv_k");
         }
         if let Some(s) = sb_v {
-            self.run_gemv_fp8_perchannel(dev, cmd, wv, s, hidden_norm, v_buf,
-                cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, "gemv_v");
+            self.run_gemv_fp8_dispatch(dev, cmd, wv, s, hidden_norm, v_buf,
+                cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim,
+                layer_weight_scale_block(model, layer, "attn_v.weight"), "gemv_v");
         } else {
             self.run_gemv(dev, registry, cmd, sv, wv, hidden_norm, v_buf,
                 cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, scale_v, "gemv_v");
@@ -2175,8 +2289,9 @@ impl Forward {
         let scale_o = layer_weight_scale_scalar(model, layer, "attn_output.weight");
         let sb_o = layer_weight_scale_buf(model, layer, "attn_output.weight");
         if let Some(s) = sb_o {
-            self.run_gemv_fp8_perchannel(dev, cmd, wo, s, attn_out, o_buf,
-                cfg.n_heads * cfg.head_dim, cfg.hidden_dim, "gemv_o");
+            self.run_gemv_fp8_dispatch(dev, cmd, wo, s, attn_out, o_buf,
+                cfg.n_heads * cfg.head_dim, cfg.hidden_dim,
+                layer_weight_scale_block(model, layer, "attn_output.weight"), "gemv_o");
         } else {
             self.run_gemv(dev, registry, cmd, so, wo, attn_out, o_buf,
                 cfg.n_heads * cfg.head_dim, cfg.hidden_dim, scale_o, "gemv_o");
@@ -2211,15 +2326,17 @@ impl Forward {
         let sb_g = layer_weight_scale_buf(model, layer, "ffn_gate.weight");
         let sb_u = layer_weight_scale_buf(model, layer, "ffn_up.weight");
         if let Some(s) = sb_g {
-            self.run_gemv_fp8_perchannel(dev, cmd, wg, s, hidden_norm, gate_buf,
-                cfg.hidden_dim, cfg.ffn_dim, "gemv_gate");
+            self.run_gemv_fp8_dispatch(dev, cmd, wg, s, hidden_norm, gate_buf,
+                cfg.hidden_dim, cfg.ffn_dim,
+                layer_weight_scale_block(model, layer, "ffn_gate.weight"), "gemv_gate");
         } else {
             self.run_gemv(dev, registry, cmd, sg, wg, hidden_norm, gate_buf,
                 cfg.hidden_dim, cfg.ffn_dim, scale_g, "gemv_gate");
         }
         if let Some(s) = sb_u {
-            self.run_gemv_fp8_perchannel(dev, cmd, wu, s, hidden_norm, up_buf,
-                cfg.hidden_dim, cfg.ffn_dim, "gemv_up");
+            self.run_gemv_fp8_dispatch(dev, cmd, wu, s, hidden_norm, up_buf,
+                cfg.hidden_dim, cfg.ffn_dim,
+                layer_weight_scale_block(model, layer, "ffn_up.weight"), "gemv_up");
         } else {
             self.run_gemv(dev, registry, cmd, su, wu, hidden_norm, up_buf,
                 cfg.hidden_dim, cfg.ffn_dim, scale_u, "gemv_up");
@@ -2246,8 +2363,9 @@ impl Forward {
         let scale_d = layer_weight_scale_scalar(model, layer, "ffn_down.weight");
         let sb_d = layer_weight_scale_buf(model, layer, "ffn_down.weight");
         if let Some(s) = sb_d {
-            self.run_gemv_fp8_perchannel(dev, cmd, wd, s, ffn_hidden, ffn_out,
-                cfg.ffn_dim, cfg.hidden_dim, "gemv_down");
+            self.run_gemv_fp8_dispatch(dev, cmd, wd, s, ffn_hidden, ffn_out,
+                cfg.ffn_dim, cfg.hidden_dim,
+                layer_weight_scale_block(model, layer, "ffn_down.weight"), "gemv_down");
         } else {
             self.run_gemv(dev, registry, cmd, sd, wd, ffn_hidden, ffn_out,
                 cfg.ffn_dim, cfg.hidden_dim, scale_d, "gemv_down");
@@ -2496,6 +2614,11 @@ impl Forward {
                 self.fp8pc_pool,
                 vk::DescriptorPoolResetFlags::empty(),
             )?;
+            // Sprint 35 — same for the block-wise FP8 pool.
+            dev.device.reset_descriptor_pool(
+                self.fp8bw_pool,
+                vk::DescriptorPoolResetFlags::empty(),
+            )?;
             // Sprint 29 — same for the lm_head dedicated pool.
             dev.device.reset_descriptor_pool(
                 self.lmhead_pool,
@@ -2506,6 +2629,8 @@ impl Forward {
         // Sprint 30 — pool reset just invalidated every cached fp8pc
         // descriptor set; drop the keys.
         self.fp8pc_ds_cache.clear();
+        // Sprint 35 — same for the block-wise cache.
+        self.fp8bw_ds_cache.clear();
         // Sprint 12D — also reset the barrier-elision tracker so the
         // first dispatch in the next forward can't see stale dirty
         // flags from a previous (already-fence-waited) submit.
@@ -2695,6 +2820,169 @@ impl Forward {
             );
             dev.device.cmd_dispatch(cmd, m, 1, 1);
         });
+    }
+
+    /// Sprint 35 — block-wise FP8 GEMV. Same descriptor-set scheme as
+    /// the per-channel variant (4 storage buffers: weight, input,
+    /// output, scale) so the cache-key shape is identical. The scale
+    /// SSBO is interpreted as a row-major `[N/block_n, K/block_k]`
+    /// FP32 grid; the shader recomputes
+    /// `scale[(row/block_n) * num_kblocks + b]` per K-block.
+    #[allow(clippy::too_many_arguments)]
+    fn run_gemv_fp8_blockwise(
+        &mut self,
+        dev: &VulkanDevice,
+        cmd: vk::CommandBuffer,
+        weights: vk::Buffer,
+        scale: vk::Buffer,
+        input: vk::Buffer,
+        output: vk::Buffer,
+        k: u32,
+        m: u32,
+        block_n: u32,
+        block_k: u32,
+        label: &str,
+    ) {
+        self.run_gemv_fp8_blockwise_at(
+            dev, cmd, weights, scale, input, output, k, m, block_n, block_k, 0, 0, label,
+        );
+    }
+
+    /// Sprint 35 — block-wise GEMV with explicit input/output token
+    /// offsets. The looped prefill fallback (`run_gemm_fp8_blockwise_via_gemv_loop`)
+    /// dispatches one of these per prompt token, stepping through the
+    /// stacked activation buffer without rebinding descriptor sets.
+    #[allow(clippy::too_many_arguments)]
+    fn run_gemv_fp8_blockwise_at(
+        &mut self,
+        dev: &VulkanDevice,
+        cmd: vk::CommandBuffer,
+        weights: vk::Buffer,
+        scale: vk::Buffer,
+        input: vk::Buffer,
+        output: vk::Buffer,
+        k: u32,
+        m: u32,
+        block_n: u32,
+        block_k: u32,
+        input_off_floats: u32,
+        output_off_floats: u32,
+        label: &str,
+    ) {
+        debug_assert!(k % block_k == 0, "k {k} not divisible by block_k {block_k}");
+        let key = (weights.as_raw(), input.as_raw(), output.as_raw(), scale.as_raw());
+        let set = if let Some(&cached) = self.fp8bw_ds_cache.get(&key) {
+            cached
+        } else {
+            let alloc_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(self.fp8bw_pool)
+                .set_layouts(std::slice::from_ref(&self.fp8bw_dsl));
+            let set = unsafe { dev.device.allocate_descriptor_sets(&alloc_info) }
+                .expect("fp8bw descriptor set alloc")[0];
+            let infos = [
+                vk::DescriptorBufferInfo::default().buffer(weights).offset(0).range(vk::WHOLE_SIZE),
+                vk::DescriptorBufferInfo::default().buffer(input).offset(0).range(vk::WHOLE_SIZE),
+                vk::DescriptorBufferInfo::default().buffer(output).offset(0).range(vk::WHOLE_SIZE),
+                vk::DescriptorBufferInfo::default().buffer(scale).offset(0).range(vk::WHOLE_SIZE),
+            ];
+            let writes: Vec<vk::WriteDescriptorSet> = (0..4)
+                .map(|i| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(i as u32)
+                        .descriptor_count(1)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(std::slice::from_ref(&infos[i]))
+                })
+                .collect();
+            unsafe { dev.device.update_descriptor_sets(&writes, &[]) };
+            self.fp8bw_ds_cache.insert(key, set);
+            set
+        };
+
+        let pc = super::pipeline::Fp8BlockwiseGemvPushConstants {
+            ncols: k,
+            stride_a: k,
+            stride_d: m,
+            block_size_n: block_n,
+            block_size_k: block_k,
+            num_kblocks: k / block_k,
+            input_off_floats,
+            output_off_floats,
+        };
+        let pipeline = self.fp8bw_pipeline;
+        let layout = self.fp8bw_pipeline_layout;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, m, 1, 1);
+        });
+    }
+
+    /// Sprint 35 — prefill fallback for block-wise FP8 weights.
+    /// `run_gemm_fp8_naive` consumes a 1D scale grid; until a real
+    /// block-wise GEMM kernel lands, prefill loops the block-wise
+    /// GEMV across the M-stack of activations. Slow at large M (one
+    /// GEMV per token) but correct at any M ≥ 1, which lets chat
+    /// coherence tests pass on Qwen3-FP8 / DeepSeek-FP8.
+    #[allow(clippy::too_many_arguments)]
+    fn run_gemm_fp8_blockwise_via_gemv_loop(
+        &mut self,
+        dev: &VulkanDevice,
+        cmd: vk::CommandBuffer,
+        weights: vk::Buffer,
+        scale: vk::Buffer,
+        activations: vk::Buffer,
+        output: vk::Buffer,
+        n: u32,        // output rows per token
+        seq_len: u32,  // M (token count)
+        k: u32,        // input dim per token
+        block_n: u32,
+        block_k: u32,
+        label: &'static str,
+    ) {
+        for t in 0..seq_len {
+            self.run_gemv_fp8_blockwise_at(
+                dev, cmd, weights, scale, activations, output,
+                k, n, block_n, block_k,
+                t * k, t * n,
+                label,
+            );
+        }
+    }
+
+    /// Sprint 35 — routing wrapper: per-channel vs block-wise.
+    /// Picks the right pipeline based on whether the caller passed
+    /// a `block` tuple. Keeps the call sites in `dispatch_layer*`
+    /// to one extra `layer_weight_scale_block` lookup + one method
+    /// call.
+    #[allow(clippy::too_many_arguments)]
+    fn run_gemv_fp8_dispatch(
+        &mut self,
+        dev: &VulkanDevice,
+        cmd: vk::CommandBuffer,
+        weights: vk::Buffer,
+        scale: vk::Buffer,
+        input: vk::Buffer,
+        output: vk::Buffer,
+        k: u32,
+        m: u32,
+        block: Option<(u32, u32)>,
+        label: &'static str,
+    ) {
+        match block {
+            Some((bn, bk)) => self.run_gemv_fp8_blockwise(
+                dev, cmd, weights, scale, input, output, k, m, bn, bk, label,
+            ),
+            None => self.run_gemv_fp8_perchannel(
+                dev, cmd, weights, scale, input, output, k, m, label,
+            ),
+        }
     }
 
     /// Sprint 29 — dedicated F16 GEMV dispatch for lm_head. Mirrors
@@ -4602,25 +4890,52 @@ impl Forward {
             // above because gemm_kind = MulMm for FP8).
             let scale_q = layer_weight_scale_buf(model, layer, "attn_q.weight")
                 .expect("FP8 GEMM Q requires a scale buffer");
+            let blk_q = layer_weight_scale_block(model, layer, "attn_q.weight");
             let scale_k = layer_weight_scale_buf(model, layer, "attn_k.weight")
                 .expect("FP8 GEMM K requires a scale buffer");
+            let blk_k = layer_weight_scale_block(model, layer, "attn_k.weight");
             let scale_v = layer_weight_scale_buf(model, layer, "attn_v.weight")
                 .expect("FP8 GEMM V requires a scale buffer");
-            self.run_gemm_fp8_naive(
-                dev, registry, cmd, wq, scale_q,
-                gemm_input_attn, self.batch_q.handle,
-                q_dim, seq_len, hidden, "gemm_q_fp8",
-            );
-            self.run_gemm_fp8_naive(
-                dev, registry, cmd, wk, scale_k,
-                gemm_input_attn, self.batch_k.handle,
-                kv_dim, seq_len, hidden, "gemm_k_fp8",
-            );
-            self.run_gemm_fp8_naive(
-                dev, registry, cmd, wv, scale_v,
-                gemm_input_attn, self.batch_v.handle,
-                kv_dim, seq_len, hidden, "gemm_v_fp8",
-            );
+            let blk_v = layer_weight_scale_block(model, layer, "attn_v.weight");
+            if let Some((bn, bk)) = blk_q {
+                    self.run_gemm_fp8_blockwise_via_gemv_loop(
+                        dev, cmd, wq, scale_q,
+                        gemm_input_attn, self.batch_q.handle,
+                        q_dim, seq_len, hidden, bn, bk, "gemm_q_fp8_bw",
+                    );
+                } else {
+                    self.run_gemm_fp8_naive(
+                        dev, registry, cmd, wq, scale_q,
+                        gemm_input_attn, self.batch_q.handle,
+                        q_dim, seq_len, hidden, "gemm_q_fp8",
+                    );
+                }
+            if let Some((bn, bk)) = blk_k {
+                    self.run_gemm_fp8_blockwise_via_gemv_loop(
+                        dev, cmd, wk, scale_k,
+                        gemm_input_attn, self.batch_k.handle,
+                        kv_dim, seq_len, hidden, bn, bk, "gemm_k_fp8_bw",
+                    );
+                } else {
+                    self.run_gemm_fp8_naive(
+                        dev, registry, cmd, wk, scale_k,
+                        gemm_input_attn, self.batch_k.handle,
+                        kv_dim, seq_len, hidden, "gemm_k_fp8",
+                    );
+                }
+            if let Some((bn, bk)) = blk_v {
+                    self.run_gemm_fp8_blockwise_via_gemv_loop(
+                        dev, cmd, wv, scale_v,
+                        gemm_input_attn, self.batch_v.handle,
+                        kv_dim, seq_len, hidden, bn, bk, "gemm_v_fp8_bw",
+                    );
+                } else {
+                    self.run_gemm_fp8_naive(
+                        dev, registry, cmd, wv, scale_v,
+                        gemm_input_attn, self.batch_v.handle,
+                        kv_dim, seq_len, hidden, "gemm_v_fp8",
+                    );
+                }
         } else {
             self.run_gemm(
                 dev, registry, cmd, sq, wq,
@@ -5002,11 +5317,20 @@ impl Forward {
             if is_fp8_layer_weight(model, layer, "attn_output.weight") {
                 let scale_o = layer_weight_scale_buf(model, layer, "attn_output.weight")
                     .expect("FP8 GEMM O requires a scale buffer");
-                self.run_gemm_fp8_naive(
-                    dev, registry, cmd, wo, scale_o,
-                    gemm_input_o, self.batch_o.handle,
-                    hidden, seq_len, q_dim, "gemm_o_fp8",
-                );
+            let blk_o = layer_weight_scale_block(model, layer, "attn_output.weight");
+                if let Some((bn, bk)) = blk_o {
+                        self.run_gemm_fp8_blockwise_via_gemv_loop(
+                            dev, cmd, wo, scale_o,
+                            gemm_input_o, self.batch_o.handle,
+                            hidden, seq_len, q_dim, bn, bk, "gemm_o_fp8_bw",
+                        );
+                    } else {
+                        self.run_gemm_fp8_naive(
+                            dev, registry, cmd, wo, scale_o,
+                            gemm_input_o, self.batch_o.handle,
+                            hidden, seq_len, q_dim, "gemm_o_fp8",
+                        );
+                    }
             } else {
                 self.run_gemm(
                     dev, registry, cmd, so, wo,
@@ -5082,18 +5406,36 @@ impl Forward {
             // Sprint 20-Wire — SafeTensors FP8 path for gate + up.
             let scale_g = layer_weight_scale_buf(model, layer, "ffn_gate.weight")
                 .expect("FP8 GEMM gate requires a scale buffer");
+            let blk_g = layer_weight_scale_block(model, layer, "ffn_gate.weight");
             let scale_u = layer_weight_scale_buf(model, layer, "ffn_up.weight")
                 .expect("FP8 GEMM up requires a scale buffer");
-            self.run_gemm_fp8_naive(
-                dev, registry, cmd, wg, scale_g,
-                gemm_input_ffn, self.batch_gate.handle,
-                ffn, seq_len, hidden, "gemm_gate_fp8",
-            );
-            self.run_gemm_fp8_naive(
-                dev, registry, cmd, wu, scale_u,
-                gemm_input_ffn, self.batch_up.handle,
-                ffn, seq_len, hidden, "gemm_up_fp8",
-            );
+            let blk_u = layer_weight_scale_block(model, layer, "ffn_up.weight");
+            if let Some((bn, bk)) = blk_g {
+                    self.run_gemm_fp8_blockwise_via_gemv_loop(
+                        dev, cmd, wg, scale_g,
+                        gemm_input_ffn, self.batch_gate.handle,
+                        ffn, seq_len, hidden, bn, bk, "gemm_gate_fp8_bw",
+                    );
+                } else {
+                    self.run_gemm_fp8_naive(
+                        dev, registry, cmd, wg, scale_g,
+                        gemm_input_ffn, self.batch_gate.handle,
+                        ffn, seq_len, hidden, "gemm_gate_fp8",
+                    );
+                }
+            if let Some((bn, bk)) = blk_u {
+                    self.run_gemm_fp8_blockwise_via_gemv_loop(
+                        dev, cmd, wu, scale_u,
+                        gemm_input_ffn, self.batch_up.handle,
+                        ffn, seq_len, hidden, bn, bk, "gemm_up_fp8_bw",
+                    );
+                } else {
+                    self.run_gemm_fp8_naive(
+                        dev, registry, cmd, wu, scale_u,
+                        gemm_input_ffn, self.batch_up.handle,
+                        ffn, seq_len, hidden, "gemm_up_fp8",
+                    );
+                }
         } else {
             let sg = layer_weight_shader_gemm(model, layer, "ffn_gate.weight", gemm_kind, ffn, seq_len, self.mul_mm_coopmat_enabled, self.mul_mm_coopmat_f16acc_enabled);
             let su = layer_weight_shader_gemm(model, layer, "ffn_up.weight", gemm_kind, ffn, seq_len, self.mul_mm_coopmat_enabled, self.mul_mm_coopmat_f16acc_enabled);
@@ -5143,11 +5485,20 @@ impl Forward {
         if is_fp8_layer_weight(model, layer, "ffn_down.weight") {
             let scale_d = layer_weight_scale_buf(model, layer, "ffn_down.weight")
                 .expect("FP8 GEMM down requires a scale buffer");
-            self.run_gemm_fp8_naive(
-                dev, registry, cmd, wd, scale_d,
-                gemm_input_down, self.batch_ffn_out.handle,
-                hidden, seq_len, ffn, "gemm_down_fp8",
-            );
+            let blk_d = layer_weight_scale_block(model, layer, "ffn_down.weight");
+            if let Some((bn, bk)) = blk_d {
+                    self.run_gemm_fp8_blockwise_via_gemv_loop(
+                        dev, cmd, wd, scale_d,
+                        gemm_input_down, self.batch_ffn_out.handle,
+                        hidden, seq_len, ffn, bn, bk, "gemm_down_fp8_bw",
+                    );
+                } else {
+                    self.run_gemm_fp8_naive(
+                        dev, registry, cmd, wd, scale_d,
+                        gemm_input_down, self.batch_ffn_out.handle,
+                        hidden, seq_len, ffn, "gemm_down_fp8",
+                    );
+                }
         } else {
             self.run_gemm(
                 dev, registry, cmd, sd, wd,
@@ -5420,6 +5771,15 @@ fn layer_weight_scale_buf(model: &LoadedModel, layer: u32, suffix: &str) -> Opti
     model
         .tensor(&key)
         .and_then(|t| t.scale_buffer.as_ref().map(|b| b.handle))
+}
+
+/// Sprint 35 — Returns the (block_n, block_k) tuple when a layer's
+/// weight ships a 2D block-wise scale grid (Qwen3-FP8 / DeepSeek-V3-FP8).
+/// `None` for per-tensor / per-channel scales — those callers stick
+/// with the per-channel GEMV path.
+fn layer_weight_scale_block(model: &LoadedModel, layer: u32, suffix: &str) -> Option<(u32, u32)> {
+    let key = format!("blk.{layer}.{suffix}");
+    model.tensor(&key).and_then(|t| t.scale_block)
 }
 
 /// Sprint 20-Wire — `true` iff a layer's weight tensor is FP8 E4M3.

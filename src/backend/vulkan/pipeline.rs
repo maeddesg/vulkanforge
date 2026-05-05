@@ -60,6 +60,27 @@ pub struct Fp8GemmPushConstants {
     pub weight_scale_bits: u32,
 }
 
+/// Sprint 35 — push constants for `mul_mat_vec_fp8_blockwise.comp`.
+/// 8 × u32 = 32 B. Layout mirrors the GLSL `parameter` block. One WG
+/// per output row dispatches one of these; `block_size_n=1` collapses
+/// to per-row scaling, matching the brief's "Per-Channel" case. The
+/// `*_off_floats` slots let the prefill GEMV-loop fallback step
+/// through the M-stack of activations / outputs without re-binding
+/// descriptor sets per token.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Fp8BlockwiseGemvPushConstants {
+    pub ncols: u32,
+    pub stride_a: u32,
+    pub stride_d: u32,
+    pub block_size_n: u32,
+    pub block_size_k: u32,
+    pub num_kblocks: u32,
+    pub input_off_floats: u32,
+    pub output_off_floats: u32,
+}
+const _: () = assert!(std::mem::size_of::<Fp8BlockwiseGemvPushConstants>() == 32);
+
 // ---- Phase-2B: per-shader push-constant structs ----------------------
 //
 // One `#[repr(C)]` struct per GLSL push-constant block, with the field

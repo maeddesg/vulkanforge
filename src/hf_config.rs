@@ -58,6 +58,17 @@ pub struct QuantizationConfig {
     /// FP8 models). Names match the HF tensor-name schema.
     #[serde(default)]
     pub ignore: Vec<String>,
+    /// Sprint 35 — block-wise FP8 (Qwen3-FP8, DeepSeek-V3-FP8). When
+    /// present, weights ship with a 2D scale grid `[N/block_n, K/block_k]`
+    /// instead of a per-tensor or per-channel scale. Stored verbatim
+    /// from `config.json`'s `quantization_config.weight_block_size`.
+    #[serde(default)]
+    pub weight_block_size: Option<[u32; 2]>,
+    /// Sprint 35 — `e4m3` for Qwen3-FP8 / DeepSeek-V3-FP8. Carried
+    /// through verbatim; the loader rejects anything that isn't
+    /// `e4m3` to fail loud rather than silently mis-dequantize.
+    #[serde(default)]
+    pub fmt: Option<String>,
 }
 
 impl HfConfig {
