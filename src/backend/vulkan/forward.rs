@@ -60,6 +60,13 @@ const MUL_MAT_VEC_FP8_PERCHANNEL: &[u8] =
 const MUL_MAT_VEC_FP8_BLOCKWISE: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_fp8_blockwise.spv"));
 
+// Sprint 36 — block-wise FP8 GEMM (BN=32) SPV. Replaces the Sprint 35
+// GEMV-loop fallback. Push-constants carry `block_n`, `block_k`,
+// `num_kblocks`; the kernel folds the per-block scale into the A-tile
+// load before the WMMA chain.
+const MUL_COOPMAT_FP8_BN32_BLOCKWISE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_fp8_bn32_blockwise.spv"));
+
 // Sprint 29 — F16 GEMV SPV for the dedicated lm_head pipeline. Same
 // SPV as the production `MulMatVecF16` registry entry; the harness
 // pattern (PipelineCache::null + dedicated DSL/pool) bypasses the
@@ -378,6 +385,18 @@ pub struct Forward {
     fp8bw_pipeline: vk::Pipeline,
     fp8bw_pool: vk::DescriptorPool,
     fp8bw_ds_cache: HashMap<(u64, u64, u64, u64), vk::DescriptorSet>,
+
+    // Sprint 36 — block-wise FP8 GEMM resources (BN=32 prefill kernel).
+    // Same 4-binding descriptor scheme as the GEMV variant; differs in
+    // the SPV (`mul_coopmat_fp8_bn32_blockwise`) and a 9-u32 push
+    // constant block. Replaces the Sprint 35 GEMV-loop fallback in
+    // `dispatch_layer_batch`.
+    fp8bwgemm_shader_module: vk::ShaderModule,
+    fp8bwgemm_dsl: vk::DescriptorSetLayout,
+    fp8bwgemm_pipeline_layout: vk::PipelineLayout,
+    fp8bwgemm_pipeline: vk::Pipeline,
+    fp8bwgemm_pool: vk::DescriptorPool,
+    fp8bwgemm_ds_cache: HashMap<(u64, u64, u64, u64), vk::DescriptorSet>,
 
     // Sprint 29 — harness-style dedicated F16 GEMV resources for the
     // lm_head dispatch (M=152064, K=5120 on Qwen2.5-14B-FP8). Mirrors
@@ -1166,6 +1185,79 @@ impl Forward {
             (module, dsl, pipeline_layout, pipeline, pool)
         };
 
+        // Sprint 36 — block-wise FP8 GEMM (BN=32) pipeline. Same
+        // 4-binding scheme as the GEMV variants; differs in the SPV
+        // and the 9-u32 push constant block. BLOCK_SIZE=512 spec,
+        // requiredSubgroupSize=64 (the BN=32 kernel is Wave64).
+        let (
+            fp8bwgemm_shader_module,
+            fp8bwgemm_dsl,
+            fp8bwgemm_pipeline_layout,
+            fp8bwgemm_pipeline,
+            fp8bwgemm_pool,
+        ) = unsafe {
+            let words: Vec<u32> = MUL_COOPMAT_FP8_BN32_BLOCKWISE
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let module = device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&words),
+                None,
+            )?;
+            let dsl_bindings: Vec<_> = (0..4).map(|i| {
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(i).descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE)
+            }).collect();
+            let dsl = device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&dsl_bindings),
+                None,
+            )?;
+            let push_range = vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .offset(0)
+                .size(std::mem::size_of::<super::pipeline::Fp8BlockwiseGemmPushConstants>() as u32);
+            let layouts_arr = [dsl];
+            let push_ranges = [push_range];
+            let pipeline_layout = device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&layouts_arr)
+                    .push_constant_ranges(&push_ranges),
+                None,
+            )?;
+            // BN=32 kernel is Wave64; require full subgroups so the
+            // `gl_SubgroupID` derivation lands on the 8-subgroup grid.
+            let mut subgroup_info = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+                .required_subgroup_size(64);
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(module)
+                .name(c"main")
+                .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
+                .push_next(&mut subgroup_info);
+            let pipeline = device.create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[vk::ComputePipelineCreateInfo::default()
+                    .stage(stage)
+                    .layout(pipeline_layout)],
+                None,
+            ).map_err(|(_, e)| e)?[0];
+            // Pool sized like fp8bw GEMV: prefill cache typically
+            // covers ~7 GEMMs × ~36 layers + retries, comfortably
+            // within 1024 sets.
+            let pool = device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(1024)
+                    .pool_sizes(&[vk::DescriptorPoolSize {
+                        ty: vk::DescriptorType::STORAGE_BUFFER,
+                        descriptor_count: 1024 * 4,
+                    }])
+                    .flags(vk::DescriptorPoolCreateFlags::empty()),
+                None,
+            )?;
+            (module, dsl, pipeline_layout, pipeline, pool)
+        };
+
         // Sprint 29 — dedicated F16 GEMV pipeline for lm_head. Mirrors
         // the production registry's MulMatVecF16 entry (BLOCK_SIZE=64
         // spec, requiredSubgroupSize=64, REQUIRE_FULL_SUBGROUPS, 5
@@ -1304,6 +1396,12 @@ impl Forward {
             fp8bw_pipeline,
             fp8bw_pool,
             fp8bw_ds_cache: HashMap::new(),
+            fp8bwgemm_shader_module,
+            fp8bwgemm_dsl,
+            fp8bwgemm_pipeline_layout,
+            fp8bwgemm_pipeline,
+            fp8bwgemm_pool,
+            fp8bwgemm_ds_cache: HashMap::new(),
             lmhead_shader_module,
             lmhead_dsl,
             lmhead_pipeline_layout,
@@ -2019,6 +2117,12 @@ impl Forward {
             device.destroy_pipeline_layout(self.fp8bw_pipeline_layout, None);
             device.destroy_descriptor_set_layout(self.fp8bw_dsl, None);
             device.destroy_shader_module(self.fp8bw_shader_module, None);
+            // Sprint 36 — block-wise FP8 GEMM cleanup
+            device.destroy_descriptor_pool(self.fp8bwgemm_pool, None);
+            device.destroy_pipeline(self.fp8bwgemm_pipeline, None);
+            device.destroy_pipeline_layout(self.fp8bwgemm_pipeline_layout, None);
+            device.destroy_descriptor_set_layout(self.fp8bwgemm_dsl, None);
+            device.destroy_shader_module(self.fp8bwgemm_shader_module, None);
             device.destroy_descriptor_pool(self.lmhead_pool, None);
             device.destroy_pipeline(self.lmhead_pipeline, None);
             device.destroy_pipeline_layout(self.lmhead_pipeline_layout, None);
@@ -2619,6 +2723,11 @@ impl Forward {
                 self.fp8bw_pool,
                 vk::DescriptorPoolResetFlags::empty(),
             )?;
+            // Sprint 36 — same for the block-wise FP8 GEMM pool.
+            dev.device.reset_descriptor_pool(
+                self.fp8bwgemm_pool,
+                vk::DescriptorPoolResetFlags::empty(),
+            )?;
             // Sprint 29 — same for the lm_head dedicated pool.
             dev.device.reset_descriptor_pool(
                 self.lmhead_pool,
@@ -2631,6 +2740,8 @@ impl Forward {
         self.fp8pc_ds_cache.clear();
         // Sprint 35 — same for the block-wise cache.
         self.fp8bw_ds_cache.clear();
+        // Sprint 36 — same for the block-wise GEMM cache.
+        self.fp8bwgemm_ds_cache.clear();
         // Sprint 12D — also reset the barrier-elision tracker so the
         // first dispatch in the next forward can't see stale dirty
         // flags from a previous (already-fence-waited) submit.
@@ -2924,13 +3035,106 @@ impl Forward {
         });
     }
 
-    /// Sprint 35 — prefill fallback for block-wise FP8 weights.
-    /// `run_gemm_fp8_naive` consumes a 1D scale grid; until a real
-    /// block-wise GEMM kernel lands, prefill loops the block-wise
-    /// GEMV across the M-stack of activations. Slow at large M (one
-    /// GEMV per token) but correct at any M ≥ 1, which lets chat
-    /// coherence tests pass on Qwen3-FP8 / DeepSeek-FP8.
+    /// Sprint 36 — block-wise FP8 GEMM (BN=32 cooperative matrix kernel).
+    /// Replaces the Sprint 35 GEMV-loop fallback. Same descriptor scheme
+    /// as the per-channel `MulCoopmatFp8Bn32` registry entry; differs in
+    /// the SPV (`mul_coopmat_fp8_bn32_blockwise.comp` folds the per-block
+    /// scale into the A-tile load) and the 9-u32 push constant layout.
+    ///
+    /// Constraints (asserted): BM=64 must divide block_n, BK=16 must
+    /// divide block_k. Qwen3-FP8 and DeepSeek-V3-FP8 satisfy both with
+    /// `weight_block_size=[128, 128]`.
     #[allow(clippy::too_many_arguments)]
+    fn run_gemm_fp8_blockwise(
+        &mut self,
+        dev: &VulkanDevice,
+        cmd: vk::CommandBuffer,
+        weight_buf: vk::Buffer,
+        scale_buf: vk::Buffer,
+        activations_fp32: vk::Buffer,
+        output: vk::Buffer,
+        m: u32,
+        n: u32,
+        k: u32,
+        block_n: u32,
+        block_k: u32,
+        label: &'static str,
+    ) {
+        const BM: u32 = 64;
+        const BN: u32 = 32;
+        const BK: u32 = 16;
+        debug_assert!(block_n % BM == 0,
+            "block_n {block_n} must be a multiple of BM={BM} for blockwise GEMM");
+        debug_assert!(block_k % BK == 0,
+            "block_k {block_k} must be a multiple of BK={BK} for blockwise GEMM");
+        debug_assert!(k % block_k == 0,
+            "k {k} must be a multiple of block_k {block_k}");
+
+        let key = (
+            weight_buf.as_raw(),
+            activations_fp32.as_raw(),
+            output.as_raw(),
+            scale_buf.as_raw(),
+        );
+        let set = if let Some(&cached) = self.fp8bwgemm_ds_cache.get(&key) {
+            cached
+        } else {
+            let alloc_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(self.fp8bwgemm_pool)
+                .set_layouts(std::slice::from_ref(&self.fp8bwgemm_dsl));
+            let set = unsafe { dev.device.allocate_descriptor_sets(&alloc_info) }
+                .expect("fp8bwgemm descriptor set alloc")[0];
+            let infos = [
+                vk::DescriptorBufferInfo::default().buffer(weight_buf).offset(0).range(vk::WHOLE_SIZE),
+                vk::DescriptorBufferInfo::default().buffer(activations_fp32).offset(0).range(vk::WHOLE_SIZE),
+                vk::DescriptorBufferInfo::default().buffer(output).offset(0).range(vk::WHOLE_SIZE),
+                vk::DescriptorBufferInfo::default().buffer(scale_buf).offset(0).range(vk::WHOLE_SIZE),
+            ];
+            let writes: Vec<vk::WriteDescriptorSet> = (0..4)
+                .map(|i| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(i as u32)
+                        .descriptor_count(1)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(std::slice::from_ref(&infos[i]))
+                })
+                .collect();
+            unsafe { dev.device.update_descriptor_sets(&writes, &[]) };
+            self.fp8bwgemm_ds_cache.insert(key, set);
+            set
+        };
+
+        let pc = super::pipeline::Fp8BlockwiseGemmPushConstants {
+            m, n, k,
+            stride_a: k,
+            stride_b: k,
+            stride_c: m,
+            block_n,
+            block_k,
+            num_kblocks: k / block_k,
+        };
+        let groups_x = (m + BM - 1) / BM;
+        let groups_y = (n + BN - 1) / BN;
+        let pipeline = self.fp8bwgemm_pipeline;
+        let layout = self.fp8bwgemm_pipeline_layout;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, groups_x, groups_y, 1);
+        });
+    }
+
+    /// Sprint 35 — prefill fallback for block-wise FP8 weights.
+    /// Superseded by `run_gemm_fp8_blockwise` (Sprint 36) for the
+    /// common `[128, 128]` shape. Kept for shapes where BM∤block_n
+    /// or BK∤block_k.
+    #[allow(clippy::too_many_arguments, dead_code)]
     fn run_gemm_fp8_blockwise_via_gemv_loop(
         &mut self,
         dev: &VulkanDevice,
@@ -4898,7 +5102,7 @@ impl Forward {
                 .expect("FP8 GEMM V requires a scale buffer");
             let blk_v = layer_weight_scale_block(model, layer, "attn_v.weight");
             if let Some((bn, bk)) = blk_q {
-                    self.run_gemm_fp8_blockwise_via_gemv_loop(
+                    self.run_gemm_fp8_blockwise(
                         dev, cmd, wq, scale_q,
                         gemm_input_attn, self.batch_q.handle,
                         q_dim, seq_len, hidden, bn, bk, "gemm_q_fp8_bw",
@@ -4911,7 +5115,7 @@ impl Forward {
                     );
                 }
             if let Some((bn, bk)) = blk_k {
-                    self.run_gemm_fp8_blockwise_via_gemv_loop(
+                    self.run_gemm_fp8_blockwise(
                         dev, cmd, wk, scale_k,
                         gemm_input_attn, self.batch_k.handle,
                         kv_dim, seq_len, hidden, bn, bk, "gemm_k_fp8_bw",
@@ -4924,7 +5128,7 @@ impl Forward {
                     );
                 }
             if let Some((bn, bk)) = blk_v {
-                    self.run_gemm_fp8_blockwise_via_gemv_loop(
+                    self.run_gemm_fp8_blockwise(
                         dev, cmd, wv, scale_v,
                         gemm_input_attn, self.batch_v.handle,
                         kv_dim, seq_len, hidden, bn, bk, "gemm_v_fp8_bw",
@@ -5319,7 +5523,7 @@ impl Forward {
                     .expect("FP8 GEMM O requires a scale buffer");
             let blk_o = layer_weight_scale_block(model, layer, "attn_output.weight");
                 if let Some((bn, bk)) = blk_o {
-                        self.run_gemm_fp8_blockwise_via_gemv_loop(
+                        self.run_gemm_fp8_blockwise(
                             dev, cmd, wo, scale_o,
                             gemm_input_o, self.batch_o.handle,
                             hidden, seq_len, q_dim, bn, bk, "gemm_o_fp8_bw",
@@ -5411,7 +5615,7 @@ impl Forward {
                 .expect("FP8 GEMM up requires a scale buffer");
             let blk_u = layer_weight_scale_block(model, layer, "ffn_up.weight");
             if let Some((bn, bk)) = blk_g {
-                    self.run_gemm_fp8_blockwise_via_gemv_loop(
+                    self.run_gemm_fp8_blockwise(
                         dev, cmd, wg, scale_g,
                         gemm_input_ffn, self.batch_gate.handle,
                         ffn, seq_len, hidden, bn, bk, "gemm_gate_fp8_bw",
@@ -5424,7 +5628,7 @@ impl Forward {
                     );
                 }
             if let Some((bn, bk)) = blk_u {
-                    self.run_gemm_fp8_blockwise_via_gemv_loop(
+                    self.run_gemm_fp8_blockwise(
                         dev, cmd, wu, scale_u,
                         gemm_input_ffn, self.batch_up.handle,
                         ffn, seq_len, hidden, bn, bk, "gemm_up_fp8_bw",
@@ -5487,7 +5691,7 @@ impl Forward {
                 .expect("FP8 GEMM down requires a scale buffer");
             let blk_d = layer_weight_scale_block(model, layer, "ffn_down.weight");
             if let Some((bn, bk)) = blk_d {
-                    self.run_gemm_fp8_blockwise_via_gemv_loop(
+                    self.run_gemm_fp8_blockwise(
                         dev, cmd, wd, scale_d,
                         gemm_input_down, self.batch_ffn_out.handle,
                         hidden, seq_len, ffn, bn, bk, "gemm_down_fp8_bw",

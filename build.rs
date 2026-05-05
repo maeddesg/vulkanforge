@@ -1077,6 +1077,14 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "mul_mat_vec_fp8_blockwise.comp",
         defines: &[],
     },
+    // Sprint 36 — block-wise FP8 GEMM (prefill). Replaces the Sprint
+    // 35 GEMV-loop fallback with a real BN=32 cooperative matrix
+    // kernel that folds the per-block scale into the A-tile load.
+    ShaderJob {
+        out_name: "mul_coopmat_fp8_bn32_blockwise.spv",
+        entry_source: "mul_coopmat_fp8_bn32_blockwise.comp",
+        defines: &[],
+    },
     // Sprint 20-M3 — FP32 weight GEMV. Used for lm_head on SafeTensors
     // FP8 models (lm_head is excluded from FP8 quantization on
     // neuralmagic / naive-quantized models, so it carries through

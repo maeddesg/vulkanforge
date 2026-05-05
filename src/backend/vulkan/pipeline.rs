@@ -60,6 +60,24 @@ pub struct Fp8GemmPushConstants {
     pub weight_scale_bits: u32,
 }
 
+/// Sprint 36 — push constants for `mul_coopmat_fp8_bn32_blockwise.comp`.
+/// 9 × u32 = 36 B (rounded up to 40 B by Vulkan? — it's tightly packed).
+/// Mirrors `Fp8GemmPushConstants` plus three block-size fields.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Fp8BlockwiseGemmPushConstants {
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    pub stride_a: u32,
+    pub stride_b: u32,
+    pub stride_c: u32,
+    pub block_n: u32,
+    pub block_k: u32,
+    pub num_kblocks: u32,
+}
+const _: () = assert!(std::mem::size_of::<Fp8BlockwiseGemmPushConstants>() == 36);
+
 /// Sprint 35 — push constants for `mul_mat_vec_fp8_blockwise.comp`.
 /// 8 × u32 = 32 B. Layout mirrors the GLSL `parameter` block. One WG
 /// per output row dispatches one of these; `block_size_n=1` collapses

@@ -1,0 +1,193 @@
+#version 460
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_float_e4m3 : require
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_bfloat16 : enable
+
+// Sprint 36 — block-wise FP8 GEMM (Qwen3-FP8 / DeepSeek-V3-FP8 family).
+//
+// Same tiling as `mul_coopmat_fp8_bn32.comp` (BM=64, BN=32, BK=16, 8
+// subgroups in a 4×2 grid). The single behavioural delta is the scale
+// fold: instead of multiplying `acc × scale[m]` at output write time
+// (which assumes a 1D per-row scale), we read `scale[(m_block) *
+// num_kblocks + k_block]` once per K-step and pre-multiply each FP8
+// weight during the A-tile load. The WMMA chain then sees pre-scaled
+// values and the output write is a plain copy.
+//
+// Why per-K-step (not per K-element):
+//   * BM=64 ≤ block_n (=128 for Qwen3) AND wg_m is BM-aligned, so all
+//     64 rows of a WG share one n-block. n_block is constant per WG.
+//   * BK=16 ≤ block_k (=128 for Qwen3), so the entire BM×BK A-tile
+//     loaded each iteration sits in one (n_block, k_block) cell.
+//     A single `scale[]` read per K-iter suffices.
+//
+// Constraints (asserted at dispatch time):
+//   * BM | block_n   (so n_block is constant per WG)
+//   * BK | block_k   (so the A-tile lies within one k_block)
+
+#define ELEM_TYPE bfloat16_t
+
+const uint BLOCK_SIZE = 512;
+const uint BM         = 64;
+const uint BN         = 32;
+const uint BK         = 16;
+const uint TM         = 16;
+const uint TN         = 16;
+const uint TK         = 16;
+const uint NUM_SG     = BLOCK_SIZE / 64;
+
+const uint A_STRIDE = BK + 1;
+const uint B_STRIDE = BN + 1;
+const uint C_STRIDE = BN + 1;
+
+shared ELEM_TYPE buf_a[BM * A_STRIDE];
+shared ELEM_TYPE buf_b[BK * B_STRIDE];
+shared float     buf_c[BM * C_STRIDE];
+
+layout(local_size_x = BLOCK_SIZE) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufA { uint  data_a[]; };
+layout(set = 0, binding = 1) readonly  buffer BufB { float b[]; };
+layout(set = 0, binding = 2) writeonly buffer BufC { float c[]; };
+// Sprint 36 — block-wise scale grid `[m / block_n, k / block_k]`,
+// flattened row-major. Indexed as `scale[m_blk * num_kblocks + k_blk]`.
+layout(set = 0, binding = 3) readonly  buffer ScaleBuf { float scale[]; };
+
+layout(push_constant) uniform PC {
+    uint m;
+    uint n;
+    uint k;
+    uint stride_a;
+    uint stride_b;
+    uint stride_c;
+    uint block_n;     // N-direction block size (e.g. 128)
+    uint block_k;     // K-direction block size (e.g. 128)
+    uint num_kblocks; // = k / block_k
+} pc;
+
+void main() {
+    const uint wg_m = gl_WorkGroupID.x * BM;
+    const uint wg_n = gl_WorkGroupID.y * BN;
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint sg   = gl_SubgroupID;
+    const uint sg_m_idx = sg >> 1;
+    const uint sg_n_idx = sg & 1u;
+    const uint sg_m_base = sg_m_idx * TM;
+    const uint sg_n_base = sg_n_idx * TN;
+
+    // n_block is constant per workgroup (BM=64 divides block_n=128 on
+    // Qwen3; the dispatch guard rejects other shapes).
+    const uint m_block_base = wg_m / pc.block_n;
+    const uint scale_row_off = m_block_base * pc.num_kblocks;
+
+    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> acc =
+        coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
+
+    const uint a_row    = tid >> 2;
+    const uint a_k_base = (tid & 3u) * 4u;
+    const bool a_active = tid < 256u;
+
+    const uint b_tid    = tid - 256u;
+    const uint b_n      = b_tid >> 2;
+    const uint b_k_base = (b_tid & 3u) * 4u;
+    const bool b_active = tid >= 256u && tid < 384u;
+
+    for (uint kk = 0; kk < pc.k; kk += BK) {
+        // Sprint 36 — one scale read per K-iter; broadcast across the
+        // workgroup. All 1024 FP8 elements in the A-tile share this
+        // scale because (a) the WG covers one n-block and (b) the
+        // BK=16 K-tile lies within one k_block.
+        const uint k_block = kk / pc.block_k;
+        const float blk_scale = scale[scale_row_off + k_block];
+
+        if (a_active) {
+            const uint global_row    = wg_m + a_row;
+            const uint a_gk_base     = kk + a_k_base;
+            const bool row_in_bounds = global_row < pc.m;
+            const bool a_word_full   = row_in_bounds && (a_gk_base + 3u < pc.k);
+            uint word = 0u;
+            if (a_word_full) {
+                const uint elem_idx = global_row * pc.stride_a + a_gk_base;
+                word = data_a[elem_idx >> 2u];
+            } else if (row_in_bounds) {
+                for (uint w = 0u; w < 4u; w++) {
+                    const uint gk = a_gk_base + w;
+                    if (gk < pc.k) {
+                        const uint ei = global_row * pc.stride_a + gk;
+                        const uint sh = (ei & 3u) * 8u;
+                        word |= (data_a[ei >> 2u] & (0xFFu << sh));
+                    }
+                }
+            }
+            [[unroll]] for (uint w = 0u; w < 4u; w++) {
+                const uint8_t byte = uint8_t((word >> (w * 8u)) & 0xFFu);
+                // Sprint 36 — fold the block scale into the BF16 cast.
+                // One extra VALU vs the per-channel bn32 shader; the
+                // converted value is what WMMA consumes.
+                const float dequant = float(uintBitsToFloate4m3EXT(byte)) * blk_scale;
+                buf_a[a_row * A_STRIDE + a_k_base + w] = ELEM_TYPE(dequant);
+            }
+        }
+
+        if (b_active) {
+            const uint b_gn      = wg_n + b_n;
+            const uint b_gk_base = kk + b_k_base;
+            const bool b_full    = b_gn < pc.n && (b_gk_base + 3u < pc.k);
+            vec4 act4 = vec4(0.0);
+            if (b_full) {
+                const uint base = b_gn * pc.stride_b + b_gk_base;
+                act4 = vec4(b[base + 0u], b[base + 1u], b[base + 2u], b[base + 3u]);
+            } else if (b_gn < pc.n) {
+                for (uint w = 0u; w < 4u; w++) {
+                    const uint gk = b_gk_base + w;
+                    if (gk < pc.k) {
+                        act4[w] = b[b_gn * pc.stride_b + gk];
+                    }
+                }
+            }
+            buf_b[(b_k_base + 0u) * B_STRIDE + b_n] = ELEM_TYPE(act4.x);
+            buf_b[(b_k_base + 1u) * B_STRIDE + b_n] = ELEM_TYPE(act4.y);
+            buf_b[(b_k_base + 2u) * B_STRIDE + b_n] = ELEM_TYPE(act4.z);
+            buf_b[(b_k_base + 3u) * B_STRIDE + b_n] = ELEM_TYPE(act4.w);
+        }
+
+        barrier();
+
+        coopmat<ELEM_TYPE, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> matA;
+        coopmat<ELEM_TYPE, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> matB;
+        coopMatLoad(matA, buf_a, sg_m_base * A_STRIDE, A_STRIDE,
+                    gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB, buf_b, sg_n_base, B_STRIDE,
+                    gl_CooperativeMatrixLayoutRowMajor);
+        acc = coopMatMulAdd(matA, matB, acc);
+
+        barrier();
+    }
+
+    coopMatStore(acc, buf_c, sg_m_base * C_STRIDE + sg_n_base, C_STRIDE,
+                 gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+
+    // Sprint 36 — scale already folded into A-tile, so output is a
+    // plain copy from staging LDS to the global C buffer.
+    [[unroll]] for (uint w = 0u; w < 4u; w++) {
+        const uint fidx    = w * BLOCK_SIZE + tid;
+        const uint m_local = fidx / BN;
+        const uint n_local = fidx & (BN - 1u);
+        const uint gm      = wg_m + m_local;
+        const uint gn      = wg_n + n_local;
+        if (gm < pc.m && gn < pc.n) {
+            c[gn * pc.stride_c + gm] = buf_c[m_local * C_STRIDE + n_local];
+        }
+    }
+}
