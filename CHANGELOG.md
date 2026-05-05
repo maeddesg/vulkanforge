@@ -1,5 +1,162 @@
 # Changelog
 
+## v0.3.8 — Block-wise FP8 (Qwen3-FP8) (2026-05-08)
+
+### Headline
+
+**Block-wise FP8 support — Qwen3-8B-FP8 runs end-to-end at 64.5 tok/s
+decode, 770 tok/s prefill at pp=512.** This is the format used by
+every official Qwen3 / Qwen3.5 / DeepSeek-V3 FP8 release on HuggingFace
+(`weight_block_size: [128, 128]`). All three FP8 scaling strategies —
+per-tensor, per-channel, block-wise — are now auto-detected from the
+SafeTensors metadata. Block-wise prefill matches the per-tensor 8B
+Llama path (770 vs 757 tok/s); the scale fold has no measurable
+overhead in the GEMM steady state.
+
+### Block-wise FP8 Performance (Qwen3-8B-FP8, RX 9070 XT, Mesa 26.1-rc3)
+
+| Sprint                | Decode    | pp=64    | pp=128   | pp=512    | Avg W   | tok/s/W |
+|-----------------------|----------:|---------:|---------:|----------:|--------:|--------:|
+| 35 (decode-only)      |  64.5     |  153.8   |  166.4   |  157.2    |  305 W  |  0.21   |
+| **36 (BN=32 GEMM)**   | **64.5**  | **669.7**| **721.9**|**770.1**  |**156 W**|**0.41** |
+| Δ vs Sprint 35        | unchanged | +335 %   | +334 %   | **+390 %**| −49 %   | +95 %   |
+
+Decode unchanged (Sprint 36 only touched the prefill GEMM path). Avg
+power drops because the BN=32 GEMM finishes the prefill batch faster
+than the GEMV-loop fallback could.
+
+### What changed
+
+**Sprint 35 — Block-wise FP8 Decode** (commit `c41767c`, 711 ins / 97 del)
+
+* `vk_shaders/mul_mat_vec_fp8_blockwise.comp` (77 LOC) — new GEMV with
+  per-K-block scale lookup (`scale[(row/block_n) * num_kblocks + b]`)
+  and wave-level `subgroupAdd` reduction. Same 4-binding scheme as
+  `mul_mat_vec_fp8_perchannel.comp`; differs in the 8-u32 push
+  constant block carrying `block_size_n`, `block_size_k`,
+  `num_kblocks`, and `input/output_off_floats` slots for prefill
+  fallback dispatching.
+* `loader.rs`: 2D scale shape parsing, both `.weight_scale` and
+  `.weight_scale_inv` suffixes recognised, BF16 / F16 / F32 scale
+  dtypes, `qwen3` joins `llama` / `qwen2` in the SafeTensors arch
+  matcher. Trivially-2D `[N, 1]` shapes (Qwen2.5 per-channel) collapse
+  to per-channel automatically.
+* `forward.rs`: `fp8bw_*` pipeline triple + descriptor cache,
+  `run_gemv_fp8_dispatch` routing wrapper, all 10 GEMV call sites in
+  `dispatch_layer` / `dispatch_layer_partial` updated.
+* `GpuTensor.scale_block: Option<(u32, u32)>` field.
+* Initial prefill via `run_gemm_fp8_blockwise_via_gemv_loop`
+  (M sequential GEMVs — slow but correct, replaced by Sprint 36).
+
+**Sprint 36 — Block-wise FP8 GEMM** (commit `1aa6521`, 436 ins / 13 del)
+
+* `vk_shaders/mul_coopmat_fp8_bn32_blockwise.comp` (161 LOC) — BN=32
+  cooperative matrix GEMM. Strategy: fold the per-block scale into
+  the A-tile load (`bf16(float(fp8) * block_scale)`) so the WMMA
+  chain sees pre-scaled values and the output write is a plain copy.
+  One extra VALU per FP8 element, no coopmat scalar-multiply needed.
+* Architectural pre-condition: BM=64 divides block_n=128 AND wg_m is
+  BM-aligned, so `m_block_base = wg_m / block_n` is constant per
+  workgroup. The entire BM×BK A-tile lies within one (n_block,
+  k_block) cell, so a single scalar covers all 1024 FP8 elements per
+  K-iter.
+* `Fp8BlockwiseGemmPushConstants` (36 B = 9 × u32) in `pipeline.rs`.
+* `fp8bwgemm_*` pipeline triple (mirror of fp8bw GEMV with the new
+  push range size), `run_gemm_fp8_blockwise` method.
+* Replaces the GEMV-loop fallback at all 7 GEMM call sites in
+  `dispatch_layer_batch`. The loop helper stays in tree
+  (`#[allow(dead_code)]`) for shapes where BM∤block_n / BK∤block_k.
+
+### Loader auto-detection
+
+The SafeTensors loader now recognises all three FP8 scaling strategies
+and routes each to the right GEMV/GEMM pipeline without any
+configuration:
+
+| On-disk suffix          | Scale shape                | Strategy      | Routed kernel                              |
+|-------------------------|----------------------------|---------------|--------------------------------------------|
+| `.weight_scale`         | `[]` / `[1]`              | per-tensor    | `run_gemv_fp8_perchannel` (broadcast)      |
+| `.weight_scale`         | `[N]` or `[N, 1]`          | per-channel   | `run_gemv_fp8_perchannel`                  |
+| `.weight_scale_inv`     | `[N/bn, K/bk]`             | block-wise    | `run_gemv_fp8_blockwise` (decode) + `run_gemm_fp8_blockwise` (prefill) |
+
+Scale dtype: BF16 / F16 / F32 — all three handled. The `_inv` suffix
+is just an upstream naming convention (DeepSeek/Qwen3 ship the
+precomputed inverse); the dequant math is `weight × scale` either way.
+
+### Reference models
+
+| Model                                 | Format            | VRAM     | Decode    | pp=512    |
+|---------------------------------------|-------------------|---------:|----------:|----------:|
+| `neuralmagic/Meta-Llama-3.1-8B-FP8`   | per-tensor FP8    |  7.5 GB  |  69 t/s   |  757 t/s  |
+| `larryvrh/Qwen2.5-14B-Instruct-FP8`   | per-channel FP8   | 13.8 GB  |  14 t/s   |  338 t/s  |
+| **`Qwen/Qwen3-8B-FP8`**               | **block-wise [128,128] FP8** | **~8.5 GB** | **64 t/s** | **770 t/s** |
+
+### Mesa timeout fix
+
+Intermittent `ring gfx_0.0.0 timeout` on Mesa 26.1-rc3 with large
+compute command buffers (~1200 dispatches) was caused by the 2-second
+default amdgpu compute timeout. Our 14B prefill at pp=1024 takes
+~2.9 seconds. Fix: `amdgpu.lockup_timeout=10000,10000` kernel
+parameter. With the timeout fix Mesa 26.1-rc3 lands within ±5 % of
+26.0.6 on FP8 prefill — not an in-driver regression. Credit:
+Pierre-Eric Pelloux-Prayer (Mesa).
+
+### Benchmark comparison (carried forward from v0.3.7 sprints)
+
+Full VulkanForge vs llama.cpp (Vulkan + ROCm) benchmark with power
+measurement at `results/v038_bench_comparison.md`. Headline: VF wins
+decode `tok/s/W` 1.6–1.9 × across every directly comparable 8B
+configuration, both vs llama.cpp ROCm and vs llama.cpp Vulkan.
+
+### RDNA4 ISA Analysis + Mesa RFEs
+
+* Sprint 32B: RDNA4 ISA deep-read identified native FP8 WMMA and
+  `GLOBAL_LOAD_TR_B64` as blocked by RADV (not application-fixable).
+* Sprint 34: confirmed ACO does not emit `GLOBAL_LOAD_TR` for
+  `coopMatLoad` from SSBO. Test artefacts at
+  `tests/sprint34_load_tr/` — public-facing for upstream RFE.
+
+### SPV count
+
+104 → 106 SPIR-V shaders (`mul_mat_vec_fp8_blockwise` +
+`mul_coopmat_fp8_bn32_blockwise`).
+
+### Reports
+
+* `results/v038_sprint35_blockwise_fp8.md` — Sprint 35 decode-only.
+* `results/v038_sprint36_blockwise_gemm.md` — Sprint 36 BN=32 GEMM.
+* `results/v038_bench_comparison.md` — VF vs llama.cpp v0.3.7 bench
+  with power.
+
+### Known limitations
+
+* **14B FP8 decode: 14 tok/s.** Runtime-state interaction confirmed
+  by RGP — not fixable at application layer.
+* **Block-wise FP8 GEMM constraints:** `block_n % BM == 0` and
+  `block_k % BK == 0` (with BM=64, BK=16). Qwen3 and DeepSeek-V3
+  `[128, 128]` satisfy both. Models with smaller blocks would fall
+  back to the GEMV-loop helper.
+* **FP8 SafeTensors models require `--tokenizer-from`** pointing at
+  a GGUF from the same model family — SafeTensors models don't ship
+  the GGUF tokenizer that VF's BPE consumes.
+* **VF bench accepts only Q4_K_M GGUF** — `vulkanforge bench` rejects
+  Q8_0 / other GGUF quants. FP8 SafeTensors are accepted via
+  `--tokenizer-from`.
+* **`VULKANFORGE_ENABLE_FP8=1` still required** to enable the
+  `VK_EXT_shader_float8` device extension at startup.
+
+### Commit trail
+
+```
+Sprint 34B  c979e7e  Organize Mesa LOAD_TR test artefacts
+Sprint 34C  results/v038_bench_comparison.md  VF vs llama.cpp ROCm + Vulkan
+Sprint 34D  results/v038_bench_comparison.md  Vulkan-vs-Vulkan, 15-prompt
+Sprint 35   c41767c  Block-wise FP8 decode (Qwen3-8B-FP8, 64.5 tok/s)
+Sprint 36   1aa6521  Block-wise FP8 GEMM (pp=512: 157 → 770 tok/s, +390 %)
+```
+
+---
+
 ## v0.3.7 — FP8 prefill +113% (2026-05-07)
 
 ### Headline

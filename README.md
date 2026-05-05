@@ -15,6 +15,18 @@ Compute-only — no swapchain, no graphics queues — built directly on `ash 0.3
 
 ## Status
 
+**v0.3.8 — Block-wise FP8 (Qwen3-FP8) — 770 tok/s prefill.** Adds
+support for `weight_block_size: [128, 128]` FP8 quantization, the
+format used by every official Qwen3 / Qwen3.5 / DeepSeek-V3 FP8
+release on HuggingFace. Qwen3-8B-FP8 runs at **64.5 tok/s decode,
+770 tok/s prefill at pp=512**, matching the per-tensor 8B Llama path
+on prefill (770 vs 757) — block-scale fold during the A-tile load
+has no measurable steady-state cost. All three FP8 scaling strategies
+(per-tensor, per-channel, block-wise) auto-detected from SafeTensors
+metadata. Recommended driver: **Mesa 26.1+** with
+`amdgpu.lockup_timeout=10000,10000` for 14B+ models (avoids the 2 s
+compute-timeout on long prefill submits).
+
 **v0.3.7 — FP8 prefill +113%.** Cooperative-matrix tiling rewrite
 of the FP8 GEMM kernel takes 14B Qwen2.5-FP8 prefill at pp=512 from
 159 to 338 tok/s — the first real performance sprint since
@@ -98,18 +110,40 @@ Enable: `VULKANFORGE_KV_FP8=1`. Quality indistinguishable from
 FP16: 15 / 15 coherent on `run_15prompt_bench`, multi-turn KV
 recall verified end-to-end.
 
-### Native FP8 LLM (SafeTensors, v0.3.4)
+### Native FP8 LLM (SafeTensors)
 
-VulkanForge runs `compressed-tensors` per-tensor FP8 LLMs end-to-end
-without unpacking to FP16/BF16. The reference model is
-`neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8`:
+VulkanForge runs FP8 SafeTensors models end-to-end without unpacking
+to FP16/BF16. **All three FP8 scaling strategies** are auto-detected
+from `config.json` + the SafeTensors header — just point at the model
+directory.
 
-| Model + quant                          | VRAM (GPU)  | Decode    | Prefill @ pp=512 | Coherent |
-|----------------------------------------|------------:|----------:|-----------------:|---------:|
-| Meta-Llama-3.1-8B-Instruct-FP8         |   7.48 GiB  | 73 t/s    |    757 t/s       |  15/15   |
-| Qwen2.5-14B-Instruct-FP8 (per-channel) |  13.77 GiB  | 14 t/s    |    338 t/s       |  15/15   |
+| Model                                  | Scaling                  | VRAM (GPU)  | Decode    | Prefill @ pp=512 | Coherent |
+|----------------------------------------|--------------------------|------------:|----------:|-----------------:|---------:|
+| Meta-Llama-3.1-8B-Instruct-FP8         | per-tensor               |   7.48 GiB  |  69 t/s   |  757 t/s         |  15/15   |
+| Qwen2.5-14B-Instruct-FP8               | per-channel              |  13.77 GiB  |  14 t/s   |  338 t/s         |  15/15   |
+| **Qwen3-8B-FP8** (new in v0.3.8)       | **block-wise [128,128]** |  **8.5 GiB** | **64 t/s** | **770 t/s**    |    ✓     |
 
-(Mesa RADV 26.0.6, RX 9070 XT. Decode median of 3, prefill median of 3.)
+Block-wise FP8 (`weight_block_size: [128, 128]`) is the format used
+by every official Qwen3 / Qwen3.5 / DeepSeek-V3 FP8 release on
+HuggingFace. (Mesa 26.1-rc3, RX 9070 XT. Decode median of 3, prefill
+median of 3.)
+
+#### Quick start — Qwen3-8B-FP8
+
+```bash
+# Download the model (HF CLI v0.36+: the verb is `hf download`)
+hf download Qwen/Qwen3-8B-FP8 --local-dir ~/models/Qwen3-8B-FP8
+
+# Tokenizer comes from the matching GGUF (FP8 SafeTensors don't ship
+# the BPE that VF consumes). Any Qwen3 GGUF works.
+hf download Qwen/Qwen3-8B-GGUF qwen3-8b-q4_k_m.gguf \
+  --local-dir ~/models
+
+VULKANFORGE_ENABLE_FP8=1 vulkanforge chat \
+  --model ~/models/Qwen3-8B-FP8/ \
+  --tokenizer-from ~/models/qwen3-8b-q4_k_m.gguf \
+  --temperature 0.6
+```
 
 ### FP8 Performance Notes
 
@@ -170,8 +204,12 @@ VULKANFORGE_ENABLE_FP8=1 vulkanforge chat \
 Per-channel FP8 (`strategy: "channel"`, used by `larryvrh/Qwen2.5-14B-Instruct-FP8`
 and other community Qwen2.5-FP8 builds) is **supported as of v0.3.5**
 via SSBO scale-vector kernels and dedicated dispatch resources for
-the per-channel GEMV path (Sprint 24-Inline). Block-wise FP8 (Qwen3-FP8
-format, block_size=128) is not yet supported.
+the per-channel GEMV path (Sprint 24-Inline). **Block-wise FP8**
+(`weight_block_size: [128, 128]`, used by Qwen3-FP8 / DeepSeek-V3-FP8
+and the Qwen3.5 family) is **supported as of v0.3.8** via a dedicated
+GEMV (`mul_mat_vec_fp8_blockwise.comp`) and a BN=32 cooperative-matrix
+GEMM (`mul_coopmat_fp8_bn32_blockwise.comp`) that folds the per-block
+scale into the A-tile load (Sprints 35 + 36).
 
 ### Multi-architecture support
 
@@ -184,13 +222,41 @@ format, block_size=128) is not yet supported.
 | DeepSeek-R1-Distill-Llama-8B Q4_K_M    | llama / GGUF        | gpt2 / llama-bpe | DeepSeek-R1   | ✅           |
 | Mistral-7B-Instruct-v0.3 Q4_K_M        | llama / GGUF        | llama (SPM)      | Mistral       | ✅           |
 | Qwen2.5-14B-Instruct-FP8 (per-channel) | qwen2 / SafeTensors | gpt2 / qwen2     | ChatML        | ✅ native FP8 (new in v0.3.5) |
+| Qwen3-8B-FP8 (block-wise [128,128])    | qwen3 / SafeTensors | gpt2 / qwen2     | ChatML        | ✅ native FP8 (new in v0.3.8) |
 
-**103 SPIR-V pipelines, 37 lib tests + 40+ GPU correctness tests,
+**106 SPIR-V pipelines, 37 lib tests + 40+ GPU correctness tests,
 15 / 15 prompts coherent on Qwen3-8B Q4_K_M, Llama-3.1-8B-FP8,
-and Qwen2.5-14B-FP8.** See `INSTALL.md` for setup.
+and Qwen2.5-14B-FP8; Qwen3-8B-FP8 coherent on the `<think>`-mode
+smoke set.** See `INSTALL.md` for setup.
+
+### Power efficiency vs llama.cpp on RX 9070 XT
+
+GPU power sampled at 10 Hz from `/sys/class/drm/card1/device/hwmon/.../power1_average`,
+steady-state average after warmup; full numbers in
+`results/v038_bench_comparison.md`.
+
+| Config              | VF tok/s | VF Avg W | llama.cpp tok/s | llama.cpp Avg W | VF tok/s/W | llama.cpp tok/s/W |
+|---------------------|---------:|---------:|----------------:|----------------:|-----------:|------------------:|
+| 8B Q4_K_M (decode)  |     121  |    209 W |       94 (ROCm) |          310 W  |   **0.58** |              0.30 |
+|                     |          |          |       114 (Vk)  |          312 W  |            |              0.37 |
+| 8B FP8 (decode)     |      69  |    135 W |       64 (Q8_0 ROCm) |     246 W  |   **0.51** |              0.26 |
+|                     |          |          |       73 (Q8_0 Vk)   |     251 W  |            |              0.29 |
+| Qwen3-8B FP8 (decode, v0.3.8) | 64 |   156 W |    n/a*         |    n/a          |   **0.41** |              n/a  |
+
+Across every directly comparable 8B config, VF wins decode `tok/s/W`
+by 1.6× to 1.9×. Prefill: llama.cpp ROCm wins 6× at 8B-Q8_0 (rocBLAS
+GEMM is hard to beat at this shape); VF block-wise FP8 prefill
+(770 t/s) is in the same range as VF per-tensor 8B FP8 (757 t/s).
+
+\* Qwen3-FP8 has no llama.cpp equivalent — block-wise FP8 SafeTensors
+loading isn't supported by llama.cpp.
 
 ### What VulkanForge does that llama.cpp Vulkan doesn't
 
+- **Block-wise FP8 SafeTensors models** (new in v0.3.8) — Qwen3-FP8 /
+  Qwen3.5-FP8 / DeepSeek-V3-FP8 with `weight_block_size: [128, 128]`,
+  loaded directly without any conversion step. llama.cpp doesn't load
+  these formats at all.
 - **First 14B FP8 LLM on a 16 GiB consumer GPU** (new in v0.3.5)
   — Qwen2.5-14B-Instruct-FP8, 13.77 GiB VRAM, 14.1 tok/s decode,
   15/15 coherent. Per-channel scale-vector kernels and Qwen2
@@ -341,8 +407,10 @@ MSRV is **Rust 1.85** (edition 2024). Build dependencies require a working
 `shaderc` install (the `shaderc-sys` crate); on Arch / CachyOS this is
 `shaderc` from the official repos. `VK_KHR_cooperative_matrix` must be
 advertised by the driver — RADV gfx1201 with Mesa 26.0.5+ qualifies.
-Mesa 26.1-rc3 is functionally fine (Sprint 13B) but does not improve
-performance vs 26.0.6; recommended driver remains **Mesa 26.0.6**.
+For 14B+ models on long prefill, **recommended: Mesa 26.1+ with
+`amdgpu.lockup_timeout=10000,10000` on the kernel command line** —
+the default 2 s amdgpu compute timeout fires on `pp=1024` 14B prefill
+submits (~2.9 s wall). Mesa 26.0.6 also works at smaller pp.
 
 ## Run
 
