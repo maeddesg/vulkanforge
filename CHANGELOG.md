@@ -1,5 +1,65 @@
 # Changelog
 
+## v0.3.14 — Multi-turn REPL on the SafeTensors path (2026-05-10)
+
+`run_chat_safetensors` was a single-shot path inherited from
+Sprint 20-M3: it read one prompt (from `VF_PROMPT` or the first
+stdin line), generated one reply, and exited. The GGUF path
+(`run_chat`) has had a real multi-turn REPL via `ChatSession` since
+v0.1.0; the SafeTensors path lagged behind.
+
+v0.3.14 brings parity. After rendering the reply, `vulkanforge
+chat --model <fp8-dir>/` returns to the `> ` prompt and waits for
+the next turn, with KV cache state preserved across turns.
+
+### Behavior
+
+* **`VF_PROMPT="..."` mode** unchanged — runs one turn and exits
+  (preserves CI / regression-test semantics).
+* **Interactive (no `VF_PROMPT`)** — `rustyline` REPL with the
+  same slash-commands as the GGUF path:
+    * `/quit` (or `/q` / `/exit`) — exit cleanly.
+    * `/reset` — clear KV cache, restart at turn 1.
+    * `/think` — toggle the `<think>...</think>` filter.
+    * `/help` — list commands.
+* Turn 0 renders via `template.render_first_turn` (full
+  system + user + assistant priming). Turn ≥ 1 renders via
+  `template.render_continuation` (just the boundary specials +
+  user + assistant priming) — same convention as the GGUF
+  `ChatSession`.
+* Context overflow is reported with a hint to `/reset` instead of
+  panicking.
+
+### Smoke
+
+```bash
+$ printf '%s\n' "Hi." "What is 2+2?" "/quit" | \
+    VF_FP8=auto vulkanforge chat --model ~/models/Qwen3-8B-FP8/
+…
+[21 prompt, 10 gen, prefill 306 t/s, decode 62.4 t/s]   # turn 1
+[17 prompt, 10 gen, prefill 367 t/s, decode 60.8 t/s]   # turn 2 (continuation)
+```
+
+Turn 2's 17 prompt tokens vs turn 1's 21 confirms the
+continuation-form template fired (no system re-render, no extra
+BOS).
+
+### What changed
+
+* `src/main.rs` — `run_chat_safetensors` reuses the rustyline +
+  command-dispatch shape from `run_chat`. KV cache position is
+  tracked manually via `current_pos` / `turn_count` (the
+  SafeTensors path doesn't go through `ChatSession` because the
+  latter hard-wires `EmbeddingSource::Gguf` — refactoring
+  `ChatSession` to take an `EmbeddingSource` would be a larger
+  change for no benefit in this release). Optional
+  `<think>` filter wraps the per-token callback the same way
+  `ChatSession::send_streaming` does.
+
+48 lib tests pass (no test-surface change).
+
+---
+
 ## v0.3.13 — `tokenizer.json` auto-load from model dir (2026-05-10)
 
 ### Headline

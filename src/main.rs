@@ -559,19 +559,6 @@ fn run_chat_safetensors(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>
     println!("  Pipelines: {}", registry.count());
     println!();
 
-    let user_prompt = std::env::var("VF_PROMPT").ok().unwrap_or_else(|| {
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line).ok();
-        line.trim().to_string()
-    });
-    if user_prompt.is_empty() {
-        return Err("empty prompt — set VF_PROMPT or pipe a line".into());
-    }
-    println!("> {user_prompt}");
-    println!();
-
-    let prompt_tokens = template.render_first_turn(&tokenizer, &args.system, &user_prompt);
-
     let cfg_g = GenerateConfig {
         max_tokens: args.max_tokens,
         print_stream: false,
@@ -584,12 +571,6 @@ fn run_chat_safetensors(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>
             seed: args.seed,
         },
     };
-
-    let mut on_token = |_id: u32, raw: &str| {
-        print!("{raw}");
-        let _ = std::io::stdout().flush();
-    };
-    forward.kv_cache.reset();
     // Sprint 20-Wire — FP8 GEMM is now wired through
     // `dispatch_layer_batch` (the 7 layer GEMM call sites branch on
     // `is_fp8_layer_weight`), so SafeTensors prefill no longer needs
@@ -599,25 +580,146 @@ fn run_chat_safetensors(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>
     let force_per_token_prefill = std::env::var("VULKANFORGE_FORCE_PER_TOKEN")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    let r = generate_from_tokens(
-        &mut forward, &dev, &registry, &cmd_ctx, &model,
-        EmbeddingSource::Host(&host_embed),
-        &cfg, &tokenizer,
-        &prompt_tokens, 0, &cfg_g,
-        force_per_token_prefill,
-        &mut on_token,
-    )?;
-    println!();
-    println!();
-    println!(
-        "  [{} prompt, {} gen, prefill {:.1} ms ({:.1} tok/s), decode {:.1} tok/s{}]",
-        r.prompt_tokens,
-        r.generated_tokens,
-        r.prefill_time.as_secs_f64() * 1000.0,
-        r.prompt_tokens as f64 / r.prefill_time.as_secs_f64().max(1e-6),
-        r.generated_tokens as f64 / r.decode_time.as_secs_f64().max(1e-6),
-        if r.stopped_on_eos { "" } else { ", capped" },
-    );
+
+    forward.kv_cache.reset();
+    let mut current_pos: u32 = 0;
+    let mut turn_count: u32 = 0;
+    let max_seq = max_context;
+    let mut think_filter = args.think_filter;
+
+    // v0.3.13B — multi-turn REPL on the SafeTensors path. Mirrors
+    // the GGUF `run_chat` loop: VF_PROMPT runs one turn and exits
+    // (preserves CI / smoke semantics); otherwise rustyline drives
+    // an interactive `> ` prompt with /quit, /reset, /help, /think.
+    // KV cache state carries across turns; the chat-template's
+    // `render_continuation` emits the continuation form for turn ≥ 1.
+    let run_turn = |forward: &mut Forward,
+                        user_prompt: &str,
+                        current_pos: &mut u32,
+                        turn_count: &mut u32,
+                        think_filter: bool|
+     -> Result<bool, Box<dyn std::error::Error>> {
+        let prefill = if *turn_count == 0 {
+            template.render_first_turn(&tokenizer, &args.system, user_prompt)
+        } else {
+            template.render_continuation(&tokenizer, user_prompt)
+        };
+        let need = prefill.len() as u32 + cfg_g.max_tokens;
+        if *current_pos + need > max_seq {
+            eprintln!(
+                "\n  [context overflow: {} + {} > {}]",
+                *current_pos, need, max_seq,
+            );
+            eprintln!("  Use /reset to start a new conversation.");
+            return Ok(false);
+        }
+        // Optional `<think>...</think>` filter — reuses the same
+        // streaming filter the GGUF ChatSession applies.
+        let mut filter = if think_filter {
+            Some(vulkanforge::backend::vulkan::decode::ThinkFilter::new())
+        } else {
+            None
+        };
+        let mut on_token = |_id: u32, raw: &str| {
+            if let Some(f) = filter.as_mut() {
+                let visible = f.push(raw);
+                if !visible.is_empty() {
+                    print!("{visible}");
+                    let _ = std::io::stdout().flush();
+                }
+            } else {
+                print!("{raw}");
+                let _ = std::io::stdout().flush();
+            }
+        };
+        let r = generate_from_tokens(
+            forward, &dev, &registry, &cmd_ctx, &model,
+            EmbeddingSource::Host(&host_embed),
+            &cfg, &tokenizer,
+            &prefill, *current_pos, &cfg_g,
+            force_per_token_prefill,
+            &mut on_token,
+        )?;
+        if let Some(f) = filter.as_mut() {
+            let tail = f.flush();
+            if !tail.is_empty() {
+                print!("{tail}");
+                let _ = std::io::stdout().flush();
+            }
+        }
+        println!();
+        println!();
+        println!(
+            "  [{} prompt, {} gen, prefill {:.1} ms ({:.1} tok/s), decode {:.1} tok/s{}]",
+            r.prompt_tokens,
+            r.generated_tokens,
+            r.prefill_time.as_secs_f64() * 1000.0,
+            r.prompt_tokens as f64 / r.prefill_time.as_secs_f64().max(1e-6),
+            r.generated_tokens as f64 / r.decode_time.as_secs_f64().max(1e-6),
+            if r.stopped_on_eos { "" } else { ", capped" },
+        );
+        *current_pos += r.prompt_tokens as u32 + r.generated_tokens as u32;
+        *turn_count += 1;
+        Ok(true)
+    };
+
+    if let Ok(prompt) = std::env::var("VF_PROMPT") {
+        if !prompt.trim().is_empty() {
+            println!("> {prompt}");
+            println!();
+            run_turn(&mut forward, &prompt, &mut current_pos, &mut turn_count, think_filter)?;
+        }
+    } else {
+        println!("  Type /help for commands, /quit to exit.");
+        let mut rl = rustyline::DefaultEditor::new()?;
+        loop {
+            println!();
+            let line = match rl.readline("> ") {
+                Ok(s) => {
+                    if !s.trim().is_empty() {
+                        let _ = rl.add_history_entry(&s);
+                    }
+                    s
+                }
+                Err(rustyline::error::ReadlineError::Eof)
+                | Err(rustyline::error::ReadlineError::Interrupted) => break,
+                Err(e) => {
+                    eprintln!("  [readline error: {e}]");
+                    break;
+                }
+            };
+            let trimmed = line.trim();
+            match trimmed {
+                "" => continue,
+                "/quit" | "/q" | "/exit" => break,
+                "/help" | "/h" => {
+                    println!("  /reset     clear KV cache + history");
+                    println!("  /think     toggle <think> filter (current: {})",
+                             if think_filter { "on" } else { "off" });
+                    println!("  /quit      exit");
+                    println!("  /help      this list");
+                }
+                "/reset" => {
+                    forward.kv_cache.reset();
+                    current_pos = 0;
+                    turn_count = 0;
+                    println!("  (context cleared)");
+                }
+                "/think" => {
+                    think_filter = !think_filter;
+                    println!("  think-filter: {}", if think_filter { "on" } else { "off" });
+                }
+                _ => {
+                    println!();
+                    if let Err(e) = run_turn(
+                        &mut forward, trimmed, &mut current_pos, &mut turn_count, think_filter,
+                    ) {
+                        eprintln!("\n  [error: {e}]");
+                    }
+                }
+            }
+        }
+    }
 
     forward.destroy(&dev.device, &mut allocator);
     cmd_ctx.destroy(&dev.device);
