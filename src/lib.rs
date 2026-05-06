@@ -27,5 +27,6 @@
 )]
 
 pub mod backend;
+pub mod cpu;
 pub mod safetensors;
 pub mod hf_config;

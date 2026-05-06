@@ -13,6 +13,7 @@ fancy-regex = "0.13"
 gpu-allocator = "0.27"
 half = "2"
 memmap2 = "0.9"
+rayon = "1"
 rustyline = "15"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
