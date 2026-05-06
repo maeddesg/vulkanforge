@@ -2,7 +2,8 @@
 *.spv
 !tests/sprint34_load_tr/*.spv
 captures/
-.claude/
+.claude/*
+!.claude/CLAUDE.md
 VP_VULKANINFO_*.json
 docs/vulkanforge_*
 docs/vulkaninfo_*

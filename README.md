@@ -146,3 +146,8 @@ and a single-shot mode via `VF_PROMPT="..."`.
 For the full architectural notes and the v0.2.x optimization audit
 (nine falsified hypotheses against the residual gap to llama.cpp),
 see [CHANGELOG.md](CHANGELOG.md).
+
+## License
+
+VulkanForge is licensed under the
+[GNU General Public License v3.0](LICENSE).
