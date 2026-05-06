@@ -1,5 +1,103 @@
 # Changelog
 
+## v0.3.11 — Llama-FP8 activation-range fix (2026-05-10)
+
+### Headline
+
+**Llama-3.1-8B-FP8 native WMMA: 13/15 → 15/15 coherent on the
+deterministic 15-prompt suite.** Sprint 42B documented two
+code-generation prompts (#5 Go REST API, #11 distributed message
+queue) collapsing to `!!!!!!` output on the per-tensor FP8 path.
+Root cause was the same activation-range overflow that Sprint 38
+Part 2 hit on block-wise FP8: a naive `floate4m3_t(act_fp32)`
+cast clips post-RMS-norm activations larger than ±448 to FP8 E4M3
+saturation, NaN propagates through the rest of the layer chain,
+and the sampler's argmax collapses to one repeating token.
+
+This release ports the Sprint 39 fix (per-block dynamic activation
+absmax + rescale before the FP8 cast) to the per-tensor native
+WMMA path. The K-loop now steps in `PT_K_BLOCK = 128` granularity:
+each outer step computes a per-block activation absmax via
+`subgroupMax` + LDS reduction, derives `act_scale = max(absmax /
+448, eps)`, scales activations into FP8 range during the B-tile
+cast, and folds `partial_acc * act_scale` into the running
+accumulator. The per-row weight scale stays at output-write time
+unchanged.
+
+### Coherence (15-prompt suite, all six configurations)
+
+| Configuration                                    | v0.3.10 | v0.3.11 |
+|--------------------------------------------------|--------:|--------:|
+| Qwen3-8B Q4_K_M GGUF                             |   15/15 |   15/15 |
+| Llama-3.1-8B Q4_K_M GGUF                         |   15/15 |   15/15 |
+| Qwen3-8B-FP8 native WMMA + activation quant      |   15/15 |   15/15 |
+| Qwen2.5-14B-FP8 native WMMA + CPU `lm_head`      |   15/15 |   15/15 |
+| **Llama-3.1-8B-FP8 native WMMA**                 | **13/15**| **15/15** |
+| **Llama-3.1-8B-FP8 native WMMA + CPU `lm_head`** | **13/15**| **15/15** |
+
+**90 / 90 = 100 % coherent across all six production paths.**
+
+### Performance trade
+
+| Model               | pp=512 v0.3.10 | pp=512 v0.3.11 | Δ      |
+|---------------------|---------------:|---------------:|-------:|
+| Llama-3.1-8B-FP8    |       1197 t/s |       1130 t/s | −5.6 % |
+| Qwen2.5-14B-FP8     |        450 t/s |        428 t/s | −4.9 % |
+| Decode (both)       |     unchanged  |     unchanged  | ±1 %   |
+
+The 4.9–5.6 % prefill overhead is the cost of the absmax pre-scan
+(8 reads/thread × 1 `subgroupMax` × 1 LDS reduce × 1 barrier per
+PT_K_BLOCK). It matches the Sprint 39 forecast of "5–8 %
+overhead". Decode is unchanged because `lm_head` is GEMV (no
+WMMA path) and the act-quant only fires inside the `coopmat` GEMM.
+
+The same trade was made on Sprint 39 (Qwen3 block-wise: 1218
+→ 1118 = −8 % for `!!!!!` → coherent). Earlier per-tensor numbers
+(`1197 t/s pp=512`) were technically faster but produced garbage
+on 2/15 prompts; the Sprint 42C number is what you actually want
+to advertise.
+
+### What changed
+
+* `vk_shaders/mul_coopmat_fp8_native_bn32.comp` — restructured
+  K-loop into outer (kb in `PT_K_BLOCK = 128` increments) +
+  inner (8 WMMA steps), added `wave_maxes[NUM_SG]` LDS, added
+  the activation pre-scan + rescale + clamp on B-tile load,
+  added a `partial_acc * act_scale` fold per outer step. ~70 LOC
+  delta. Pure shader change — no Rust-side surface change, no
+  pipeline-layout change, no descriptor-set change.
+* New extensions on the shader: `GL_KHR_shader_subgroup_arithmetic`,
+  `GL_KHR_shader_subgroup_vote`. Both already used by the
+  block-wise sibling shader.
+
+No code changes elsewhere. 45 lib tests still pass.
+
+### Deferred from the Sprint 42C brief
+
+This release ships only the activation-range fix from the
+Sprint 42C brief. The other items in the brief are convenience
+features that don't affect correctness; they're left for a
+follow-up release:
+
+* **`VF_FP8=auto` unified env variable** — auto-detect FP8 model,
+  Mesa version, AVX-512, model size, and pick `VF_FP8_NATIVE_WMMA`
+  / `VF_CPU_LM_HEAD` automatically.
+* **`tokenizer.json` auto-load from model dir** — eliminate the
+  `--tokenizer-from <gguf>` requirement for FP8 SafeTensors models.
+
+The existing flags (`VULKANFORGE_ENABLE_FP8`,
+`VF_FP8_NATIVE_WMMA`, `VF_CPU_LM_HEAD`) and `--tokenizer-from`
+work exactly as in v0.3.10. The fix in v0.3.11 is a drop-in;
+no user action required.
+
+### Known limitations now closed
+
+The "Llama-3.1-8B-FP8 (per-tensor) — long code-generation edge
+case" entry from the v0.3.10 changelog is **resolved**. The
+`README.md` Limitations section is updated.
+
+---
+
 ## v0.3.10 — CPU `lm_head` offload + AVX-512 Q6_K (2026-05-10)
 
 ### Headline

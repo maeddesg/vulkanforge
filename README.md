@@ -34,9 +34,10 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
 - **2× better power efficiency** (tok/s/W) on decode vs llama.cpp.
 - **Llama-3, Qwen2.5, Qwen3, Mistral, DeepSeek-R1-Distill** model
   families covered (see [docs/MODELS.md](docs/MODELS.md)).
-- **15 / 15 coherent on Qwen3-8B (GGUF + FP8) and Qwen2.5-14B-FP8**
-  on the deterministic 15-prompt suite; 86 / 90 (95.5 %) across
-  six full configurations (see [Quality](#quality-15-prompt-benchmark) below).
+- **90 / 90 coherent (100 %)** on the deterministic 15-prompt suite
+  across all six production configurations — GGUF, FP8 native WMMA
+  (per-tensor / per-channel / block-wise), and CPU `lm_head` offload
+  (see [Quality](#quality-15-prompt-benchmark) below).
 
 ## Quick start
 
@@ -93,8 +94,8 @@ RADV unless noted. Full tables with power data and methodology in
 
 | Model            | Scale type           | VulkanForge | vLLM 0.20.1 ROCm* |
 |------------------|----------------------|------------:|------------------:|
-| Llama-3.1-8B FP8 | per-tensor           |        1197 |             14757 |
-| Qwen2.5-14B FP8  | per-channel          |         450 |             (n/a) |
+| Llama-3.1-8B FP8 | per-tensor           |        1130 |             14757 |
+| Qwen2.5-14B FP8  | per-channel          |         428 |             (n/a) |
 | Qwen3-8B FP8     | block-wise [128,128] |        1118 |              2776 |
 
 \* vLLM 0.20.1 is **not optimized for gfx1201** — model load logs
@@ -144,25 +145,25 @@ on any Mesa 26.0.6+ with no special requirements.
 
 ## Quality (15-prompt benchmark)
 
-Sprint 42B ran the deterministic 15-prompt suite across all six
-production paths (greedy decoding, temperature = 0):
+The deterministic 15-prompt suite (greedy decoding, temperature = 0)
+on all six production paths:
 
-| Configuration                                    | Coherent | Median decode |
-|--------------------------------------------------|---------:|--------------:|
-| Qwen3-8B Q4_K_M GGUF                             |  **15/15** | 109 tok/s |
-| Llama-3.1-8B Q4_K_M GGUF                         |  **15/15** | 112 tok/s |
-| Qwen3-8B-FP8 native WMMA + activation quant      |  **15/15** |  62 tok/s |
-| Qwen2.5-14B-FP8 native WMMA + CPU `lm_head`      |  **15/15** |  17 tok/s |
-| Llama-3.1-8B-FP8 native WMMA                     |    13/15 |  70 tok/s |
-| Llama-3.1-8B-FP8 native WMMA + CPU `lm_head`     |    13/15 |  46 tok/s |
+| Configuration                                    | Coherent   | Median decode |
+|--------------------------------------------------|-----------:|--------------:|
+| Qwen3-8B Q4_K_M GGUF                             |  **15/15** |     109 tok/s |
+| Llama-3.1-8B Q4_K_M GGUF                         |  **15/15** |     112 tok/s |
+| Qwen3-8B-FP8 native WMMA + activation quant      |  **15/15** |      62 tok/s |
+| Qwen2.5-14B-FP8 native WMMA + CPU `lm_head`      |  **15/15** |      17 tok/s |
+| Llama-3.1-8B-FP8 native WMMA                     |  **15/15** |      70 tok/s |
+| Llama-3.1-8B-FP8 native WMMA + CPU `lm_head`     |  **15/15** |      46 tok/s |
 
-**86 / 90 prompts (95.5 %) coherent across the full suite.** Known
-limitation on Llama-3.1-8B-FP8 (per-tensor): two long
-code-generation prompts (Go REST API, distributed message-queue
-design) collapse to `!` output, with or without CPU offload — a
-narrow activation-range edge case in the per-tensor FFN GEMM.
-Block-wise (Qwen3) and per-channel (Qwen2.5-14B) FP8 paths are
-unaffected.
+**90 / 90 prompts (100 %) coherent across the full suite.**
+v0.3.11 closes the v0.3.10 Llama-FP8 per-tensor edge case (2/15
+code-gen prompts collapsing to `!`) by porting the Sprint 39
+per-block activation-absmax + rescale pattern to the per-tensor
+WMMA path. The fix costs ~5 % on prefill (1197 → 1130 tok/s on
+8B-FP8 pp=512) — an unavoidable trade for keeping post-RMS-norm
+activations inside the FP8 E4M3 ±448 envelope.
 
 ## Driver requirements
 
@@ -206,12 +207,6 @@ and a single-shot mode via `VF_PROMPT="..."`.
   does not bench.
 - Mistral / Llama-2 SPM tokenizer not yet wired for FP8 SafeTensors
   (only `gpt2` tokenizer family).
-- **Llama-3.1-8B-FP8 (per-tensor) — long code-generation edge case:**
-  2 of 15 prompts on the deterministic suite (Go REST API,
-  distributed message-queue design) collapse to `!` output. The
-  failure is in the GPU FFN path, not lm_head — switching to CPU
-  lm_head doesn't fix it. Other models (Qwen3 block-wise,
-  Qwen2.5-14B per-channel) are unaffected. Investigation pending.
 
 For the full architectural notes and the v0.2.x optimization audit
 (nine falsified hypotheses against the residual gap to llama.cpp),

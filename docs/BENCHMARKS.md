@@ -141,7 +141,7 @@ v0.3.9 native FP8 WMMA — the cleaner signal.
 |----------------|------------------|--------------|--------:|------:|
 | vLLM 0.20.1    | 8B Llama FP8     | per-tensor   | **14757** | 147 |
 | vLLM 0.20.1    | 8B Qwen3 FP8     | block-wise   |    2776 | 185 |
-| VF v0.3.9      | 8B Llama FP8     | per-tensor   |    1197 | 204 |
+| VF v0.3.11     | 8B Llama FP8     | per-tensor   |    1130 | 204 |
 | VF v0.3.9      | 8B Qwen3 FP8     | block-wise   |    1118 | 273 |
 
 **vLLM wins prefill 2.5× (block-wise) to 12× (per-tensor).** ROCm's
@@ -232,14 +232,17 @@ Mesa 26.1+. Mesa 26.0.x silently runs the BF16 conversion path.
 
 | Model                    | Scale type           | Mesa 26.0.x / no flag | Mesa 26.1+ native | Δ        |
 |--------------------------|----------------------|----------------------:|------------------:|---------:|
-| Llama-3.1-8B-FP8         | per-tensor           |                   757 |          **1197** | **+58 %** |
-| Qwen2.5-14B-FP8          | per-channel          |                   325 |           **450** | **+39 %** |
+| Llama-3.1-8B-FP8         | per-tensor           |                   757 |          **1130** | **+49 %** |
+| Qwen2.5-14B-FP8          | per-channel          |                   325 |           **428** | **+32 %** |
 | Qwen3-8B-FP8             | block-wise [128,128] |                   770 |          **1118** | **+45 %** |
 
-The block-wise win required a per-k_block dynamic activation absmax
-(Sprint 39) — the naive FP32→FP8 cast lost too much dynamic range
-against block-wise-calibrated weights. See
-`results/v039_sprint39_blockwise_act_quant.md` for the algorithm + ISA.
+All three FP8 paths use a per-k_block dynamic activation absmax
+(`PT_K_BLOCK = 128`) to keep post-RMS-norm activations inside the
+FP8 E4M3 ±448 envelope before the `floate4m3_t` cast. The pattern
+landed first for block-wise (Sprint 39) and was extended to
+per-tensor / per-channel in v0.3.11 to fix a Llama-FP8 long
+code-generation collapse — see `results/v039_sprint39_blockwise_act_quant.md`
+for the algorithm and CHANGELOG.md v0.3.11 for the per-tensor port.
 
 ---
 
@@ -257,11 +260,16 @@ tokenizer robustness). Greedy decoding (`temperature = 0`),
 | Llama-3.1-8B Q4_K_M GGUF                            |   **15/15** |  111.7 tok/s | chat driver |
 | Qwen3-8B-FP8 native WMMA + activation quant         |   **15/15** |   61.5 tok/s | block-wise + Sprint 39 act-quant |
 | Qwen2.5-14B-FP8 native WMMA + CPU `lm_head`         |   **15/15** |   17.5 tok/s | per-channel + Sprint 41B AVX |
-| Llama-3.1-8B-FP8 native WMMA                        |     13/15 |   69.5 tok/s | code-gen edge case (#5, #11) |
-| Llama-3.1-8B-FP8 native WMMA + CPU `lm_head`        |     13/15 |   46.1 tok/s | same prompts as above (lm_head not the cause) |
+| Llama-3.1-8B-FP8 native WMMA                        |   **15/15** |   69.6 tok/s | per-tensor + v0.3.11 act-quant |
+| Llama-3.1-8B-FP8 native WMMA + CPU `lm_head`        |   **15/15** |   46.1 tok/s | per-tensor + v0.3.11 act-quant + AVX |
 
-**Total: 86 / 90 prompts coherent (95.5 %).** All gates ≥ 12/15
-cleared.
+**Total: 90 / 90 prompts coherent (100 %).** v0.3.11 closes the
+v0.3.10 Llama-FP8 per-tensor activation-range edge case (prompts
+#5 Go REST API, #11 distributed message-queue design) by porting
+the Sprint 39 per-block absmax + rescale pattern to the per-tensor
+WMMA shader. Cost: ~5 % prefill on Llama-FP8 (1197 → 1130 tok/s
+at pp=512), zero decode impact. See
+[CHANGELOG.md](../CHANGELOG.md) v0.3.11 for the math.
 
 ### Category pass rate
 
