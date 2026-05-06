@@ -9,5 +9,7 @@
 //! lm_head to finish before sampling. Phase B (pipeline overlap)
 //! is a future sprint.
 
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+pub mod avx512_gemv;
 pub mod lm_head;
 pub mod q6k;

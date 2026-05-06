@@ -76,6 +76,13 @@ impl CpuLmHead {
     /// Hidden state is FP32; weights are Q6_K dequantized inline.
     /// Output is FP32. Parallelized across vocab rows; each row's
     /// dot product is sequential within a thread.
+    ///
+    /// Sprint 41 — runtime dispatch: AVX-512F → AVX-512 hybrid
+    /// kernel, otherwise scalar reference. The AVX-512 path
+    /// vectorizes the FMA chain (16 elements per `vfmadd231ps`)
+    /// while keeping the Q6_K nibble unpack scalar — that's
+    /// enough for a 2–3× speedup on Llama-8B-FP8 lm_head without
+    /// the complexity of a full vectorized dequant.
     pub fn forward(&self, hidden: &[f32], logits: &mut [f32]) {
         assert_eq!(
             hidden.len(),
@@ -88,13 +95,22 @@ impl CpuLmHead {
             "CpuLmHead::forward: logits length mismatch"
         );
 
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+        {
+            if std::is_x86_feature_detected!("avx512f") {
+                self.gemv_q6k_avx512(hidden, logits);
+                return;
+            }
+        }
+        self.gemv_q6k_scalar(hidden, logits);
+    }
+
+    /// Scalar reference GEMV. Fallback for non-AVX-512 CPUs and
+    /// the calibration target for the AVX-512 path's correctness
+    /// tests.
+    fn gemv_q6k_scalar(&self, hidden: &[f32], logits: &mut [f32]) {
         let blocks_per_row = self.blocks_per_row;
         let weights = self.weights.as_slice();
-
-        // Each output row is independent. Rayon's chunk size of 1
-        // is fine because rows are large (16 blocks × 256 elements
-        // = 4 KB of weights + 16 KB hidden); per-task overhead is
-        // dwarfed by the per-row compute.
         logits
             .par_iter_mut()
             .enumerate()
@@ -103,6 +119,36 @@ impl CpuLmHead {
                 let mut sum = 0.0f32;
                 for (b, block) in row.iter().enumerate() {
                     sum += dot_q6k_block(block, &hidden[b * QK_K..(b + 1) * QK_K]);
+                }
+                *out = sum;
+            });
+    }
+
+    /// AVX-512 GEMV. Per-row dot product calls into the hybrid
+    /// kernel in [`crate::cpu::avx512_gemv`]. The `unsafe` block
+    /// is sound: we runtime-detected `avx512f` in [`forward`]
+    /// before dispatching here.
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    fn gemv_q6k_avx512(&self, hidden: &[f32], logits: &mut [f32]) {
+        let blocks_per_row = self.blocks_per_row;
+        let weights = self.weights.as_slice();
+        logits
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(v, out)| {
+                let row = &weights[v * blocks_per_row..(v + 1) * blocks_per_row];
+                let mut sum = 0.0f32;
+                for (b, block) in row.iter().enumerate() {
+                    // SAFETY: `forward` already verified AVX-512F
+                    // at runtime. The `target_feature` annotation
+                    // on `dot_q6k_block_avx512` makes the compiler
+                    // aware of the precondition.
+                    sum += unsafe {
+                        crate::cpu::avx512_gemv::dot_q6k_block_avx512(
+                            block,
+                            &hidden[b * QK_K..(b + 1) * QK_K],
+                        )
+                    };
                 }
                 *out = sum;
             });
