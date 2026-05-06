@@ -1,5 +1,123 @@
 # Changelog
 
+## v0.3.10 — CPU `lm_head` offload + AVX-512 Q6_K (2026-05-10)
+
+### Headline
+
+**CPU `lm_head` offload** — vocabulary projection moves to CPU
+RAM as Q6_K. Hand-tuned AVX-512 GEMV (full vectorized dequant +
+FMA on Zen 4) drops the lookup off the GPU's VRAM bus and frees
+~970 MB. On 14B FP8 the CPU path **beats the pure-GPU baseline
+by 32 %** (17.8 vs 13.5 tok/s); on 8B FP8 it's a 32 % decode
+penalty traded for the VRAM saving.
+
+Opt-in via `VF_CPU_LM_HEAD=1`. Three runtime tiers: full AVX-512
+(Sprint 41B) → AVX-512 hybrid (Sprint 41A) → scalar reference
+(Sprint 40 P2). Auto-selected via `is_x86_feature_detected!`.
+
+### CPU `lm_head` performance (Zen 4 7945HX, DDR5-5600 dual-channel)
+
+| Model               | GPU `lm_head` | CPU `lm_head` (AVX-512 full) | VRAM saved | tok/s/W gain |
+|---------------------|--------------:|-----------------------------:|-----------:|-------------:|
+| Llama-3.1-8B-FP8    |     70 tok/s  |                **47.6 tok/s** |  −970 MB   |    n/a (penalty) |
+| **Qwen2.5-14B-FP8** |   13.5 tok/s  |                **17.8 tok/s** | **−970 MB**| **+32 %**     |
+
+Sprint speedup chain on Llama-8B-FP8 decode (CPU `lm_head` only,
+to highlight the AVX-512 work):
+
+| Path                              | Decode | Speedup vs scalar |
+|-----------------------------------|-------:|------------------:|
+| Sprint 40 P2 — scalar Rayon       |  16.8  |              1.0× |
+| Sprint 41A — AVX-512 hybrid       |  27.7  |              1.65× |
+| Sprint 41B — AVX-512 full dequant |  47.6  |          **2.83×** |
+
+### 15-prompt quality benchmark (Sprint 42B)
+
+Six production paths × 15-prompt deterministic suite, greedy
+decoding, 100-token cap:
+
+| Configuration                                   | Coherent  |
+|-------------------------------------------------|----------:|
+| Qwen3-8B Q4_K_M GGUF                            | **15/15** |
+| Llama-3.1-8B Q4_K_M GGUF                        | **15/15** |
+| Qwen3-8B-FP8 native WMMA + activation quant     | **15/15** |
+| Qwen2.5-14B-FP8 native WMMA + CPU `lm_head`     | **15/15** |
+| Llama-3.1-8B-FP8 native WMMA                    |    13/15  |
+| Llama-3.1-8B-FP8 native WMMA + CPU `lm_head`    |    13/15  |
+
+**86 / 90 = 95.5 % coherent.** All gates ≥ 12/15 cleared.
+
+### Sprint trail
+
+```
+Sprint 40 P1   Design + roofline analysis (CPU lm_head feasibility)
+Sprint 40 P2/1 Q6_K codec + scalar GEMV + unit tests (standalone module)
+Sprint 40 P2/2 Live integration (loader skip + forward routing + staging buf)
+Sprint 41A     AVX-512 hybrid (scalar dequant + AVX FMA)              ×1.65
+Sprint 41B     Full AVX-512 dequant (vpshufb + vpsrlvd + vfmadd231ps) ×2.83
+Sprint 42      Pipeline overlap analysis — honest-negative
+                (single-submit was already in place from Sprint 40)
+Sprint 42B     15-prompt quality bench (86/90 = 95.5 %)
+```
+
+### Implementation surface
+
+* `src/cpu/mod.rs`, `src/cpu/q6k.rs`, `src/cpu/lm_head.rs` (new ~720 LOC):
+  Q6_K codec, runtime-dispatch GEMV, FP32 → Q6_K requantizer.
+* `src/cpu/avx512_gemv.rs` (new ~260 LOC): hybrid (Sprint 41A) +
+  full (Sprint 41B) AVX-512 kernels with cross-check unit tests.
+* `src/backend/vulkan/loader.rs` (+121 LOC): `LoadedModel::cpu_lm_head`
+  field, FP8/FP16/BF16/F32 → FP32 → Q6_K requantize at load time,
+  GPU-upload skip when the env flag is set.
+* `src/backend/vulkan/forward.rs` (+136 LOC): `hidden_staging`
+  GpuBuffer (host-mapped), `dispatch_final` CPU-branch with proper
+  compute → transfer → host barriers, `forward_token` and
+  `wait_and_read_logits` CPU-side post-pass writing logits into the
+  staging buffer.
+* `src/backend/vulkan/decode.rs` (+4 LOC): pass `model` to
+  `wait_and_read_logits`.
+
+109 SPVs unchanged. **45 lib tests** (37 prior + 8 new in `cpu::`).
+
+### Known limitations
+
+* **Llama-3.1-8B-FP8 (per-tensor) — long code-generation edge case**:
+  2 / 15 prompts on the deterministic suite (Go REST API,
+  distributed message-queue design) collapse to `!` output.
+  Failure is in the GPU FFN GEMM for per-tensor FP8 on long
+  outputs; switching to CPU `lm_head` does **not** fix it
+  (same prompts fail in both paths). Block-wise (Qwen3) and
+  per-channel (Qwen2.5-14B) FP8 paths are unaffected because their
+  per-block / per-channel scales keep activations in range.
+  Activation-range investigation pending.
+* **CPU `lm_head` on 8B is 32 % slower than GPU.** Default OFF;
+  recommended only on 12 GiB cards or for VRAM-constrained
+  multi-session setups.
+* **`VF_CPU_LM_HEAD=1` requires AVX-512F + BW + VL** (Zen 4 /
+  Sapphire Rapids). Falls back to AVX-512F-only hybrid (Skylake-X /
+  Cannon Lake) or scalar (older / non-x86) — both of which are
+  significantly slower. The 17.8 tok/s 14B number is specifically
+  the full kernel.
+* **Pipeline overlap (Phase B+) deferred.** Real GPU/CPU overlap
+  needs speculative draft tokens; the current path is single-submit
+  + serialized CPU GEMV. v0.4 candidate. See Sprint 42 honest-
+  negative report for analysis.
+
+### vLLM gap update
+
+| Model + workload                  | VF v0.3.10 | vLLM 0.20.1 ROCm | Gap     |
+|-----------------------------------|-----------:|-----------------:|--------:|
+| Llama-8B-FP8 decode (b=1)         |   70 tok/s |        53 tok/s  | VF +32 %|
+| Llama-8B-FP8 prefill pp=512       | 1197 tok/s |     14 757 tok/s | 12.3 ×  |
+| Qwen3-8B-FP8 decode (b=1)         |   62 tok/s |        22 tok/s  | VF +180 %|
+| Qwen3-8B-FP8 prefill pp=512       | 1118 tok/s |      2 776 tok/s |  2.5 ×  |
+| Qwen2.5-14B-FP8 + CPU `lm_head`   | 17.8 tok/s |  (not benched)   |   —     |
+
+VF wins single-user decode on every direct comparison; vLLM
+remains ahead on FP8 prefill (specialized ROCm GEMM kernels).
+
+---
+
 ## v0.3.9 — Native FP8 WMMA on Mesa 26.1+ (2026-05-09)
 
 ### Headline

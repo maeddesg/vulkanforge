@@ -5,8 +5,10 @@ unless noted otherwise. Power sampled at 10 Hz from
 `/sys/class/drm/card1/device/hwmon/hwmon*/power1_average`, first 20
 samples discarded as warm-up.
 
-VulkanForge build: v0.3.9 + Sprint 39 (commit `95185aa`). Mesa 26.1-rc3
+VulkanForge build: **v0.3.10** (commits up to `5d4bced` for code,
+through Sprint 42B for the 15-prompt quality bench). Mesa 26.1-rc3
 RADV unless a specific run is tagged 26.0.6. ROCm 7.2.2 / Linux 7.0.3.
+Zen 4 / 7945HX 16-core for the CPU `lm_head` numbers.
 
 ---
 
@@ -20,6 +22,7 @@ RADV unless a specific run is tagged 26.0.6. ROCm 7.2.2 / Linux 7.0.3.
 | GGUF prefill (Q4_K_M / Q8_0)          | llama.cpp (Vulkan ≥ ROCm on RDNA4)   |
 | FP8 prefill (per-tensor / block-wise) | vLLM (untuned but still 2.5–12× ahead) |
 | Batch serving (b≥4)                   | vLLM (VF is single-stream)           |
+| **14B FP8 decode + VRAM-tight**       | **VulkanForge with `VF_CPU_LM_HEAD=1`** (17.8 vs GPU 13.5 + 970 MB freed) |
 
 ---
 
@@ -164,6 +167,64 @@ VulkanForge is single-stream; batched throughput is out of scope.
 
 ---
 
+## CPU `lm_head` offload (v0.3.10, `VF_CPU_LM_HEAD=1`)
+
+When the env flag is set, the loader requantizes `lm_head.weight`
+from FP8/BF16/F16/F32 to Q6_K and keeps it in CPU pinned RAM. The
+GPU does the layer pass + `cmd_copy_buffer` of the post-norm hidden
+state into a host-mapped staging buffer; the CPU then runs the
+Q6_K GEMV via hand-tuned AVX-512 intrinsics. Three runtime tiers,
+auto-detected via `is_x86_feature_detected!`:
+
+| Runtime feature       | Path                                  | Sprint |
+|-----------------------|---------------------------------------|--------|
+| AVX-512F + BW + VL    | Full vectorized dequant + FMA          | 41B    |
+| AVX-512F only         | Hybrid (scalar dequant + AVX FMA)      | 41A    |
+| no AVX-512            | Scalar reference (8 threads via Rayon) | 40 P2  |
+
+### Decode by tier (Zen 4 7945HX, DDR5-5600 dual-channel)
+
+| Model              | GPU `lm_head` | Scalar (40) | Hybrid AVX (41A) | Full AVX (41B) | VRAM saved |
+|--------------------|--------------:|------------:|-----------------:|---------------:|-----------:|
+| Llama-3.1-8B-FP8   |          70.0 |        16.8 |             27.7 |       **47.6** |   −970 MB  |
+| Qwen2.5-14B-FP8    |          13.5 |         7.6 |             12.7 |       **17.8** | **−970 MB**|
+
+The 14B row is the structural win: Sprint 41B's full-vectorized
+dequant at 17.8 tok/s **beats the pure-GPU baseline (13.5 tok/s)
+by 32 %** on top of freeing the VRAM. On 8B the path is a
+correctness-first VRAM-saving trade — at 47.6 tok/s vs the GPU's
+70 tok/s, 32 % decode penalty in exchange for 970 MB freed VRAM.
+
+### Algorithm — full AVX-512 dequant (Sprint 41B)
+
+Per 32-element iteration of one Q6_K block (8 iters per block):
+
+```text
+ql 16 bytes → vpand + vpsrlw + vpand + vpunpcklbw/hi → 32 nibbles
+qh  8 bytes → vpshufb [0,0,0,0, 1,1,1,1, …] → 4× repeat
+              vpsrlvd [0,2,4,6, 0,2,4,6, …] + vpand 0x03 → high 2 bits
+q6 = lo | (hi << 4); q_signed = q6 - 32
+dq = vcvtdq2ps(q_signed) × sub_scale
+acc = vfmadd231ps(dq, hidden_chunk, acc)
+```
+
+ISA confirmation in the release binary (objdump): per inner-loop
+iteration we see 2× `vfmadd231ps`, 2× `vpshufb`, 2× `vpsrlvd`,
+2× `vpmovzxbd`, 2× `vcvtdq2ps`, 2× `vpand[d]`, 2× `vpor`,
+2× `vpslld`. 159 AVX-512 instructions in total across the binary.
+
+### Roofline
+
+DDR5-5600 dual-channel ≈ 76 GB/s sustained. 8B Q6_K `lm_head`
+weight = 430 MB → 5.66 ms theoretical minimum per token = 177 t/s
+ceiling. We measure 47.6 t/s — ~27 % of the ceiling. Closing the
+remaining gap on 8B requires speculative decoding (see Sprint 42
+honest-negative report for why blocking single-submit is the
+status quo). 14B already wins because the GPU layers themselves
+take ~70 ms, plenty of room for the CPU to land its 5–6 ms work.
+
+---
+
 ## Native FP8 — Mesa 26.1+ vs Mesa 26.0.x
 
 `VF_FP8_NATIVE_WMMA=1` enables `V_WMMA_F32_16X16X16_FP8_FP8` on
@@ -179,6 +240,53 @@ The block-wise win required a per-k_block dynamic activation absmax
 (Sprint 39) — the naive FP32→FP8 cast lost too much dynamic range
 against block-wise-calibrated weights. See
 `results/v039_sprint39_blockwise_act_quant.md` for the algorithm + ISA.
+
+---
+
+## 15-prompt quality benchmark (Sprint 42B)
+
+Deterministic 15-prompt suite (`inference_test_prompts_15.json` —
+ROCmForge v1.0 inference validation set, 7 categories spanning
+smoke, code generation, prose, reasoning, context stress, numerics,
+tokenizer robustness). Greedy decoding (`temperature = 0`),
+100-token cap.
+
+| Configuration                                       | Coherent | Median decode | Notes |
+|-----------------------------------------------------|---------:|--------------:|-------|
+| Qwen3-8B Q4_K_M GGUF                                |   **15/15** |  108.5 tok/s | full bench via `cargo run --release --example run_15prompt_bench` |
+| Llama-3.1-8B Q4_K_M GGUF                            |   **15/15** |  111.7 tok/s | chat driver |
+| Qwen3-8B-FP8 native WMMA + activation quant         |   **15/15** |   61.5 tok/s | block-wise + Sprint 39 act-quant |
+| Qwen2.5-14B-FP8 native WMMA + CPU `lm_head`         |   **15/15** |   17.5 tok/s | per-channel + Sprint 41B AVX |
+| Llama-3.1-8B-FP8 native WMMA                        |     13/15 |   69.5 tok/s | code-gen edge case (#5, #11) |
+| Llama-3.1-8B-FP8 native WMMA + CPU `lm_head`        |     13/15 |   46.1 tok/s | same prompts as above (lm_head not the cause) |
+
+**Total: 86 / 90 prompts coherent (95.5 %).** All gates ≥ 12/15
+cleared.
+
+### Category pass rate
+
+| Category              | Pass rate |
+|-----------------------|----------:|
+| smoke                 |   100 %   |
+| prose                 |   100 %   |
+| reasoning             |   100 %   |
+| context_stress        |   100 %   |
+| numerics              |   100 %   |
+| tokenizer_robustness  |   100 %   |
+| code_generation       |   79.2 %  |
+
+The 4 failures cluster on Llama-3.1-8B-FP8 prompts #5 (Go REST API)
+and #11 (distributed message-queue design), with and without CPU
+`lm_head`. The CPU/GPU `lm_head` symmetry rules out the
+quantization-on-CPU path as the source — the failure is in the GPU
+FFN GEMM for per-tensor FP8 on long code-generation outputs.
+Block-wise (Qwen3) and per-channel (Qwen2.5-14B) variants are
+unaffected because their per-block / per-channel scales keep
+activations in range.
+
+Driver: `results/sprint42b_15prompt_logs/run_15p_chat.py` (local;
+`results/` is gitignored per project convention). Raw replies and
+per-prompt decode tok/s in the same directory.
 
 ---
 

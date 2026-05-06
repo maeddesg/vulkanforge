@@ -19,14 +19,23 @@ Tokenizer is read from the GGUF file; no extra setup needed.
 VulkanForge auto-detects all three FP8 scaling strategies from the
 `config.json` `quantization_config` block + the SafeTensors header.
 
-| Scale type           | Example model                                      | VRAM     | Decode | Prefill pp=512 (Mesa 26.1+ native) | Coherence |
-|----------------------|----------------------------------------------------|---------:|-------:|-----------------------------------:|----------:|
-| Per-tensor           | `neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8`      |  7.5 GiB |  69 t/s | **1197 t/s** (Sprint 38 P1)        |   15 / 15 |
-| Per-channel          | `larryvrh/Qwen2.5-14B-Instruct-FP8`               | 13.8 GiB |  14 t/s |  **450 t/s** (Sprint 38 P1)        |   15 / 15 |
-| Block-wise [128,128] | `Qwen/Qwen3-8B-FP8`                                |  8.5 GiB |  64 t/s | **1118 t/s** (Sprint 39)           |        ✓  |
+| Scale type           | Example model                                  | VRAM (GPU) | Decode (GPU) | Prefill pp=512* | CPU `lm_head` decode | 15-prompt coherence |
+|----------------------|------------------------------------------------|-----------:|-------------:|----------------:|---------------------:|--------------------:|
+| Per-tensor           | `neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8`   |   7.5 GiB  |     69 tok/s | **1197 tok/s**  |        47.6 tok/s    |              13/15  |
+| Per-channel          | `larryvrh/Qwen2.5-14B-Instruct-FP8`            |  13.8 GiB  |     14 tok/s |   **450 tok/s** |    **17.8 tok/s** ✓  |              15/15  |
+| Block-wise [128,128] | `Qwen/Qwen3-8B-FP8`                             |   8.5 GiB  |     62 tok/s |  **1118 tok/s** |   (not benched yet)  |              15/15  |
 
-On Mesa 26.0.x or with the flag unset, all three paths run on the
-BF16 conversion fallback at ~770 / 325 / 757 t/s respectively.
+\*With `VF_FP8_NATIVE_WMMA=1` on Mesa 26.1+. On Mesa 26.0.x or
+without the flag, all three paths use the BF16 conversion fallback
+at ~770 / 325 / 757 tok/s respectively.
+
+The CPU `lm_head` column shows decode tok/s when
+`VF_CPU_LM_HEAD=1` is set (AVX-512 Q6_K GEMV on Zen 4 7945HX,
+v0.3.10). The ✓ marks the 14B win zone: per-channel FP8 with the
+CPU offload **beats the GPU baseline by 32 %** while freeing
+970 MB of VRAM. Per-tensor 8B trades 32 % decode for the same
+VRAM saving — useful on 12 GB cards or when running multiple 8B
+sessions, otherwise leave the flag off.
 
 ### FP8 quirks
 

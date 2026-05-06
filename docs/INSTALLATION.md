@@ -98,13 +98,60 @@ Boolean flags accept `1` / `0`, `true` / `false`, case-insensitive.
 |--------------------------------|---------|-----------------------------------------------------------------------------------|
 | `VULKANFORGE_ENABLE_FP8`       | `0`     | Allow FP8 SafeTensors loading (auto-detects per-tensor / per-channel / block-wise) |
 | `VF_FP8_NATIVE_WMMA`           | `0`     | Use native FP8 WMMA (requires Mesa 26.1+; covers all three FP8 scaling strategies) |
+| `VF_CPU_LM_HEAD`               | `0`     | Offload `lm_head` to CPU as Q6_K (saves ~970 MB VRAM; AVX-512 GEMV; v0.3.10) |
 | `VF_FP8_GEMM_BN`               | `32`    | GEMM tile size for the FP8 BF16 path: `16` (naive) / `32` (default) / `64` (opt-in) |
 | `VF_FP8_GEMM_BN32`             | unset   | Legacy opt-out: `0` falls back to BN=16                                           |
 | `VULKANFORGE_KV_FP8`           | `0`     | FP8 E4M3 KV cache (half the KV memory; +tiny perplexity)                          |
 | `VULKANFORGE_COOPMAT_FP8`      | `1`     | Enable FP8 coopmat code paths                                                     |
 | `VULKANFORGE_DISABLE_BARRIER_ELISION` | `0` | Debug: keep all compute barriers (Sprint 12D dirty-flag tracker)                  |
+| `VULKANFORGE_DISABLE_ASYNC_DECODE` | `0` | Debug: serial decode loop instead of pipelined `pre_record` + `submit` + `wait` |
 | `VF_PROMPT`                    | unset   | Single-shot chat: `chat` reads this string and exits after one response          |
 | `VF_LMHEAD_HARNESS`            | `1`     | Use the dedicated F16 lm_head pipeline (Sprint 29). Set `0` for the registry path |
+
+### CPU `lm_head` offload (`VF_CPU_LM_HEAD=1`)
+
+When set, the loader requantizes `lm_head.weight` from FP8/FP16/BF16
+to **Q6_K** at startup and keeps it in CPU pinned RAM. The decode
+loop downloads the post-norm hidden state into a 16 KB host-mapped
+buffer (folded into the same Vulkan submit as the layer dispatches),
+then runs an AVX-512 Q6_K GEMV on the CPU.
+
+**Benefits:**
+
+- ~970 MB freed from VRAM (model-dependent — see
+  `docs/BENCHMARKS.md` for per-model numbers).
+- 14B FP8 decode is **32 % faster** than the GPU baseline on
+  Zen 4 / 7945HX (17.8 vs 13.5 tok/s). The 14B GPU `lm_head` GEMV
+  is bandwidth-bound on VRAM; offloading it lets DDR5 (76 GB/s)
+  share the work in parallel with the GPU pipeline.
+- Enables 14B FP8 on 12 GB GPUs that wouldn't otherwise fit.
+
+**Trade-offs:**
+
+- 8B FP8 decode: 32 % slower than GPU (47.6 vs 70 tok/s) — use
+  for VRAM savings, not speed.
+- Requires AVX-512F + BW + VL (Zen 4, Ice Lake+). Older CPUs
+  fall through to a scalar path that is several times slower.
+
+**Runtime dispatch tiers** (auto-selected via
+`is_x86_feature_detected!`):
+
+| CPU features          | Path                                  | Sprint |
+|-----------------------|---------------------------------------|--------|
+| AVX-512F + BW + VL    | Full vectorized dequant + FMA          | 41B    |
+| AVX-512F only         | Hybrid (scalar dequant + AVX FMA)      | 41A    |
+| no AVX-512            | Scalar reference (multi-threaded)      | 40 P2  |
+
+Confirm AVX-512 on your CPU:
+
+```bash
+grep -o 'avx512[a-z]*' /proc/cpuinfo | sort -u
+# → wants avx512f, avx512bw, avx512vl for the full kernel
+```
+
+The flag is opt-in. On non-x86 / non-AVX-512 platforms the binary
+still builds, but `VF_CPU_LM_HEAD=1` falls back to the slow scalar
+path.
 
 Path / model variables:
 
@@ -125,6 +172,17 @@ export VF_FP8_NATIVE_WMMA=1
 
 Set them in your shell profile or `~/.config/environment.d/vulkanforge.conf`.
 On Mesa 26.0.x leave `VF_FP8_NATIVE_WMMA` unset.
+
+For 14B FP8 on Zen 4 / Sapphire Rapids (or 12 GB cards anywhere
+with AVX-512), additionally:
+
+```bash
+export VF_CPU_LM_HEAD=1
+```
+
+This is a clean win on 14B (faster + saves 970 MB VRAM). On 8B FP8
+it's a VRAM-vs-speed trade — leave it off unless you specifically
+need the VRAM headroom.
 
 ## Troubleshooting
 

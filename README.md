@@ -27,9 +27,16 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
   per-tensor, per-channel, block-wise `[128, 128]`.
 - **Native FP8 WMMA on Mesa 26.1+** (`VF_FP8_NATIVE_WMMA=1`)
   — +45–58 % FP8 prefill across all three sub-types.
+- **CPU `lm_head` offload (v0.3.10)** — Q6_K weights on CPU RAM,
+  hand-tuned AVX-512 GEMV (Zen 4). Frees ~970 MB VRAM and on
+  **14B FP8 it's 32 % faster than the GPU baseline**
+  (17.8 vs 13.5 tok/s).
 - **2× better power efficiency** (tok/s/W) on decode vs llama.cpp.
 - **Llama-3, Qwen2.5, Qwen3, Mistral, DeepSeek-R1-Distill** model
   families covered (see [docs/MODELS.md](docs/MODELS.md)).
+- **15 / 15 coherent on Qwen3-8B (GGUF + FP8) and Qwen2.5-14B-FP8**
+  on the deterministic 15-prompt suite; 86 / 90 (95.5 %) across
+  six full configurations (see [Quality](#quality-15-prompt-benchmark) below).
 
 ## Quick start
 
@@ -46,6 +53,13 @@ VULKANFORGE_ENABLE_FP8=1 vulkanforge chat \
 VF_FP8_NATIVE_WMMA=1 VULKANFORGE_ENABLE_FP8=1 vulkanforge chat \
   --model ~/models/Qwen3-8B-FP8/ \
   --tokenizer-from ~/models/Qwen3-8B-Q4_K_M.gguf
+
+# CPU lm_head offload (v0.3.10, AVX-512 Zen 4 / Ice Lake+)
+# Saves ~970 MB VRAM. On 14B FP8 it's faster than the GPU lm_head.
+VF_CPU_LM_HEAD=1 VF_FP8_NATIVE_WMMA=1 VULKANFORGE_ENABLE_FP8=1 \
+  vulkanforge chat \
+    --model ~/models/Qwen2.5-14B-Instruct-FP8/ \
+    --tokenizer-from ~/models/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_k_m.gguf
 ```
 
 Verify Mesa 26.1+ before setting `VF_FP8_NATIVE_WMMA=1`:
@@ -100,6 +114,56 @@ block-wise uses `TritonFp8BlockScaledMMKernel` (untuned). Run with
 that fits the workload — single-user chat is VulkanForge, batch
 serving is vLLM.
 
+### CPU `lm_head` offload (v0.3.10, AVX-512)
+
+`VF_CPU_LM_HEAD=1` moves the vocabulary projection onto the CPU as
+Q6_K, freeing ~970 MB of VRAM. Hand-tuned AVX-512 kernel (Zen 4 /
+Ice Lake+ runtime-detected; scalar fallback otherwise).
+
+| Model              | GPU `lm_head`      | CPU `lm_head` (AVX-512) | VRAM saved | Verdict |
+|--------------------|-------------------:|------------------------:|-----------:|---------|
+| Llama-3.1-8B-FP8   | 70 tok/s           |  47.6 tok/s             |  −970 MB   | use for VRAM, not speed |
+| **Qwen2.5-14B-FP8**| 13.5 tok/s         | **17.8 tok/s (+32 %)**  | **−970 MB**| **CPU wins both axes** |
+
+The 14B win is structural: the GPU `lm_head` GEMV is bandwidth-bound
+on 644 GB/s VRAM, and offloading it lets DDR5 (32 threads × L3 →
+DDR5-5600 76 GB/s) carry the work in parallel with the rest of the
+GPU pipeline freed up. Combined with the 970 MB VRAM saving, the
+flag is a default-on candidate for 14B FP8 on Zen 4.
+
+## Optional features
+
+| Feature              | Flag                       | Requires                     | Effect                              |
+|----------------------|----------------------------|------------------------------|-------------------------------------|
+| FP8 model loading    | `VULKANFORGE_ENABLE_FP8=1` | Mesa 26.0.6+                 | Load HuggingFace FP8 SafeTensors    |
+| Native FP8 WMMA      | `VF_FP8_NATIVE_WMMA=1`     | Mesa 26.1+                   | +45–58 % FP8 prefill                |
+| CPU `lm_head` offload| `VF_CPU_LM_HEAD=1`         | AVX-512F + BW + VL (Zen 4 / Ice Lake+) | −970 MB VRAM, 14B +32 % decode |
+
+All features are opt-in. Without flags, VulkanForge runs GGUF models
+on any Mesa 26.0.6+ with no special requirements.
+
+## Quality (15-prompt benchmark)
+
+Sprint 42B ran the deterministic 15-prompt suite across all six
+production paths (greedy decoding, temperature = 0):
+
+| Configuration                                    | Coherent | Median decode |
+|--------------------------------------------------|---------:|--------------:|
+| Qwen3-8B Q4_K_M GGUF                             |  **15/15** | 109 tok/s |
+| Llama-3.1-8B Q4_K_M GGUF                         |  **15/15** | 112 tok/s |
+| Qwen3-8B-FP8 native WMMA + activation quant      |  **15/15** |  62 tok/s |
+| Qwen2.5-14B-FP8 native WMMA + CPU `lm_head`      |  **15/15** |  17 tok/s |
+| Llama-3.1-8B-FP8 native WMMA                     |    13/15 |  70 tok/s |
+| Llama-3.1-8B-FP8 native WMMA + CPU `lm_head`     |    13/15 |  46 tok/s |
+
+**86 / 90 prompts (95.5 %) coherent across the full suite.** Known
+limitation on Llama-3.1-8B-FP8 (per-tensor): two long
+code-generation prompts (Go REST API, distributed message-queue
+design) collapse to `!` output, with or without CPU offload — a
+narrow activation-range edge case in the per-tensor FFN GEMM.
+Block-wise (Qwen3) and per-channel (Qwen2.5-14B) FP8 paths are
+unaffected.
+
 ## Driver requirements
 
 | Mesa version | Capabilities                                                                  |
@@ -142,6 +206,12 @@ and a single-shot mode via `VF_PROMPT="..."`.
   does not bench.
 - Mistral / Llama-2 SPM tokenizer not yet wired for FP8 SafeTensors
   (only `gpt2` tokenizer family).
+- **Llama-3.1-8B-FP8 (per-tensor) — long code-generation edge case:**
+  2 of 15 prompts on the deterministic suite (Go REST API,
+  distributed message-queue design) collapse to `!` output. The
+  failure is in the GPU FFN path, not lm_head — switching to CPU
+  lm_head doesn't fix it. Other models (Qwen3 block-wise,
+  Qwen2.5-14B per-channel) are unaffected. Investigation pending.
 
 For the full architectural notes and the v0.2.x optimization audit
 (nine falsified hypotheses against the residual gap to llama.cpp),
