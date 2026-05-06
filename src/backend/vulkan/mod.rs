@@ -5,6 +5,7 @@ pub mod commands;
 pub mod decode;
 pub mod device;
 pub mod forward;
+pub mod bfloat16_ext;
 pub mod fp8_ext;
 pub mod gguf;
 pub mod kv_cache;

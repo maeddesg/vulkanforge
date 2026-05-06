@@ -196,12 +196,44 @@ impl VulkanDevice {
             device_extensions.push(crate::backend::vulkan::fp8_ext::SHADER_FLOAT8_EXT_NAME.as_ptr());
         }
 
+        // Sprint 39 — `VK_KHR_shader_bfloat16`. The BF16-narrow FP8 GEMM
+        // cousins (`mul_coopmat_fp8_bn32(.comp|_blockwise.comp)`,
+        // `_multi_wg.comp`, `_naive.comp`) declare BFloat16TypeKHR +
+        // BFloat16CooperativeMatrixKHR capabilities. RADV runs the
+        // pipelines without the extension being enabled, but
+        // validation layers fire VUID-…-pCode-08742 on every
+        // shader-module create. Enable the extension when the runtime
+        // advertises it (Mesa 26.1+) and silence the warnings. We
+        // probe the available device extensions explicitly so a
+        // Mesa 26.0.x runtime keeps working untouched (it just sees
+        // the warnings as before).
+        let bfloat16_available = unsafe {
+            instance
+                .enumerate_device_extension_properties(physical_device)
+                .map(|exts| {
+                    exts.iter().any(|e| {
+                        let name = std::ffi::CStr::from_ptr(e.extension_name.as_ptr());
+                        name == crate::backend::vulkan::bfloat16_ext::SHADER_BFLOAT16_KHR_NAME
+                    })
+                })
+                .unwrap_or(false)
+        };
+        if bfloat16_available {
+            device_extensions.push(
+                crate::backend::vulkan::bfloat16_ext::SHADER_BFLOAT16_KHR_NAME.as_ptr(),
+            );
+        }
+
         let mut coopmat_features =
             vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
         let mut fp8_features =
             crate::backend::vulkan::fp8_ext::PhysicalDeviceShaderFloat8FeaturesEXT::default()
                 .shader_float8(true)
                 .shader_float8_cooperative_matrix(true);
+        let mut bfloat16_features =
+            crate::backend::vulkan::bfloat16_ext::PhysicalDeviceShaderBfloat16FeaturesKHR::default()
+                .shader_bfloat16_type(true)
+                .shader_bfloat16_cooperative_matrix(true);
 
         let mut device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_create_info))
@@ -213,6 +245,9 @@ impl VulkanDevice {
             .push_next(&mut coopmat_features);
         if fp8_opt_in {
             device_create_info = device_create_info.push_next(&mut fp8_features);
+        }
+        if bfloat16_available {
+            device_create_info = device_create_info.push_next(&mut bfloat16_features);
         }
 
         let device =
