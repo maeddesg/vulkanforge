@@ -101,6 +101,13 @@ pub struct LoadedModel {
     pub tensors: HashMap<String, GpuTensor>,
     pub bytes_uploaded: u64,
     pub upload_duration: Duration,
+    /// Sprint 40 Part 2 — `lm_head` weights requantized to Q6_K and
+    /// resident in CPU pinned RAM, populated when `VF_CPU_LM_HEAD=1`.
+    /// `Forward::dispatch_final` branches on this field: when `Some`,
+    /// the GPU `lm_head` GEMV is skipped and the post-norm hidden
+    /// state is downloaded for a CPU GEMV instead. `None` keeps the
+    /// status-quo GPU path.
+    pub cpu_lm_head: Option<crate::cpu::lm_head::CpuLmHead>,
 }
 
 impl LoadedModel {
@@ -244,6 +251,11 @@ impl LoadedModel {
             tensors,
             bytes_uploaded,
             upload_duration,
+            // GGUF path does not yet support CPU lm_head offload; the
+            // SafeTensors path does. Future sprint extends this to
+            // GGUF Q6_K (which is already 6-bit on disk and would
+            // map directly into a `CpuLmHead` without requantize).
+            cpu_lm_head: None,
         })
     }
 
@@ -437,10 +449,27 @@ impl LoadedModel {
         // shader change.
         let has_lm_head = st.tensors.contains_key("lm_head.weight");
         let skip_embed_gpu = has_lm_head && !hf.tie_word_embeddings;
+        // Sprint 40 Part 2 — `VF_CPU_LM_HEAD=1` opt-in: skip the
+        // GPU upload of `lm_head.weight` and instead requantize it
+        // to Q6_K on the CPU. The forward.rs decode path branches
+        // on `LoadedModel::cpu_lm_head` to pick CPU vs GPU lm_head.
+        let cpu_lm_head_enabled = std::env::var("VF_CPU_LM_HEAD")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let skip_lm_head_gpu = cpu_lm_head_enabled && has_lm_head;
         let mut plans: Vec<Plan> = Vec::with_capacity(st.tensors.len());
         for (hf_name, info) in &st.tensors {
             // Skip scale metadata — already harvested above.
             if hf_name.ends_with(".weight_scale") || hf_name.ends_with(".input_scale") {
+                continue;
+            }
+            // Sprint 40 Part 2 — when CPU lm_head is enabled, the
+            // GPU copy of `lm_head.weight` is unused (dispatch_final
+            // takes the CPU branch). Skip the upload to free 0.5–
+            // 0.8 GiB of VRAM. The lm_head bytes are dequantized
+            // and requantized to Q6_K for the CPU path further
+            // below — we still mmap them via `st.tensor_bytes`.
+            if skip_lm_head_gpu && hf_name == "lm_head.weight" {
                 continue;
             }
             // Sprint 22B — skip the embedding GPU upload (host cache
@@ -780,12 +809,104 @@ impl LoadedModel {
             }
         };
 
+        // Sprint 40 Part 2 — build the CPU `lm_head` (Q6_K) when the
+        // `VF_CPU_LM_HEAD=1` opt-in flag was set. We dequantize
+        // whatever native dtype the SafeTensors file uses to FP32,
+        // apply the FP8 weight scale if present, and hand the FP32
+        // matrix to `CpuLmHead::from_fp32_weights` for the on-load
+        // requantize. The corresponding GPU upload was already
+        // skipped above (`skip_lm_head_gpu`).
+        let cpu_lm_head = if cpu_lm_head_enabled {
+            let info = st
+                .tensor("lm_head.weight")
+                .ok_or_else(|| {
+                    LoaderError::Buffer(
+                        "VF_CPU_LM_HEAD=1 but lm_head.weight not in SafeTensors".into(),
+                    )
+                })?;
+            let raw = st.tensor_bytes(info);
+            // Shape is [vocab, hidden]. Both must be present.
+            let vocab_size = *info.shape.first().ok_or_else(|| {
+                LoaderError::Buffer("lm_head.weight: missing vocab dim".into())
+            })? as usize;
+            let hidden_size = *info.shape.get(1).ok_or_else(|| {
+                LoaderError::Buffer("lm_head.weight: missing hidden dim".into())
+            })? as usize;
+
+            // Dequantize bytes → FP32. Llama-3.1, Qwen2.5, Qwen3 all
+            // ship lm_head as BF16; F16 / F32 / F8E4M3 are accepted
+            // for completeness.
+            let n_elements = vocab_size * hidden_size;
+            let mut fp32 = vec![0.0_f32; n_elements];
+            match info.dtype {
+                TensorDtype::F32 => {
+                    fp32.copy_from_slice(bytemuck::cast_slice(raw));
+                }
+                TensorDtype::F16 => {
+                    for i in 0..n_elements {
+                        let h = u16::from_le_bytes([raw[2 * i], raw[2 * i + 1]]);
+                        fp32[i] = half::f16::from_bits(h).to_f32();
+                    }
+                }
+                TensorDtype::BF16 => {
+                    for i in 0..n_elements {
+                        let bf = u16::from_le_bytes([raw[2 * i], raw[2 * i + 1]]);
+                        fp32[i] = bf16_to_f32(bf);
+                    }
+                }
+                TensorDtype::F8E4M3 => {
+                    // FP8 lm_head — rare but valid. Use ash bindings
+                    // for the conversion; the loader does the same in
+                    // the GPU upload path via the shader.
+                    use crate::backend::vulkan::fp8_ext::fp8_e4m3_to_f32;
+                    for i in 0..n_elements {
+                        fp32[i] = fp8_e4m3_to_f32(raw[i]);
+                    }
+                    // Apply scale if present (per-tensor scalar; the
+                    // exotic per-channel / block-wise lm_head cases
+                    // are not in the wild on the supported models).
+                    let vf_name = hf_name_to_vf("lm_head.weight");
+                    if let Some(ps) = weight_scales.get(&vf_name) {
+                        if !ps.flat.is_empty() {
+                            let scale = ps.flat[0];
+                            for v in fp32.iter_mut() {
+                                *v *= scale;
+                            }
+                        }
+                    }
+                }
+                other => {
+                    return Err(LoaderError::Buffer(format!(
+                        "VF_CPU_LM_HEAD=1: lm_head.weight has unsupported dtype {other:?}"
+                    )));
+                }
+            };
+
+            let t0 = Instant::now();
+            let lm = crate::cpu::lm_head::CpuLmHead::from_fp32_weights(
+                &fp32,
+                vocab_size,
+                hidden_size,
+            );
+            eprintln!(
+                "VF_CPU_LM_HEAD=1: lm_head {}×{} requantized to Q6_K ({:.1} MB, {:.0} ms)",
+                vocab_size,
+                hidden_size,
+                lm.size_bytes() as f64 / 1e6,
+                t0.elapsed().as_secs_f64() * 1000.0,
+            );
+            Some(lm)
+        } else {
+            None
+        };
+
         Ok((
             Self {
                 config,
                 tensors,
                 bytes_uploaded,
                 upload_duration,
+                cpu_lm_head,
             },
             host_embed,
             hf,

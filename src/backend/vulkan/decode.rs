@@ -581,7 +581,7 @@ pub fn generate_from_tokens(
                 forward.pre_record(dev, registry, model, cur_slot, pos)?;
 
                 // Stage 2: wait for previous GPU work, read logits, sample.
-                last_logits = forward.wait_and_read_logits(dev, prev_slot)?;
+                last_logits = forward.wait_and_read_logits(dev, prev_slot, model)?;
                 let next_id = sample_next_token(
                     &mut last_logits, &generated, &config.sampling, &mut rng_state,
                 );
@@ -605,7 +605,7 @@ pub fn generate_from_tokens(
 
             // Drain: read logits from the last submitted slot.
             let last_slot = 1 - cur_slot;
-            last_logits = forward.wait_and_read_logits(dev, last_slot)?;
+            last_logits = forward.wait_and_read_logits(dev, last_slot, model)?;
         }
     } else {
         // ---- Serial path (pre-15E behaviour) ----

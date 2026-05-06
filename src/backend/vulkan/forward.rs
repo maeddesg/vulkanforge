@@ -266,6 +266,14 @@ pub struct Forward {
     /// `cmd_copy_buffer` into this staging buffer, which is the one
     /// the host actually reads.
     logits_staging: GpuBuffer,
+    /// Sprint 40 Part 2 — host-readable staging copy of the
+    /// post-norm hidden state. Used by the CPU `lm_head` offload
+    /// (`VF_CPU_LM_HEAD=1`): when `model.cpu_lm_head` is `Some`,
+    /// `dispatch_final` copies `hidden_norm` here instead of
+    /// running the GPU lm_head GEMV. Always allocated (small,
+    /// `hidden_dim * 4` bytes — ~16 KB on 8B, ~20 KB on 14B), so
+    /// the same `Forward` instance handles both paths cleanly.
+    hidden_staging: GpuBuffer,
     // Always-bound dummies for unused descriptor slots.
     fuse0: GpuBuffer,
     fuse1: GpuBuffer,
@@ -609,9 +617,25 @@ impl Forward {
         &mut self,
         dev: &VulkanDevice,
         slot: usize,
+        model: &LoadedModel,
     ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         let fence = self.async_fences[slot];
         unsafe { dev.device.wait_for_fences(&[fence], true, u64::MAX)?; }
+        // Sprint 40 Part 2 — when CPU lm_head is active, the GPU
+        // submit copied the post-norm hidden state into
+        // `hidden_staging` (via `dispatch_final`) and skipped the
+        // GPU lm_head GEMV. Run the Q6_K GEMV on the CPU now and
+        // return its logits directly, bypassing `logits_staging`.
+        if let Some(ref cpu_lm) = model.cpu_lm_head {
+            let hidden_n = self.config.hidden_dim as usize;
+            let hidden: Vec<f32> = {
+                let bytes = self.hidden_staging.read_bytes()?;
+                bytemuck::cast_slice::<u8, f32>(&bytes[..hidden_n * 4]).to_vec()
+            };
+            let mut logits = vec![0.0_f32; cpu_lm.vocab_size];
+            cpu_lm.forward(&hidden, &mut logits);
+            return Ok(logits);
+        }
         // Sprint 27 — read from host-mapped staging copy.
         let bytes = self.logits_staging.read_bytes()?;
         Ok(bytemuck::cast_slice::<u8, f32>(
@@ -756,6 +780,17 @@ impl Forward {
         let logits_buf = mk_storage(logits_bytes, MemoryLocation::GpuOnly, "logits_buf")?;
         let logits_staging =
             mk_storage(logits_bytes, MemoryLocation::GpuToCpu, "logits_staging")?;
+        // Sprint 40 Part 2 — host-readable staging for the CPU lm_head
+        // offload. Sized for the post-norm hidden state (FP32, length
+        // = hidden_dim). Cheap regardless of whether the offload is
+        // active; keeps the buffer-management code path uniform.
+        let hidden_bytes_size: u64 =
+            (config.hidden_dim as u64) * std::mem::size_of::<f32>() as u64;
+        let hidden_staging = mk_storage(
+            hidden_bytes_size,
+            MemoryLocation::GpuToCpu,
+            "hidden_staging",
+        )?;
         let fuse0 = mk_storage(16, MemoryLocation::GpuOnly, "fuse0_dummy")?;
         let fuse1 = mk_storage(16, MemoryLocation::GpuOnly, "fuse1_dummy")?;
 
@@ -1406,6 +1441,7 @@ impl Forward {
             layers_per_submit,
             logits_buf,
             logits_staging,
+            hidden_staging,
             fuse0, fuse1,
             rope_ff_buf, rope_idx_buf,
             kv_cache, config,
@@ -1718,6 +1754,27 @@ impl Forward {
             }
             self.record_decode_dispatches(dev, registry, cmd, model, cur_slot, position);
         })?;
+
+        // Sprint 40 Part 2 — CPU lm_head post-pass. `dispatch_final`
+        // already copied the post-norm hidden state into
+        // `hidden_staging` and skipped the GPU lm_head GEMV. We
+        // now run the Q6_K GEMV on the CPU and overwrite
+        // `logits_staging` with the result so the existing readback
+        // path (next few lines) picks up the right values.
+        if let Some(ref cpu_lm) = model.cpu_lm_head {
+            let hidden_n = self.config.hidden_dim as usize;
+            // Borrow ends at the closure's `}` — we then mutably
+            // borrow `self.logits_staging` via `write_bytes`.
+            let hidden: Vec<f32> = {
+                let bytes = self.hidden_staging.read_bytes()?;
+                bytemuck::cast_slice::<u8, f32>(&bytes[..hidden_n * 4]).to_vec()
+            };
+            let vocab = self.config.vocab_size as usize;
+            let mut logits = vec![0.0_f32; vocab];
+            cpu_lm.forward(&hidden, &mut logits);
+            self.logits_staging
+                .write_bytes(bytemuck::cast_slice(&logits))?;
+        }
 
         // Logits readback (Sprint 27 — from host-mapped staging).
         let bytes = self.logits_staging.read_bytes()?;
@@ -2221,6 +2278,7 @@ impl Forward {
         }
         self.logits_buf.destroy(device, allocator);
         self.logits_staging.destroy(device, allocator);
+        self.hidden_staging.destroy(device, allocator);
         self.fuse0.destroy(device, allocator);
         self.fuse1.destroy(device, allocator);
         self.rope_ff_buf.destroy(device, allocator);
@@ -2561,6 +2619,84 @@ impl Forward {
             .expect("output_norm.weight")
             .buffer
             .handle;
+        // Sprint 40 Part 2 — CPU lm_head branch. When the loader has
+        // built a `CpuLmHead` (only happens when `VF_CPU_LM_HEAD=1`
+        // was set), we still run the final RMS norm on the GPU but
+        // skip the GPU lm_head GEMV. Instead we copy the post-norm
+        // hidden state into the host-mapped `hidden_staging` buffer.
+        // After the CB submits + completes, `forward_token` reads
+        // the hidden state, runs `cpu_lm_head.forward`, and writes
+        // the logits into `logits_staging` directly. The `cmd_copy`
+        // here is tiny (~16 KB) and folds into the same submit, so
+        // the only added serialization is the CPU GEMV itself —
+        // hence "Phase A blocking".
+        if model.cpu_lm_head.is_some() {
+            let hidden_norm = self.cur().hidden_norm.handle;
+            self.run_rms_norm(
+                dev, registry, cmd,
+                input, w_norm, hidden_norm,
+                self.config.hidden_dim, 1, self.config.rms_norm_eps, "rms_norm_final",
+            );
+            self.mark_written(&[hidden_norm]);
+            // Make the RMS-norm SHADER_WRITE visible to the
+            // upcoming TRANSFER_READ.
+            let pre = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(hidden_norm)
+                .offset(0)
+                .size(vk::WHOLE_SIZE);
+            let copy = vk::BufferCopy {
+                src_offset: 0,
+                dst_offset: 0,
+                size: (self.config.hidden_dim as u64) * 4,
+            };
+            // Then make the staging buffer's TRANSFER_WRITE visible
+            // to the host read that follows submit.
+            let post = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.hidden_staging.handle)
+                .offset(0)
+                .size(vk::WHOLE_SIZE);
+            unsafe {
+                dev.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    std::slice::from_ref(&pre),
+                    &[],
+                );
+                dev.device.cmd_copy_buffer(
+                    cmd,
+                    hidden_norm,
+                    self.hidden_staging.handle,
+                    std::slice::from_ref(&copy),
+                );
+                dev.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    std::slice::from_ref(&post),
+                    &[],
+                );
+            }
+            // Skip the GPU `lm_head` GEMV entirely. `record_logits_readback`
+            // still runs after this on the existing `logits_buf` /
+            // `logits_staging` pair — it copies a stale logits buffer
+            // that `forward_token` overwrites with the CPU result
+            // immediately afterwards. The wasted ~600 KB GPU→CPU
+            // copy is negligible.
+            return;
+        }
         // LM head: prefer dedicated `output.weight`; fall back to tied
         // `token_embd.weight` (Phase 2 doesn't tie weights, but be safe).
         let lm = model
