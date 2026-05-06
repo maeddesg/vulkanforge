@@ -4,5 +4,7 @@
 captures/
 .claude/
 VP_VULKANINFO_*.json
-docs/
+docs/vulkanforge_*
+docs/vulkaninfo_*
+docs/wmma_*
 results/

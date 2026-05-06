@@ -162,14 +162,71 @@ the prototyped native path needs activation quantization to ship safely.
   (added vLLM 0.20.1 ROCm numbers + corrected prefill-isolation
   methodology)
 
+### Sprint 39 — Block-wise FP8 activation quantize fix (post-release, 2026-05-09)
+
+The Sprint 38 Part 2 scaffold is now active. Sprint 39 adds in-shader
+**per-k_block dynamic activation absmax** + rescale, which fixes the
+honest-negative coherence bug from Part 2. `VF_FP8_NATIVE_WMMA=1` now
+covers all three FP8 scaling strategies coherently.
+
+| Model + workload                         | BF16 path | Native broken (P2) | Native fixed (S39)    |
+|------------------------------------------|----------:|-------------------:|----------------------:|
+| Qwen3-8B-FP8 pp=512 (block-wise)         |       770 |  1218 (❌ "!!!")    | **1118** (✅ coherent) |
+| Qwen3-8B-FP8 pp=1024 (block-wise)        |       769 |  1222 (❌)          | **1116** (✅)          |
+| Qwen3-8B-FP8 decode                      |      64.2 |        64.2        |               64.2    |
+| Qwen3-8B-FP8 Avg W (pp=512)              |       227 |         244        |                273    |
+| Qwen3-8B-FP8 tok/s/W pp=512              |      3.39 |        4.99        |          **4.10** (+21 % vs BF16) |
+
+**+45 % over BF16 baseline with coherent output.** −8 % vs the broken
+P2 kernel (the absmax pre-scan + rescale cost). Token-for-token
+identical greedy output to the BF16 path on `What is 2+2?` and
+`Write a haiku about computing.` smoke prompts.
+
+#### Algorithm
+
+In-shader per-k_block dynamic absmax over the 32×128 activation
+tile, then rescaled FP32→FP8 cast:
+
+```glsl
+for kb in 0..num_kblocks:
+  // pre-scan: 4096 acts / 512 threads = 8 reads/thread
+  thread_max = max over 8 abs(act) values
+  wave_max   = subgroupMax(thread_max)
+  wave_maxes[gl_SubgroupID] = wave_max          // one writer per wave
+  barrier
+  tile_absmax = max over wave_maxes[0..NUM_SG]
+  act_scale     = max(tile_absmax / 448, 1e-12)
+  combined      = blk_scale * act_scale          // weight × act
+
+  partial_acc = 0
+  for step in inner_steps:
+    buf_b[...] = floate4m3_t(clamp(act * (1/act_scale), -448, 448))
+    partial_acc = MulAdd(matA_fp8, matB_fp8, partial_acc)
+
+  partial_acc *= combined                        // 4× v_mul_f32
+  total_acc   += partial_acc                     // 4× v_add_f32
+```
+
+`combined` cancels the activation rescale inside `partial_acc`,
+recovering the unscaled GEMM with weight-block scaling. Math is
+preserved modulo FP8 precision losses now bounded into safe range.
+
+#### Lesson
+
+**Bench tok/s is NOT a correctness signal.** Sprint 38 P2 cleared the
++59 % perf gate while emitting `!`. Only `vulkanforge chat` smoke
+caught it. Memory entry `feedback_bench_throughput_not_correctness.md`
+written to enforce the rule going forward; Sprint 39 ran chat-smoke
+FIRST per that mandate.
+
 ### Commit Trail
 
 ```
 Sprint 37          c41767c..0c72373  Mesa FP8 CoopMat confirmed on 26.1-rc3
 Sprint 38-Bench    31310cc           vLLM 0.20.1 full comparison
 Sprint 38 Part 1   59e08b2           Native FP8 WMMA per-tensor/per-channel
-Sprint 38 Part 2  (post-release)     Block-wise FP8 native scaffold (disabled,
-                                     pending activation-quant pass)
+Sprint 38 Part 2   076b6d7           Block-wise FP8 native scaffold (disabled)
+Sprint 39          95185aa           Per-k-block activation quantize → block-wise +45 %
 ```
 
 ---
