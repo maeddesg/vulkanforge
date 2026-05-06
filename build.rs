@@ -1096,6 +1096,19 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "mul_coopmat_fp8_native_bn32.comp",
         defines: &[],
     },
+    // Sprint 38 Part 2 — block-wise FP8 native WMMA. Combines the
+    // Sprint 36 block-wise scale layout with native FP8 WMMA via a
+    // partial accumulator. Inner k-loop sums BK=16 WMMA steps into a
+    // partial coopmat<float>; after each block_k the partial is
+    // multiplied by the per-(n_block, k_block) scale (4× v_mul_f32)
+    // and added into the total accumulator (4× v_add_f32). Output is
+    // a plain copy. Opt-in via VF_FP8_NATIVE_WMMA=1 for block-wise
+    // FP8 models (Qwen3-FP8 / DeepSeek-V3-FP8).
+    ShaderJob {
+        out_name: "mul_coopmat_fp8_native_bn32_blockwise.spv",
+        entry_source: "mul_coopmat_fp8_native_bn32_blockwise.comp",
+        defines: &[],
+    },
     // Sprint 20-M3 — FP32 weight GEMV. Used for lm_head on SafeTensors
     // FP8 models (lm_head is excluded from FP8 quantization on
     // neuralmagic / naive-quantized models, so it carries through

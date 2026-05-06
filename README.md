@@ -19,20 +19,25 @@ Compute-only — no swapchain, no graphics queues — built directly on `ash 0.3
 Per-tensor and per-channel FP8 models (Llama-3.1-FP8, Qwen2.5-FP8) get
 a new `V_WMMA_F32_16X16X16_FP8_FP8` cooperative-matrix path that
 removes the FP8→BF16 conversion step from the K-loop. Llama-3.1-8B-FP8
-prefill: **757 → 1197 tok/s (+58%)** at pp=512. Qwen2.5-14B-FP8: **325
-→ 450 tok/s (+39%)**. Decode is unchanged (GEMV at M=1, no WMMA).
+prefill: **757 → 1197 tok/s (+58 %)** at pp=512. Qwen2.5-14B-FP8:
+**325 → 450 tok/s (+39 %)**. Decode is unchanged (GEMV at M=1, no WMMA).
 Block-wise FP8 (Qwen3-FP8) keeps the Sprint-36 BF16 scale-fold path —
-native FP8 doesn't apply there. Opt-in via `VF_FP8_NATIVE_WMMA=1`,
-default OFF for Mesa 26.0.x compatibility.
+a native block-wise shader was prototyped (Sprint 38 Part 2) but stays
+disabled because the naive FP32→FP8 cast on the activation tile loses
+too much dynamic range for block-wise weights (vLLM and llama.cpp's
+W8A8 Block FP8 paths quantize activations dynamically; we don't yet).
+The native shader is in tree, ready for the activation-quantization
+pass to land. Opt-in via `VF_FP8_NATIVE_WMMA=1`, default OFF for
+Mesa 26.0.x compatibility.
 
 ### Driver Requirements
 
 - **Mesa 26.0.6+** — full GGUF + FP8 support (BF16 WMMA path on every
   FP8 sub-type, including block-wise).
-- **Mesa 26.1+** — enables native FP8 WMMA for +37–58% FP8 prefill
-  via `VF_FP8_NATIVE_WMMA=1`. Required Vulkan feature:
-  `shaderFloat8CooperativeMatrix = true` (check via
-  `vulkaninfo | grep shaderFloat8CooperativeMatrix`).
+- **Mesa 26.1+** — enables native FP8 WMMA for per-tensor and
+  per-channel FP8 prefill (+37–58 %) via `VF_FP8_NATIVE_WMMA=1`.
+  Required Vulkan feature: `shaderFloat8CooperativeMatrix = true`
+  (check via `vulkaninfo | grep shaderFloat8CooperativeMatrix`).
 - Kernel parameter `amdgpu.lockup_timeout=10000,10000` recommended for
   14B+ models (avoids the 2 s compute timeout on long prefill submits).
 
@@ -145,11 +150,11 @@ directory.
 
 **Mesa 26.1+ with `VF_FP8_NATIVE_WMMA=1` (recommended path on RDNA4):**
 
-| Model                                  | Scaling                  | VRAM (GPU)  | Decode    | Prefill @ pp=512 | Coherent |
-|----------------------------------------|--------------------------|------------:|----------:|-----------------:|---------:|
-| Meta-Llama-3.1-8B-Instruct-FP8         | per-tensor               |   7.48 GiB  |  69 t/s   | **1197 t/s** (+58%) |  15/15   |
-| Qwen2.5-14B-Instruct-FP8               | per-channel              |  13.77 GiB  |  14 t/s   | **450 t/s** (+39%) |  15/15   |
-| Qwen3-8B-FP8                           | block-wise [128,128]     |   8.5 GiB   |  64 t/s   |  770 t/s         |    ✓     |
+| Model                                  | Scaling                  | VRAM (GPU)  | Decode    | Prefill @ pp=512    | Coherent |
+|----------------------------------------|--------------------------|------------:|----------:|--------------------:|---------:|
+| Meta-Llama-3.1-8B-Instruct-FP8         | per-tensor               |   7.48 GiB  |  69 t/s   | **1197 t/s** (+58 %) |  15/15   |
+| Qwen2.5-14B-Instruct-FP8               | per-channel              |  13.77 GiB  |  14 t/s   |  **450 t/s** (+39 %) |  15/15   |
+| Qwen3-8B-FP8                           | block-wise [128,128]     |   8.5 GiB   |  64 t/s   |  770 t/s (BF16 path)|    ✓     |
 
 **Mesa 26.0.x fallback (BF16 conversion path) — also default if `VF_FP8_NATIVE_WMMA` is unset:**
 
@@ -160,13 +165,21 @@ directory.
 | Qwen3-8B-FP8 (new in v0.3.8)           | block-wise [128,128]     |   8.5 GiB   |  64 t/s   |  770 t/s         |    ✓     |
 
 Block-wise FP8 (`weight_block_size: [128, 128]`) — used by every
-official Qwen3 / Qwen3.5 / DeepSeek-V3 FP8 release — keeps the BF16
-scale-fold path on every Mesa version: native FP8 WMMA can't host the
-per-block scale application without a different shader strategy
-(future sprint). Per-tensor and per-channel FP8 win the +37–58 %
-prefill on Mesa 26.1+. Decode is unchanged across all paths
-(memory-bandwidth-bound GEMV, no WMMA at M=1).
-(Mesa 26.1-rc3, RX 9070 XT. Decode median of 3, prefill median of 3.)
+official Qwen3 / Qwen3.5 / DeepSeek-V3 FP8 release — keeps the Sprint
+36 BF16 scale-fold path on every Mesa version *and* with the native
+flag set. A native block-wise shader using a partial-accumulator scale
+trick was prototyped (Sprint 38 Part 2, in tree at
+`vk_shaders/mul_coopmat_fp8_native_bn32_blockwise.comp`) — bench
+throughput hit +59 % but coherence failed: a naive FP32→FP8 cast on
+the activation tile destroys too much dynamic range for block-wise
+weights, which were calibrated against per-token-quantized activations
+(the way vLLM and llama.cpp's W8A8 Block FP8 paths handle it).
+The shader and pipeline stay built so the next sprint can swap them
+in once a separate activation-quantization dispatch lands. Per-tensor
+and per-channel FP8 win the +37–58 % prefill on Mesa 26.1+ today.
+Decode is unchanged across all paths (memory-bandwidth-bound GEMV, no
+WMMA at M=1). (Mesa 26.1-rc3, RX 9070 XT. Decode median of 3, prefill
+median of 3.)
 
 #### Quick start — Qwen3-8B-FP8
 
@@ -201,6 +214,14 @@ VF_FP8_NATIVE_WMMA=1 VULKANFORGE_ENABLE_FP8=1 vulkanforge chat \
 VULKANFORGE_ENABLE_FP8=1 vulkanforge chat \
   --model ~/models/Meta-Llama-3.1-8B-Instruct-FP8/ \
   --tokenizer-from ~/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
+
+# Block-wise (Qwen3-FP8): the flag is silently ignored on this path
+# until the next sprint lands the activation-quant pass — runs on
+# the Sprint 36 BF16 scale-fold path (770 tok/s).
+VULKANFORGE_ENABLE_FP8=1 vulkanforge chat \
+  --model ~/models/Qwen3-8B-FP8/ \
+  --tokenizer-from ~/models/Qwen3-8B-Q4_K_M.gguf \
+  --temperature 0.6
 ```
 
 ### FP8 Performance Notes
@@ -216,6 +237,15 @@ still cannot load FP8 SafeTensors models at all.
   fallback. Activations are converted FP32→FP8 on the B-side via
   `v_cvt_pk_fp8_f32` (RADV/ACO does not support mixed-type FP8/BF16
   cooperative matrix — both A and B must be FP8).
+- **Qwen3-8B FP8 block-wise prefill: still 770 tok/s.** A native
+  partial-accumulator shader (Sprint 38 Part 2) was prototyped and
+  benched at 1218 tok/s, but coherence failed because the naive
+  FP32→FP8 activation cast loses too much dynamic range against
+  block-wise-calibrated weights. Shipping it would produce garbage
+  output, so the routing falls back to the Sprint 36 BF16 scale-fold
+  path even when `VF_FP8_NATIVE_WMMA=1` is set. The native shader is
+  in tree, ready for a future sprint that adds per-token activation
+  quantization (the way vLLM and llama.cpp do it).
 - **14B FP8 prefill (Mesa 26.1+, native): 450 tok/s** — +39 % over
   the 325-tok/s BF16 fallback. The remaining gap to the FP8 peak is
   partly LDS staging (per-step `ds_store_b8` + `ds_load_u8`) and
@@ -286,7 +316,7 @@ scale into the A-tile load (Sprints 35 + 36).
 | Qwen2.5-14B-Instruct-FP8 (per-channel) | qwen2 / SafeTensors | gpt2 / qwen2     | ChatML        | ✅ native FP8 (new in v0.3.5) |
 | Qwen3-8B-FP8 (block-wise [128,128])    | qwen3 / SafeTensors | gpt2 / qwen2     | ChatML        | ✅ native FP8 (new in v0.3.8) |
 
-**107 SPIR-V pipelines, 37 lib tests + 40+ GPU correctness tests,
+**109 SPIR-V pipelines, 37 lib tests + 40+ GPU correctness tests,
 15 / 15 prompts coherent on Qwen3-8B Q4_K_M, Llama-3.1-8B-FP8,
 and Qwen2.5-14B-FP8; Qwen3-8B-FP8 coherent on the `<think>`-mode
 smoke set.** See `INSTALL.md` for setup.

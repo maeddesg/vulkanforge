@@ -16,6 +16,19 @@ WMMA). Block-wise FP8 (Qwen3) keeps the Sprint-36 BF16 scale-fold
 path. Opt-in via `VF_FP8_NATIVE_WMMA=1`, default OFF for
 Mesa 26.0.x compatibility.
 
+> **Sprint 38 Part 2 honest-negative:** A native FP8 block-wise
+> shader was prototyped (`mul_coopmat_fp8_native_bn32_blockwise.comp`)
+> using a partial-accumulator + per-block scalar-multiply pattern.
+> Bench throughput was excellent (1218 tok/s, +59 %) but coherence
+> failed: Qwen3-8B-FP8 generated only the `!` token. Root cause is
+> the naive FP32→FP8 cast on the B-tile — block-wise FP8 weights
+> were calibrated against per-token-quantized activations (vLLM and
+> llama.cpp's W8A8 Block FP8 paths quantize activations dynamically;
+> we don't yet). The shader, pipeline, and routing scaffolding stay
+> in tree; `VF_FP8_NATIVE_WMMA=1` on block-wise models continues to
+> use the Sprint 36 BF16 scale-fold path until a separate activation-
+> quantization pass lands. Future sprint.
+
 ### Native FP8 WMMA Performance (RX 9070 XT, Mesa 26.1-rc3, 3 runs)
 
 | Model              | Metric        | BF16 path | Native FP8 (Mesa 26.1+)| Δ        |
@@ -54,15 +67,16 @@ fail at the missing FP8 cooperative-matrix capability.
 To check support: `vulkaninfo | grep shaderFloat8CooperativeMatrix`
 must show `true`.
 
-### vLLM gap closure (per-tensor 8B FP8 prefill)
+### vLLM gap closure (Sprint 38-Bench baseline)
 
-Sprint 38-Bench measured vLLM 0.20.1 ROCm at 14757 tok/s prefill
-on Llama-3.1-8B-FP8 (specialized `ROCmFP8ScaledMMLinearKernel`).
-VF v0.3.8 was 757 tok/s — **19.5× gap**. v0.3.9 native FP8 closes
-that to **12.3×** (1197 tok/s). The remaining gap is tile selection
-and ROCm-specific kernel tuning, not WMMA-level — closing it would
-need shape-aware auto-tuning or a Split-K layout, not another
-shader rewrite.
+Sprint 38-Bench measured vLLM 0.20.1 ROCm at 14757 tok/s prefill on
+Llama-3.1-8B-FP8 (specialized `ROCmFP8ScaledMMLinearKernel`). VF v0.3.8
+was 757 tok/s — **19.5× gap**. v0.3.9 native FP8 closes that to **12.3×**
+(1197 tok/s). The remaining gap is tile selection and ROCm-specific
+kernel tuning, not WMMA-level — closing it would need shape-aware
+auto-tuning or a Split-K layout, not another shader rewrite. Block-wise
+Qwen3-FP8 stays at 770 tok/s for now (3.6× gap to vLLM's 2776 tok/s);
+the prototyped native path needs activation quantization to ship safely.
 
 ### Routing matrix
 
@@ -72,25 +86,41 @@ shader rewrite.
 | Per-tensor FP8 (Llama)  | `1`                  | **`MulCoopmatFp8NativeBn32`** (FP8 native) |
 | Per-channel FP8         | unset / `0`          | `MulCoopmatFp8Bn32`                        |
 | Per-channel FP8         | `1`                  | **`MulCoopmatFp8NativeBn32`**              |
-| Block-wise FP8 (Qwen3)  | any                  | `mul_coopmat_fp8_bn32_blockwise` (Sprint 36) |
+| Block-wise FP8 (Qwen3)  | unset / `0`          | `mul_coopmat_fp8_bn32_blockwise` (Sprint 36 BF16 scale-fold) |
+| Block-wise FP8 (Qwen3)  | `1`                  | `mul_coopmat_fp8_bn32_blockwise` (BF16 fallback — see Part 2 honest-negative above; native path stays disabled) |
 | GGUF Q4_K_M / Q8_0      | irrelevant           | `MulMmqQ4K…` etc. (no FP8 path)            |
 
 ### What changed
 
-- `vk_shaders/mul_coopmat_fp8_native_bn32.comp` (new, 148 LOC) —
-  native FP8×FP8 cooperative-matrix GEMM. Same tile geometry as
-  `mul_coopmat_fp8_bn32.comp` (BM=64, BN=32, BK=16, 8 subgroups
+- `vk_shaders/mul_coopmat_fp8_native_bn32.comp` (new, 148 LOC, Sprint 38
+  Part 1) — native FP8×FP8 cooperative-matrix GEMM. Same tile geometry
+  as `mul_coopmat_fp8_bn32.comp` (BM=64, BN=32, BK=16, 8 subgroups
   arranged 4×2). ELEM_TYPE = `floate4m3_t`. A-tile uses
   `uintBitsToFloate4m3EXT` (no float roundtrip); B-tile uses
   `floate4m3_t(fp32_value)` (ACO emits `v_cvt_pk_fp8_f32`).
-- `build.rs` — new `ShaderJob` for the native SPV.
-- `src/backend/vulkan/shaders.rs` — `ShaderId::MulCoopmatFp8NativeBn32`,
-  name, SPV bytes, registry index.
+- `vk_shaders/mul_coopmat_fp8_native_bn32_blockwise.comp` (new, 224 LOC,
+  Sprint 38 Part 2 — **scaffolded but disabled**). Block-wise variant.
+  Outer K-loop over `num_kblocks`, inner loop runs 8 WMMA steps per
+  block (BK=16 × 8 = block_k=128). Each k_block accumulates into a
+  partial `coopmat<float>`, then `partial *= blk_scale; total += partial`.
+  Output write is a plain copy. Compiles, builds, and the partial-acc
+  pattern is preserved in tree for the next sprint to swap in once a
+  per-token activation-quantization pass lands.
+- `build.rs` — two new `ShaderJob` entries.
+- `src/backend/vulkan/shaders.rs` — `ShaderId::MulCoopmatFp8NativeBn32`
+  (Part 1) + name + SPV bytes + registry index.
 - `src/backend/vulkan/pipeline_registry.rs` — new ShaderId in the
-  no-spec-constant FP8 group.
-- `src/backend/vulkan/forward.rs` — env-flag routing in
-  `run_gemm_fp8_naive`: `use_native = VF_FP8_NATIVE_WMMA && use_bn32`,
-  picks `MulCoopmatFp8NativeBn32` when set.
+  no-spec-constant FP8 group (Part 1).
+- `src/backend/vulkan/forward.rs`:
+  * Part 1 routing in `run_gemm_fp8_naive`: `use_native = VF_FP8_NATIVE_WMMA
+    && use_bn32`, picks `MulCoopmatFp8NativeBn32` when set.
+  * Part 2 adds a parallel `fp8bwgemm_native_pipeline` (shares
+    DSL/layout/pool with the Sprint 36 cousin since bindings + push
+    constants are identical). Pipeline is built and kept warm; the
+    routing in `run_gemm_fp8_blockwise` reads `VF_FP8_NATIVE_WMMA` but
+    deliberately ignores it (BF16 fallback) until activation quant is
+    wired. This keeps the framework in tree without shipping garbage.
+- 109 SPIR-V pipelines in tree (107 → 109).
 
 ### Pre-check work (Sprint 38, recorded as honest negatives)
 
@@ -109,24 +139,25 @@ shader rewrite.
 
 ### Known limitations
 
-- Native FP8 WMMA covers per-tensor and per-channel scales. Block-wise
-  FP8 stays on the BF16 scale-fold path (the per-K-block scale gets
-  applied during the FP8→float→BF16 conversion that the native shader
-  removes — different scale strategy needed, future sprint).
 - Mixed-type FP8 / BF16 / FP16 cooperative matrix is unsupported on
   RADV/ACO (Mesa 26.1-rc3, gfx1201). Activations are converted
   FP32→FP8 in the shader.
 - `VF_FP8_NATIVE_WMMA=1` on Mesa 26.0.x will fail at pipeline build —
   the flag is only valid with Mesa 26.1+.
 - Decode does not benefit (GEMV path, no WMMA at M=1).
+- Block-wise native path requires `block_n` divisible by BM=64 and
+  `block_k` divisible by BK=16 (Qwen3 / DeepSeek-V3 with [128,128]
+  satisfy both). Other block-shapes fall through to the BF16
+  scale-fold path automatically.
 - Validation-layer warnings about `SPV_KHR_bfloat16` capability still
   fire (the BF16-cousin shaders in tree). Cosmetic; pipelines still
   build. Cleanup deferred.
 
 ### Reports
 
-- Sprint report: `results/v039_sprint38_fp8_native_wmma.md`
-- ISA dumps + bench logs: `results/sprint38_part1_logs/`
+- Sprint 38 Part 1 report: `results/v039_sprint38_fp8_native_wmma.md`
+- Sprint 38 Part 2 report (honest-negative): `results/v039_sprint38p2_blockwise_native.md`
+- ISA dumps + bench logs: `results/sprint38_part1_logs/`, `results/sprint38p2_logs/`
 - vLLM full comparison (Sprint 38-Bench): `results/v038_bench_comparison.md`
   (added vLLM 0.20.1 ROCm numbers + corrected prefill-isolation
   methodology)
@@ -134,9 +165,11 @@ shader rewrite.
 ### Commit Trail
 
 ```
-Sprint 37        c41767c..0c72373  Mesa FP8 CoopMat confirmed on 26.1-rc3
-Sprint 38-Bench  31310cc           vLLM 0.20.1 full comparison
-Sprint 38 Part 1 (this release)    Native FP8 WMMA shader
+Sprint 37          c41767c..0c72373  Mesa FP8 CoopMat confirmed on 26.1-rc3
+Sprint 38-Bench    31310cc           vLLM 0.20.1 full comparison
+Sprint 38 Part 1   59e08b2           Native FP8 WMMA per-tensor/per-channel
+Sprint 38 Part 2  (post-release)     Block-wise FP8 native scaffold (disabled,
+                                     pending activation-quant pass)
 ```
 
 ---

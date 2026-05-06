@@ -67,6 +67,15 @@ const MUL_MAT_VEC_FP8_BLOCKWISE: &[u8] =
 const MUL_COOPMAT_FP8_BN32_BLOCKWISE: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_fp8_bn32_blockwise.spv"));
 
+// Sprint 38 Part 2 — block-wise FP8 GEMM with NATIVE FP8 WMMA. Same
+// descriptor set + push-constant layout as the BF16 cousin, but the
+// shader uses `coopmat<floate4m3_t>` and applies the per-block scale
+// via a partial accumulator multiplied by the scalar block scale,
+// then summed into the total accumulator. Routed when
+// `VF_FP8_NATIVE_WMMA=1` for block-wise FP8 models.
+const MUL_COOPMAT_FP8_NATIVE_BN32_BLOCKWISE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_fp8_native_bn32_blockwise.spv"));
+
 // Sprint 29 — F16 GEMV SPV for the dedicated lm_head pipeline. Same
 // SPV as the production `MulMatVecF16` registry entry; the harness
 // pattern (PipelineCache::null + dedicated DSL/pool) bypasses the
@@ -397,6 +406,13 @@ pub struct Forward {
     fp8bwgemm_pipeline: vk::Pipeline,
     fp8bwgemm_pool: vk::DescriptorPool,
     fp8bwgemm_ds_cache: HashMap<(u64, u64, u64, u64), vk::DescriptorSet>,
+
+    // Sprint 38 Part 2 — block-wise FP8 GEMM with native FP8 WMMA.
+    // Shares dsl/pipeline_layout/pool with the BF16 cousin above; only
+    // the shader module + pipeline differ. Routed when
+    // `VF_FP8_NATIVE_WMMA=1` for block-wise FP8 models.
+    fp8bwgemm_native_shader_module: vk::ShaderModule,
+    fp8bwgemm_native_pipeline: vk::Pipeline,
 
     // Sprint 29 — harness-style dedicated F16 GEMV resources for the
     // lm_head dispatch (M=152064, K=5120 on Qwen2.5-14B-FP8). Mirrors
@@ -1258,6 +1274,42 @@ impl Forward {
             (module, dsl, pipeline_layout, pipeline, pool)
         };
 
+        // Sprint 38 Part 2 — block-wise FP8 GEMM with native FP8 WMMA.
+        // Parallel pipeline that reuses fp8bwgemm_dsl / pipeline_layout
+        // (identical descriptor + push-constant layout) but binds the
+        // native FP8 SPV. Selected at dispatch time by env flag, so we
+        // pay the build cost of one extra pipeline (cheap) and skip
+        // duplicating DSL/layout/pool.
+        let (fp8bwgemm_native_shader_module, fp8bwgemm_native_pipeline) = unsafe {
+            let words: Vec<u32> = MUL_COOPMAT_FP8_NATIVE_BN32_BLOCKWISE
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let module = device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&words),
+                None,
+            )?;
+            let mut subgroup_info =
+                vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+                    .required_subgroup_size(64);
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(module)
+                .name(c"main")
+                .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
+                .push_next(&mut subgroup_info);
+            let pipeline = device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    &[vk::ComputePipelineCreateInfo::default()
+                        .stage(stage)
+                        .layout(fp8bwgemm_pipeline_layout)],
+                    None,
+                )
+                .map_err(|(_, e)| e)?[0];
+            (module, pipeline)
+        };
+
         // Sprint 29 — dedicated F16 GEMV pipeline for lm_head. Mirrors
         // the production registry's MulMatVecF16 entry (BLOCK_SIZE=64
         // spec, requiredSubgroupSize=64, REQUIRE_FULL_SUBGROUPS, 5
@@ -1402,6 +1454,8 @@ impl Forward {
             fp8bwgemm_pipeline,
             fp8bwgemm_pool,
             fp8bwgemm_ds_cache: HashMap::new(),
+            fp8bwgemm_native_shader_module,
+            fp8bwgemm_native_pipeline,
             lmhead_shader_module,
             lmhead_dsl,
             lmhead_pipeline_layout,
@@ -2120,6 +2174,11 @@ impl Forward {
             // Sprint 36 — block-wise FP8 GEMM cleanup
             device.destroy_descriptor_pool(self.fp8bwgemm_pool, None);
             device.destroy_pipeline(self.fp8bwgemm_pipeline, None);
+            // Sprint 38 Part 2 — native FP8 block-wise pipeline shares
+            // dsl/layout/pool with the BF16 cousin; only destroy the
+            // pipeline + module here.
+            device.destroy_pipeline(self.fp8bwgemm_native_pipeline, None);
+            device.destroy_shader_module(self.fp8bwgemm_native_shader_module, None);
             device.destroy_pipeline_layout(self.fp8bwgemm_pipeline_layout, None);
             device.destroy_descriptor_set_layout(self.fp8bwgemm_dsl, None);
             device.destroy_shader_module(self.fp8bwgemm_shader_module, None);
@@ -3116,6 +3175,24 @@ impl Forward {
         };
         let groups_x = (m + BM - 1) / BM;
         let groups_y = (n + BN - 1) / BN;
+        // Sprint 38 Part 2 — `VF_FP8_NATIVE_WMMA=1` was meant to also
+        // route block-wise FP8 to the native FP8 cooperative-matrix
+        // pipeline (`fp8bwgemm_native_pipeline`). The shader compiles
+        // and the bench reports +59 % throughput, but a coherence
+        // check on Qwen3-8B-FP8 produces only the `!` token — the
+        // naive FP32→FP8 cast on the B-tile destroys too much dynamic
+        // range for block-wise weights, which were calibrated against
+        // dynamically-quantized activations (per-token scaling, the
+        // way vLLM and llama.cpp's W8A8 Block FP8 paths do it).
+        // Until a separate activation-quantize pass lands (own dispatch
+        // with per-token / per-block scale), block-wise FP8 stays on
+        // the Sprint 36 BF16 scale-fold path even when the env flag is
+        // set. The native pipeline is still built and kept warm in the
+        // cache so the next sprint can swap it in once the activation
+        // quantization is wired up.
+        let _native_fp8_wmma_blockwise_disabled = std::env::var("VF_FP8_NATIVE_WMMA")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         let pipeline = self.fp8bwgemm_pipeline;
         let layout = self.fp8bwgemm_pipeline_layout;
         self.profile(label, dev, cmd, |dev, cmd| unsafe {
