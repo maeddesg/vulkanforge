@@ -42,26 +42,27 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
 ## Quick start
 
 ```bash
-# GGUF (works on Mesa 26.0.6+, the default-everywhere path)
+# GGUF — no flag needed, default-everywhere path (Mesa 26.0.6+)
 vulkanforge chat --model ~/models/Qwen3-8B-Q4_K_M.gguf
 
-# Native FP8 SafeTensors (Mesa 26.0.6+, BF16 conversion path)
-VULKANFORGE_ENABLE_FP8=1 vulkanforge chat \
+# FP8 SafeTensors — one flag, all auto-detected (v0.3.12)
+# Detects: FP8 model (config.json), native WMMA (Mesa 26.1+),
+# AVX-512 (host), model size → CPU lm_head offload (≥ 12 B).
+VF_FP8=auto vulkanforge chat \
   --model ~/models/Qwen3-8B-FP8/ \
   --tokenizer-from ~/models/Qwen3-8B-Q4_K_M.gguf
 
-# Native FP8 WMMA (Mesa 26.1+, +45–58 % FP8 prefill)
-VF_FP8_NATIVE_WMMA=1 VULKANFORGE_ENABLE_FP8=1 vulkanforge chat \
-  --model ~/models/Qwen3-8B-FP8/ \
-  --tokenizer-from ~/models/Qwen3-8B-Q4_K_M.gguf
-
-# CPU lm_head offload (v0.3.10, AVX-512 Zen 4 / Ice Lake+)
-# Saves ~970 MB VRAM. On 14B FP8 it's faster than the GPU lm_head.
-VF_CPU_LM_HEAD=1 VF_FP8_NATIVE_WMMA=1 VULKANFORGE_ENABLE_FP8=1 \
-  vulkanforge chat \
-    --model ~/models/Qwen2.5-14B-Instruct-FP8/ \
-    --tokenizer-from ~/models/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_k_m.gguf
+# 14 B FP8 with auto CPU lm_head — saves 970 MB VRAM, +9 % decode
+VF_FP8=auto vulkanforge chat \
+  --model ~/models/Qwen2.5-14B-Instruct-FP8/ \
+  --tokenizer-from ~/models/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_k_m.gguf
 ```
+
+The legacy v0.3.10 flags (`VULKANFORGE_ENABLE_FP8=1`,
+`VF_FP8_NATIVE_WMMA=1`, `VF_CPU_LM_HEAD=1`) still work as explicit
+overrides — handy when you want CPU `lm_head` on an 8 B model for
+VRAM headroom, or want to force the BF16 fallback for a regression
+check.
 
 Verify Mesa 26.1+ before setting `VF_FP8_NATIVE_WMMA=1`:
 

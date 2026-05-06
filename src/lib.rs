@@ -26,6 +26,7 @@
     clippy::large_enum_variant,
 )]
 
+pub mod auto_detect;
 pub mod backend;
 pub mod cpu;
 pub mod safetensors;

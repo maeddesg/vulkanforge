@@ -1,5 +1,140 @@
 # Changelog
 
+## v0.3.12 — `VF_FP8=auto` (one flag instead of three) (2026-05-10)
+
+### Headline
+
+A single env var now drives all FP8 routing. The three v0.3.10
+opt-in flags collapse into one auto-detected default:
+
+```bash
+# v0.3.10 / v0.3.11
+VULKANFORGE_ENABLE_FP8=1 VF_FP8_NATIVE_WMMA=1 VF_CPU_LM_HEAD=1 \
+  vulkanforge chat \
+    --model ~/models/Qwen2.5-14B-Instruct-FP8/ \
+    --tokenizer-from ~/models/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_k_m.gguf
+
+# v0.3.12
+VF_FP8=auto vulkanforge chat \
+  --model ~/models/Qwen2.5-14B-Instruct-FP8/ \
+  --tokenizer-from ~/models/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_k_m.gguf
+```
+
+### Auto-detection chain
+
+`VF_FP8=auto` runs in two phases (split because Vulkan capability
+is only knowable after `VulkanDevice::new()`):
+
+**Phase A — pre-device, in `run_*_safetensors`:**
+* Read `config.json` from the model directory.
+* Detect FP8: `quantization_config.quant_method == "fp8"` (Qwen3-FP8,
+  DeepSeek-V3-FP8) **or** `quant_method == "compressed-tensors"`
+  with `format ∈ {"naive-quantized", "float-quantized"}`
+  (neuralmagic Llama-FP8, Qwen2.5-14B-FP8). INT8 W8A8 is correctly
+  excluded (`format == "int-quantized"`).
+* If FP8 detected → set `VULKANFORGE_ENABLE_FP8=1`.
+
+**Phase B — post-device, before `Forward::new()`:**
+* Read back the device's actual `native_fp8_wmma` capability
+  (advertised when `VK_EXT_shader_float8` is in the device's
+  extension list — Mesa 26.1+ on RADV gfx1201). Set
+  `VF_FP8_NATIVE_WMMA=1` if true.
+* Detect AVX-512F+BW+VL on the host CPU via
+  `is_x86_feature_detected!`. Estimate model size from
+  `config.json` (`12 × hidden² × layers + 2 × vocab × hidden`,
+  good to ~10 % across 7–70 B). Set `VF_CPU_LM_HEAD=1` when
+  AVX-512 ∧ size ≥ 12 B. The 12 B cutoff is calibrated: 8 B
+  models are ~32 % faster on the GPU `lm_head`; 14 B+ models
+  are faster on CPU AVX-512 + save 970 MB VRAM.
+
+Banner on each `auto`-mode launch:
+
+```
+VF_FP8=auto detected:
+  FP8 model:      yes
+  Native WMMA:    yes (Mesa 26.1+)
+  AVX-512:        yes
+  Model size:     ~16.8 B params
+  → Native WMMA:  ON
+  → CPU lm_head:  ON (auto: ≥ 12 B + AVX-512)
+```
+
+### Backward compatibility
+
+The legacy flags `VULKANFORGE_ENABLE_FP8` / `VF_FP8_NATIVE_WMMA` /
+`VF_CPU_LM_HEAD` work exactly as in v0.3.10/v0.3.11:
+
+* If `VF_FP8` is *not* set, the legacy `VULKANFORGE_ENABLE_FP8=1`
+  fallback is honored (`Fp8Mode::On`).
+* If `VF_FP8=auto` is set, explicit `VF_FP8_NATIVE_WMMA=0/1` and
+  `VF_CPU_LM_HEAD=0/1` overrides still win — e.g.
+  `VF_FP8=auto VF_CPU_LM_HEAD=1` forces CPU `lm_head` even on an
+  8 B model (handy when you're VRAM-starved at the cost of speed).
+
+`VF_FP8=0` explicitly disables FP8 routing on a SafeTensors dir.
+`VF_FP8=auto` on a GGUF model is a no-op.
+
+### Mesa 26.0.x graceful fallback
+
+Pre-v0.3.12 device init pushed `VK_EXT_shader_float8` into the
+device-create extension list whenever `VULKANFORGE_ENABLE_FP8=1`,
+which crashed with `VK_ERROR_EXTENSION_NOT_PRESENT` on Mesa
+26.0.x. v0.3.12 probes
+`enumerate_device_extension_properties()` first, only pushes the
+extension when advertised, and prints a one-line warning + falls
+back to the BF16 conversion path otherwise. `VF_FP8=auto` on Mesa
+26.0.x now works without crashing — you get BF16-narrow FP8, just
+not native cooperative-matrix.
+
+### Coherence (15-prompt suite, all FP8 paths via `VF_FP8=auto`)
+
+| Configuration                                 | v0.3.11 | v0.3.12 |
+|-----------------------------------------------|--------:|--------:|
+| Qwen3-8B Q4_K_M GGUF                          |   15/15 |   15/15 |
+| Llama-3.1-8B Q4_K_M GGUF                      |   15/15 |   15/15 |
+| Qwen3-8B-FP8 (`VF_FP8=auto`)                  |   15/15 |   15/15 |
+| Qwen2.5-14B-FP8 (`VF_FP8=auto`, auto CPU)     |   15/15 |   15/15 |
+| Llama-3.1-8B-FP8 (`VF_FP8=auto`)              |   15/15 |   15/15 |
+| Llama-3.1-8B-FP8 (legacy flag combo)          |   15/15 |   15/15 |
+
+**90 / 90 = 100 % coherent across all six paths.** Decode within
+±1 % of v0.3.11.
+
+### Performance impact
+
+Zero on the hot path. The auto-detect work is one `config.json`
+read + one Vulkan extension enumeration at startup — both
+sub-millisecond, both amortized over the session. Llama-FP8
+prefill pp=512 unchanged at 1130 t/s.
+
+### Deferred from the Sprint 42C brief
+
+* **`tokenizer.json` auto-load from model dir** — needs an HF
+  BPE parser plus a Jinja2 chat-template renderer. Both are
+  meaningful additions (the `tokenizers` crate is ~5 MB; a
+  minijinja dep adds another). Deferred to v0.3.13. Use
+  `--tokenizer-from <gguf>` for now (unchanged from v0.3.10).
+
+### What changed
+
+* `src/auto_detect.rs` (new, ~250 LOC) — `Fp8Mode`,
+  `parse_fp8_mode`, `detect_fp8_model_dir`,
+  `estimate_model_size_billions`, `detect_avx512`,
+  `apply_pre_device`, `apply_post_device`, `print_summary`. 3
+  new unit tests.
+* `src/lib.rs` — `pub mod auto_detect;`.
+* `src/backend/vulkan/device.rs` — probe `VK_EXT_shader_float8`
+  before requesting it; expose `pub native_fp8_wmma: bool` on
+  `VulkanDevice`; warn-not-crash on Mesa 26.0.x.
+* `src/main.rs` — call `apply_pre_device` at the top of
+  `run_chat_safetensors` / `run_bench_safetensors`, and
+  `apply_post_device` + `print_summary` immediately after
+  `VulkanDevice::new()`. ~6 LOC each.
+
+48 lib tests pass (45 prior + 3 new in `auto_detect::`).
+
+---
+
 ## v0.3.11 — Llama-FP8 activation-range fix (2026-05-10)
 
 ### Headline

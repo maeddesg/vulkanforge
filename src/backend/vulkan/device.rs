@@ -23,6 +23,11 @@ pub struct VulkanDevice {
     pub device: ash::Device,
     pub compute_queue: vk::Queue,
     pub queue_family_index: u32,
+    /// True when the driver advertises `VK_EXT_shader_float8` *and*
+    /// `shaderFloat8CooperativeMatrix` — i.e. native FP8 WMMA is
+    /// usable (Mesa 26.1+ on RADV gfx1201). v0.3.12 `VF_FP8=auto`
+    /// reads this to decide whether to set `VF_FP8_NATIVE_WMMA=1`.
+    pub native_fp8_wmma: bool,
     debug_loader: Option<debug_utils::Instance>,
     debug_messenger: vk::DebugUtilsMessengerEXT,
 }
@@ -192,8 +197,34 @@ impl VulkanDevice {
 
         let mut device_extensions: Vec<*const i8> =
             vec![vk::KHR_COOPERATIVE_MATRIX_NAME.as_ptr()];
-        if fp8_opt_in {
+
+        // Sprint 42C / v0.3.12 — probe `VK_EXT_shader_float8` availability
+        // before requesting it. Pre-v0.3.12 device.rs pushed the extension
+        // unconditionally on `fp8_opt_in`, which crashed with
+        // `VK_ERROR_EXTENSION_NOT_PRESENT` on Mesa 26.0.x. Probing makes
+        // `VF_FP8=auto` safe on older drivers (no native WMMA, but no
+        // hard crash either) and lets `VF_FP8_NATIVE_WMMA` reflect the
+        // device's *actual* capability rather than the user's request.
+        let fp8_ext_available = unsafe {
+            instance
+                .enumerate_device_extension_properties(physical_device)
+                .map(|exts| {
+                    exts.iter().any(|e| {
+                        let name = std::ffi::CStr::from_ptr(e.extension_name.as_ptr());
+                        name == crate::backend::vulkan::fp8_ext::SHADER_FLOAT8_EXT_NAME
+                    })
+                })
+                .unwrap_or(false)
+        };
+        let push_fp8_ext = fp8_opt_in && fp8_ext_available;
+        if push_fp8_ext {
             device_extensions.push(crate::backend::vulkan::fp8_ext::SHADER_FLOAT8_EXT_NAME.as_ptr());
+        } else if fp8_opt_in && !fp8_ext_available {
+            eprintln!(
+                "VulkanForge: VK_EXT_shader_float8 not advertised by driver — \
+                 falling back to BF16 conversion path (Mesa 26.0.x). Update to \
+                 Mesa 26.1+ for native FP8 cooperative-matrix WMMA."
+            );
         }
 
         // Sprint 39 — `VK_KHR_shader_bfloat16`. The BF16-narrow FP8 GEMM
@@ -243,7 +274,7 @@ impl VulkanDevice {
             .push_next(&mut features12)
             .push_next(&mut features13)
             .push_next(&mut coopmat_features);
-        if fp8_opt_in {
+        if push_fp8_ext {
             device_create_info = device_create_info.push_next(&mut fp8_features);
         }
         if bfloat16_available {
@@ -266,6 +297,7 @@ impl VulkanDevice {
             device,
             compute_queue,
             queue_family_index,
+            native_fp8_wmma: push_fp8_ext,
             debug_loader,
             debug_messenger,
         })

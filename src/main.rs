@@ -461,7 +461,17 @@ fn run_chat_safetensors(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>
     // Sprint 22 — `--max-context N` plumbed.
     let max_context = args.max_context.unwrap_or(MAX_SEQ_LEN);
 
+    // v0.3.12 — `VF_FP8=auto` Phase A: read config.json, set
+    // `VULKANFORGE_ENABLE_FP8=1` if it's an FP8 model so device.rs
+    // requests the FP8 cooperative-matrix extension.
+    let phase_a = vulkanforge::auto_detect::apply_pre_device(&args.model);
+
     let dev = VulkanDevice::new()?;
+
+    // Phase B — set `VF_FP8_NATIVE_WMMA=1` / `VF_CPU_LM_HEAD=1` based
+    // on the device's actual capability + host CPU + model size.
+    vulkanforge::auto_detect::apply_post_device(&phase_a, dev.native_fp8_wmma);
+    vulkanforge::auto_detect::print_summary(&phase_a, dev.native_fp8_wmma);
     let mut allocator = Allocator::new(&AllocatorCreateDesc {
         instance: dev.instance.clone(),
         device: dev.device.clone(),
@@ -1089,7 +1099,12 @@ fn run_bench_safetensors(
         .collect::<Result<_, _>>()
         .map_err(|e| format!("invalid --pp-list (must be comma-separated u32): {e}"))?;
 
+    // v0.3.12 — `VF_FP8=auto` Phase A (mirror of run_chat_safetensors).
+    let phase_a = vulkanforge::auto_detect::apply_pre_device(&model_dir);
+
     let dev = VulkanDevice::new()?;
+    vulkanforge::auto_detect::apply_post_device(&phase_a, dev.native_fp8_wmma);
+    vulkanforge::auto_detect::print_summary(&phase_a, dev.native_fp8_wmma);
     let mut allocator = Allocator::new(&AllocatorCreateDesc {
         instance: dev.instance.clone(),
         device: dev.device.clone(),
