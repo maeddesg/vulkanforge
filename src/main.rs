@@ -455,9 +455,12 @@ fn run_chat_safetensors(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>
         generate_from_tokens, EmbeddingSource, GenerateConfig,
     };
 
-    let tokenizer_gguf = args.tokenizer_from.ok_or_else(|| -> Box<dyn std::error::Error> {
-        "--tokenizer-from <gguf> is required when --model points at a SafeTensors directory".into()
-    })?;
+    // v0.3.13 — `--tokenizer-from` is now optional. When omitted,
+    // we auto-load `tokenizer.json` + `tokenizer_config.json` from
+    // the model directory. Pass `--tokenizer-from <gguf>` to keep
+    // the v0.3.10–v0.3.12 path (e.g. for an SPM SafeTensors model
+    // that doesn't ship a usable `tokenizer.json` yet).
+    let tokenizer_from = args.tokenizer_from.clone();
     // Sprint 22 — `--max-context N` plumbed.
     let max_context = args.max_context.unwrap_or(MAX_SEQ_LEN);
 
@@ -490,11 +493,39 @@ fn run_chat_safetensors(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>
         LoadedModel::load_safetensors(&dev, &mut allocator, &args.model)?;
     let cfg = model.config.clone();
 
-    let tok_gguf = GgufFile::open(&tokenizer_gguf)?;
-    let tokenizer = Tokenizer::from_gguf(&tok_gguf)?;
-    let template = vulkanforge::backend::vulkan::chat_template::ChatTemplate::detect(
-        &tok_gguf, &tokenizer,
-    );
+    let (tokenizer, template, tokenizer_source_label) = match tokenizer_from.as_ref() {
+        Some(gguf_path) => {
+            let tok_gguf = GgufFile::open(gguf_path)?;
+            let tokenizer = Tokenizer::from_gguf(&tok_gguf)?;
+            let template = vulkanforge::backend::vulkan::chat_template::ChatTemplate::detect(
+                &tok_gguf, &tokenizer,
+            );
+            (tokenizer, template, gguf_path.display().to_string())
+        }
+        None => {
+            // v0.3.13 — auto-load from the model dir. tokenizer.json
+            // is required; tokenizer_config.json carries the
+            // chat_template + bos/eos token literals.
+            let tokenizer = Tokenizer::from_hf_dir(&args.model).map_err(
+                |e| -> Box<dyn std::error::Error> {
+                    format!(
+                        "auto-load tokenizer.json from {}/ failed: {e}. \
+                         Pass --tokenizer-from <gguf> to fall back.",
+                        args.model.display()
+                    )
+                    .into()
+                },
+            )?;
+            let template = vulkanforge::backend::vulkan::chat_template::ChatTemplate::detect_hf(
+                &args.model, &tokenizer,
+            );
+            (
+                tokenizer,
+                template,
+                format!("{}/tokenizer.json", args.model.display()),
+            )
+        }
+    };
 
     if max_context > cfg.context_length {
         eprintln!(
@@ -518,7 +549,7 @@ fn run_chat_safetensors(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>
     println!();
     println!("VulkanForge — native FP8 chat (Sprint 20-M3)");
     println!("  Model:       {}", args.model.display());
-    println!("  Tokenizer:   {}", tokenizer_gguf.display());
+    println!("  Tokenizer:   {}", tokenizer_source_label);
     println!(
         "    {:.2} GiB · {} layers · hidden={} · heads={} · kv_heads={} · ctx_max={}",
         model.bytes_uploaded as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -1089,9 +1120,9 @@ fn run_bench_safetensors(
         EmbeddingSource, GenerateConfig, Sampling, generate_from_tokens,
     };
 
-    let tokenizer_gguf = tokenizer_from.ok_or_else(|| -> Box<dyn std::error::Error> {
-        "--tokenizer-from <gguf> is required when --model points at a SafeTensors directory".into()
-    })?;
+    // v0.3.13 — `--tokenizer-from` is optional; when omitted we
+    // auto-load tokenizer.json from the model dir (same as
+    // `run_chat_safetensors`).
 
     let pp_sizes: Vec<u32> = pp_list
         .split(',')
@@ -1127,8 +1158,26 @@ fn run_bench_safetensors(
         LoadedModel::load_safetensors(&dev, &mut allocator, &model_dir)?;
     let cfg = model.config.clone();
 
-    let tok_gguf = GgufFile::open(&tokenizer_gguf)?;
-    let tokenizer = Tokenizer::from_gguf(&tok_gguf)?;
+    let (tokenizer, tokenizer_source_label) = match tokenizer_from.as_ref() {
+        Some(gguf_path) => {
+            let tok_gguf = GgufFile::open(gguf_path)?;
+            let tokenizer = Tokenizer::from_gguf(&tok_gguf)?;
+            (tokenizer, gguf_path.display().to_string())
+        }
+        None => {
+            let tokenizer = Tokenizer::from_hf_dir(&model_dir).map_err(
+                |e| -> Box<dyn std::error::Error> {
+                    format!(
+                        "auto-load tokenizer.json from {}/ failed: {e}. \
+                         Pass --tokenizer-from <gguf> to fall back.",
+                        model_dir.display()
+                    )
+                    .into()
+                },
+            )?;
+            (tokenizer, format!("{}/tokenizer.json", model_dir.display()))
+        }
+    };
 
     let max_pp_local = pp_sizes.iter().copied().max().unwrap_or(64);
     let kv_cache = KvCache::new(
@@ -1146,7 +1195,7 @@ fn run_bench_safetensors(
     println!();
     println!("  vulkanforge bench (SafeTensors FP8) — {} runs/sample", runs);
     println!("    Model:     {}", model_dir.display());
-    println!("    Tokenizer: {}", tokenizer_gguf.display());
+    println!("    Tokenizer: {}", tokenizer_source_label);
     println!();
 
     // ---- 1. Decode benchmark ----

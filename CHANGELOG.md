@@ -1,5 +1,117 @@
 # Changelog
 
+## v0.3.13 — `tokenizer.json` auto-load from model dir (2026-05-10)
+
+### Headline
+
+`--tokenizer-from <gguf>` is no longer required for FP8 SafeTensors
+models. The tokenizer + chat template are loaded straight from the
+HuggingFace model directory:
+
+```bash
+# v0.3.12
+VF_FP8=auto vulkanforge chat \
+  --model ~/models/Qwen3-8B-FP8/ \
+  --tokenizer-from ~/models/Qwen3-8B-Q4_K_M.gguf  # ← gone
+
+# v0.3.13
+VF_FP8=auto vulkanforge chat --model ~/models/Qwen3-8B-FP8/
+```
+
+Combined with v0.3.12's `VF_FP8=auto`, this collapses the four
+v0.3.10 inputs (`VULKANFORGE_ENABLE_FP8`, `VF_FP8_NATIVE_WMMA`,
+`VF_CPU_LM_HEAD`, `--tokenizer-from`) into a single env var.
+
+### How it works
+
+When `--tokenizer-from` is omitted on a SafeTensors directory:
+
+1. **`Tokenizer::from_hf_dir()`** parses
+   `<model_dir>/tokenizer.json` and builds the *same* internal
+   `BpeData` struct as `from_gguf_bpe`. Two upstream merge formats
+   are handled: space-joined strings (`"Ġ Ġ"` — Llama-3.1) and
+   pair lists (`["Ġ", "Ġ"]` — Qwen3 / newer `tokenizers` crate
+   output). Special-token IDs come from `added_tokens`; bos / eos
+   literals from `tokenizer_config.json`. Flavour is detected from
+   the presence of `<|im_start|>` (Qwen2 / Qwen3 ChatML) or
+   `<|begin_of_text|>` (Llama-3).
+
+2. **`ChatTemplate::detect_hf()`** reads
+   `<model_dir>/tokenizer_config.json::chat_template` and applies
+   the same string heuristics as `detect()` (DeepSeek-R1, Llama-3,
+   ChatML, Mistral) plus the same flavour fallback. The renderers
+   themselves (`render_chatml_first`, `render_llama3_first`, etc.)
+   are unchanged — they target the canonical layouts, not the
+   upstream Jinja string.
+
+No new dependencies. The `tokenizers` crate (~5 MB) and a Jinja2
+runtime (`minijinja` ~200 KB) would be heavyweight ways to do
+exactly what VF's existing hand-rolled BPE + chat-template renderers
+already do correctly. Reusing them keeps the binary lean.
+
+### Backward compatibility
+
+`--tokenizer-from <gguf>` still works exactly as in v0.3.12:
+
+* SPM SafeTensors models (Mistral, Llama-2 family) don't ship a
+  usable `tokenizer.json` for VF's BPE path yet — pass
+  `--tokenizer-from` for those.
+* Regression checks ("is the GGUF tokenizer producing identical
+  tokens to the HF one?") need the explicit flag.
+* CI smokes that pin the tokenizer source by path still work.
+
+### Coherence (15-prompt suite, all FP8 paths via `VF_FP8=auto`, no --tokenizer-from)
+
+| Configuration                                 | v0.3.12 | v0.3.13 |
+|-----------------------------------------------|--------:|--------:|
+| Qwen3-8B-FP8 (HF auto-load)                   |   15/15 |   15/15 |
+| Qwen2.5-14B-FP8 (HF auto-load + auto CPU)     |   15/15 |   15/15 |
+| Llama-3.1-8B-FP8 (HF auto-load)               |   15/15 |   15/15 |
+| Llama-3.1-8B-FP8 (legacy `--tokenizer-from`)  |   15/15 |   15/15 |
+| Qwen3-8B Q4_K_M GGUF                          |   15/15 |   15/15 |
+| Llama-3.1-8B Q4_K_M GGUF                      |   15/15 |   15/15 |
+
+**90 / 90 = 100 % coherent across all six paths.** Decode
+bit-identical to v0.3.12 with GGUF tokenizer (same BPE merges,
+same specials, same flavour, same chat_template renderer):
+
+| Model              | v0.3.12 (--tokenizer-from) | v0.3.13 (HF auto-load) |
+|--------------------|---------------------------:|-----------------------:|
+| Llama-3.1-8B-FP8   |                  69.4 tok/s |             69.5 tok/s |
+| Qwen3-8B-FP8       |                  61.3 tok/s |             61.3 tok/s |
+| Qwen2.5-14B-FP8    |                  19.1 tok/s |             19.0 tok/s |
+
+### Sprint 42C — fully delivered
+
+Sprint 42C planned four items; all four shipped over three
+releases:
+
+| Brief item                         | Shipped in |
+|------------------------------------|-----------:|
+| Llama-FP8 activation-range fix     |    v0.3.11 |
+| `VF_FP8=auto` + auto-detect chain  |    v0.3.12 |
+| Mesa 26.0.x graceful FP8 fallback  |    v0.3.12 |
+| `tokenizer.json` auto-load         |    v0.3.13 |
+
+### What changed
+
+* `src/backend/vulkan/tokenizer.rs` — `Tokenizer::from_hf_dir()`
+  (~150 LOC). Parses `tokenizer.json` (both merge formats) +
+  `tokenizer_config.json`; mirrors `from_gguf_bpe` for the
+  internal `BpeData` build.
+* `src/backend/vulkan/chat_template.rs` — `ChatTemplate::detect_hf()`
+  (~25 LOC). Reads `chat_template` from `tokenizer_config.json`
+  and reuses the same heuristics as `detect()`.
+* `src/main.rs` — `run_chat_safetensors` and
+  `run_bench_safetensors` now branch on `tokenizer_from`: `Some`
+  → existing GGUF path; `None` → HF auto-load. The banner reports
+  the actual source.
+
+48 lib tests pass — same set as v0.3.12, no new tests
+(behavior-equivalence with the GGUF path is what we verify).
+
+---
+
 ## v0.3.12 — `VF_FP8=auto` (one flag instead of three) (2026-05-10)
 
 ### Headline

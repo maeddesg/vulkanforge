@@ -25,6 +25,7 @@
 //! and call `encode()` only on the regular text between them.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use fancy_regex::Regex;
 
@@ -257,6 +258,231 @@ impl Tokenizer {
 
         let pre_split = Regex::new(pre_regex)
             .map_err(|e| TokenizerError::BadRegex(format!("{e}")))?;
+
+        let inner = TokenizerInner::Bpe(BpeData {
+            vocab,
+            token_to_id,
+            merges,
+            pre_split,
+            flavour,
+            byte_to_char,
+            char_to_byte,
+        });
+
+        Ok(Self {
+            inner,
+            bos_id,
+            eos_id,
+            extra_eos_ids,
+            im_start_id,
+            im_end_id,
+            endoftext_id,
+        })
+    }
+
+    /// v0.3.13 — load a HuggingFace BPE tokenizer directly from
+    /// `<model_dir>/tokenizer.json` (+ `tokenizer_config.json` for the
+    /// special-token literals). Builds the *same* internal `BpeData`
+    /// struct as `from_gguf_bpe`, so all the existing chat-template
+    /// renderers (`ChatTemplate::render_*`) keep working unchanged.
+    ///
+    /// Two upstream `merges` formats are handled:
+    ///   * `["Ġ Ġ", "Ġ ĠĠĠ", …]` — space-joined strings (Llama-3.1).
+    ///   * `[["Ġ","Ġ"], ["ĠĠ","ĠĠ"], …]` — pair lists (Qwen3 / newer
+    ///     `tokenizers` crate output).
+    ///
+    /// Flavour is detected from the presence of `<|im_start|>`
+    /// (Qwen2 / Qwen3 ChatML) or `<|begin_of_text|>` (Llama-3). SPM
+    /// SafeTensors models (Mistral) aren't yet covered — they'd need
+    /// a different upstream payload (`tokenizer.model` SentencePiece
+    /// proto) and aren't in the v0.3.13 scope.
+    pub fn from_hf_dir(model_dir: &Path) -> Result<Self, TokenizerError> {
+        let tjson_path = model_dir.join("tokenizer.json");
+        let tjson_bytes = std::fs::read(&tjson_path).map_err(|e| {
+            TokenizerError::Malformed(format!(
+                "read {}: {e}",
+                tjson_path.display()
+            ))
+        })?;
+        let tjson: serde_json::Value = serde_json::from_slice(&tjson_bytes)
+            .map_err(|e| TokenizerError::Malformed(format!("parse tokenizer.json: {e}")))?;
+
+        let model = tjson
+            .get("model")
+            .ok_or_else(|| TokenizerError::Malformed("tokenizer.json: missing model".into()))?;
+        let model_type = model.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if model_type != "BPE" {
+            return Err(TokenizerError::BadModel(format!(
+                "tokenizer.json model.type = {model_type:?}, only BPE supported"
+            )));
+        }
+
+        // Vocab — `model.vocab` is `{token_string: id}`. Some IDs may
+        // be claimed by `added_tokens` instead (specials live there
+        // for Qwen3). Allocate a `vocab` Vec sized for `max_id + 1`
+        // and fill from both sources.
+        let vocab_obj = model
+            .get("vocab")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| TokenizerError::Malformed("model.vocab missing or not object".into()))?;
+        let added: Vec<(u32, String)> = tjson
+            .get("added_tokens")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| {
+                        let id = t.get("id")?.as_u64()? as u32;
+                        let content = t.get("content")?.as_str()?.to_string();
+                        Some((id, content))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut max_id: u32 = 0;
+        for v in vocab_obj.values() {
+            if let Some(i) = v.as_u64() {
+                max_id = max_id.max(i as u32);
+            }
+        }
+        for (id, _) in &added {
+            max_id = max_id.max(*id);
+        }
+        let mut vocab: Vec<String> = vec![String::new(); (max_id + 1) as usize];
+        let mut token_to_id: HashMap<String, u32> =
+            HashMap::with_capacity(vocab_obj.len() + added.len());
+        for (k, v) in vocab_obj.iter() {
+            let id = v
+                .as_u64()
+                .ok_or_else(|| TokenizerError::Malformed("vocab id not u64".into()))?
+                as u32;
+            vocab[id as usize] = k.clone();
+            token_to_id.insert(k.clone(), id);
+        }
+        for (id, content) in &added {
+            // added_tokens beats vocab on collision (specials must
+            // own their slot).
+            vocab[*id as usize] = content.clone();
+            token_to_id.insert(content.clone(), *id);
+        }
+
+        // Merges — handle both string and array forms.
+        let merges_arr = model
+            .get("merges")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| TokenizerError::Malformed("model.merges missing".into()))?;
+        let mut merges: HashMap<String, u32> = HashMap::with_capacity(merges_arr.len());
+        for (rank, m) in merges_arr.iter().enumerate() {
+            let (left, right) = if let Some(s) = m.as_str() {
+                let space = s
+                    .find(' ')
+                    .ok_or_else(|| TokenizerError::BadMerge(s.to_string()))?;
+                (&s[..space], &s[space + 1..])
+            } else if let Some(arr) = m.as_array() {
+                let l = arr
+                    .first()
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| TokenizerError::BadMerge("merge[].0 missing".into()))?;
+                let r = arr
+                    .get(1)
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| TokenizerError::BadMerge("merge[].1 missing".into()))?;
+                (l, r)
+            } else {
+                return Err(TokenizerError::BadMerge(format!(
+                    "merge[{rank}] not str or array"
+                )));
+            };
+            let mut joined = String::with_capacity(left.len() + right.len());
+            joined.push_str(left);
+            joined.push_str(right);
+            merges.entry(joined).or_insert(rank as u32);
+        }
+
+        // Flavour from added_tokens. Both Qwen2/Qwen3 use ChatML
+        // specials, so a single `<|im_start|>` check covers both.
+        let flavour = if token_to_id.contains_key("<|im_start|>") {
+            TokenizerFlavour::Qwen2
+        } else if token_to_id.contains_key("<|begin_of_text|>") {
+            TokenizerFlavour::Llama3
+        } else {
+            return Err(TokenizerError::BadModel(
+                "HF BPE tokenizer flavour unknown (no <|im_start|>, no <|begin_of_text|>)"
+                    .into(),
+            ));
+        };
+        let pre_regex = match flavour {
+            TokenizerFlavour::Qwen2 => QWEN2_PRE_REGEX,
+            TokenizerFlavour::Llama3 => LLAMA3_PRE_REGEX,
+        };
+        let pre_split = Regex::new(pre_regex)
+            .map_err(|e| TokenizerError::BadRegex(format!("{e}")))?;
+
+        // bos / eos literals from tokenizer_config.json. The fields
+        // can be either a plain string or an object `{ "content": …,
+        // "lstrip": …, … }`.
+        let tcfg_path = model_dir.join("tokenizer_config.json");
+        let lookup_token_str = |val: &serde_json::Value| -> Option<String> {
+            if let Some(s) = val.as_str() {
+                return Some(s.to_string());
+            }
+            if let Some(obj) = val.as_object() {
+                return obj.get("content").and_then(|v| v.as_str()).map(String::from);
+            }
+            None
+        };
+        let (bos_id, eos_id_opt) = match std::fs::read(&tcfg_path) {
+            Ok(bytes) => {
+                let tcfg: serde_json::Value =
+                    serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                let bos = tcfg
+                    .get("bos_token")
+                    .and_then(lookup_token_str)
+                    .and_then(|s| token_to_id.get(&s).copied());
+                let eos = tcfg
+                    .get("eos_token")
+                    .and_then(lookup_token_str)
+                    .and_then(|s| token_to_id.get(&s).copied());
+                (bos, eos)
+            }
+            Err(_) => (None, None),
+        };
+        // EOS fallback by flavour if tokenizer_config.json didn't
+        // pin one (some upstream models leave eos_token unset).
+        let eos_id = eos_id_opt
+            .or_else(|| match flavour {
+                TokenizerFlavour::Qwen2 => token_to_id.get("<|im_end|>").copied(),
+                TokenizerFlavour::Llama3 => token_to_id.get("<|eot_id|>").copied(),
+            })
+            .ok_or_else(|| {
+                TokenizerError::Malformed("no eos_token resolvable from tokenizer_config.json".into())
+            })?;
+
+        let endoftext_id = token_to_id.get("<|endoftext|>").copied();
+        let im_start_id = token_to_id.get("<|im_start|>").copied();
+        let im_end_id = token_to_id.get("<|im_end|>").copied();
+
+        let mut extra_eos_ids: Vec<u32> = Vec::new();
+        match flavour {
+            TokenizerFlavour::Qwen2 => {
+                if let Some(et) = endoftext_id {
+                    if et != eos_id {
+                        extra_eos_ids.push(et);
+                    }
+                }
+            }
+            TokenizerFlavour::Llama3 => {
+                for name in ["<|eot_id|>", "<|end_of_text|>", "<|eom_id|>"] {
+                    if let Some(&id) = token_to_id.get(name) {
+                        if id != eos_id && !extra_eos_ids.contains(&id) {
+                            extra_eos_ids.push(id);
+                        }
+                    }
+                }
+            }
+        }
+
+        let (byte_to_char, char_to_byte) = build_byte_unicode_tables();
 
         let inner = TokenizerInner::Bpe(BpeData {
             vocab,

@@ -14,6 +14,8 @@
 //! ships the DeepSeek-R1 template; Mistral and Llama-3 both share
 //! `arch=llama` but use very different layouts).
 
+use std::path::Path;
+
 use super::gguf::GgufFile;
 use super::tokenizer::{Tokenizer, TokenizerFlavour};
 
@@ -80,6 +82,42 @@ impl ChatTemplate {
         // Llama-2 family) returns `None` from `flavour()` — default
         // those to the Mistral [INST] template, which is the only
         // SPM-style template we currently render.
+        match tokenizer.flavour() {
+            Some(TokenizerFlavour::Qwen2) => ChatTemplate::ChatML,
+            Some(TokenizerFlavour::Llama3) => ChatTemplate::Llama3,
+            None => ChatTemplate::Mistral,
+        }
+    }
+
+    /// v0.3.13 — detect from a HuggingFace SafeTensors model
+    /// directory's `tokenizer_config.json`. Same string heuristics as
+    /// [`Self::detect`], same flavour fallback. The renderers
+    /// themselves are unchanged — they target the canonical layouts,
+    /// not the upstream Jinja string.
+    pub fn detect_hf(model_dir: &Path, tokenizer: &Tokenizer) -> Self {
+        let tcfg_path = model_dir.join("tokenizer_config.json");
+        let template_str = std::fs::read_to_string(&tcfg_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| {
+                v.get("chat_template")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_default();
+
+        if template_str.contains("<｜User｜>") || template_str.contains("<｜Assistant｜>") {
+            return ChatTemplate::DeepSeekR1;
+        }
+        if template_str.contains("<|start_header_id|>") || template_str.contains("<|eot_id|>") {
+            return ChatTemplate::Llama3;
+        }
+        if template_str.contains("<|im_start|>") || template_str.contains("<|im_end|>") {
+            return ChatTemplate::ChatML;
+        }
+        if template_str.contains("[INST]") {
+            return ChatTemplate::Mistral;
+        }
         match tokenizer.flavour() {
             Some(TokenizerFlavour::Qwen2) => ChatTemplate::ChatML,
             Some(TokenizerFlavour::Llama3) => ChatTemplate::Llama3,
