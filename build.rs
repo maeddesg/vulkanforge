@@ -1085,6 +1085,17 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "mul_coopmat_fp8_bn32_blockwise.comp",
         defines: &[],
     },
+    // Sprint 38 Part 1 — native FP8×FP8 WMMA prefill kernel. Same
+    // tile geometry as bn32_v2, but cooperative-matrix element type
+    // is `floate4m3_t` instead of `bfloat16_t`. ACO emits
+    // v_wmma_f32_16x16x16_fp8_fp8 directly. Activations (FP32) are
+    // converted to FP8 via v_cvt_pk_fp8_f32 during B-tile staging.
+    // Opt-in via VF_FP8_NATIVE_WMMA=1 (Mesa 26.1+ required).
+    ShaderJob {
+        out_name: "mul_coopmat_fp8_native_bn32.spv",
+        entry_source: "mul_coopmat_fp8_native_bn32.comp",
+        defines: &[],
+    },
     // Sprint 20-M3 — FP32 weight GEMV. Used for lm_head on SafeTensors
     // FP8 models (lm_head is excluded from FP8 quantization on
     // neuralmagic / naive-quantized models, so it carries through

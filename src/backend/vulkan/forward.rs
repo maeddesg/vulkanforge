@@ -4402,6 +4402,8 @@ impl Forward {
         //
         // Override via `VF_FP8_GEMM_BN={16,32,64}`. Legacy
         // `VF_FP8_GEMM_BN32=0` still respected as opt-out to BN=16.
+        // Sprint 38 Part 1 — `VF_FP8_NATIVE_WMMA=1` opt-in selects the
+        // FP8×FP8 cooperative-matrix variant of BN=32 (Mesa 26.1+).
         let bn_override = std::env::var("VF_FP8_GEMM_BN")
             .ok()
             .and_then(|v| v.parse::<u32>().ok());
@@ -4409,10 +4411,16 @@ impl Forward {
             .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
             .unwrap_or(false);
         let bn_target = bn_override.unwrap_or(if bn32_disabled { 16 } else { 32 });
+        let native_fp8_wmma = std::env::var("VF_FP8_NATIVE_WMMA")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         let use_bn64 = bn_target >= 64 && m >= 64 && n >= 64;
         let use_bn32 = !use_bn64 && bn_target >= 32 && m >= 64 && n >= 64;
+        let use_native = native_fp8_wmma && use_bn32;
         let multi_wg = m >= 64 && n >= 64;
-        let shader = if use_bn64 {
+        let shader = if use_native {
+            ShaderId::MulCoopmatFp8NativeBn32
+        } else if use_bn64 {
             ShaderId::MulCoopmatFp8Bn64
         } else if use_bn32 {
             ShaderId::MulCoopmatFp8Bn32

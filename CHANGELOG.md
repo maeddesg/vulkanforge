@@ -1,5 +1,146 @@
 # Changelog
 
+## v0.3.9 — Native FP8 WMMA on Mesa 26.1+ (2026-05-09)
+
+### Headline
+
+**Native `V_WMMA_F32_16X16X16_FP8_FP8` on RDNA4 — per-tensor and
+per-channel FP8 prefill +37–58 %.** The new
+`mul_coopmat_fp8_native_bn32.comp` shader replaces the FP8→BF16
+conversion path with `coopmat<floate4m3_t>` for both A and B tiles;
+ACO emits the FP8 WMMA instruction directly and the activation
+FP32→FP8 conversion folds into `v_cvt_pk_fp8_f32`. Llama-3.1-8B-FP8
+prefill: **757 → 1197 tok/s (+58 %)** at pp=512. Qwen2.5-14B-FP8:
+**325 → 450 tok/s (+39 %)**. Decode is unchanged (GEMV at M=1, no
+WMMA). Block-wise FP8 (Qwen3) keeps the Sprint-36 BF16 scale-fold
+path. Opt-in via `VF_FP8_NATIVE_WMMA=1`, default OFF for
+Mesa 26.0.x compatibility.
+
+### Native FP8 WMMA Performance (RX 9070 XT, Mesa 26.1-rc3, 3 runs)
+
+| Model              | Metric        | BF16 path | Native FP8 (Mesa 26.1+)| Δ        |
+|--------------------|---------------|----------:|-----------------------:|---------:|
+| Llama-3.1-8B-FP8   | pp=64         |     650.2 |                  990.9 | **+52 %** |
+| Llama-3.1-8B-FP8   | pp=128        |     696.9 |                 1078.7 | **+55 %** |
+| Llama-3.1-8B-FP8   | pp=512        |     756.6 |             **1197.0** | **+58 %** |
+| Llama-3.1-8B-FP8   | pp=1024       |     776.9 |                 1235.2 | **+59 %** |
+| Llama-3.1-8B-FP8   | Decode        |      69.6 |                   68.6 |     ≈ 0  |
+| Llama-3.1-8B-FP8   | Avg W         |     204.4 |                  203.9 |     ≈ 0  |
+| Llama-3.1-8B-FP8   | tok/s/W pp=512|      3.70 |                **5.87** | **+59 %** |
+| Qwen2.5-14B-FP8    | pp=64         |     262.0 |                  353.2 | **+35 %** |
+| Qwen2.5-14B-FP8    | pp=128        |     307.1 |                  423.1 | **+38 %** |
+| Qwen2.5-14B-FP8    | pp=512        |     324.7 |              **450.2** | **+39 %** |
+| Qwen2.5-14B-FP8    | Decode        |      13.5 |                   13.6 |     ≈ 0  |
+| Qwen2.5-14B-FP8    | Avg W         |     195.7 |                  180.3 |   −8 %   |
+| Qwen2.5-14B-FP8    | tok/s/W pp=512|      1.66 |                **2.50** | **+51 %** |
+
+### Why +58 % instead of the forecast +15–25 %
+
+Three effects compound: (1) native WMMA instruction eliminates BF16
+setup overhead, (2) 8-bit LDS storage halves staging bandwidth,
+(3) FP8→BF16 conversion chain removed entirely. The FP32→FP8
+activation conversion (B-side) replaces the old FP32→BF16 path at
+equal cost.
+
+### Mesa 26.1 Requirement
+
+Native FP8 WMMA requires Mesa 26.1+ with
+`shaderFloat8CooperativeMatrix = true`. On Mesa 26.0.x VulkanForge
+falls back to the BF16 conversion path automatically (every model
+works, FP8 prefill is just slower). **Do not set
+`VF_FP8_NATIVE_WMMA=1` on Mesa 26.0.x** — pipeline creation will
+fail at the missing FP8 cooperative-matrix capability.
+
+To check support: `vulkaninfo | grep shaderFloat8CooperativeMatrix`
+must show `true`.
+
+### vLLM gap closure (per-tensor 8B FP8 prefill)
+
+Sprint 38-Bench measured vLLM 0.20.1 ROCm at 14757 tok/s prefill
+on Llama-3.1-8B-FP8 (specialized `ROCmFP8ScaledMMLinearKernel`).
+VF v0.3.8 was 757 tok/s — **19.5× gap**. v0.3.9 native FP8 closes
+that to **12.3×** (1197 tok/s). The remaining gap is tile selection
+and ROCm-specific kernel tuning, not WMMA-level — closing it would
+need shape-aware auto-tuning or a Split-K layout, not another
+shader rewrite.
+
+### Routing matrix
+
+| Model format            | `VF_FP8_NATIVE_WMMA` | Active shader                              |
+|-------------------------|----------------------|--------------------------------------------|
+| Per-tensor FP8 (Llama)  | unset / `0`          | `MulCoopmatFp8Bn32` (BF16 narrow)          |
+| Per-tensor FP8 (Llama)  | `1`                  | **`MulCoopmatFp8NativeBn32`** (FP8 native) |
+| Per-channel FP8         | unset / `0`          | `MulCoopmatFp8Bn32`                        |
+| Per-channel FP8         | `1`                  | **`MulCoopmatFp8NativeBn32`**              |
+| Block-wise FP8 (Qwen3)  | any                  | `mul_coopmat_fp8_bn32_blockwise` (Sprint 36) |
+| GGUF Q4_K_M / Q8_0      | irrelevant           | `MulMmqQ4K…` etc. (no FP8 path)            |
+
+### What changed
+
+- `vk_shaders/mul_coopmat_fp8_native_bn32.comp` (new, 148 LOC) —
+  native FP8×FP8 cooperative-matrix GEMM. Same tile geometry as
+  `mul_coopmat_fp8_bn32.comp` (BM=64, BN=32, BK=16, 8 subgroups
+  arranged 4×2). ELEM_TYPE = `floate4m3_t`. A-tile uses
+  `uintBitsToFloate4m3EXT` (no float roundtrip); B-tile uses
+  `floate4m3_t(fp32_value)` (ACO emits `v_cvt_pk_fp8_f32`).
+- `build.rs` — new `ShaderJob` for the native SPV.
+- `src/backend/vulkan/shaders.rs` — `ShaderId::MulCoopmatFp8NativeBn32`,
+  name, SPV bytes, registry index.
+- `src/backend/vulkan/pipeline_registry.rs` — new ShaderId in the
+  no-spec-constant FP8 group.
+- `src/backend/vulkan/forward.rs` — env-flag routing in
+  `run_gemm_fp8_naive`: `use_native = VF_FP8_NATIVE_WMMA && use_bn32`,
+  picks `MulCoopmatFp8NativeBn32` when set.
+
+### Pre-check work (Sprint 38, recorded as honest negatives)
+
+* `coopmat<floate4m3_t> × coopmat<bfloat16_t>` → amdllpc crash on
+  RADV/ACO. Mixed FP8/BF16 cooperative matrix is **not supported**;
+  both A and B must be the same type. The cleaner-looking design
+  (FP8 weights × BF16 activations) is unavailable.
+* `coopmat<floate4m3_t> × coopmat<float16_t>` → same amdllpc crash.
+* Decision: convert activations FP32 → FP8 inside the shader. The
+  precision impact is identical to what vLLM and llama.cpp do on
+  their FP8 inference paths.
+* RGA confirms the production shader emits exactly one
+  `v_wmma_f32_16x16x16_fp8_fp8` per WMMA call, no `v_perm_b32`,
+  no `v_cvt_*` outside the activation conversion, and direct
+  `buffer_load_b32` for FP8 weights.
+
+### Known limitations
+
+- Native FP8 WMMA covers per-tensor and per-channel scales. Block-wise
+  FP8 stays on the BF16 scale-fold path (the per-K-block scale gets
+  applied during the FP8→float→BF16 conversion that the native shader
+  removes — different scale strategy needed, future sprint).
+- Mixed-type FP8 / BF16 / FP16 cooperative matrix is unsupported on
+  RADV/ACO (Mesa 26.1-rc3, gfx1201). Activations are converted
+  FP32→FP8 in the shader.
+- `VF_FP8_NATIVE_WMMA=1` on Mesa 26.0.x will fail at pipeline build —
+  the flag is only valid with Mesa 26.1+.
+- Decode does not benefit (GEMV path, no WMMA at M=1).
+- Validation-layer warnings about `SPV_KHR_bfloat16` capability still
+  fire (the BF16-cousin shaders in tree). Cosmetic; pipelines still
+  build. Cleanup deferred.
+
+### Reports
+
+- Sprint report: `results/v039_sprint38_fp8_native_wmma.md`
+- ISA dumps + bench logs: `results/sprint38_part1_logs/`
+- vLLM full comparison (Sprint 38-Bench): `results/v038_bench_comparison.md`
+  (added vLLM 0.20.1 ROCm numbers + corrected prefill-isolation
+  methodology)
+
+### Commit Trail
+
+```
+Sprint 37        c41767c..0c72373  Mesa FP8 CoopMat confirmed on 26.1-rc3
+Sprint 38-Bench  31310cc           vLLM 0.20.1 full comparison
+Sprint 38 Part 1 (this release)    Native FP8 WMMA shader
+```
+
+---
+
 ## v0.3.8 — Block-wise FP8 (Qwen3-FP8) (2026-05-08)
 
 ### Headline

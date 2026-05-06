@@ -85,6 +85,15 @@ pub enum ShaderId {
     /// ~3 WGs/CU due to the larger LDS footprint (~21 KiB/WG).
     /// Routed by `VF_FP8_GEMM_BN=64` for `m >= 64 && n >= 64`.
     MulCoopmatFp8Bn64,
+    /// Sprint 38 Part 1 — native FP8×FP8 cooperative-matrix variant
+    /// of `MulCoopmatFp8Bn32`. ELEM_TYPE = floate4m3_t instead of
+    /// bfloat16_t; ACO emits `v_wmma_f32_16x16x16_fp8_fp8` directly
+    /// and `v_cvt_pk_fp8_f32` for the activation FP32 → FP8 conversion.
+    /// Requires Mesa 26.1+ (FP8 cooperative matrix). Mixed FP8/BF16
+    /// is unsupported on RADV (amdllpc rejects). Routed by
+    /// `VF_FP8_NATIVE_WMMA=1` for per-tensor / per-channel FP8
+    /// models; block-wise FP8 stays on the Sprint 36 BF16 path.
+    MulCoopmatFp8NativeBn32,
     RmsNorm,
     RopeNorm,
     RopeNeox,
@@ -358,6 +367,7 @@ impl ShaderId {
             ShaderId::MulCoopmatFp8MultiWg => "mul_coopmat_fp8_multi_wg",
             ShaderId::MulCoopmatFp8Bn32 => "mul_coopmat_fp8_bn32",
             ShaderId::MulCoopmatFp8Bn64 => "mul_coopmat_fp8_bn64",
+            ShaderId::MulCoopmatFp8NativeBn32 => "mul_coopmat_fp8_native_bn32",
             ShaderId::RmsNorm => "rms_norm_f32",
             ShaderId::RopeNorm => "rope_norm_f32",
             ShaderId::RopeNeox => "rope_neox_f32",
@@ -468,6 +478,7 @@ impl ShaderId {
             ShaderId::MulCoopmatFp8MultiWg => MUL_COOPMAT_FP8_MULTI_WG,
             ShaderId::MulCoopmatFp8Bn32 => MUL_COOPMAT_FP8_BN32,
             ShaderId::MulCoopmatFp8Bn64 => MUL_COOPMAT_FP8_BN64,
+            ShaderId::MulCoopmatFp8NativeBn32 => MUL_COOPMAT_FP8_NATIVE_BN32,
             ShaderId::RmsNorm => RMS_NORM_F32,
             ShaderId::RopeNorm => ROPE_NORM_F32,
             ShaderId::RopeNeox => ROPE_NEOX_F32,
@@ -585,6 +596,7 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::MulCoopmatFp8MultiWg,
     ShaderId::MulCoopmatFp8Bn32,
     ShaderId::MulCoopmatFp8Bn64,
+    ShaderId::MulCoopmatFp8NativeBn32,
     ShaderId::RmsNorm,
     ShaderId::RopeNorm,
     ShaderId::RopeNeox,
@@ -729,6 +741,8 @@ pub const MUL_COOPMAT_FP8_BN32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_fp8_bn32_v2.spv"));
 pub const MUL_COOPMAT_FP8_BN64: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_fp8_bn64_v2.spv"));
+pub const MUL_COOPMAT_FP8_NATIVE_BN32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_fp8_native_bn32.spv"));
 pub const RMS_NORM_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm_f32.spv"));
 pub const ROPE_NORM_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope_norm_f32.spv"));
 pub const ROPE_NEOX_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope_neox_f32.spv"));
