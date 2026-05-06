@@ -77,12 +77,18 @@ impl CpuLmHead {
     /// Output is FP32. Parallelized across vocab rows; each row's
     /// dot product is sequential within a thread.
     ///
-    /// Sprint 41 — runtime dispatch: AVX-512F → AVX-512 hybrid
-    /// kernel, otherwise scalar reference. The AVX-512 path
-    /// vectorizes the FMA chain (16 elements per `vfmadd231ps`)
-    /// while keeping the Q6_K nibble unpack scalar — that's
-    /// enough for a 2–3× speedup on Llama-8B-FP8 lm_head without
-    /// the complexity of a full vectorized dequant.
+    /// Sprint 41 — runtime dispatch:
+    ///
+    /// - AVX-512F + BW + VL → fully vectorized Q6_K dequant + FMA
+    ///   (Sprint 41B, [`dot_q6k_block_avx512_full`]).
+    /// - AVX-512F only      → hybrid scalar dequant + AVX-512 FMA
+    ///   (Sprint 41A, [`dot_q6k_block_avx512`]).
+    /// - otherwise          → scalar reference.
+    ///
+    /// On Zen 4 / Sapphire Rapids the full path runs; the hybrid
+    /// is retained for older AVX-512F-only platforms (Skylake-X,
+    /// Cannon Lake) where BW/VL aren't both present. Scalar
+    /// covers everything else (ARM, older x86, MIPS for tests).
     pub fn forward(&self, hidden: &[f32], logits: &mut [f32]) {
         assert_eq!(
             hidden.len(),
@@ -97,6 +103,13 @@ impl CpuLmHead {
 
         #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
         {
+            if std::is_x86_feature_detected!("avx512f")
+                && std::is_x86_feature_detected!("avx512bw")
+                && std::is_x86_feature_detected!("avx512vl")
+            {
+                self.gemv_q6k_avx512_full(hidden, logits);
+                return;
+            }
             if std::is_x86_feature_detected!("avx512f") {
                 self.gemv_q6k_avx512(hidden, logits);
                 return;
@@ -124,10 +137,9 @@ impl CpuLmHead {
             });
     }
 
-    /// AVX-512 GEMV. Per-row dot product calls into the hybrid
-    /// kernel in [`crate::cpu::avx512_gemv`]. The `unsafe` block
-    /// is sound: we runtime-detected `avx512f` in [`forward`]
-    /// before dispatching here.
+    /// Sprint 41A AVX-512 GEMV — hybrid (scalar dequant + AVX FMA).
+    /// Kept for AVX-512F-only platforms; Sprint 41B's full kernel
+    /// requires AVX-512BW + VL on top.
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     fn gemv_q6k_avx512(&self, hidden: &[f32], logits: &mut [f32]) {
         let blocks_per_row = self.blocks_per_row;
@@ -145,6 +157,34 @@ impl CpuLmHead {
                     // aware of the precondition.
                     sum += unsafe {
                         crate::cpu::avx512_gemv::dot_q6k_block_avx512(
+                            block,
+                            &hidden[b * QK_K..(b + 1) * QK_K],
+                        )
+                    };
+                }
+                *out = sum;
+            });
+    }
+
+    /// Sprint 41B AVX-512 GEMV — full vectorized dequant + FMA.
+    /// On Zen 4 / Sapphire Rapids this is the production path.
+    /// Calls [`crate::cpu::avx512_gemv::dot_q6k_block_avx512_full`].
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    fn gemv_q6k_avx512_full(&self, hidden: &[f32], logits: &mut [f32]) {
+        let blocks_per_row = self.blocks_per_row;
+        let weights = self.weights.as_slice();
+        logits
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(v, out)| {
+                let row = &weights[v * blocks_per_row..(v + 1) * blocks_per_row];
+                let mut sum = 0.0f32;
+                for (b, block) in row.iter().enumerate() {
+                    // SAFETY: `forward` already verified AVX-512F + BW + VL
+                    // at runtime. The full kernel's `target_feature`
+                    // requires the same set.
+                    sum += unsafe {
+                        crate::cpu::avx512_gemv::dot_q6k_block_avx512_full(
                             block,
                             &hidden[b * QK_K..(b + 1) * QK_K],
                         )
