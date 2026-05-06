@@ -3175,25 +3175,22 @@ impl Forward {
         };
         let groups_x = (m + BM - 1) / BM;
         let groups_y = (n + BN - 1) / BN;
-        // Sprint 38 Part 2 — `VF_FP8_NATIVE_WMMA=1` was meant to also
-        // route block-wise FP8 to the native FP8 cooperative-matrix
-        // pipeline (`fp8bwgemm_native_pipeline`). The shader compiles
-        // and the bench reports +59 % throughput, but a coherence
-        // check on Qwen3-8B-FP8 produces only the `!` token — the
-        // naive FP32→FP8 cast on the B-tile destroys too much dynamic
-        // range for block-wise weights, which were calibrated against
-        // dynamically-quantized activations (per-token scaling, the
-        // way vLLM and llama.cpp's W8A8 Block FP8 paths do it).
-        // Until a separate activation-quantize pass lands (own dispatch
-        // with per-token / per-block scale), block-wise FP8 stays on
-        // the Sprint 36 BF16 scale-fold path even when the env flag is
-        // set. The native pipeline is still built and kept warm in the
-        // cache so the next sprint can swap it in once the activation
-        // quantization is wired up.
-        let _native_fp8_wmma_blockwise_disabled = std::env::var("VF_FP8_NATIVE_WMMA")
+        // Sprint 38 Part 2 + Sprint 39 — `VF_FP8_NATIVE_WMMA=1` selects
+        // the native FP8 cooperative-matrix pipeline. Sprint 38 Part 2
+        // shipped with this routing disabled because the naive
+        // FP32→FP8 cast on the B-tile destroyed too much dynamic range
+        // for block-wise weights; Sprint 39 adds an in-shader
+        // per-k_block dynamic activation absmax + rescale, so the
+        // native path now produces coherent output and the routing is
+        // re-enabled.
+        let native_fp8_wmma = std::env::var("VF_FP8_NATIVE_WMMA")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let pipeline = self.fp8bwgemm_pipeline;
+        let pipeline = if native_fp8_wmma {
+            self.fp8bwgemm_native_pipeline
+        } else {
+            self.fp8bwgemm_pipeline
+        };
         let layout = self.fp8bwgemm_pipeline_layout;
         self.profile(label, dev, cmd, |dev, cmd| unsafe {
             dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);

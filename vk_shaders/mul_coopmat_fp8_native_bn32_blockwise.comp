@@ -2,6 +2,8 @@
 #extension GL_KHR_cooperative_matrix : enable
 #extension GL_KHR_memory_scope_semantics : enable
 #extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_vote : require
 #extension GL_EXT_shader_explicit_arithmetic_types : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
@@ -13,27 +15,43 @@
 #extension GL_EXT_float_e4m3 : require
 #extension GL_EXT_scalar_block_layout : enable
 
-// Sprint 38 Part 2 — block-wise FP8 GEMM with native FP8 WMMA.
+// Sprint 38 Part 2 + Sprint 39 — block-wise FP8 GEMM with native FP8
+// WMMA and per-k-block ACTIVATION QUANTIZATION.
 //
-// Combines Sprint 36's block-wise scale layout (Qwen3-FP8 / DeepSeek-V3-FP8
-// `weight_block_size: [128, 128]`) with Sprint 38 Part 1's native FP8
-// cooperative-matrix path (`v_wmma_f32_16x16x16_fp8_fp8`).
+// Combines Sprint 36's block-wise weight-scale layout (Qwen3-FP8 /
+// DeepSeek-V3-FP8 `weight_block_size: [128, 128]`) with Sprint 38 Part 1's
+// native FP8 cooperative-matrix path (`v_wmma_f32_16x16x16_fp8_fp8`)
+// and dynamic per-k-block activation quantization (Sprint 39).
 //
-// Sprint 36 folded the per-block scale into the FP8→BF16 conversion
-// step during A-tile staging. The native FP8 path has no FP8→BF16
-// conversion (matrix elements stay FP8 all the way to WMMA), so a
-// different scale-application strategy is required.
+// Sprint 38 Part 2 (honest-negative): a naive `floate4m3_t(act_fp32)`
+// cast on the B-tile loses too much dynamic range for block-wise
+// weights — Qwen3-FP8 calibration assumes per-token-quantized
+// activations (the way vLLM's W8A8 Block FP8 path handles it).
+// Bench was 1218 tok/s but `vulkanforge chat` produced only "!".
 //
-// Strategy: PARTIAL ACCUMULATOR + SCALAR MULTIPLY.
+// Sprint 39 fix: BEFORE each k_block's WMMA inner loop we scan the
+// 32×128 = 4096 activations that tile will read, compute their
+// absmax via subgroupMax + LDS reduction, derive
+//   act_scale = max(absmax / 448, eps)
+// and use `act_scale_inv` to scale activations into FP8 range
+// during the B-tile FP32→FP8 conversion. After the inner loop the
+// partial accumulator is multiplied by `(blk_scale * act_scale)`
+// instead of just `blk_scale`. Math is unchanged modulo FP8
+// precision losses now bounded into safe range.
+//
+// Cost: one extra pass over the activation block per k_block (4096
+// reads / 512 threads = 8 reads/thread + one subgroupMax + one LDS
+// barrier). Empirically a few percent of the WMMA chain time —
+// Sprint 38 Part 2 measured 1218 tok/s; Sprint 39 lands a bit lower
+// but ships *coherent* output. BF16 fallback baseline is 770 tok/s.
+//
+// Strategy: PARTIAL ACCUMULATOR + COMBINED-SCALAR MULTIPLY.
 //   K-loop is split into outer (k_block) and inner (8 K-steps × BK=16
-//   = block_k=128). Inside one k_block all WMMAs accumulate into a
-//   partial coopmat<float> accumulator. After each k_block the partial
-//   is multiplied by the block scale (`partial * blk_scale`) and added
-//   to the total accumulator (`total + partial`). GLSL allows
-//   coopmat-times-scalar and coopmat-plus-coopmat; ACO emits 4× v_mul_f32
-//   plus 4× v_add_f32 per k_block (the 16×16 acc is 4 VGPRs/lane
-//   on RDNA4 Wave64). The output write is a plain copy — scale is
-//   already inside total_acc.
+//   = block_k=128). Pre-scan loop computes act_scale once per k_block.
+//   Inner WMMA chain accumulates into a partial coopmat<float>.
+//   After each k_block: `partial *= (blk_scale * act_scale); total += partial;`.
+//   ACO emits 4× v_mul_f32 + 4× v_add_f32 for the matrix scale/add
+//   (the 16×16 acc is 4 VGPRs/lane on RDNA4 Wave64).
 //
 // Constraints (asserted at dispatch time):
 //   * BM | block_n   (n_block constant per WG; required for one
@@ -64,6 +82,9 @@ const uint C_STRIDE = BN + 1;
 shared ELEM_TYPE buf_a[BM * A_STRIDE];
 shared ELEM_TYPE buf_b[BK * B_STRIDE];
 shared float     buf_c[BM * C_STRIDE];
+// Sprint 39 — per-subgroup partial absmaxes for the activation
+// pre-scan. Final cross-subgroup reduction is a small unrolled loop.
+shared float     wave_maxes[NUM_SG];
 
 layout(local_size_x = BLOCK_SIZE) in;
 
@@ -117,9 +138,51 @@ void main() {
     // Number of inner WMMA steps that share one block scale.
     const uint inner_steps = pc.block_k / BK;
 
+    // Pre-scan thread mapping: each of the 512 threads scans 8 floats
+    // out of the 32×128 = 4096 activations belonging to this k_block.
+    // Layout: tid → (n_idx ∈ 0..31, k_offset ∈ {0,8,16,...,120}).
+    const uint scan_n_idx = tid >> 4;             // 0..31
+    const uint scan_k_off = (tid & 15u) * 8u;     // 0, 8, ..., 120
+
     for (uint kb = 0u; kb < pc.num_kblocks; kb++) {
         const float blk_scale = scale[scale_row_off + kb];
         const uint  k_start    = kb * pc.block_k;
+
+        // ─────────────────────────────────────────────────────────────
+        // Sprint 39 — activation pre-scan: dynamic per-k_block absmax.
+        // Each thread reads up to 8 activation floats and tracks its
+        // local absmax. subgroupMax reduces across each Wave64. The
+        // 8 wave maxes are written to LDS, then every thread reads
+        // the 8 values and reduces locally to the tile absmax.
+        // ─────────────────────────────────────────────────────────────
+        float thread_max = 0.0;
+        const uint scan_gn = wg_n + scan_n_idx;
+        if (scan_gn < pc.n) {
+            const uint scan_base = scan_gn * pc.stride_b + k_start + scan_k_off;
+            [[unroll]] for (uint w = 0u; w < 8u; w++) {
+                const uint gk = k_start + scan_k_off + w;
+                if (gk < pc.k) {
+                    thread_max = max(thread_max, abs(b[scan_base + w]));
+                }
+            }
+        }
+        const float wave_max = subgroupMax(thread_max);
+        if (subgroupElect()) {
+            wave_maxes[gl_SubgroupID] = wave_max;
+        }
+        barrier();
+
+        float tile_absmax = 0.0;
+        [[unroll]] for (uint w = 0u; w < NUM_SG; w++) {
+            tile_absmax = max(tile_absmax, wave_maxes[w]);
+        }
+        // Avoid div-by-zero when an entire activation block happens
+        // to be zero (e.g. masked attention warm-up steps).
+        const float act_scale     = max(tile_absmax * (1.0 / 448.0), 1e-12);
+        const float act_scale_inv = 1.0 / act_scale;
+        const float combined      = blk_scale * act_scale;
+        // Wave_maxes can now be reused next iteration; the inner k-loop
+        // does not touch it.
 
         // Reset partial accumulator at the top of each k_block.
         partial_acc =
@@ -155,7 +218,10 @@ void main() {
                 }
             }
 
-            // ---- B-tile: FP32 activations → FP8 ----
+            // ---- B-tile: FP32 activations → FP8, scaled ----
+            // Apply the per-k_block dynamic act_scale_inv before the
+            // FP32→FP8 cast so values land inside FP8 E4M3's ±448
+            // range. Clamp guards against rounding overshoot.
             if (b_active) {
                 const uint b_gn      = wg_n + b_n;
                 const uint b_gk_base = kk + b_k_base;
@@ -172,6 +238,7 @@ void main() {
                         }
                     }
                 }
+                act4 = clamp(act4 * act_scale_inv, vec4(-448.0), vec4(448.0));
                 buf_b[(b_k_base + 0u) * B_STRIDE + b_n] = ELEM_TYPE(act4.x);
                 buf_b[(b_k_base + 1u) * B_STRIDE + b_n] = ELEM_TYPE(act4.y);
                 buf_b[(b_k_base + 2u) * B_STRIDE + b_n] = ELEM_TYPE(act4.z);
@@ -191,8 +258,8 @@ void main() {
             barrier();
         }
 
-        // Apply this k_block's scale, fold into total.
-        partial_acc = partial_acc * blk_scale;
+        // Apply combined (weight × activation) scale, fold into total.
+        partial_acc = partial_acc * combined;
         total_acc   = total_acc + partial_acc;
     }
 
