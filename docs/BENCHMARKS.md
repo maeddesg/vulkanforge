@@ -92,18 +92,45 @@ falsification table in v0.2.x sprints).
 VulkanForge is also an out-of-the-box configuration: no shape-aware
 auto-tuning, single-stream only.
 
-### Decode (tok/s, batch=1, single-user)
+### Decode (tok/s, batch=1, single-user) — measured 2026-05-09
 
-| Engine         | Model            | Scale type   | Decode | Avg W | tok/s/W |
-|----------------|------------------|--------------|-------:|------:|--------:|
-| **VF v0.3.9**  | 8B Llama FP8     | per-tensor   |  **69** | 135 | **0.51** |
-| vLLM 0.20.1    | 8B Llama FP8     | per-tensor   |     53 | 147 |   0.36  |
-| **VF v0.3.9**  | 8B Qwen3 FP8     | block-wise   |  **64** | 156 | **0.41** |
-| vLLM 0.20.1    | 8B Qwen3 FP8     | block-wise   |     32 | 185 |   0.17  |
+Measurement methodology (Sprint 39C):
+- VF: `vulkanforge chat --max-tokens 256 --temperature 0.0` with a
+  long-response prompt; power sampled across the decode window.
+- vLLM: `vllm bench latency --batch-size 1 --input-len 1
+  --output-len 128 --enforce-eager --num-iters 5`; decode tok/s
+  derived as 128 / avg_latency.
+- Both measurements are **decode-dominated** (≥ 117 generated tokens
+  for VF runs, 128 for vLLM) so the W value is decode steady-state,
+  not bench-wide.
 
-**VF wins decode 1.30–2.03× at lower power** — a clean win even given
-vLLM's gfx1201 caveats. Decode is memory-bandwidth-bound; VF's
-Vulkan-native GEMV beats vLLM's eager-mode Python overhead.
+| Engine         | Model            | Scale type   | Decode | Avg W | tok/s/W | Notes                       |
+|----------------|------------------|--------------|-------:|------:|--------:|-----------------------------|
+| **VF v0.3.9**  | 8B Llama FP8     | per-tensor   |  **69.8** | 166.2 | **0.42** | Native FP8 WMMA, Mesa 26.1+ |
+| vLLM 0.20.1    | 8B Llama FP8     | per-tensor   |     53.2 | 159.2 |   0.33  | `ROCmFP8ScaledMMLinearKernel` |
+| **VF v0.3.9**  | 8B Qwen3 FP8     | block-wise   |  **62.0** | 125.3 | **0.49** | Native FP8 WMMA + act-quant |
+| vLLM 0.20.1    | 8B Qwen3 FP8     | block-wise   |     22.4 | 166.5 |   0.13  | `TritonFp8BlockScaledMMKernel` (untuned for gfx1201) |
+| **VF v0.3.9**  | 14B Qwen2.5 FP8  | per-channel  |  **13.5** | 151.2 | **0.089** | vLLM 14B not benched (16 GiB VRAM tight) |
+
+**VF wins decode 1.31× (Llama) up to 2.77× (Qwen3) at equal-or-lower
+power.** Note vLLM's Qwen3 number specifically: at `input-len=1`,
+vLLM falls into a slower scheduler path (22.4 t/s vs 31.7 t/s when
+the prefill is non-trivial). Even comparing against the more
+favourable 31.7 t/s subtraction methodology used in the
+Sprint 38-Bench report, VF's 62 t/s lead stays.
+
+Decode is memory-bandwidth-bound; VF's Vulkan-native GEMV beats
+vLLM's eager-mode Python dispatch overhead consistently across all
+three FP8 sub-types.
+
+#### Earlier (Sprint 34D) decode + Avg-W reading
+
+The previous version of this table cited `135 W / 0.51 tok/s/W` for
+VF Llama-8B-FP8. That figure came from a Sprint 34D bench on
+Mesa 26.0.6 + VF v0.3.7 (BF16 conversion path) and used a
+*bench-wide* Avg W (mixed prefill + decode). The Sprint 39C
+measurement above is **decode-only** with a long-response prompt and
+v0.3.9 native FP8 WMMA — the cleaner signal.
 
 ### Prefill pp=512 (tok/s)
 
@@ -182,3 +209,5 @@ Raw bench logs and power CSVs are persisted in `results/`:
 - `results/v039_sprint39_blockwise_act_quant.md` — Sprint 39 fix + activation-quant
 - `results/sprint34cd_logs/`, `results/sprint38_part1_logs/`, `results/sprint38p2_logs/`,
   `results/sprint38_vllm_logs/`, `results/sprint39_logs/` — bench + power raw data
+- `results/sprint39c_decode_power_logs/` — Sprint 39C decode-only power
+  measurements (chat-driven for VF, latency `in=1 out=128` for vLLM)

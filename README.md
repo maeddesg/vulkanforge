@@ -89,12 +89,12 @@ sub-optimal!`. Per-tensor uses `ROCmFP8ScaledMMLinearKernel` (specialized);
 block-wise uses `TritonFp8BlockScaledMMKernel` (untuned). Run with
 `VLLM_ROCM_USE_AITER=0 --enforce-eager` (only working configuration on RDNA4).
 
-### Native FP8 decode (single-user, batch=1)
+### Native FP8 decode (single-user, batch=1, decode-only power)
 
-| Model            | VulkanForge | vLLM 0.20.1 ROCm |
-|------------------|------------:|-----------------:|
-| Llama-3.1-8B FP8 |      **69** |               53 |
-| Qwen3-8B FP8     |      **64** |               32 |
+| Model            | VulkanForge (tok/s @ Avg W) | vLLM 0.20.1 ROCm (tok/s @ Avg W) | VF tok/s/W gain |
+|------------------|----------------------------:|---------------------------------:|----------------:|
+| Llama-3.1-8B FP8 |        **70 t/s @ 166 W**   |              53 t/s @ 159 W      | **+27 %**       |
+| Qwen3-8B FP8     |        **62 t/s @ 125 W**   |              22 t/s @ 167 W      | **+267 %**      |
 
 **VF wins decode 1.3–2×; vLLM wins prefill 2.5–12×.** Pick the engine
 that fits the workload — single-user chat is VulkanForge, batch
