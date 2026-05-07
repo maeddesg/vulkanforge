@@ -370,6 +370,102 @@ pub struct ModelConfig {
     pub context_length: u32,
     pub has_qk_norm: bool,
     pub rms_norm_eps: f32,
+    /// Sprint 43B-2 — Gemma-4 specific per-layer specs. `None` for
+    /// every other architecture; the existing dispatch path remains
+    /// untouched. When `Some`, `head_dim` and `ffn_dim` above are
+    /// the *maximum* across all layers (used for `Forward::new`
+    /// buffer sizing); the per-layer values live inside `Gemma4Spec`.
+    pub gemma4: Option<Gemma4Spec>,
+}
+
+/// Sprint 43B-2 — per-Gemma-4 model state. Pulled into `ModelConfig`
+/// rather than `LoadedModel` because the forward needs it to choose
+/// the dispatch branch and per-layer weights.
+#[derive(Debug, Clone)]
+pub struct Gemma4Spec {
+    /// Sliding-window length (512 for E2B). Sliding layers should
+    /// only attend to the last `sliding_window` positions; in the
+    /// 43B-2 minimal-viable forward we ignore this and use full
+    /// causal — output is garbage anyway without PLE. The field is
+    /// stored here so 43C can wire it without changing the API.
+    pub sliding_window: u32,
+    /// Final logits soft-cap (`30.0` for E2B). Applied CPU-side
+    /// after `lm_head`: `logits = cap × tanh(logits / cap)`.
+    pub final_logit_softcapping: Option<f32>,
+    /// Embedding scale = `√hidden_size` for Gemma. Applied to the
+    /// initial token embedding before layer 0.
+    pub embed_scale: f32,
+    /// `gelu_pytorch_tanh` for E2B. Captured raw; consumer matches.
+    /// In the 43B-2 minimal-viable path we substitute SiLU (existing
+    /// shader) — output is garbage but the dispatch runs.
+    pub hidden_activation: String,
+    /// Whether `lm_head` is tied to `embed_tokens` (true for E2B).
+    pub tie_word_embeddings: bool,
+    /// `first_kv_shared_layer_idx = num_hidden_layers - num_kv_shared_layers`.
+    /// Layers `[0, first_kv_shared)` compute their own K/V. Layers
+    /// `[first_kv_shared, num_layers)` reuse K/V from the last
+    /// non-shared layer of the same `layer_type`. For E2B: 35 − 20 = 15.
+    pub first_kv_shared: u32,
+    /// `[layer_idx → spec]` of length `n_layers`.
+    pub layers: Vec<Gemma4LayerSpec>,
+    /// `[layer_idx → scalar]` of length `n_layers`. Each layer
+    /// multiplies its output by this value at the very end of its
+    /// forward pass. Loaded from the per-layer `layer_scalar` BF16
+    /// `[1]` tensor in the SafeTensors archive (gelernt — typische
+    /// Werte 0.018 .. 0.87 für E2B).
+    pub layer_scalars: Vec<f32>,
+}
+
+/// Sprint 43B-2 — per-layer routing state for a Gemma-4 stack.
+#[derive(Debug, Clone, Copy)]
+pub struct Gemma4LayerSpec {
+    pub kind: Gemma4LayerKind,
+    /// 256 (sliding) or 512 (full) for E2B. Used as push-constant
+    /// per-dispatch; the buffers are sized to `max(head_dim)`.
+    pub head_dim: u32,
+    /// 6144 for layers `[0, first_kv_shared)`, 12 288 for shared
+    /// layers (double-wide MLP per `use_double_wide_mlp`).
+    pub intermediate_size: u32,
+    /// Whether this layer has its own `k_proj` / `v_proj` /
+    /// `k_norm` / `v_norm` weights. False for layers
+    /// `[first_kv_shared, n_layers)` — they reuse K/V from a
+    /// type-matched earlier layer instead.
+    pub has_kv_proj: bool,
+    /// Where this layer reads K/V from (and, for the two writer
+    /// layers in 0..first_kv_shared, where it writes to).
+    pub kv_source: Gemma4KvSource,
+    /// 10 000 (sliding) / 1 000 000 (full) for E2B.
+    pub rope_theta: f32,
+    /// Proportional-rotation factor for the full-attention RoPE
+    /// variant. `Some(0.25)` for full layers in E2B; `None` for
+    /// sliding layers (= default RoPE).
+    pub rope_partial_factor: Option<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gemma4LayerKind {
+    Sliding,
+    Full,
+}
+
+/// Sprint 43B-2 — KV-cache routing for a single layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gemma4KvSource {
+    /// Layer computes & owns its KV (layers 0..first_kv_shared
+    /// minus the two write-shared layers below).
+    Own,
+    /// Layer 13 in E2B — owns its KV *and* this slot is the source
+    /// for every later sliding layer (15, 16, 17, 18, 20, …).
+    OwnAndPublishesSliding,
+    /// Layer 14 in E2B — owns its KV *and* this slot is the source
+    /// for every later full-attention layer (19, 24, 29, 34).
+    OwnAndPublishesFull,
+    /// Sliding layer in `[first_kv_shared, n_layers)` — reads K/V
+    /// from the `OwnAndPublishesSliding` slot.
+    SubscribesSliding,
+    /// Full layer in `[first_kv_shared, n_layers)` — reads K/V
+    /// from the `OwnAndPublishesFull` slot.
+    SubscribesFull,
 }
 
 impl ModelConfig {
@@ -441,6 +537,7 @@ impl ModelConfig {
             context_length,
             has_qk_norm,
             rms_norm_eps,
+            gemma4: None,
         })
     }
 }

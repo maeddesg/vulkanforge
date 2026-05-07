@@ -98,6 +98,11 @@ pub enum TokenizerFlavour {
     Qwen2,
     /// Llama-3 family — `pre="llama-bpe"`. Header-id / eot_id specials.
     Llama3,
+    /// Sprint 43B-2 — Gemma-4 family. `▁`-prefixed SP-style BPE with
+    /// `byte_fallback: true`. Special tokens are `<bos>` (id=2),
+    /// `<eos>` (id=1), `<|turn>` / `<turn|>` for chat boundaries,
+    /// plus the multimodal markers we don't consume yet.
+    Gemma2,
 }
 
 /// Internal storage discriminator.
@@ -168,6 +173,10 @@ impl Tokenizer {
         let pre_regex = match flavour {
             TokenizerFlavour::Qwen2 => QWEN2_PRE_REGEX,
             TokenizerFlavour::Llama3 => LLAMA3_PRE_REGEX,
+            // Sprint 43B-2 — Gemma-4 isn't reachable from the GGUF
+            // path (no llama.cpp Gemma-4 support); arm exists for
+            // exhaustiveness only.
+            TokenizerFlavour::Gemma2 => "[\\s\\S]+",
         };
 
         // Vocab — Array<string>.
@@ -252,6 +261,10 @@ impl Tokenizer {
                     }
                 }
             }
+            // Sprint 43B-2 — Gemma-4 isn't reachable through the
+            // GGUF path (no llama.cpp Gemma-4 support yet); arm
+            // listed for exhaustiveness only.
+            TokenizerFlavour::Gemma2 => {}
         }
 
         let (byte_to_char, char_to_byte) = build_byte_unicode_tables();
@@ -401,19 +414,30 @@ impl Tokenizer {
 
         // Flavour from added_tokens. Both Qwen2/Qwen3 use ChatML
         // specials, so a single `<|im_start|>` check covers both.
+        // Sprint 43B-2: Gemma-4 detected via the `<|turn>` chat
+        // boundary marker (asymmetric tag, unique to Gemma-4).
         let flavour = if token_to_id.contains_key("<|im_start|>") {
             TokenizerFlavour::Qwen2
         } else if token_to_id.contains_key("<|begin_of_text|>") {
             TokenizerFlavour::Llama3
+        } else if token_to_id.contains_key("<|turn>") && token_to_id.contains_key("<turn|>") {
+            TokenizerFlavour::Gemma2
         } else {
             return Err(TokenizerError::BadModel(
-                "HF BPE tokenizer flavour unknown (no <|im_start|>, no <|begin_of_text|>)"
+                "HF BPE tokenizer flavour unknown (no <|im_start|>, no <|begin_of_text|>, no <|turn>)"
                     .into(),
             ));
         };
         let pre_regex = match flavour {
             TokenizerFlavour::Qwen2 => QWEN2_PRE_REGEX,
             TokenizerFlavour::Llama3 => LLAMA3_PRE_REGEX,
+            // Gemma-4 doesn't actually need a pre-split regex — its
+            // pre_tokenizer is `Split` on " " with `MergedWithPrevious`
+            // semantics (each word inherits its leading space as `▁`).
+            // We give the regex a permissive default so the BpeData
+            // struct stays uniform; the encode path branches on
+            // flavour and bypasses the regex entirely.
+            TokenizerFlavour::Gemma2 => "[\\s\\S]+",
         };
         let pre_split = Regex::new(pre_regex)
             .map_err(|e| TokenizerError::BadRegex(format!("{e}")))?;
@@ -453,6 +477,10 @@ impl Tokenizer {
             .or_else(|| match flavour {
                 TokenizerFlavour::Qwen2 => token_to_id.get("<|im_end|>").copied(),
                 TokenizerFlavour::Llama3 => token_to_id.get("<|eot_id|>").copied(),
+                // Gemma-4 ships `<eos>` (id=1) as the canonical end-
+                // of-stream and `<turn|>` (id=106) as the per-turn
+                // boundary. Default to `<eos>`.
+                TokenizerFlavour::Gemma2 => token_to_id.get("<eos>").copied(),
             })
             .ok_or_else(|| {
                 TokenizerError::Malformed("no eos_token resolvable from tokenizer_config.json".into())
@@ -477,6 +505,20 @@ impl Tokenizer {
                         if id != eos_id && !extra_eos_ids.contains(&id) {
                             extra_eos_ids.push(id);
                         }
+                    }
+                }
+            }
+            // Sprint 43B-2 — Gemma-4: stop on `<turn|>` (per-turn
+            // boundary, id=106 in E2B) and `<eos>` (model-level end,
+            // id=1). The primary eos_id covers one; the other lands
+            // here.
+            TokenizerFlavour::Gemma2 => {
+                if let Some(&id) = token_to_id.get("<turn|>") {
+                    if id != eos_id { extra_eos_ids.push(id); }
+                }
+                if let Some(&id) = token_to_id.get("<eos>") {
+                    if id != eos_id && !extra_eos_ids.contains(&id) {
+                        extra_eos_ids.push(id);
                     }
                 }
             }
@@ -551,7 +593,10 @@ impl Tokenizer {
     /// should call [`Tokenizer::encode_no_prefix`].
     pub fn encode(&self, text: &str) -> Vec<u32> {
         match &self.inner {
-            TokenizerInner::Bpe(b) => bpe_encode(b, text),
+            TokenizerInner::Bpe(b) => match b.flavour {
+                TokenizerFlavour::Gemma2 => gemma_encode(b, text),
+                _ => bpe_encode(b, text),
+            },
             TokenizerInner::Spm(s) => s.encode(text),
         }
     }
@@ -563,7 +608,10 @@ impl Tokenizer {
     /// ends mid-word.
     pub fn encode_no_prefix(&self, text: &str) -> Vec<u32> {
         match &self.inner {
-            TokenizerInner::Bpe(b) => bpe_encode(b, text),
+            TokenizerInner::Bpe(b) => match b.flavour {
+                TokenizerFlavour::Gemma2 => gemma_encode(b, text),
+                _ => bpe_encode(b, text),
+            },
             TokenizerInner::Spm(s) => s.encode_no_prefix(text),
         }
     }
@@ -573,14 +621,20 @@ impl Tokenizer {
     /// expands `<0xHH>` byte tokens and replaces `▁` with space (SPM).
     pub fn decode(&self, ids: &[u32]) -> String {
         match &self.inner {
-            TokenizerInner::Bpe(b) => bpe_decode(b, ids),
+            TokenizerInner::Bpe(b) => match b.flavour {
+                TokenizerFlavour::Gemma2 => gemma_decode(b, ids),
+                _ => bpe_decode(b, ids),
+            },
             TokenizerInner::Spm(s) => s.decode(ids),
         }
     }
 
     pub fn decode_token(&self, id: u32) -> String {
         match &self.inner {
-            TokenizerInner::Bpe(b) => bpe_decode_token(b, id),
+            TokenizerInner::Bpe(b) => match b.flavour {
+                TokenizerFlavour::Gemma2 => gemma_decode(b, &[id]),
+                _ => bpe_decode_token(b, id),
+            },
             TokenizerInner::Spm(s) => s.decode_token(id),
         }
     }
@@ -595,11 +649,20 @@ impl Tokenizer {
     /// straddles a token boundary).
     pub fn decode_token_bytes(&self, id: u32) -> Vec<u8> {
         match &self.inner {
-            TokenizerInner::Bpe(b) => {
-                let mut buf = Vec::with_capacity(8);
-                bpe_decode_into(b, id, &mut buf);
-                buf
-            }
+            TokenizerInner::Bpe(b) => match b.flavour {
+                TokenizerFlavour::Gemma2 => {
+                    // Gemma decode is "render the vocab string with `▁`
+                    // → ' '" + "byte tokens turn into raw bytes". For a
+                    // single token we just take the bytes via the joint
+                    // decoder.
+                    gemma_decode(b, &[id]).into_bytes()
+                }
+                _ => {
+                    let mut buf = Vec::with_capacity(8);
+                    bpe_decode_into(b, id, &mut buf);
+                    buf
+                }
+            },
             TokenizerInner::Spm(s) => s.decode_token_bytes(id),
         }
     }
@@ -728,6 +791,155 @@ fn bpe_decode_into(b: &BpeData, id: u32, out: &mut Vec<u8>) {
             out.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
         }
     }
+}
+
+// ---------- Gemma-4 BPE encode/decode (Sprint 43B-2) ----------
+//
+// Gemma-4's BPE is *not* GPT-2 byte-level. Three differences from the
+// `bpe_*` family above:
+//
+//   1. **No byte-level pre-encoding.** Each Unicode codepoint is
+//      either looked up directly in `vocab` (for ASCII / extended
+//      Latin / CJK / etc.) or — when not present — falls back to
+//      its UTF-8 byte sequence emitted as `<0xHH>` tokens.
+//   2. **`▁` (U+2581) marks word boundaries.** Spaces in the input
+//      are normalised to `▁` *before* the BPE merge graph runs, so
+//      the merge graph naturally combines `▁` + `the` → `▁the`,
+//      `▁` + `hello` → `▁hello`.
+//   3. **Standard rank-ordered BPE merges** then collapse the
+//      char-level pieces into the final vocab tokens.
+//
+// Decode reverses (1) and (2): tokens whose string starts with `<0x`
+// are interpreted as raw bytes; everything else has its `▁` runs
+// rewritten back to spaces.
+//
+// 43B-2 minimal-viable scope: this is enough to encode standard
+// chat prompts (English, basic punctuation, the Gemma-4 special-
+// turn markers). Esoteric Unicode that isn't in the 262 K vocab as a
+// single character will still take the byte-fallback path. We do *not*
+// try to escape outermost added-tokens here — the chat template is
+// expected to call `special_id()` and `encode()` separately and stitch
+// the result.
+
+fn gemma_encode(b: &BpeData, text: &str) -> Vec<u32> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    // Step 1: normalise spaces to `▁`. We do this on a `String` rather
+    // than streaming because the merge graph operates on full Unicode
+    // codepoints — char-by-char, but with stable boundaries.
+    let normalised: String = text.chars().map(|c| if c == ' ' { '\u{2581}' } else { c }).collect();
+
+    // Step 2: produce a `Vec<String>` of single-codepoint pieces
+    // (BPE works at codepoint granularity, not byte granularity, for
+    // Gemma's vocab). Codepoints not present in `vocab` get expanded
+    // via byte-fallback into `<0xHH>` tokens up front.
+    let mut pieces: Vec<String> = Vec::with_capacity(normalised.len());
+    for c in normalised.chars() {
+        let s = c.to_string();
+        if b.token_to_id.contains_key(&s) {
+            pieces.push(s);
+        } else {
+            // Byte-fallback: emit one `<0xHH>` per UTF-8 byte.
+            let mut tmp = [0u8; 4];
+            let bytes = c.encode_utf8(&mut tmp).as_bytes();
+            for &byte in bytes {
+                pieces.push(format!("<0x{:02X}>", byte));
+            }
+        }
+    }
+    if pieces.is_empty() {
+        return Vec::new();
+    }
+
+    // Step 3: rank-ordered BPE merge over the codepoint pieces. Same
+    // algorithm as `bpe_merge`, just operating on a different starting
+    // alphabet — `bpe_merge` takes a single &str and re-splits it into
+    // `chars()`, so we'd lose the `<0xHH>` byte tokens that are made
+    // of multiple chars each. Re-implement the merge loop here so the
+    // initial tokenisation we computed above is preserved.
+    let mut tokens = pieces;
+    while tokens.len() >= 2 {
+        let mut best: Option<(usize, u32)> = None;
+        for i in 0..tokens.len() - 1 {
+            let mut joined = String::with_capacity(tokens[i].len() + tokens[i + 1].len());
+            joined.push_str(&tokens[i]);
+            joined.push_str(&tokens[i + 1]);
+            if let Some(&prio) = b.merges.get(&joined) {
+                if best.map_or(true, |(_, p)| prio < p) {
+                    best = Some((i, prio));
+                }
+            }
+        }
+        match best {
+            None => break,
+            Some((idx, _)) => {
+                let right = tokens.remove(idx + 1);
+                tokens[idx].push_str(&right);
+            }
+        }
+    }
+
+    // Step 4: lookup. Unknown pieces get a single byte-fallback expansion
+    // as a last resort (shouldn't happen if the merge graph is well-
+    // behaved — every merge result must be in the vocab).
+    let mut out = Vec::with_capacity(tokens.len());
+    for tok in &tokens {
+        if let Some(&id) = b.token_to_id.get(tok.as_str()) {
+            out.push(id);
+        } else {
+            // Last-ditch: re-decompose into bytes and emit fallbacks.
+            for byte in tok.as_bytes() {
+                let key = format!("<0x{:02X}>", byte);
+                if let Some(&id) = b.token_to_id.get(key.as_str()) {
+                    out.push(id);
+                } else {
+                    // Truly unrecoverable — this would be a malformed
+                    // vocab. We push 0 (`<pad>` for Gemma) and warn
+                    // through the test smoke; the Forward will run
+                    // with garbage instead of panicking.
+                    out.push(0);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn gemma_decode(b: &BpeData, ids: &[u32]) -> String {
+    let mut bytes: Vec<u8> = Vec::with_capacity(ids.len() * 2);
+    for &id in ids {
+        let s = match b.vocab.get(id as usize) {
+            Some(s) => s.as_str(),
+            None => continue,
+        };
+        // `<0xHH>` byte-fallback tokens decode to a single raw byte.
+        if s.len() == 6
+            && s.as_bytes()[0] == b'<'
+            && s.as_bytes()[1] == b'0'
+            && s.as_bytes()[2] == b'x'
+            && s.as_bytes()[5] == b'>'
+        {
+            if let Ok(byte) = u8::from_str_radix(&s[3..5], 16) {
+                bytes.push(byte);
+                continue;
+            }
+        }
+        // Special tokens like `<bos>`, `<eos>`, `<|turn>`, `<turn|>`
+        // are not byte-fallback shapes; they stay verbatim and serve
+        // as visible markers if the chat code prints them. The
+        // `▁ → space` substitution applies inline.
+        for ch in s.chars() {
+            if ch == '\u{2581}' {
+                bytes.push(b' ');
+            } else {
+                let mut tmp = [0u8; 4];
+                bytes.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
+            }
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Apply Qwen3's ChatML template — matches the `add_generation_prompt

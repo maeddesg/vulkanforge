@@ -39,6 +39,11 @@ pub enum ChatTemplate {
     /// Mistral Instruct form: `<s>[INST] {user} [/INST]`. Multi-turn
     /// re-uses the same `[INST]…[/INST]` brackets per turn.
     Mistral,
+    /// Sprint 43B-2 — Gemma-4 chat form (asymmetric `<|turn>` /
+    /// `<turn|>` boundary tokens, completely different from the
+    /// `<start_of_turn>` / `<end_of_turn>` of Gemma-1/2/3):
+    /// `<|turn>system\n{system}<turn|>\n<|turn>user\n{user}<turn|>\n<|turn>model\n`.
+    Gemma4,
     /// Plain text — system + user concatenated, no role markers.
     Raw,
 }
@@ -85,6 +90,7 @@ impl ChatTemplate {
         match tokenizer.flavour() {
             Some(TokenizerFlavour::Qwen2) => ChatTemplate::ChatML,
             Some(TokenizerFlavour::Llama3) => ChatTemplate::Llama3,
+            Some(TokenizerFlavour::Gemma2) => ChatTemplate::Gemma4,
             None => ChatTemplate::Mistral,
         }
     }
@@ -118,9 +124,20 @@ impl ChatTemplate {
         if template_str.contains("[INST]") {
             return ChatTemplate::Mistral;
         }
+        // Sprint 43B-2 — Gemma-4's chat template is large (~16 KB
+        // Jinja with macros). Two heuristics catch it: the asymmetric
+        // `<|turn>` / `<turn|>` boundary tokens are unique to Gemma-4
+        // (Gemma-1/2/3 use `<start_of_turn>` / `<end_of_turn>`).
+        // The chat_template may not always be in tokenizer_config.json
+        // (Gemma-4 ships it as a separate `chat_template.jinja` file)
+        // — fall through to the flavour check below in that case.
+        if template_str.contains("<|turn>") && template_str.contains("<turn|>") {
+            return ChatTemplate::Gemma4;
+        }
         match tokenizer.flavour() {
             Some(TokenizerFlavour::Qwen2) => ChatTemplate::ChatML,
             Some(TokenizerFlavour::Llama3) => ChatTemplate::Llama3,
+            Some(TokenizerFlavour::Gemma2) => ChatTemplate::Gemma4,
             None => ChatTemplate::Mistral,
         }
     }
@@ -139,6 +156,7 @@ impl ChatTemplate {
             ChatTemplate::Llama3 => render_llama3_first(tokenizer, system, user),
             ChatTemplate::DeepSeekR1 => render_deepseek_first(tokenizer, system, user),
             ChatTemplate::Mistral => render_mistral_first(tokenizer, system, user),
+            ChatTemplate::Gemma4 => render_gemma4_first(tokenizer, system, user),
             ChatTemplate::Raw => render_raw_first(tokenizer, system, user),
         }
     }
@@ -152,9 +170,75 @@ impl ChatTemplate {
             ChatTemplate::Llama3 => render_llama3_continuation(tokenizer, user),
             ChatTemplate::DeepSeekR1 => render_deepseek_continuation(tokenizer, user),
             ChatTemplate::Mistral => render_mistral_continuation(tokenizer, user),
+            ChatTemplate::Gemma4 => render_gemma4_continuation(tokenizer, user),
             ChatTemplate::Raw => render_raw_continuation(tokenizer, user),
         }
     }
+}
+
+// ---------- Gemma-4 (Sprint 43B-2) ----------
+//
+// Format extracted from the upstream `chat_template.jinja`
+// (lines 179–344): three boundary forms,
+//
+//   `<|turn>system\n{system}<turn|>\n`
+//   `<|turn>user\n{user}<turn|>\n`
+//   `<|turn>model\n{model}<turn|>\n`
+//
+// The system block is *optional* per the upstream guard
+// `if enable_thinking or tools or messages[0]['role'] in
+//  ['system', 'developer']` — we always emit it when the caller
+// passes a non-empty system prompt and skip it otherwise.
+
+fn gemma4_special(tokenizer: &Tokenizer, name: &str) -> u32 {
+    tokenizer
+        .special_id(name)
+        .unwrap_or_else(|| panic!("Gemma-4 chat template missing special token {name:?}"))
+}
+
+fn render_gemma4_first(tokenizer: &Tokenizer, system: &str, user: &str) -> Vec<u32> {
+    let bos = tokenizer.bos_id.unwrap_or_else(|| gemma4_special(tokenizer, "<bos>"));
+    let sot = gemma4_special(tokenizer, "<|turn>");
+    let eot = gemma4_special(tokenizer, "<turn|>");
+
+    let mut tokens = Vec::new();
+    tokens.push(bos);
+    if !system.is_empty() {
+        tokens.push(sot);
+        tokens.extend(tokenizer.encode("system\n"));
+        tokens.extend(tokenizer.encode(system));
+        tokens.push(eot);
+        tokens.extend(tokenizer.encode("\n"));
+    }
+    tokens.push(sot);
+    tokens.extend(tokenizer.encode("user\n"));
+    tokens.extend(tokenizer.encode(user));
+    tokens.push(eot);
+    tokens.extend(tokenizer.encode("\n"));
+    tokens.push(sot);
+    tokens.extend(tokenizer.encode("model\n"));
+    tokens
+}
+
+fn render_gemma4_continuation(tokenizer: &Tokenizer, user: &str) -> Vec<u32> {
+    let sot = gemma4_special(tokenizer, "<|turn>");
+    let eot = gemma4_special(tokenizer, "<turn|>");
+
+    let mut tokens = Vec::new();
+    // The previous turn's `<turn|>` may not have been committed yet
+    // (the caller may have stopped at it as EOS). Replay it here so
+    // the model sees a clean turn-boundary before the new user
+    // message.
+    tokens.push(eot);
+    tokens.extend(tokenizer.encode("\n"));
+    tokens.push(sot);
+    tokens.extend(tokenizer.encode("user\n"));
+    tokens.extend(tokenizer.encode(user));
+    tokens.push(eot);
+    tokens.extend(tokenizer.encode("\n"));
+    tokens.push(sot);
+    tokens.extend(tokenizer.encode("model\n"));
+    tokens
 }
 
 // ---------- ChatML (Qwen3) ----------

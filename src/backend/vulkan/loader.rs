@@ -474,7 +474,8 @@ impl LoadedModel {
             }
             // Sprint 22B — skip the embedding GPU upload (host cache
             // covers all reads).
-            if skip_embed_gpu && hf_name == "model.embed_tokens.weight" {
+            if skip_embed_gpu && (hf_name == "model.embed_tokens.weight"
+                || hf_name == "model.language_model.embed_tokens.weight") {
                 continue;
             }
             let Some(vf_name) = hf_to_vf_name(hf_name) else {
@@ -774,9 +775,17 @@ impl LoadedModel {
         // copy, and EmbeddingSource::Host avoids a per-token GPU
         // readback during decode.
         let host_embed = {
-            let info = st.tensor("model.embed_tokens.weight")
+            // Sprint 43B-2 — Gemma-4 nests embed under `model.language_model.`.
+            // Probe both names so the same loader path covers Llama / Qwen
+            // (`model.embed_tokens.weight`) and Gemma-4
+            // (`model.language_model.embed_tokens.weight`).
+            let info = st
+                .tensor("model.embed_tokens.weight")
+                .or_else(|| st.tensor("model.language_model.embed_tokens.weight"))
                 .ok_or_else(|| LoaderError::Buffer(
-                    "model.embed_tokens.weight not present in SafeTensors".into()
+                    "embed_tokens.weight not present in SafeTensors \
+                     (tried model.embed_tokens.weight and \
+                     model.language_model.embed_tokens.weight)".into()
                 ))?;
             let raw = st.tensor_bytes(info);
             match info.dtype {
@@ -1029,6 +1038,8 @@ fn hf_to_model_config(hf: &HfConfig) -> Result<ModelConfig, LoaderError> {
     // a different rope_theta default (1e6 for Qwen2.5 vs 5e5 for
     // Llama-3) — both read from `config.json` directly, so no code
     // branch needed.
+    use super::gguf::{Gemma4KvSource, Gemma4LayerKind, Gemma4LayerSpec, Gemma4Spec, RopeVariant};
+
     let arch = match hf.model_type.as_str() {
         "llama" => "llama",
         "qwen2" => "qwen2",
@@ -1037,45 +1048,109 @@ fn hf_to_model_config(hf: &HfConfig) -> Result<ModelConfig, LoaderError> {
         // gated on the actual presence of `attn_*.bias` tensors in the
         // SafeTensors archive (Qwen3 omits them, Qwen2.5 carries them).
         "qwen3" => "qwen3",
-        // Sprint 43B-1 — Gemma-4 architecture detection lands now;
-        // the heterogeneous-head_dim forward path + sliding/full
-        // attention dispatch + PLE ship in 43B-2 / 43D. We bail out
-        // early so the loader doesn't half-load tensors of shapes the
-        // forward can't yet route. Sprint 43A's analysis ships in
-        // results/v0314_sprint43_gemma4_e2b_analysis.md.
-        "gemma4" => {
-            return Err(LoaderError::Buffer(format!(
-                "Gemma-4 architecture detected (text_config: hidden={}, \
-                 layers={}, sliding_window={}, kv_shared={}). The text \
-                 decoder lands in Sprint 43B-2 (forward + 4 new shaders); \
-                 PLE ships in Sprint 43D. Loader stub bails here to avoid \
-                 half-running an unsupported pipeline.",
-                hf.hidden_size,
-                hf.num_hidden_layers,
-                hf.gemma4
-                    .as_ref()
-                    .map(|g| g.sliding_window)
-                    .unwrap_or(0),
-                hf.gemma4
-                    .as_ref()
-                    .map(|g| g.num_kv_shared_layers)
-                    .unwrap_or(0),
-            )));
-        }
+        // Sprint 43B-2 — Gemma-4 weights load through this path. The
+        // forward refactor in 43B-2 picks it up via `cfg.gemma4 =
+        // Some(Gemma4Spec)`. Sprint 43D adds PLE.
+        "gemma4" => "gemma4",
         other => {
             return Err(LoaderError::Buffer(format!(
                 "SafeTensors model_type '{other}' not yet supported \
-                 (have: 'llama', 'qwen2', 'qwen3'; \
-                 'gemma4' detected but text-decoder support arrives \
-                 in Sprint 43B-2)"
+                 (have: 'llama', 'qwen2', 'qwen3', 'gemma4')"
             )));
         }
     };
-    use super::gguf::RopeVariant;
     // Sprint 35 — Qwen3 ships per-head Q/K norms (`q_norm` / `k_norm`)
     // that the forward pass dispatches when `has_qk_norm` is true.
-    // Qwen2/Llama set this `false`; Qwen3 keeps it `true`.
-    let has_qk_norm = hf.model_type == "qwen3";
+    // Sprint 43B-2 — Gemma-4 also ships them.
+    let has_qk_norm = matches!(hf.model_type.as_str(), "qwen3" | "gemma4");
+
+    // Sprint 43B-2 — for Gemma-4, allocate buffers sized to the
+    // *maximum* head_dim and intermediate_size across all layers
+    // (sliding=256 / full=512, plain=6144 / double-wide=12288 in E2B).
+    // Per-layer push-constants pick the actual size at dispatch time.
+    let (head_dim, ffn_dim, gemma4_spec) = if let Some(gm) = hf.gemma4.as_ref() {
+        let max_head_dim = gm.head_dim_sliding.max(gm.head_dim_full);
+        let max_ffn = if gm.use_double_wide_mlp {
+            gm.intermediate_size * 2
+        } else {
+            gm.intermediate_size
+        };
+        let first_kv_shared = hf.num_hidden_layers.saturating_sub(gm.num_kv_shared_layers);
+
+        // Find the last sliding / last full layer index in
+        // `[0, first_kv_shared)`. Those two layers carry the extra
+        // "publishes shared KV" responsibility, mirroring HF's
+        // `store_full_length_kv = True` flag.
+        let mut last_sliding_pre: Option<u32> = None;
+        let mut last_full_pre: Option<u32> = None;
+        for i in 0..first_kv_shared {
+            match gm.layer_types[i as usize] {
+                crate::hf_config::Gemma4LayerType::Sliding => last_sliding_pre = Some(i),
+                crate::hf_config::Gemma4LayerType::Full => last_full_pre = Some(i),
+            }
+        }
+
+        let mut layer_specs = Vec::with_capacity(hf.num_hidden_layers as usize);
+        for i in 0..hf.num_hidden_layers {
+            let is_shared = i >= first_kv_shared;
+            let kind = match gm.layer_types[i as usize] {
+                crate::hf_config::Gemma4LayerType::Sliding => Gemma4LayerKind::Sliding,
+                crate::hf_config::Gemma4LayerType::Full => Gemma4LayerKind::Full,
+            };
+            let head_dim_layer = match kind {
+                Gemma4LayerKind::Sliding => gm.head_dim_sliding,
+                Gemma4LayerKind::Full => gm.head_dim_full,
+            };
+            let intermediate_layer = if is_shared && gm.use_double_wide_mlp {
+                gm.intermediate_size * 2
+            } else {
+                gm.intermediate_size
+            };
+            let kv_source = if is_shared {
+                match kind {
+                    Gemma4LayerKind::Sliding => Gemma4KvSource::SubscribesSliding,
+                    Gemma4LayerKind::Full => Gemma4KvSource::SubscribesFull,
+                }
+            } else if Some(i) == last_sliding_pre {
+                Gemma4KvSource::OwnAndPublishesSliding
+            } else if Some(i) == last_full_pre {
+                Gemma4KvSource::OwnAndPublishesFull
+            } else {
+                Gemma4KvSource::Own
+            };
+            let (theta, partial) = match kind {
+                Gemma4LayerKind::Sliding => (gm.sliding_rope_theta, None),
+                Gemma4LayerKind::Full => (gm.full_rope_theta, gm.full_rope_partial_factor),
+            };
+            layer_specs.push(Gemma4LayerSpec {
+                kind,
+                head_dim: head_dim_layer,
+                intermediate_size: intermediate_layer,
+                has_kv_proj: !is_shared,
+                kv_source,
+                rope_theta: theta,
+                rope_partial_factor: partial,
+            });
+        }
+
+        let embed_scale = (hf.hidden_size as f32).sqrt();
+        let spec = Gemma4Spec {
+            sliding_window: gm.sliding_window,
+            final_logit_softcapping: gm.final_logit_softcapping,
+            embed_scale,
+            hidden_activation: gm.hidden_activation.clone(),
+            tie_word_embeddings: hf.tie_word_embeddings,
+            first_kv_shared,
+            layers: layer_specs,
+            // layer_scalars get filled by the loader in a second pass
+            // once the BF16 [1] tensors have been read off disk.
+            layer_scalars: vec![1.0; hf.num_hidden_layers as usize],
+        };
+        (max_head_dim, max_ffn, Some(spec))
+    } else {
+        (hf.head_dim(), hf.intermediate_size, None)
+    };
+
     // Important: SafeTensors / PyTorch carries Q/K weights in the
     // *un-permuted* HuggingFace layout, where RoPE rotates the
     // [i, i + head_dim/2] pairs (NeoX / GPT-NeoX style). llama.cpp's
@@ -1087,17 +1162,18 @@ fn hf_to_model_config(hf: &HfConfig) -> Result<ModelConfig, LoaderError> {
     Ok(ModelConfig {
         architecture: arch.to_string(),
         hidden_dim: hf.hidden_size,
-        ffn_dim: hf.intermediate_size,
+        ffn_dim,
         n_heads: hf.num_attention_heads,
         n_kv_heads: hf.n_kv_heads(),
-        head_dim: hf.head_dim(),
+        head_dim,
         n_layers: hf.num_hidden_layers,
         vocab_size: hf.vocab_size,
         rms_norm_eps: hf.rms_norm_eps,
         rope_freq_base: hf.rope_theta,
-        rope_dim: hf.head_dim(),
+        rope_dim: head_dim,
         rope_variant: RopeVariant::Neox,
         context_length: hf.max_position_embeddings.unwrap_or(2048),
         has_qk_norm,
+        gemma4: gemma4_spec,
     })
 }
