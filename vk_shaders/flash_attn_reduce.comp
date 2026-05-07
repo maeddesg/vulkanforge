@@ -39,36 +39,43 @@ void main() {
         return;
     }
     uint o_off = h * p.head_dim;
-    bool d1_valid = (tid + 64) < p.head_dim;
 
+    // Sprint 43D-2 — striped per-thread accumulators (head_dim ≤ 512).
+    // Pre-43D-2 hardcoded 2 dims/thread (head_dim ≤ 128).
+    const uint MAX_DIMS_PER_THREAD = 8;
+    float acc[MAX_DIMS_PER_THREAD];
+    for (uint d_idx = 0; d_idx < MAX_DIMS_PER_THREAD; ++d_idx) {
+        acc[d_idx] = 0.0;
+    }
+    uint dims_per_thread = (p.head_dim + WGSIZE - 1) / WGSIZE;
     float global_max = -1e30;
     float global_sum = 0.0;
-    float acc0       = 0.0;
-    float acc1       = 0.0;
 
     for (uint t = 0; t < p.n_tiles; ++t) {
         uint partial_idx = h * p.n_tiles + t;
         float tile_max  = scratch_max[partial_idx];
         float tile_sum  = scratch_sum[partial_idx];
-        float tile_out0 = scratch_out[partial_idx * p.head_dim + tid];
-        float tile_out1 = d1_valid
-            ? scratch_out[partial_idx * p.head_dim + tid + 64]
-            : 0.0;
 
         float new_max = max(global_max, tile_max);
         float k_old   = exp(global_max - new_max);
         float k_new   = exp(tile_max   - new_max);
-        acc0       = acc0 * k_old + tile_out0 * k_new;
-        acc1       = acc1 * k_old + tile_out1 * k_new;
+
+        for (uint d_idx = 0; d_idx < dims_per_thread; ++d_idx) {
+            uint d = tid + d_idx * WGSIZE;
+            float tile_out = (d < p.head_dim)
+                ? scratch_out[partial_idx * p.head_dim + d]
+                : 0.0;
+            acc[d_idx] = acc[d_idx] * k_old + tile_out * k_new;
+        }
         global_sum = global_sum * k_old + tile_sum * k_new;
         global_max = new_max;
     }
 
     float inv_sum = 1.0 / global_sum;
-    if (tid < p.head_dim) {
-        o[o_off + tid] = acc0 * inv_sum;
-    }
-    if (d1_valid) {
-        o[o_off + tid + 64] = acc1 * inv_sum;
+    for (uint d_idx = 0; d_idx < dims_per_thread; ++d_idx) {
+        uint d = tid + d_idx * WGSIZE;
+        if (d < p.head_dim) {
+            o[o_off + d] = acc[d_idx] * inv_sum;
+        }
     }
 }

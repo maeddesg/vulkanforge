@@ -113,12 +113,22 @@ void main() {
     uint pos_stride = p.n_kv_heads * p.head_dim;
     uint head_off   = kvh * p.head_dim;
 
-    // Per-thread output accumulators. With WGSIZE=64 and head_dim=128
-    // (Qwen3) each thread covers 2 output dimensions: `tid` and
-    // `tid + 64`. Bounds-checked at write time so smaller head_dim
-    // values still work.
-    float my_out0 = 0.0;
-    float my_out1 = 0.0;
+    // Per-thread output accumulators. With WGSIZE=64 each thread
+    // covers `ceil(head_dim / 64)` output dimensions striped at
+    // `tid + d_idx * 64`. Hardcoded to 2 dims/thread (128 max
+    // head_dim) before Sprint 43D-2 — fine for Qwen3 (head_dim=128)
+    // but produced uninitialised attn_out for Gemma-4 sliding (256)
+    // and full (512), which then NaN-cascades through O-proj.
+    // Sprint 43D-2: bumped MAX_DIMS_PER_THREAD to 8 (= 64 × 8 = 512
+    // max head_dim, covers Gemma-4 full). For head_dim=128 the loop
+    // runs exactly 2 iterations — the math is bit-identical to the
+    // pre-43D-2 hand-unrolled form.
+    const uint MAX_DIMS_PER_THREAD = 8;
+    float my_out[MAX_DIMS_PER_THREAD];
+    for (uint d_idx = 0; d_idx < MAX_DIMS_PER_THREAD; ++d_idx) {
+        my_out[d_idx] = 0.0;
+    }
+    uint dims_per_thread = (p.head_dim + WGSIZE - 1) / WGSIZE;
     float my_max  = -1e30;
     float my_sum  = 0.0;
 
@@ -146,8 +156,9 @@ void main() {
         // this evaluates to 0 which zeroes out un-initialised state
         // — safe.
         float kfac = exp(my_max - new_max);
-        my_out0 *= kfac;
-        my_out1 *= kfac;
+        for (uint d_idx = 0; d_idx < dims_per_thread; ++d_idx) {
+            my_out[d_idx] *= kfac;
+        }
         my_sum  *= kfac;
 
         float pscore = valid ? exp(score - new_max) : 0.0;
@@ -161,19 +172,18 @@ void main() {
         barrier();
 
         // ---- Weighted V-sum update ----
-        // Each thread accumulates over the full tile but only into
-        // its two output dims (tid, tid+64). With Qwen3's head_dim=128
-        // and WGSIZE=64 these always exist; we still bounds-check the
-        // upper one so smaller head_dim values are safe.
+        // Each thread accumulates over the full tile into its
+        // `dims_per_thread` output dims at offsets `tid + d_idx × WGSIZE`.
         uint tile_size = min(TILE, p.seq_len - tile_base);
-        bool d1_valid = (tid + 64) < p.head_dim;
         for (uint i = 0; i < tile_size; ++i) {
             uint global_t  = tile_base + i;
             uint v_pos_off = global_t * pos_stride + head_off;
             float pi = scores_lds[i];
-            my_out0 += pi * load_v(v_pos_off + tid);
-            if (d1_valid) {
-                my_out1 += pi * load_v(v_pos_off + tid + 64);
+            for (uint d_idx = 0; d_idx < dims_per_thread; ++d_idx) {
+                uint d = tid + d_idx * WGSIZE;
+                if (d < p.head_dim) {
+                    my_out[d_idx] += pi * load_v(v_pos_off + d);
+                }
             }
         }
         barrier();   // before next tile rewrites scores_lds
@@ -181,10 +191,10 @@ void main() {
 
     // ---- Final normalisation + write-back. ----
     float inv_sum = 1.0 / my_sum;
-    if (tid < p.head_dim) {
-        o[o_off + tid] = my_out0 * inv_sum;
-    }
-    if ((tid + 64) < p.head_dim) {
-        o[o_off + tid + 64] = my_out1 * inv_sum;
+    for (uint d_idx = 0; d_idx < dims_per_thread; ++d_idx) {
+        uint d = tid + d_idx * WGSIZE;
+        if (d < p.head_dim) {
+            o[o_off + d] = my_out[d_idx] * inv_sum;
+        }
     }
 }

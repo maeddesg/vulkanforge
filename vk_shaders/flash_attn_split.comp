@@ -111,20 +111,25 @@ void main() {
     barrier();
 
     // ---- Weighted V-sum, parallel over output dim ----
-    // Each thread takes 2 output dims (`tid` and `tid + 64`) — same
-    // pattern as Phase-4B `flash_attn.comp`. Bounds-checked for
-    // future head_dim != 128 deployments.
-    float my_out0 = 0.0;
-    float my_out1 = 0.0;
-    bool d1_valid = (tid + 64) < p.head_dim;
+    // Sprint 43D-2 — striped per-thread accumulators (handles head_dim
+    // up to WGSIZE × MAX_DIMS_PER_THREAD = 64 × 8 = 512). Pre-43D-2
+    // hardcoded 2 dims/thread; bit-identical for head_dim=128.
+    const uint MAX_DIMS_PER_THREAD = 8;
+    float my_out[MAX_DIMS_PER_THREAD];
+    for (uint d_idx = 0; d_idx < MAX_DIMS_PER_THREAD; ++d_idx) {
+        my_out[d_idx] = 0.0;
+    }
+    uint dims_per_thread = (p.head_dim + WGSIZE - 1) / WGSIZE;
     uint  tile_size = min(TILE, p.seq_len - tile_base);
     for (uint i = 0; i < tile_size; ++i) {
         uint global_t  = tile_base + i;
         uint v_pos_off = global_t * pos_stride + head_off;
         float pi = scores_lds[i];
-        my_out0 += pi * load_v(v_pos_off + tid);
-        if (d1_valid) {
-            my_out1 += pi * load_v(v_pos_off + tid + 64);
+        for (uint d_idx = 0; d_idx < dims_per_thread; ++d_idx) {
+            uint d = tid + d_idx * WGSIZE;
+            if (d < p.head_dim) {
+                my_out[d_idx] += pi * load_v(v_pos_off + d);
+            }
         }
     }
 
@@ -138,10 +143,10 @@ void main() {
         scratch_max[partial_idx] = tile_max;
         scratch_sum[partial_idx] = tile_sum;
     }
-    if (tid < p.head_dim) {
-        scratch_out[partial_idx * p.head_dim + tid] = my_out0;
-    }
-    if (d1_valid) {
-        scratch_out[partial_idx * p.head_dim + tid + 64] = my_out1;
+    for (uint d_idx = 0; d_idx < dims_per_thread; ++d_idx) {
+        uint d = tid + d_idx * WGSIZE;
+        if (d < p.head_dim) {
+            scratch_out[partial_idx * p.head_dim + d] = my_out[d_idx];
+        }
     }
 }

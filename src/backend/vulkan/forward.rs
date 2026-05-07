@@ -634,7 +634,9 @@ impl Forward {
             };
             let mut logits = vec![0.0_f32; cpu_lm.vocab_size];
             cpu_lm.forward(&hidden, &mut logits);
+            maybe_dump_logits("cpu_lm_head pre-softcap", &logits);
             apply_final_logit_softcap(&self.config, &mut logits);
+            maybe_dump_logits("cpu_lm_head post-softcap", &logits);
             return Ok(logits);
         }
         // Sprint 27 — read from host-mapped staging copy.
@@ -642,7 +644,9 @@ impl Forward {
         let mut logits = bytemuck::cast_slice::<u8, f32>(
             &bytes[..(self.config.vocab_size as usize) * 4],
         ).to_vec();
+        maybe_dump_logits("gpu_lm_head pre-softcap", &logits);
         apply_final_logit_softcap(&self.config, &mut logits);
+        maybe_dump_logits("gpu_lm_head post-softcap", &logits);
         Ok(logits)
     }
 
@@ -2535,21 +2539,57 @@ impl Forward {
         // Next: (h+i) reads input + o_buf.
         self.maybe_compute_barrier(dev, cmd, &[input, o_buf]);
 
-        // (h+i) Fused add_res1 + ffn_norm. v0.2 Sprint 9b folds
+        // (h+i) Norms around the attention residual.
+        //
+        // Llama / Qwen layout (one norm):
         //   res1 = input + o_buf
         //   hidden_norm = rms_norm(res1) * ffn_norm.weight
-        // into one dispatch.
-        let w = layer_weight(model, layer, "ffn_norm.weight");
-        self.run_multi_add_rms(
-            dev, registry, cmd,
-            input, o_buf, w,
-            /* sum_out  = */ res1,
-            /* norm_out = */ hidden_norm,
-            cfg.hidden_dim, 1, cfg.rms_norm_eps, "add_rms_ffn",
-        );
-        self.mark_written(&[res1, hidden_norm]);
-        // Next: (j) gate/up read hidden_norm.
-        self.maybe_compute_barrier(dev, cmd, &[hidden_norm]);
+        // — fused into multi_add_rms via Sprint 9b.
+        //
+        // Sprint 43D Diagnose — Gemma-4 layout (TWO norms; a different
+        // residual structure):
+        //   o_normed = rms_norm(o_buf) * post_attention_layernorm.weight
+        //   res1 = input + o_normed
+        //   hidden_norm = rms_norm(res1) * pre_feedforward_layernorm.weight
+        // (post_attention_layernorm is mapped to VF's `ffn_norm.weight`;
+        //  pre_feedforward_layernorm is the new `ffn_pre_norm.weight`
+        //  added in Sprint 43B-1.)
+        if cfg.gemma4.is_some() {
+            // Step 1: o_normed = rms_norm(o_buf) * post_attention_layernorm
+            let post_attn_w = layer_weight(model, layer, "ffn_norm.weight");
+            // Reuse `gate_buf` as scratch for the normed o (gate_buf is
+            // not yet live — it's filled by the FFN gate GEMV below).
+            self.run_rms_norm(dev, registry, cmd, o_buf, post_attn_w, gate_buf,
+                              cfg.hidden_dim, 1, cfg.rms_norm_eps, "rms_norm_post_attn");
+            self.mark_written(&[gate_buf]);
+            self.maybe_compute_barrier(dev, cmd, &[input, gate_buf]);
+
+            // Step 2: res1 = input + gate_buf
+            self.run_binary(dev, registry, cmd, ShaderId::Add,
+                            input, gate_buf, res1,
+                            cfg.hidden_dim, "add_res1_gemma4");
+            self.mark_written(&[res1]);
+            self.maybe_compute_barrier(dev, cmd, &[res1]);
+
+            // Step 3: hidden_norm = rms_norm(res1) * pre_feedforward_layernorm
+            let pre_ffn_w = layer_weight(model, layer, "ffn_pre_norm.weight");
+            self.run_rms_norm(dev, registry, cmd, res1, pre_ffn_w, hidden_norm,
+                              cfg.hidden_dim, 1, cfg.rms_norm_eps, "rms_norm_pre_ffn");
+            self.mark_written(&[hidden_norm]);
+            self.maybe_compute_barrier(dev, cmd, &[hidden_norm]);
+        } else {
+            let w = layer_weight(model, layer, "ffn_norm.weight");
+            self.run_multi_add_rms(
+                dev, registry, cmd,
+                input, o_buf, w,
+                /* sum_out  = */ res1,
+                /* norm_out = */ hidden_norm,
+                cfg.hidden_dim, 1, cfg.rms_norm_eps, "add_rms_ffn",
+            );
+            self.mark_written(&[res1, hidden_norm]);
+            // Next: (j) gate/up read hidden_norm.
+            self.maybe_compute_barrier(dev, cmd, &[hidden_norm]);
+        }
 
         // (j) gate / up
         let wg = layer_weight(model, layer, "ffn_gate.weight");
@@ -2606,13 +2646,28 @@ impl Forward {
                 ffn_dim, cfg.hidden_dim, scale_d, "gemv_down");
         }
         self.mark_written(&[ffn_out]);
-        // Next: (n) residual2 reads res1 + ffn_out.
-        self.maybe_compute_barrier(dev, cmd, &[res1, ffn_out]);
-
-        // (n) Residual2 = res1 + ffn_out → output
-        self.run_binary(dev, registry, cmd, ShaderId::Add,
-                        res1, ffn_out, output,
-                        cfg.hidden_dim, "add_res2");
+        // Sprint 43D Diagnose — Gemma-4 has a post_feedforward_layernorm
+        // applied to ffn_out *before* the final residual add.
+        if cfg.gemma4.is_some() {
+            self.maybe_compute_barrier(dev, cmd, &[ffn_out]);
+            let post_ffn_w = layer_weight(model, layer, "ffn_post_norm.weight");
+            // Reuse gate_buf again as scratch (it's been consumed by
+            // SwiGLU at this point — its hidden_dim/ffn_dim sized
+            // allocation comfortably holds the hidden-dim-sized result).
+            self.run_rms_norm(dev, registry, cmd, ffn_out, post_ffn_w, gate_buf,
+                              cfg.hidden_dim, 1, cfg.rms_norm_eps, "rms_norm_post_ffn");
+            self.mark_written(&[gate_buf]);
+            self.maybe_compute_barrier(dev, cmd, &[res1, gate_buf]);
+            self.run_binary(dev, registry, cmd, ShaderId::Add,
+                            res1, gate_buf, output,
+                            cfg.hidden_dim, "add_res2_gemma4");
+        } else {
+            self.maybe_compute_barrier(dev, cmd, &[res1, ffn_out]);
+            // (n) Residual2 = res1 + ffn_out → output
+            self.run_binary(dev, registry, cmd, ShaderId::Add,
+                            res1, ffn_out, output,
+                            cfg.hidden_dim, "add_res2");
+        }
         self.mark_written(&[output]);
         // Next: next layer's attn_norm reads `output` (= its `input`),
         // or dispatch_final reads `output`. Either way: caller's first
@@ -6219,6 +6274,75 @@ fn layer_dims(cfg: &ModelConfig, layer: u32) -> (u32, u32, f32, u32) {
         (s.head_dim, s.intermediate_size, s.rope_theta, rotary_dim)
     } else {
         (cfg.head_dim, cfg.ffn_dim, cfg.rope_freq_base, cfg.head_dim)
+    }
+}
+
+/// Sprint 43D-1 diagnose helper — env-gated logit-distribution dump.
+/// Set `VF_LOGIT_DUMP=1` (or `=2` for verbose) to print per-step
+/// argmax / top5 / mean / min / max / NaN-count to stderr during
+/// `wait_and_read_logits`. No-op otherwise. Used to bisect whether
+/// the Gemma-4 `<pad>`-argmax-collapse is a coherent distribution
+/// gone wrong, an all-NaN forward, or a particular logit slot
+/// dominating from a soft-cap clipping artifact.
+fn maybe_dump_logits(tag: &str, logits: &[f32]) {
+    let level: u32 = std::env::var("VF_LOGIT_DUMP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if level == 0 {
+        return;
+    }
+    let n = logits.len();
+    let mut max_v = f32::NEG_INFINITY;
+    let mut min_v = f32::INFINITY;
+    let mut sum: f64 = 0.0;
+    let mut nan_count: u32 = 0;
+    let mut inf_count: u32 = 0;
+    let mut max_idx: usize = 0;
+    for (i, &v) in logits.iter().enumerate() {
+        if v.is_nan() {
+            nan_count += 1;
+            continue;
+        }
+        if v.is_infinite() {
+            inf_count += 1;
+            continue;
+        }
+        sum += v as f64;
+        if v > max_v {
+            max_v = v;
+            max_idx = i;
+        }
+        if v < min_v {
+            min_v = v;
+        }
+    }
+    let valid = (n as u32) - nan_count - inf_count;
+    let mean = if valid > 0 { sum / (valid as f64) } else { 0.0 };
+
+    // Top-5 by descending logit value (NaN/Inf-skipped).
+    let mut sorted: Vec<(usize, f32)> = logits
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &v)| if v.is_finite() { Some((i, v)) } else { None })
+        .collect();
+    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let top5: Vec<(usize, f32)> = sorted.into_iter().take(5).collect();
+
+    eprintln!(
+        "[VF_LOGIT_DUMP] {tag}: n={n} argmax_idx={max_idx} max={max_v:.4} \
+         min={min_v:.4} mean={mean:.4} nan={nan_count} inf={inf_count}"
+    );
+    eprintln!("[VF_LOGIT_DUMP] {tag}: top5={top5:?}");
+    if level >= 2 {
+        // Verbose: dump first 16 + last 16 logits to spot patterns
+        // (e.g. id 0..15 mostly zero suggests pad-collapse artifact).
+        let head: Vec<(usize, f32)> = logits.iter().enumerate().take(16).map(|(i, &v)| (i, v)).collect();
+        let tail_start = n.saturating_sub(16);
+        let tail: Vec<(usize, f32)> = logits[tail_start..].iter().enumerate()
+            .map(|(i, &v)| (tail_start + i, v)).collect();
+        eprintln!("[VF_LOGIT_DUMP] {tag}: head16={head:?}");
+        eprintln!("[VF_LOGIT_DUMP] {tag}: tail16={tail:?}");
     }
 }
 

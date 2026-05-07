@@ -117,11 +117,18 @@ void main() {
     uint pos_stride = p.n_kv_heads * p.head_dim;
     uint head_off   = kvh * p.head_dim;
 
-    // Two output dims per thread (tid, tid + 64) — head_dim=128 (Qwen3 /
-    // Llama-3.1 / Mistral-7B / DeepSeek-R1) is the only configuration
-    // we exercise; smaller head_dims work via the bounds check at write.
-    float my_out0 = 0.0;
-    float my_out1 = 0.0;
+    // Sprint 43D-2 — striped per-thread accumulators. `WGSIZE=64` and
+    // each thread covers `dims_per_thread = ceil(head_dim/64)` output
+    // dims at offsets `tid + d_idx * 64`. Pre-43D-2 was hand-unrolled
+    // for 2 dims (= head_dim<=128, Qwen3 / Llama-3); Gemma-4 needs up
+    // to 8 (head_dim=512 full-attention). For head_dim=128 the loop
+    // runs exactly 2 iterations, math bit-identical.
+    const uint MAX_DIMS_PER_THREAD = 8;
+    float my_out[MAX_DIMS_PER_THREAD];
+    for (uint d_idx = 0; d_idx < MAX_DIMS_PER_THREAD; ++d_idx) {
+        my_out[d_idx] = 0.0;
+    }
+    uint dims_per_thread = (p.head_dim + WGSIZE - 1) / WGSIZE;
     float my_max  = -1e30;
     float my_sum  = 0.0;
 
@@ -145,8 +152,9 @@ void main() {
         float tile_max = subgroupMax(score);
         float new_max  = max(my_max, tile_max);
         float kfac     = exp(my_max - new_max);
-        my_out0 *= kfac;
-        my_out1 *= kfac;
+        for (uint d_idx = 0; d_idx < dims_per_thread; ++d_idx) {
+            my_out[d_idx] *= kfac;
+        }
         my_sum  *= kfac;
 
         float pscore = valid ? exp(score - new_max) : 0.0;
@@ -163,14 +171,15 @@ void main() {
         // causal_len=1, so only scores_lds[0] is real and only V[0]
         // contributes — the rest were masked to p=0 above).
         uint tile_size = min(TILE, causal_len - tile_base);
-        bool d1_valid = (tid + 64) < p.head_dim;
         for (uint i = 0; i < tile_size; ++i) {
             uint global_t  = tile_base + i;
             uint v_pos_off = global_t * pos_stride + head_off;
             float pi = scores_lds[i];
-            my_out0 += pi * load_v(v_pos_off + tid);
-            if (d1_valid) {
-                my_out1 += pi * load_v(v_pos_off + tid + 64);
+            for (uint d_idx = 0; d_idx < dims_per_thread; ++d_idx) {
+                uint d = tid + d_idx * WGSIZE;
+                if (d < p.head_dim) {
+                    my_out[d_idx] += pi * load_v(v_pos_off + d);
+                }
             }
         }
         barrier();
@@ -180,10 +189,10 @@ void main() {
     // (every query has at least one valid key, since causal_len >= 1),
     // so the divide is safe.
     float inv_sum = 1.0 / my_sum;
-    if (tid < p.head_dim) {
-        o[o_off + tid] = my_out0 * inv_sum;
-    }
-    if ((tid + 64) < p.head_dim) {
-        o[o_off + tid + 64] = my_out1 * inv_sum;
+    for (uint d_idx = 0; d_idx < dims_per_thread; ++d_idx) {
+        uint d = tid + d_idx * WGSIZE;
+        if (d < p.head_dim) {
+            o[o_off + d] = my_out[d_idx] * inv_sum;
+        }
     }
 }
