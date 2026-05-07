@@ -504,6 +504,43 @@ fn run_chat_safetensors(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>
         LoadedModel::load_safetensors(&dev, &mut allocator, &args.model)?;
     let cfg = model.config.clone();
 
+    // Sprint 43D Bisect — diagnose helper for `<pad>` / NaN cascade.
+    // Dump first 16 host_embed values (= token 0's first 16 embedding
+    // components) + per-row stats for tokens 0, 1, 2 so we can sanity-
+    // check the BF16→FP32 conversion. Gated on VF_EMBED_DUMP=1.
+    if std::env::var("VF_EMBED_DUMP").map(|s| s == "1").unwrap_or(false) {
+        let h = cfg.hidden_dim as usize;
+        eprintln!("[VF_EMBED_DUMP] host_embed.len() = {}", host_embed.len());
+        eprintln!("[VF_EMBED_DUMP] hidden_dim = {h}");
+        for tid in [0u32, 1u32, 2u32, 105u32, 106u32, 23391u32].iter() {
+            let start = (*tid as usize) * h;
+            if start + h > host_embed.len() {
+                eprintln!("[VF_EMBED_DUMP] tok {tid}: out-of-range");
+                continue;
+            }
+            let row = &host_embed[start..start + h];
+            let mut nan_count = 0u32;
+            let mut inf_count = 0u32;
+            let mut mn = f32::INFINITY;
+            let mut mx = f32::NEG_INFINITY;
+            let mut sum: f64 = 0.0;
+            for &v in row {
+                if v.is_nan() { nan_count += 1; continue; }
+                if v.is_infinite() { inf_count += 1; continue; }
+                if v < mn { mn = v; }
+                if v > mx { mx = v; }
+                sum += v as f64;
+            }
+            let valid = (h as u32) - nan_count - inf_count;
+            let mean = if valid > 0 { sum / (valid as f64) } else { 0.0 };
+            eprintln!(
+                "[VF_EMBED_DUMP] tok {tid}: nan={nan_count} inf={inf_count} \
+                 min={mn:.4} max={mx:.4} mean={mean:.4}"
+            );
+            eprintln!("[VF_EMBED_DUMP] tok {tid} first16 = {:?}", &row[..16]);
+        }
+    }
+
     let (tokenizer, template, tokenizer_source_label) = match tokenizer_from.as_ref() {
         Some(gguf_path) => {
             let tok_gguf = GgufFile::open(gguf_path)?;

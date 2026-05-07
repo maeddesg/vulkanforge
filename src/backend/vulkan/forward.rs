@@ -528,9 +528,59 @@ impl Forward {
 
         let mut input = self.cur().scratch_a.handle;
         let mut output = self.cur().scratch_b.handle;
+        // Sprint 43D Bisect — VF_LAYER_DUMP=N copies the hidden state
+        // *after* layer N into hidden_staging so the caller can read +
+        // dump it after the one_shot. N=999 means "after the final
+        // layer, before dispatch_final" (= input to the final-norm).
+        let dump_layer: i32 = std::env::var("VF_LAYER_DUMP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(-1);
         for layer in 0..self.config.n_layers {
             self.dispatch_layer(dev, registry, cmd, model, layer, position, input, output);
+            if dump_layer == (layer as i32) {
+                let bytes = (self.config.hidden_dim as u64) * 4;
+                let copy = vk::BufferCopy::default()
+                    .src_offset(0).dst_offset(0).size(bytes);
+                let bar = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+                unsafe {
+                    dev.device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        std::slice::from_ref(&bar), &[], &[],
+                    );
+                    dev.device.cmd_copy_buffer(
+                        cmd, output, self.hidden_staging.handle,
+                        std::slice::from_ref(&copy),
+                    );
+                }
+            }
             std::mem::swap(&mut input, &mut output);
+        }
+        if dump_layer == 999 {
+            let bytes = (self.config.hidden_dim as u64) * 4;
+            let copy = vk::BufferCopy::default()
+                .src_offset(0).dst_offset(0).size(bytes);
+            let bar = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            unsafe {
+                dev.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&bar), &[], &[],
+                );
+                dev.device.cmd_copy_buffer(
+                    cmd, input, self.hidden_staging.handle,
+                    std::slice::from_ref(&copy),
+                );
+            }
         }
         self.dispatch_final(dev, registry, cmd, model, input);
 
@@ -1762,6 +1812,34 @@ impl Forward {
             self.record_decode_dispatches(dev, registry, cmd, model, cur_slot, position);
         })?;
 
+        // Sprint 43D Bisect — read + dump hidden_staging if VF_LAYER_DUMP
+        // selected a layer or VF_FINAL_NORM_DUMP is on. Logged once per
+        // forward_token call.
+        if std::env::var("VF_LAYER_DUMP").is_ok()
+            || std::env::var("VF_FINAL_NORM_DUMP").is_ok()
+        {
+            let h = self.config.hidden_dim as usize;
+            let bytes = self.hidden_staging.read_bytes()?;
+            let hidden: &[f32] = bytemuck::cast_slice::<u8, f32>(&bytes[..h * 4]);
+            let mut nan = 0u32; let mut inf = 0u32;
+            let mut mn = f32::INFINITY; let mut mx = f32::NEG_INFINITY;
+            let mut sum: f64 = 0.0;
+            for &v in hidden {
+                if v.is_nan() { nan += 1; continue; }
+                if v.is_infinite() { inf += 1; continue; }
+                if v < mn { mn = v; }
+                if v > mx { mx = v; }
+                sum += v as f64;
+            }
+            let valid = (h as u32) - nan - inf;
+            let mean = if valid > 0 { sum / (valid as f64) } else { 0.0 };
+            eprintln!(
+                "[VF_LAYER_DUMP] hidden post-dispatch: \
+                 nan={nan} inf={inf} min={mn:.4} max={mx:.4} mean={mean:.4}"
+            );
+            eprintln!("[VF_LAYER_DUMP] first16 = {:?}", &hidden[..16]);
+        }
+
         // Sprint 40 Part 2 — CPU lm_head post-pass. `dispatch_final`
         // already copied the post-norm hidden state into
         // `hidden_staging` and skipped the GPU lm_head GEMV. We
@@ -2795,6 +2873,31 @@ impl Forward {
             self.config.hidden_dim, 1, self.config.rms_norm_eps, "rms_norm_final",
         );
         self.mark_written(&[hidden_norm]);
+        // Sprint 43D Bisect — VF_FINAL_NORM_DUMP=1 copies hidden_norm
+        // (= post-final-RMSNorm, pre-lm_head) into hidden_staging so
+        // forward_token can dump it. Used to bisect whether NaN enters
+        // in the final RMSNorm or in the lm_head GEMV.
+        if std::env::var("VF_FINAL_NORM_DUMP").is_ok() {
+            let bytes = (self.config.hidden_dim as u64) * 4;
+            let copy = vk::BufferCopy::default()
+                .src_offset(0).dst_offset(0).size(bytes);
+            let bar = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            unsafe {
+                dev.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&bar), &[], &[],
+                );
+                dev.device.cmd_copy_buffer(
+                    cmd, hidden_norm, self.hidden_staging.handle,
+                    std::slice::from_ref(&copy),
+                );
+            }
+        }
         // Next: lm_head GEMV reads hidden_norm.
         self.maybe_compute_barrier(dev, cmd, &[hidden_norm]);
         // Sprint 29 — F16 lm_head goes through the dedicated harness
