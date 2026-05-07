@@ -320,6 +320,12 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
             n_kv_heads: cfg.n_kv_heads,
             head_dim: cfg.head_dim,
             max_seq_len: max_context,
+            // Sprint 43D-1 — Gemma-4 ships heterogeneous head_dim
+            // (sliding=256 / full=512). For every other architecture
+            // this stays None and the cache uses the uniform stride.
+            per_layer_head_dim: cfg.gemma4.as_ref().map(|g| {
+                g.layers.iter().map(|s| s.head_dim).collect()
+            }),
         },
     )?;
     // Sprint 43C — KV cache one-shot zero-fill. Required for Gemma-4
@@ -547,6 +553,12 @@ fn run_chat_safetensors(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>
             n_kv_heads: cfg.n_kv_heads,
             head_dim: cfg.head_dim,
             max_seq_len: max_context,
+            // Sprint 43D-1 — Gemma-4 ships heterogeneous head_dim
+            // (sliding=256 / full=512). For every other architecture
+            // this stays None and the cache uses the uniform stride.
+            per_layer_head_dim: cfg.gemma4.as_ref().map(|g| {
+                g.layers.iter().map(|s| s.head_dim).collect()
+            }),
         },
     )?;
     // Sprint 43C — KV cache one-shot zero-fill. Required for Gemma-4
@@ -1122,6 +1134,9 @@ fn run_bench(
             // Bench needs to fit prefill + decode_max in the kv cache.
             // Sprint 22 — also respects `--max-context`.
             max_seq_len: bench_max_seq.max(max_pp_local + 64),
+            per_layer_head_dim: cfg.gemma4.as_ref().map(|g| {
+                g.layers.iter().map(|s| s.head_dim).collect()
+            }),
         },
     )?;
     let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;
@@ -1300,6 +1315,9 @@ fn run_bench_safetensors(
             head_dim: cfg.head_dim,
             // Sprint 22 — also respects `--max-context`.
             max_seq_len: bench_max_seq.max(max_pp_local + 64),
+            per_layer_head_dim: cfg.gemma4.as_ref().map(|g| {
+                g.layers.iter().map(|s| s.head_dim).collect()
+            }),
         },
     )?;
     let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;

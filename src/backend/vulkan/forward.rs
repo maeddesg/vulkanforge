@@ -2036,7 +2036,7 @@ impl Forward {
         // KV write — Sprint 9d.3: dispatch the FP32→FP16 conversion
         // compute shader when the cache is FP16-allocated, otherwise
         // keep the cheap vkCmdCopyBuffer transfer.
-        let row_bytes = self.kv_cache.row_bytes();
+        let row_bytes = self.kv_cache.row_bytes(layer);
         let dst_off = self.kv_cache.pos_offset_bytes(layer, position);
         let k_src = self.cur().k_buf.handle;
         let v_src = self.cur().v_buf.handle;
@@ -2463,7 +2463,7 @@ impl Forward {
         // `cfg.n_kv_heads * cfg.head_dim` (uniform max=512). The upper
         // half is unused; subsequent attention reads honour the per-
         // layer head_dim push-constant and never touch the unused tail.
-        let row_bytes = self.kv_cache.row_bytes();
+        let row_bytes = self.kv_cache.row_bytes(layer);
         let dst_off = self.kv_cache.pos_offset_bytes(layer, position);
         let k_src = self.cur().k_buf.handle;
         let v_src = self.cur().v_buf.handle;
@@ -3697,14 +3697,19 @@ impl Forward {
         position: u32,
     ) {
         let cfg = self.config.clone();
-        // Sprint 43C — KV-cache layout is uniform (cfg.head_dim across
-        // all layers); the attention shader's `head_dim` push-const
-        // doubles as the per-position stride, so it MUST stay uniform
-        // even for Gemma-4 sliding layers (256 valid + 256 stale per
-        // pos in the cache slot). The math is correct iff the upper
-        // 256 elements are zero — see the Forward::new zero-fill of
-        // the KV buffers + per-dispatch zero-pad below for sliding-
-        // layer Q/K/V projections.
+        // Sprint 43D-1 — heterogeneous KV-cache layout. The shader's
+        // `head_dim` push-const drives both the per-head loop bound and
+        // the per-position stride; with the cumulative offset table in
+        // KvCache, layer N's slab now starts at a slab whose stride
+        // matches per_layer_head_dim[N], so the push-const can carry the
+        // correct per-layer value. Default path (uniform layout)
+        // resolves to cfg.head_dim and self.attn_scale unchanged.
+        let head_dim_layer = self.kv_cache.head_dim_for(layer);
+        let attn_scale_layer = if head_dim_layer != cfg.head_dim {
+            1.0_f32 / (head_dim_layer as f32).sqrt()
+        } else {
+            self.attn_scale
+        };
         // Phase 4C: pick the multi-WG split-K path when there are
         // enough tiles to amortise the second dispatch + barrier.
         // Threshold of 2 means seq_len > TILE (= 64) goes through
@@ -3732,7 +3737,7 @@ impl Forward {
         let layer_off = self.kv_cache.layer_offset_bytes(layer);
         // v0.2 Sprint 9d.1 — KvCache::layer_size_bytes scales by
         // the configured KV element size (FP32 = 4 B by default).
-        let layer_size = self.kv_cache.layer_size_bytes();
+        let layer_size = self.kv_cache.layer_size_bytes(layer);
         let set = self.alloc_or_get_set(
             dev, kernel.descriptor_set_layout,
             &[
@@ -3745,10 +3750,10 @@ impl Forward {
         let pc = ScalarAttnPushConstants {
             n_heads: cfg.n_heads,
             n_kv_heads: cfg.n_kv_heads,
-            head_dim: cfg.head_dim,
+            head_dim: head_dim_layer,
             seq_len: position + 1,
             max_seq: self.kv_cache.config.max_seq_len,
-            scale: self.attn_scale,
+            scale: attn_scale_layer,
         };
         let layout = kernel.pipeline_layout;
         let pipeline = kernel.pipeline;
@@ -3895,8 +3900,15 @@ impl Forward {
         let layer_off = self.kv_cache.layer_offset_bytes(layer);
         // v0.2 Sprint 9d.1 — KvCache::layer_size_bytes scales by
         // the configured KV element size (FP32 = 4 B by default).
-        let layer_size = self.kv_cache.layer_size_bytes();
-        let q_bytes_total = (m as u64) * (cfg.n_heads as u64) * (cfg.head_dim as u64) * 4;
+        let layer_size = self.kv_cache.layer_size_bytes(layer);
+        // Sprint 43D-1 — per-layer head_dim for Gemma-4 heterogeneous.
+        let head_dim_layer = self.kv_cache.head_dim_for(layer);
+        let attn_scale_layer = if head_dim_layer != cfg.head_dim {
+            1.0_f32 / (head_dim_layer as f32).sqrt()
+        } else {
+            self.attn_scale
+        };
+        let q_bytes_total = (m as u64) * (cfg.n_heads as u64) * (head_dim_layer as u64) * 4;
         let set = self.alloc_or_get_set(
             dev,
             kernel.descriptor_set_layout,
@@ -3910,11 +3922,11 @@ impl Forward {
         let pc = FlashAttnBatchPushConstants {
             n_heads: cfg.n_heads,
             n_kv_heads: cfg.n_kv_heads,
-            head_dim: cfg.head_dim,
+            head_dim: head_dim_layer,
             m,
             n_kv,
             q_start,
-            scale: self.attn_scale,
+            scale: attn_scale_layer,
         };
         let layout = kernel.pipeline_layout;
         let pipeline = kernel.pipeline;
@@ -4000,8 +4012,15 @@ impl Forward {
         let layer_off = self.kv_cache.layer_offset_bytes(layer);
         // v0.2 Sprint 9d.1 — KvCache::layer_size_bytes scales by
         // the configured KV element size (FP32 = 4 B by default).
-        let layer_size = self.kv_cache.layer_size_bytes();
-        let q_bytes_total = (m as u64) * (cfg.n_heads as u64) * (cfg.head_dim as u64) * 4;
+        let layer_size = self.kv_cache.layer_size_bytes(layer);
+        // Sprint 43D-1 — per-layer head_dim for Gemma-4 heterogeneous.
+        let head_dim_layer = self.kv_cache.head_dim_for(layer);
+        let attn_scale_layer = if head_dim_layer != cfg.head_dim {
+            1.0_f32 / (head_dim_layer as f32).sqrt()
+        } else {
+            self.attn_scale
+        };
+        let q_bytes_total = (m as u64) * (cfg.n_heads as u64) * (head_dim_layer as u64) * 4;
         let set = self.alloc_or_get_set(
             dev,
             kernel.descriptor_set_layout,
@@ -4015,11 +4034,11 @@ impl Forward {
         let pc = FlashAttnBatchPushConstants {
             n_heads: cfg.n_heads,
             n_kv_heads: cfg.n_kv_heads,
-            head_dim: cfg.head_dim,
+            head_dim: head_dim_layer,
             m,
             n_kv,
             q_start,
-            scale: self.attn_scale,
+            scale: attn_scale_layer,
         };
         let layout = kernel.pipeline_layout;
         let pipeline = kernel.pipeline;
@@ -4056,7 +4075,14 @@ impl Forward {
         let layer_off = self.kv_cache.layer_offset_bytes(layer);
         // v0.2 Sprint 9d.1 — KvCache::layer_size_bytes scales by
         // the configured KV element size (FP32 = 4 B by default).
-        let layer_size = self.kv_cache.layer_size_bytes();
+        let layer_size = self.kv_cache.layer_size_bytes(layer);
+        // Sprint 43D-1 — per-layer head_dim for Gemma-4 heterogeneous.
+        let head_dim_layer = self.kv_cache.head_dim_for(layer);
+        let attn_scale_layer = if head_dim_layer != cfg.head_dim {
+            1.0_f32 / (head_dim_layer as f32).sqrt()
+        } else {
+            self.attn_scale
+        };
 
         // ---- Split-K worker ----
         // Sprint 9d.3 — FP16 KV-aware variant of the split-K worker.
@@ -4084,10 +4110,10 @@ impl Forward {
         let split_pc = FlashAttnSplitPushConstants {
             n_heads: cfg.n_heads,
             n_kv_heads: cfg.n_kv_heads,
-            head_dim: cfg.head_dim,
+            head_dim: head_dim_layer,
             seq_len: position + 1,
             max_seq: self.kv_cache.config.max_seq_len,
-            scale: self.attn_scale,
+            scale: attn_scale_layer,
             n_tiles,
         };
         let split_layout = split_kernel.pipeline_layout;
@@ -4122,7 +4148,7 @@ impl Forward {
         );
         let red_pc = FlashAttnReducePushConstants {
             n_heads: cfg.n_heads,
-            head_dim: cfg.head_dim,
+            head_dim: head_dim_layer,
             n_tiles,
         };
         let red_layout = red_kernel.pipeline_layout;
@@ -5519,7 +5545,7 @@ impl Forward {
                     kv_elements, dst_off, "kv_copy_fp16_v_b",
                 );
             } else {
-                let kv_row_bytes = self.kv_cache.row_bytes();
+                let kv_row_bytes = self.kv_cache.row_bytes(layer);
                 let bulk_size = (seq_len as u64) * kv_row_bytes;
                 let copy_k = vk::BufferCopy::default()
                     .src_offset(0).dst_offset(dst_off).size(bulk_size);
@@ -5607,7 +5633,7 @@ impl Forward {
             // batch_attn_enabled=false (the
             // `phase5b2_batch_attn_parity_qwen3_*` regression tests
             // exercise this exact code path).
-            let row_bytes = self.kv_cache.row_bytes();
+            let row_bytes = self.kv_cache.row_bytes(layer);
             let dst_off = self.kv_cache.pos_offset_bytes(layer, pos);
             if self.kv_cache.is_fp8() {
                 let kv_elements = kv_dim;

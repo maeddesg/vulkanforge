@@ -101,6 +101,15 @@ pub struct KvCacheConfig {
     pub n_kv_heads: u32,
     pub head_dim: u32,
     pub max_seq_len: u32,
+    /// Sprint 43D-1 — per-layer head_dim (heterogeneous KV cache for
+    /// Gemma-4 sliding=256 / full=512). When `None`, every layer uses
+    /// the uniform `head_dim` above (Llama / Qwen / Gemma-1 path).
+    /// When `Some(v)`, `v.len() == n_layers` and each entry overrides
+    /// the layer's per-position stride; the total cache size is the
+    /// sum of `max_seq × n_kv_heads × per_layer_head_dim[i] × elem`
+    /// across layers, and `pos_offset_bytes(layer, pos)` walks the
+    /// cumulative offset table for the heterogeneous layout.
+    pub per_layer_head_dim: Option<Vec<u32>>,
 }
 
 pub struct KvCache {
@@ -111,6 +120,13 @@ pub struct KvCache {
     /// v0.2 Sprint 9d.1 — element type chosen at allocation time.
     /// Defaults to `F32`; `VULKANFORGE_FP16_KV=1` flips to `F16`.
     pub kv_dtype: KvDtype,
+    /// Sprint 43D-1 — cumulative byte-offset table for heterogeneous
+    /// per-layer head_dim. `layer_byte_offsets[i]` is the start of
+    /// layer `i`'s slab in K (and in V). `[n_layers + 1]` entries —
+    /// the last entry equals `bytes_per_buffer`. `None` for uniform-
+    /// stride caches; consumer falls back to the closed-form
+    /// `layer * (max_seq × n_kv_heads × head_dim × elem)`.
+    pub layer_byte_offsets: Option<Vec<u64>>,
 }
 
 impl KvCache {
@@ -122,11 +138,37 @@ impl KvCache {
         // Sprint 9d.1 — runtime-selectable dtype (default F32).
         let kv_dtype = kv_dtype_from_env();
         let elem_size = kv_dtype.element_size();
-        let bytes = (config.n_layers as u64)
-            * (config.n_kv_heads as u64)
-            * (config.max_seq_len as u64)
-            * (config.head_dim as u64)
-            * elem_size;
+        // Sprint 43D-1 — heterogeneous layout: build the cumulative
+        // offset table when `per_layer_head_dim` is set. `bytes` then
+        // sums per-layer slab sizes; offsets table feeds the
+        // pos_offset_bytes / layer_offset_bytes / layer_size_bytes
+        // helpers downstream.
+        let (bytes, layer_byte_offsets) = if let Some(plhd) = config.per_layer_head_dim.as_ref() {
+            assert_eq!(
+                plhd.len() as u32, config.n_layers,
+                "per_layer_head_dim length must equal n_layers"
+            );
+            let mut offsets = Vec::with_capacity(plhd.len() + 1);
+            let mut acc: u64 = 0;
+            offsets.push(acc);
+            for &hd in plhd {
+                let layer_bytes = (config.max_seq_len as u64)
+                    * (config.n_kv_heads as u64)
+                    * (hd as u64)
+                    * elem_size;
+                acc += layer_bytes;
+                offsets.push(acc);
+            }
+            (acc, Some(offsets))
+        } else {
+            let total = (config.n_layers as u64)
+                * (config.n_kv_heads as u64)
+                * (config.max_seq_len as u64)
+                * (config.head_dim as u64)
+                * elem_size;
+            (total, None)
+        };
+        let _ = elem_size; // also referenced via kv_dtype below; silence warning if drift
 
         // Sprint 9d.3 — the WARN log from 9d.1 is gone; FP16 KV is
         // now end-to-end functional and the regression suite passes
@@ -169,6 +211,7 @@ impl KvCache {
             config,
             current_seq_len: 0,
             kv_dtype,
+            layer_byte_offsets,
         })
     }
 
@@ -210,13 +253,27 @@ impl KvCache {
         self.k_buffer.size
     }
 
-    /// Flat element offset for one layer's slice in K/V (stride per
-    /// layer = `n_kv_heads * max_seq * head_dim`).
+    /// Sprint 43D-1 — head_dim of layer `layer`. Returns the per-layer
+    /// override when set (Gemma-4 heterogeneous), else the uniform
+    /// `config.head_dim`.
+    pub fn head_dim_for(&self, layer: u32) -> u32 {
+        match self.config.per_layer_head_dim.as_ref() {
+            Some(v) => v[layer as usize],
+            None => self.config.head_dim,
+        }
+    }
+
+    /// Flat element offset for one layer's slice in K/V. Sprint
+    /// 43D-1: heterogeneous-layout-aware.
     pub fn layer_offset_elems(&self, layer: u32) -> u64 {
-        (layer as u64)
-            * (self.config.n_kv_heads as u64)
-            * (self.config.max_seq_len as u64)
-            * (self.config.head_dim as u64)
+        if let Some(off_table) = self.layer_byte_offsets.as_ref() {
+            off_table[layer as usize] / self.kv_dtype.element_size()
+        } else {
+            (layer as u64)
+                * (self.config.n_kv_heads as u64)
+                * (self.config.max_seq_len as u64)
+                * (self.config.head_dim as u64)
+        }
     }
 
     /// Byte offset for K[layer, pos, kv_head=0, dim=0] — start of one
@@ -224,24 +281,31 @@ impl KvCache {
     /// the same pos are contiguous, so a single `vkCmdCopyBuffer`
     /// region of [`row_bytes()`] writes all kv_heads in one go.
     pub fn pos_offset_bytes(&self, layer: u32, pos: u32) -> u64 {
-        let elems = self.layer_offset_elems(layer)
-            + (pos as u64) * (self.config.n_kv_heads as u64) * (self.config.head_dim as u64);
-        elems * self.kv_dtype.element_size()
+        let layer_byte = self.layer_offset_bytes(layer);
+        let row = self.row_bytes(layer);
+        layer_byte + (pos as u64) * row
     }
 
     /// Bytes per (kv_head × head_dim) — one token's full K-row /
-    /// V-row of the cache.
-    pub fn row_bytes(&self) -> u64 {
+    /// V-row of the cache. Sprint 43D-1: parameterised on layer for
+    /// heterogeneous Gemma-4 layouts; old uniform layouts return the
+    /// same value for every layer.
+    pub fn row_bytes(&self, layer: u32) -> u64 {
         (self.config.n_kv_heads as u64)
-            * (self.config.head_dim as u64)
+            * (self.head_dim_for(layer) as u64)
             * self.kv_dtype.element_size()
     }
 
     /// Byte offset for K[layer, pos=0, kv_head=0, dim=0] — pass to
     /// the attention shader so its `t * pos_stride` indexing is
-    /// rooted at the right layer.
+    /// rooted at the right layer. Sprint 43D-1: heterogeneous-layout-
+    /// aware (cumulative table for Gemma-4, closed-form otherwise).
     pub fn layer_offset_bytes(&self, layer: u32) -> u64 {
-        self.layer_offset_elems(layer) * self.kv_dtype.element_size()
+        if let Some(off_table) = self.layer_byte_offsets.as_ref() {
+            off_table[layer as usize]
+        } else {
+            self.layer_offset_elems(layer) * self.kv_dtype.element_size()
+        }
     }
 
     pub fn is_fp8(&self) -> bool {
@@ -253,14 +317,12 @@ impl KvCache {
     }
 
     /// Total bytes for one layer's K (or V) slice in the cache —
-    /// `max_seq_len × n_kv_heads × head_dim × element_size`. Used as
-    /// the `range` argument when binding the KV cache to attention
-    /// descriptors. Sprint 9d.1: replaces hardcoded `* 4`
-    /// computations at the call sites.
-    pub fn layer_size_bytes(&self) -> u64 {
+    /// `max_seq_len × n_kv_heads × per_layer_head_dim × element_size`.
+    /// Sprint 43D-1: parameterised on layer.
+    pub fn layer_size_bytes(&self, layer: u32) -> u64 {
         (self.config.max_seq_len as u64)
             * (self.config.n_kv_heads as u64)
-            * (self.config.head_dim as u64)
+            * (self.head_dim_for(layer) as u64)
             * self.kv_dtype.element_size()
     }
 
