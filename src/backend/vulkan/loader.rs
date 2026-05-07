@@ -491,7 +491,19 @@ impl LoadedModel {
             // 32 input/output layernorms, ~1 MiB total) stay FP32
             // because RmsNorm consumes FP32 weights and the shader
             // change isn't worth a few hundred KiB.
-            let is_lm_head = hf_name == "lm_head.weight";
+            // Sprint 43E-2 — Gemma-4 ties lm_head to embed_tokens. The
+            // tied buffer's `is_lm_head` heuristic in Sprint 22B was
+            // limited to literal `lm_head.weight`; for Gemma-4 the
+            // tied tensor lives at `model.language_model.embed_tokens.
+            // weight`. VF_GEMMA_EMBED_F16=1 routes Gemma-4 embed via
+            // BF16→F16 (= MulMatVecF16 path) instead of BF16→F32
+            // (= MulMatVecF32). Diagnose-only: lets us isolate
+            // whether MulMatVecF32 has a bug specific to vocab=262144
+            // by routing through the well-exercised F16 harness path.
+            let is_lm_head = hf_name == "lm_head.weight"
+                || (hf.gemma4.is_some()
+                    && hf_name == "model.language_model.embed_tokens.weight"
+                    && std::env::var("VF_GEMMA_EMBED_F16").is_ok());
             let (target_dtype, bytes) = match info.dtype {
                 TensorDtype::F8E4M3 => (GgmlType::F8E4M3, Source::Borrowed(raw)),
                 TensorDtype::F16 => (GgmlType::F16, Source::Borrowed(raw)),

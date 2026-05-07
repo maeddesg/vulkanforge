@@ -45,6 +45,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use ash::vk;
+use vulkanforge::backend::vulkan::buffers::GpuBuffer;
+use gpu_allocator::MemoryLocation;
 use clap::{Parser, Subcommand};
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 
@@ -503,6 +505,110 @@ fn run_chat_safetensors(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>
     let (model, host_embed, _hf) =
         LoadedModel::load_safetensors(&dev, &mut allocator, &args.model)?;
     let cfg = model.config.clone();
+
+    // Sprint 43E-2 — read back a slice of the GPU `token_embd.weight`
+    // buffer (= the lm_head weight for Gemma-4 with tied embeddings)
+    // and scan for NaN / Inf. host_embed is sane on CPU but lm_head
+    // produces all-NaN logits — this confirms whether the GPU upload
+    // path corrupts the buffer.
+    if std::env::var("VF_LMW_DUMP").is_ok() {
+        let lm = model
+            .tensor("output.weight")
+            .or_else(|| model.tensor("token_embd.weight"))
+            .expect("LM head tensor present");
+        eprintln!(
+            "[VF_LMW_DUMP] tensor: shape={:?} ggml_type={:?} bytes={}",
+            lm.shape, lm.ggml_type, lm.buffer.size,
+        );
+        // Read full lm weight buffer (1.5 GB for Gemma-4 token_embd).
+        // Sprint 43E-2 — full scan to find any NaN/Inf injection that
+        // a partial-128KB read missed.
+        let n_bytes = lm.buffer.size;
+        let staging = GpuBuffer::new(
+            &dev.device, &mut allocator,
+            n_bytes,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            MemoryLocation::GpuToCpu,
+            "lmw_dump_staging",
+        )?;
+        // One-shot copy from device-local lm weight buffer into the
+        // host-readable staging.
+        let cmd_ctx_dump = CommandContext::new(&dev.device, dev.queue_family_index)?;
+        cmd_ctx_dump.one_shot(&dev.device, dev.compute_queue, |cmd| unsafe {
+            let copy = vk::BufferCopy::default()
+                .src_offset(0).dst_offset(0).size(n_bytes);
+            dev.device.cmd_copy_buffer(
+                cmd, lm.buffer.handle, staging.handle,
+                std::slice::from_ref(&copy),
+            );
+        })?;
+        let bytes = staging.read_bytes()?;
+        let floats: &[f32] = bytemuck::cast_slice(&bytes[..n_bytes as usize]);
+        let mut nan = 0u64; let mut inf = 0u64;
+        let mut mn = f32::INFINITY; let mut mx = f32::NEG_INFINITY;
+        let mut sum: f64 = 0.0;
+        let mut first_nan: Option<usize> = None;
+        for (i, &v) in floats.iter().enumerate() {
+            if v.is_nan() {
+                nan += 1;
+                if first_nan.is_none() { first_nan = Some(i); }
+                continue;
+            }
+            if v.is_infinite() { inf += 1; continue; }
+            if v < mn { mn = v; }
+            if v > mx { mx = v; }
+            sum += v as f64;
+        }
+        if let Some(idx) = first_nan {
+            let row = idx / (lm.shape[1] as usize);
+            let col = idx % (lm.shape[1] as usize);
+            eprintln!(
+                "[VF_LMW_DUMP] FIRST NaN at flat_idx={idx} = row {row}, col {col}",
+            );
+        }
+        let valid = (floats.len() as u64) - nan - inf;
+        let mean = if valid > 0 { sum / (valid as f64) } else { 0.0 };
+        eprintln!(
+            "[VF_LMW_DUMP] gpu n={} nan={} inf={} min={:.4} max={:.4} mean={:.4}",
+            floats.len(), nan, inf, mn, mx, mean,
+        );
+        eprintln!("[VF_LMW_DUMP] gpu first16 = {:?}", &floats[..16]);
+
+        // Compare to host_embed (full).
+        let cmp_n = floats.len().min(host_embed.len());
+        let mut diff_count = 0u64;
+        let mut max_diff = 0.0_f32;
+        let mut first_diff: Option<usize> = None;
+        for (i, (g, h)) in floats[..cmp_n].iter().zip(host_embed[..cmp_n].iter()).enumerate() {
+            let g_nan = g.is_nan(); let h_nan = h.is_nan();
+            if g_nan != h_nan {
+                diff_count += 1;
+                if first_diff.is_none() { first_diff = Some(i); }
+                continue;
+            }
+            if g_nan && h_nan { continue; }
+            if g != h {
+                diff_count += 1;
+                if first_diff.is_none() { first_diff = Some(i); }
+                let d = (g - h).abs();
+                if d > max_diff { max_diff = d; }
+            }
+        }
+        if let Some(idx) = first_diff {
+            let row = idx / (lm.shape[1] as usize);
+            let col = idx % (lm.shape[1] as usize);
+            eprintln!(
+                "[VF_LMW_DUMP] FIRST GPU/HOST DIFF at flat_idx={idx} = row {row}, col {col}: \
+                 gpu={:.6e} host={:.6e}",
+                floats[idx], host_embed[idx],
+            );
+        }
+        eprintln!(
+            "[VF_LMW_DUMP] gpu vs host_embed[0..{cmp_n}]: \
+             diff_count={diff_count} max_abs_diff={max_diff:.4e}",
+        );
+        staging.destroy(&dev.device, &mut allocator);
+    }
 
     // Sprint 43D Bisect — diagnose helper for `<pad>` / NaN cascade.
     // Dump first 16 host_embed values (= token 0's first 16 embedding

@@ -2873,6 +2873,62 @@ impl Forward {
             self.config.hidden_dim, 1, self.config.rms_norm_eps, "rms_norm_final",
         );
         self.mark_written(&[hidden_norm]);
+        // Sprint 43E-2 — force-barrier hidden_norm before lm_head /
+        // diagnose ops below. The default `maybe_compute_barrier` path
+        // elides this barrier (cache_enabled tracker thinks hidden_norm
+        // was already flushed by a previous layer's mark_written).
+        // Without this, lm_head reads stale hidden_norm — including
+        // NaN bits from undefined GpuOnly memory init — and produces
+        // all-NaN logits. VF_NO_FINAL_BARRIER=1 skips this opt-in to
+        // verify the hypothesis.
+        if std::env::var("VF_NO_FINAL_BARRIER").is_err() {
+            let bar = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::TRANSFER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(hidden_norm)
+                .offset(0).size(vk::WHOLE_SIZE);
+            unsafe {
+                dev.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    std::slice::from_ref(&bar),
+                    &[],
+                );
+            }
+        }
+        // Sprint 43E-2 — VF_LOGITS_BUF_ZERO=1 fills logits_buf with zero
+        // *before* the lm_head dispatch. If the post-lm_head logits stay
+        // NaN, the GEMV is actually writing NaN. If they read as zero,
+        // the GEMV isn't writing at all (synchronization / dispatch
+        // issue). Diagnose-only; default off.
+        if std::env::var("VF_LOGITS_BUF_ZERO").is_ok() {
+            let logits_bytes = (self.config.vocab_size as u64) * 4;
+            unsafe {
+                dev.device.cmd_fill_buffer(
+                    cmd, self.logits_buf.handle, 0, logits_bytes, 0,
+                );
+            }
+            // Make TRANSFER_WRITE visible to upcoming SHADER_WRITE
+            // (lm_head GEMV).
+            let bar = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_WRITE);
+            unsafe {
+                dev.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&bar), &[], &[],
+                );
+            }
+        }
+
         // Sprint 43D Bisect — VF_FINAL_NORM_DUMP=1 copies hidden_norm
         // (= post-final-RMSNorm, pre-lm_head) into hidden_staging so
         // forward_token can dump it. Used to bisect whether NaN enters
@@ -2906,7 +2962,34 @@ impl Forward {
         // registry path. Toggle via VF_LMHEAD_HARNESS=0 to compare.
         let use_harness = matches!(lm_shader, ShaderId::MulMatVecF16)
             && std::env::var("VF_LMHEAD_HARNESS").map(|v| v != "0").unwrap_or(true);
-        if use_harness {
+        // Sprint 43E-2 — VF_SKIP_LM_HEAD=1 skips the lm_head GEMV
+        // entirely. Combined with VF_LOGITS_BUF_ZERO=1, logits should
+        // read back as 0.0 (the fill value). If they read NaN
+        // instead, the corruption is downstream of lm_head — i.e.
+        // either record_logits_readback or wait_and_read_logits.
+        if std::env::var("VF_SKIP_LM_HEAD").is_ok() {
+            // No-op; let logits_buf retain whatever zero-fill /
+            // previous content it had.
+        } else if std::env::var("VF_LM_COPY_HIDDEN").is_ok() {
+            // Sprint 43E-2 — replace lm_head GEMV with a literal
+            // cmd_copy_buffer of hidden_norm into the *first*
+            // hidden_dim slots of logits_buf. Reading those back
+            // should yield the same bytes that VF_FINAL_NORM_DUMP
+            // showed. If logits[0..hidden_dim] are NaN here, the
+            // entire copy-and-readback chain is broken (not the GEMV).
+            // If logits[0..hidden_dim] are the same sane values that
+            // VF_FINAL_NORM_DUMP showed, the readback is fine and
+            // the bug is *inside the lm_head GEMV itself*.
+            let bytes = (self.config.hidden_dim as u64) * 4;
+            let copy = vk::BufferCopy::default()
+                .src_offset(0).dst_offset(0).size(bytes);
+            unsafe {
+                dev.device.cmd_copy_buffer(
+                    cmd, hidden_norm, self.logits_buf.handle,
+                    std::slice::from_ref(&copy),
+                );
+            }
+        } else if use_harness {
             self.run_gemv_lmhead_dedicated(
                 dev, cmd, w_lm, hidden_norm, self.logits_buf.handle,
                 self.config.hidden_dim, self.config.vocab_size, lm_scale,
