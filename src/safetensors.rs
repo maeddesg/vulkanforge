@@ -321,10 +321,11 @@ pub fn hf_to_vf_name(hf: &str) -> Option<String> {
         "self_attn.v_norm.weight" => "attn_v_norm.weight",
         "layer_scalar" => "layer_scalar",
         // Sprint 43B-1 — Gemma-4 per-layer-input modulation pieces.
-        // VF skips them in 43B-1 (Sprint 43D wires the PLE forward).
-        "per_layer_input_gate.weight"
-        | "per_layer_projection.weight"
-        | "post_per_layer_input_norm.weight" => return None,
+        // Sprint 43D-3 wires the PLE forward block; map to `blk.N.*`
+        // names so they go through the standard tensor-upload path.
+        "per_layer_input_gate.weight" => "per_layer_input_gate.weight",
+        "per_layer_projection.weight" => "per_layer_projection.weight",
+        "post_per_layer_input_norm.weight" => "post_per_layer_input_norm.weight",
         _ => return None,
     };
     Some(format!("blk.{layer}.{vf_suffix}"))
@@ -415,8 +416,12 @@ mod tests {
     }
 
     #[test]
-    fn gemma4_skips_ple_and_multimodal() {
-        // PLE top-level table — defer to Sprint 43D.
+    fn gemma4_ple_and_multimodal_routing() {
+        // Sprint 43D-3 — PLE top-level tensors stay None; the loader
+        // pulls embed_tokens_per_layer + per_layer_projection_norm via
+        // a separate path (PleData) and never via hf_to_vf_name.
+        // per_layer_model_projection is for the AltUp path which VF
+        // doesn't implement; intentionally still skipped.
         assert_eq!(
             hf_to_vf_name("model.language_model.embed_tokens_per_layer.weight"),
             None,
@@ -429,18 +434,20 @@ mod tests {
             hf_to_vf_name("model.language_model.per_layer_projection_norm.weight"),
             None,
         );
-        // PLE per-layer pieces.
+        // Sprint 43D-3 — per-layer PLE tensors NOW go through the
+        // standard `blk.N.*` upload path so dispatch_layer can sample
+        // them via layer_weight().
         assert_eq!(
             hf_to_vf_name("model.language_model.layers.5.per_layer_input_gate.weight"),
-            None,
+            Some("blk.5.per_layer_input_gate.weight".into()),
         );
         assert_eq!(
             hf_to_vf_name("model.language_model.layers.5.per_layer_projection.weight"),
-            None,
+            Some("blk.5.per_layer_projection.weight".into()),
         );
         assert_eq!(
             hf_to_vf_name("model.language_model.layers.5.post_per_layer_input_norm.weight"),
-            None,
+            Some("blk.5.post_per_layer_input_norm.weight".into()),
         );
         // Vision / audio towers — never wanted in text-only mode.
         assert_eq!(hf_to_vf_name("model.vision_tower.layers.0.attn.weight"), None);

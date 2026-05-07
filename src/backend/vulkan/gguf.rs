@@ -414,6 +414,11 @@ pub struct Gemma4Spec {
     /// `[1]` tensor in the SafeTensors archive (gelernt — typische
     /// Werte 0.018 .. 0.87 für E2B).
     pub layer_scalars: Vec<f32>,
+    /// Sprint 43D-3 — `hidden_size_per_layer_input` (256 for E2B).
+    /// Used as both the GEMV inner dim (1536 → 256 for input_gate; 256
+    /// → 1536 for projection) and the per-slot
+    /// `per_layer_inputs` buffer stride.
+    pub hidden_size_per_layer_input: u32,
 }
 
 /// Sprint 43B-2 — per-layer routing state for a Gemma-4 stack.

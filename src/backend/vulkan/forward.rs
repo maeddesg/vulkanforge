@@ -226,6 +226,14 @@ pub struct IntermediateSlot {
     pub fa_scratch_out: GpuBuffer,
     pub fa_scratch_max: GpuBuffer,
     pub fa_scratch_sum: GpuBuffer,
+    /// Sprint 43D-3 — Per-Layer-Inputs staging buffer for Gemma-4 PLE.
+    /// Filled per token from CPU-side `PleData::build_per_layer_inputs`
+    /// (lookup + scale + per-layer rms_norm) and read by
+    /// `dispatch_layer`'s PLE block at offset
+    /// `layer * hps * 4`. Sized `num_layers × hps × 4` for Gemma-4
+    /// (= 35 × 256 × 4 = 35.84 KB on E2B); 4 bytes (placeholder) for
+    /// every other arch — never read on those paths.
+    pub per_layer_inputs: GpuBuffer,
 }
 
 pub struct Forward {
@@ -859,12 +867,27 @@ impl Forward {
                 MemoryLocation::GpuOnly,
                 &format!("fa_scratch_sum{suf}"),
             )?;
+            // Sprint 43D-3 — per-slot per-layer-inputs staging
+            // (Gemma-4 PLE). Sized `num_layers × hps × 4` for Gemma-4,
+            // 4 bytes (placeholder) otherwise. CpuToGpu so the host
+            // side `Forward::write_per_layer_inputs` writes directly
+            // and the layer dispatches read it via descriptor binding.
+            let ple_bytes: u64 = match config.gemma4.as_ref() {
+                Some(g) => (config.n_layers as u64) * (g.hidden_size_per_layer_input as u64) * 4,
+                None => 4,
+            };
+            let per_layer_inputs = mk_storage(
+                ple_bytes,
+                MemoryLocation::CpuToGpu,
+                &format!("per_layer_inputs{suf}"),
+            )?;
             Ok(IntermediateSlot {
                 scratch_a, scratch_b, hidden_norm,
                 q_buf, k_buf, v_buf, attn_out, o_buf, res1,
                 gate_buf, up_buf, ffn_hidden, ffn_out,
                 rope_pos_buf,
                 fa_scratch_out, fa_scratch_max, fa_scratch_sum,
+                per_layer_inputs,
             })
         };
         let slot0 = alloc_slot(0)?;
@@ -1803,6 +1826,7 @@ impl Forward {
         model: &LoadedModel,
         embedding: &[f32],
         position: u32,
+        token_id: u32,
     ) -> Result<ForwardStats, Box<dyn std::error::Error>> {
         let started = std::time::Instant::now();
         if std::env::var("VF_TRACE_FT").is_ok() {
@@ -1816,10 +1840,36 @@ impl Forward {
             )
             .into());
         }
-        self.cur_mut().scratch_a.write_bytes(bytemuck::cast_slice(embedding))?;
+        // Sprint 43D-3 — Gemma-4 embedding scale: HF
+        // `Gemma3nTextModel.forward` does
+        // `hidden_states = inputs_embeds * sqrt(hidden_size)` before the
+        // first decoder layer. `Gemma4Spec.embed_scale` was parsed in
+        // 43B-2 but never applied — without this multiplier the initial
+        // hidden state is ~40× too small (sqrt(1536) ≈ 39.2 on E2B),
+        // and every downstream RMSNorm runs against the wrong magnitude.
+        // Non-Gemma-4 architectures (Llama / Qwen / Mistral) write the
+        // embedding through unmodified — same as before.
+        if let Some(g) = self.config.gemma4.as_ref() {
+            let s = g.embed_scale;
+            let mut scaled = Vec::with_capacity(embedding.len());
+            for &v in embedding {
+                scaled.push(v * s);
+            }
+            self.cur_mut().scratch_a.write_bytes(bytemuck::cast_slice(&scaled))?;
+        } else {
+            self.cur_mut().scratch_a.write_bytes(bytemuck::cast_slice(embedding))?;
+        }
         // Pre-write the RoPE position buffer.
         self.cur_mut().rope_pos_buf
             .write_bytes(bytemuck::bytes_of(&(position as u32)))?;
+        // Sprint 43D-3 — Gemma-4 PLE: lookup + scale + projection_norm
+        // on the host, write the [num_layers × hps] FP32 vector into
+        // the current slot's per_layer_inputs buffer. dispatch_layer
+        // reads slice [layer*hps..(layer+1)*hps] per layer.
+        if let Some(ple) = model.ple_data.as_ref() {
+            let v = ple.build_per_layer_inputs(token_id);
+            self.cur_mut().per_layer_inputs.write_bytes(bytemuck::cast_slice(&v))?;
+        }
 
         // Reset descriptor pool for fresh allocations this forward —
         // skipped when CB-reuse is on; cached sets stay valid.
@@ -2413,6 +2463,7 @@ impl Forward {
             s.fa_scratch_out.destroy(device, allocator);
             s.fa_scratch_max.destroy(device, allocator);
             s.fa_scratch_sum.destroy(device, allocator);
+            s.per_layer_inputs.destroy(device, allocator);
         }
         self.logits_buf.destroy(device, allocator);
         self.logits_staging.destroy(device, allocator);
@@ -2893,6 +2944,124 @@ impl Forward {
                             cfg.hidden_dim, "add_res2");
         }
         self.mark_written(&[output]);
+
+        // Sprint 43D-3 — PLE (Per-Layer Embeddings) integration block.
+        // After the standard layer output (`output` = residual + attn +
+        // ffn) we add a per-layer modulation contribution gated by the
+        // pre-staged per_layer_inputs[layer] slice (built CPU-side in
+        // `forward_token` from `embed_tokens_per_layer[token_id]`).
+        //
+        // Formula (per HF transformers `Gemma3nTextDecoderLayer.forward`,
+        // sans AltUp/laurel which VF doesn't yet implement):
+        //   gate    = per_layer_input_gate @ output           # [hps]
+        //   gate    = gelu_pytorch_tanh(gate) * per_layer_inputs[layer]
+        //   proj    = per_layer_projection @ gate             # [hidden]
+        //   normed  = post_per_layer_input_norm(proj)         # [hidden]
+        //   output += normed
+        //
+        // Buffer reuse — by this point in the layer everything except
+        // `output` and `res1` is conceptually consumed:
+        //   gate_buf   — 256-dim PLE gate scratch (alloc'd ffn_dim, fits)
+        //   o_buf      — 1536-dim PLE projection output
+        //   attn_out   — 1536-dim post-rmsnorm output (distinct from o_buf
+        //                so rms_norm doesn't run in-place)
+        //   res1       — left untouched (would race with future inputs?
+        //                no — caller is next layer or dispatch_final).
+        if let Some(ple) = model.ple_data.as_ref() {
+            // Gate-stage scratch is bound from the ffn-sized `gate_buf`;
+            // we only touch the first `hps × 4` bytes.
+            let hps = ple.hps;
+            let hps_bytes = (hps as u64) * 4;
+            let hidden_bytes = (cfg.hidden_dim as u64) * 4;
+            let ple_inputs_buf = self.cur().per_layer_inputs.handle;
+            let ple_inputs_offset = (layer as u64) * hps_bytes;
+
+            // (1) gate = per_layer_input_gate @ output  — F32 GEMV (1536 → 256).
+            //     Run after a barrier on `output` (just written by add_res2).
+            self.maybe_compute_barrier(dev, cmd, &[output]);
+            let w_gate = layer_weight(model, layer, "per_layer_input_gate.weight");
+            let s_gate = layer_weight_shader(
+                model, layer, "per_layer_input_gate.weight",
+                self.mul_mat_vec_subgroup_enabled,
+            );
+            let scale_gate = layer_weight_scale_scalar(model, layer, "per_layer_input_gate.weight");
+            self.run_gemv(
+                dev, registry, cmd, s_gate, w_gate,
+                output, gate_buf,
+                cfg.hidden_dim, hps, scale_gate,
+                "ple_gemv_gate",
+            );
+            self.mark_written(&[gate_buf]);
+            self.maybe_compute_barrier(dev, cmd, &[gate_buf]);
+
+            // (2) gate ← gelu_pytorch_tanh(gate) * per_layer_inputs[layer]
+            //     Use the GLU shader: out[i] = gelu(a[i]) * b[i]. Bind
+            //     gate_buf as both `a` (read) and `out` (write), with the
+            //     PLE-input slice as `b`. The shader reads a[i] before
+            //     writing out[i], so the alias is safe (one element per
+            //     thread, no dependency across lanes).
+            let kernel = registry.get(ShaderId::GeluPytorchTanhGlu);
+            let set = self.alloc_or_get_set(
+                dev, kernel.descriptor_set_layout,
+                &[
+                    (0, gate_buf, 0, hps_bytes),
+                    (1, ple_inputs_buf, ple_inputs_offset, hps_bytes),
+                    (2, gate_buf, 0, hps_bytes),
+                ],
+            );
+            let pc = SwigluPushConstants { n: hps };
+            let dispatch_x = (hps + 255) / 256;
+            let layout = kernel.pipeline_layout;
+            let pipeline = kernel.pipeline;
+            self.profile("ple_gelu_glu", dev, cmd, |dev, cmd| unsafe {
+                dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                dev.device.cmd_bind_descriptor_sets(
+                    cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+                );
+                dev.device.cmd_push_constants(
+                    cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+                );
+                dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
+            });
+            self.mark_written(&[gate_buf]);
+            self.maybe_compute_barrier(dev, cmd, &[gate_buf]);
+
+            // (3) proj = per_layer_projection @ gate  — F32 GEMV (256 → 1536).
+            let w_proj = layer_weight(model, layer, "per_layer_projection.weight");
+            let s_proj = layer_weight_shader(
+                model, layer, "per_layer_projection.weight",
+                self.mul_mat_vec_subgroup_enabled,
+            );
+            let scale_proj = layer_weight_scale_scalar(model, layer, "per_layer_projection.weight");
+            self.run_gemv(
+                dev, registry, cmd, s_proj, w_proj,
+                gate_buf, o_buf,
+                hps, cfg.hidden_dim, scale_proj,
+                "ple_gemv_proj",
+            );
+            self.mark_written(&[o_buf]);
+            self.maybe_compute_barrier(dev, cmd, &[o_buf]);
+            let _ = hidden_bytes;
+
+            // (4) normed = rms_norm(proj, post_per_layer_input_norm.weight).
+            //     o_buf → attn_out (distinct buffer; avoids in-place edge case).
+            let w_pln = layer_weight(model, layer, "post_per_layer_input_norm.weight");
+            self.run_rms_norm(
+                dev, registry, cmd, o_buf, w_pln, attn_out,
+                cfg.hidden_dim, 1, cfg.rms_norm_eps, "ple_rms_norm",
+            );
+            self.mark_written(&[attn_out]);
+            self.maybe_compute_barrier(dev, cmd, &[attn_out, output]);
+
+            // (5) output += normed.
+            self.run_binary(
+                dev, registry, cmd, ShaderId::Add,
+                output, attn_out, output,
+                cfg.hidden_dim, "add_ple",
+            );
+            self.mark_written(&[output]);
+        }
+
         // Next: next layer's attn_norm reads `output` (= its `input`),
         // or dispatch_final reads `output`. Either way: caller's first
         // op reads `output`.

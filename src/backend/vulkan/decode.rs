@@ -484,7 +484,7 @@ pub fn generate_from_tokens(
             // future work (Sprint 19A-style coopmat coverage).
             for &tid in prefill_tokens {
                 let embd = embed_lookup(&embed_src, cfg, tid)?;
-                forward.forward_token(dev, registry, cmd_ctx, model, &embd, pos)?;
+                forward.forward_token(dev, registry, cmd_ctx, model, &embd, pos, tid)?;
                 pos += 1;
             }
         } else {
@@ -625,7 +625,7 @@ pub fn generate_from_tokens(
             generated.push(next_id);
 
             let embd = embed_lookup(&embed_src, cfg, next_id)?;
-            forward.forward_token(dev, registry, cmd_ctx, model, &embd, pos)?;
+            forward.forward_token(dev, registry, cmd_ctx, model, &embd, pos, next_id)?;
             last_logits = forward.logits()?;
             pos += 1;
         }

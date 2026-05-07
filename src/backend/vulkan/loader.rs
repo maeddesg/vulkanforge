@@ -108,6 +108,83 @@ pub struct LoadedModel {
     /// state is downloaded for a CPU GEMV instead. `None` keeps the
     /// status-quo GPU path.
     pub cpu_lm_head: Option<crate::cpu::lm_head::CpuLmHead>,
+    /// Sprint 43D-3 — per-layer-input embedding state for Gemma-4.
+    /// `Some` when the model is Gemma-4 AND the SafeTensors file has
+    /// the `embed_tokens_per_layer` + `per_layer_projection_norm`
+    /// tensors. CPU-resident; lookup + scale + RMSNorm runs on the host
+    /// per-token before each `forward_token`, then the per-layer-inputs
+    /// vector ([num_layers × hps] FP32) is uploaded to a per-slot
+    /// CpuToGpu buffer and consumed by `dispatch_layer`'s PLE block.
+    pub ple_data: Option<PleData>,
+}
+
+/// Sprint 43D-3 — Per-Layer Embeddings runtime state for Gemma-4.
+///
+/// HF transformers `Gemma3nTextModel.get_per_layer_inputs` formula:
+/// 1. Lookup row from `embed_tokens_per_layer[token_id]` (BF16, shape
+///    `[num_layers × hps]`).
+/// 2. Scale by `embed_per_layer_scale = sqrt(hps)`.
+/// 3. RMSNorm each per-layer slice with `per_layer_projection_norm.weight`.
+///
+/// All of this happens CPU-side per token (35 × 256 = 8960 floats — too
+/// small to be worth a GPU shader). The result is a [num_layers × hps]
+/// FP32 vector that gets uploaded to a per-slot CpuToGpu staging buffer
+/// and consumed by `Forward::dispatch_layer` via per-layer GEMV /
+/// activation / RMSNorm dispatches.
+pub struct PleData {
+    /// `embed_tokens_per_layer.weight` raw BF16 bytes, owned (cloned
+    /// from the SafeTensors mmap at load). Shape:
+    /// `[vocab_size_per_layer_input, num_layers × hps]`. Row-major;
+    /// `byte_offset(tok) = tok * num_layers * hps * 2`. Sized 4.7 GB
+    /// for Gemma-4-E2B (262 144 × 35 × 256 × 2 B).
+    pub embed_table_bf16: Vec<u8>,
+    /// Vocab dim of the PLE table (262 144 for E2B; usually equal to
+    /// the main vocab but stored separately for clarity).
+    pub vocab: u32,
+    /// 35 for E2B.
+    pub num_layers: u32,
+    /// 256 for E2B (`hidden_size_per_layer_input`).
+    pub hps: u32,
+    /// `sqrt(hps)` — applied to the BF16→F32 lookup before RMSNorm.
+    pub embed_per_layer_scale: f32,
+    /// `per_layer_projection_norm.weight` host vector, length `hps`.
+    pub projection_norm_gamma: Vec<f32>,
+    /// `cfg.rms_norm_eps` — same eps as the main RMSNorms in the layer.
+    pub rms_norm_eps: f32,
+}
+
+impl PleData {
+    /// CPU-side per-token PLE prep. Returns the
+    /// `[num_layers × hps]`-element FP32 buffer ready for GPU upload.
+    /// Cost: ~9 K BF16-conversions + 35 × 256 RMSNorm scalars =
+    /// ~30 K FLOPs / token. Negligible vs. one decode-step GEMV.
+    pub fn build_per_layer_inputs(&self, token_id: u32) -> Vec<f32> {
+        let nl = self.num_layers as usize;
+        let hps = self.hps as usize;
+        let row_elems = nl * hps;
+        let row_off = (token_id as usize) * row_elems * 2;
+        let row_bytes = &self.embed_table_bf16[row_off..row_off + row_elems * 2];
+        let mut out = vec![0.0_f32; row_elems];
+        for (i, chunk) in row_bytes.chunks_exact(2).enumerate() {
+            let bf = u16::from_le_bytes([chunk[0], chunk[1]]);
+            out[i] = bf16_to_f32(bf) * self.embed_per_layer_scale;
+        }
+        // RMSNorm each layer-slice independently with the shared gamma.
+        let eps = self.rms_norm_eps as f64;
+        for layer in 0..nl {
+            let slice = &mut out[layer * hps..(layer + 1) * hps];
+            let mut sum_sq = 0.0_f64;
+            for &v in slice.iter() {
+                sum_sq += (v as f64) * (v as f64);
+            }
+            let mean_sq = sum_sq / (hps as f64);
+            let scale = 1.0 / (mean_sq + eps).sqrt();
+            for (i, v) in slice.iter_mut().enumerate() {
+                *v = ((*v as f64) * scale * (self.projection_norm_gamma[i] as f64)) as f32;
+            }
+        }
+        out
+    }
 }
 
 impl LoadedModel {
@@ -256,6 +333,7 @@ impl LoadedModel {
             // GGUF Q6_K (which is already 6-bit on disk and would
             // map directly into a `CpuLmHead` without requantize).
             cpu_lm_head: None,
+            ple_data: None,
         })
     }
 
@@ -931,6 +1009,96 @@ impl LoadedModel {
             None
         };
 
+        // Sprint 43D-3 — PLE setup for Gemma-4 SafeTensors models.
+        // Two top-level tensors that the standard hf_to_vf_name path
+        // returns None for:
+        //   1. `model.language_model.embed_tokens_per_layer.weight`
+        //      Shape: [vocab_size_per_layer_input, num_layers × hps]
+        //      BF16; 4.7 GB on E2B (262144 × 35 × 256 × 2 B).
+        //      Cloned into a host Vec<u8> for runtime row lookup.
+        //   2. `model.language_model.per_layer_projection_norm.weight`
+        //      Shape: [hps]. BF16 on disk; expanded to FP32 host vec.
+        //
+        // Per-layer pieces (`per_layer_input_gate`, `per_layer_projection`,
+        // `post_per_layer_input_norm`) ship via the standard upload path
+        // since 43D-3's safetensors.rs change.
+        let ple_data = if hf.gemma4.is_some() {
+            let pl_table_info = st.tensor("model.language_model.embed_tokens_per_layer.weight");
+            let pl_norm_info = st.tensor("model.language_model.per_layer_projection_norm.weight");
+            match (pl_table_info, pl_norm_info, hf.gemma4.as_ref()) {
+                (Some(table_info), Some(norm_info), Some(gm)) => {
+                    if !matches!(table_info.dtype, TensorDtype::BF16) {
+                        return Err(LoaderError::Buffer(format!(
+                            "embed_tokens_per_layer dtype {:?} not supported (BF16 only)",
+                            table_info.dtype
+                        )));
+                    }
+                    let table_bytes = st.tensor_bytes(table_info);
+                    let nl = config.n_layers;
+                    let hps = gm.hidden_size_per_layer_input;
+                    let vocab = gm.vocab_size_per_layer_input;
+                    let expected = (vocab as u64) * (nl as u64) * (hps as u64) * 2;
+                    if table_bytes.len() as u64 != expected {
+                        return Err(LoaderError::Buffer(format!(
+                            "embed_tokens_per_layer size {} != expected {} \
+                             (vocab={vocab} × n_layers={nl} × hps={hps} × 2 B)",
+                            table_bytes.len(), expected,
+                        )));
+                    }
+                    let projection_norm_gamma: Vec<f32> = match norm_info.dtype {
+                        TensorDtype::BF16 => {
+                            let raw = st.tensor_bytes(norm_info);
+                            // `bf16_to_f32_vec` returns Vec<u8> (FP32
+                            // bytes); reinterpret as f32 values.
+                            let bytes = bf16_to_f32_vec(
+                                raw, norm_info, "per_layer_projection_norm.weight",
+                            )?;
+                            bytes
+                                .chunks_exact(4)
+                                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                .collect()
+                        }
+                        TensorDtype::F32 => {
+                            let raw = st.tensor_bytes(norm_info);
+                            raw.chunks_exact(4)
+                                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                .collect()
+                        }
+                        other => {
+                            return Err(LoaderError::Buffer(format!(
+                                "per_layer_projection_norm dtype {other:?} not supported"
+                            )));
+                        }
+                    };
+                    if projection_norm_gamma.len() != hps as usize {
+                        return Err(LoaderError::Buffer(format!(
+                            "per_layer_projection_norm has {} elements, expected {}",
+                            projection_norm_gamma.len(), hps,
+                        )));
+                    }
+                    let t0 = Instant::now();
+                    let embed_table_bf16 = table_bytes.to_vec();
+                    eprintln!(
+                        "Sprint 43D-3 PLE: embed_tokens_per_layer cloned ({:.1} GB BF16, {:.0} ms)",
+                        embed_table_bf16.len() as f64 / 1e9,
+                        t0.elapsed().as_secs_f64() * 1000.0,
+                    );
+                    Some(PleData {
+                        embed_table_bf16,
+                        vocab,
+                        num_layers: nl,
+                        hps,
+                        embed_per_layer_scale: (hps as f32).sqrt(),
+                        projection_norm_gamma,
+                        rms_norm_eps: config.rms_norm_eps,
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         Ok((
             Self {
                 config,
@@ -938,6 +1106,7 @@ impl LoadedModel {
                 bytes_uploaded,
                 upload_duration,
                 cpu_lm_head,
+                ple_data,
             },
             host_embed,
             hf,
@@ -1167,6 +1336,7 @@ fn hf_to_model_config(hf: &HfConfig) -> Result<ModelConfig, LoaderError> {
             // layer_scalars get filled by the loader in a second pass
             // once the BF16 [1] tensors have been read off disk.
             layer_scalars: vec![1.0; hf.num_hidden_layers as usize],
+            hidden_size_per_layer_input: gm.hidden_size_per_layer_input,
         };
         (max_head_dim, max_ffn, Some(spec))
     } else {
