@@ -322,6 +322,11 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
             max_seq_len: max_context,
         },
     )?;
+    // Sprint 43C — KV cache one-shot zero-fill. Required for Gemma-4
+    // (sliding layers leave the upper half of each pos slot
+    // unwritten); harmless for Llama / Qwen (every pos slot is
+    // fully overwritten by its layer).
+    kv_cache.zero_fill(&dev)?;
     let forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;
 
     print_banner(
@@ -544,6 +549,11 @@ fn run_chat_safetensors(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>
             max_seq_len: max_context,
         },
     )?;
+    // Sprint 43C — KV cache one-shot zero-fill. Required for Gemma-4
+    // (sliding layers leave the upper half of each pos slot
+    // unwritten); harmless for Llama / Qwen (every pos slot is
+    // fully overwritten by its layer).
+    kv_cache.zero_fill(&dev)?;
     let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;
 
     println!();

@@ -634,13 +634,16 @@ impl Forward {
             };
             let mut logits = vec![0.0_f32; cpu_lm.vocab_size];
             cpu_lm.forward(&hidden, &mut logits);
+            apply_final_logit_softcap(&self.config, &mut logits);
             return Ok(logits);
         }
         // Sprint 27 — read from host-mapped staging copy.
         let bytes = self.logits_staging.read_bytes()?;
-        Ok(bytemuck::cast_slice::<u8, f32>(
+        let mut logits = bytemuck::cast_slice::<u8, f32>(
             &bytes[..(self.config.vocab_size as usize) * 4],
-        ).to_vec())
+        ).to_vec();
+        apply_final_logit_softcap(&self.config, &mut logits);
+        Ok(logits)
     }
 
     pub fn new(
@@ -2318,6 +2321,14 @@ impl Forward {
         output: vk::Buffer,
     ) {
         let cfg = self.config.clone();
+        // Sprint 43C — per-layer head_dim / ffn_dim / rope_theta /
+        // rotary_dim. Falls back to cfg uniform for non-Gemma-4
+        // architectures (Llama / Qwen / etc.) — same numbers as
+        // before, no behaviour change on the existing path.
+        let (head_dim, ffn_dim, rope_theta, rotary_dim) = layer_dims(&cfg, layer);
+        let q_dim = cfg.n_heads * head_dim;
+        let kv_dim = cfg.n_kv_heads * head_dim;
+        let _ = (rope_theta, rotary_dim); // referenced via run_rope_neox_with_theta below
 
         let q_buf = self.cur().q_buf.handle;
         let k_buf = self.cur().k_buf.handle;
@@ -2356,27 +2367,27 @@ impl Forward {
         let sb_v = layer_weight_scale_buf(model, layer, "attn_v.weight");
         if let Some(s) = sb_q {
             self.run_gemv_fp8_dispatch(dev, cmd, wq, s, hidden_norm, q_buf,
-                cfg.hidden_dim, cfg.n_heads * cfg.head_dim,
+                cfg.hidden_dim, q_dim,
                 layer_weight_scale_block(model, layer, "attn_q.weight"), "gemv_q");
         } else {
             self.run_gemv(dev, registry, cmd, sq, wq, hidden_norm, q_buf,
-                cfg.hidden_dim, cfg.n_heads * cfg.head_dim, scale_q, "gemv_q");
+                cfg.hidden_dim, q_dim, scale_q, "gemv_q");
         }
         if let Some(s) = sb_k {
             self.run_gemv_fp8_dispatch(dev, cmd, wk, s, hidden_norm, k_buf,
-                cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim,
+                cfg.hidden_dim, kv_dim,
                 layer_weight_scale_block(model, layer, "attn_k.weight"), "gemv_k");
         } else {
             self.run_gemv(dev, registry, cmd, sk, wk, hidden_norm, k_buf,
-                cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, scale_k, "gemv_k");
+                cfg.hidden_dim, kv_dim, scale_k, "gemv_k");
         }
         if let Some(s) = sb_v {
             self.run_gemv_fp8_dispatch(dev, cmd, wv, s, hidden_norm, v_buf,
-                cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim,
+                cfg.hidden_dim, kv_dim,
                 layer_weight_scale_block(model, layer, "attn_v.weight"), "gemv_v");
         } else {
             self.run_gemv(dev, registry, cmd, sv, wv, hidden_norm, v_buf,
-                cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, scale_v, "gemv_v");
+                cfg.hidden_dim, kv_dim, scale_v, "gemv_v");
         }
         self.mark_written(&[q_buf, k_buf, v_buf]);
 
@@ -2388,8 +2399,6 @@ impl Forward {
         // this block the production decode path drops the biases and
         // produces structured-but-incoherent output on Qwen2.5.
         // Skipped for arches without biases (Llama / Qwen3 / Mistral).
-        let q_dim = cfg.n_heads * cfg.head_dim;
-        let kv_dim = cfg.n_kv_heads * cfg.head_dim;
         let q_bias = layer_weight_opt(model, layer, "attn_q.bias");
         let k_bias = layer_weight_opt(model, layer, "attn_k.bias");
         let v_bias = layer_weight_opt(model, layer, "attn_v.bias");
@@ -2426,20 +2435,20 @@ impl Forward {
             self.run_rms_norm_mul_rope(
                 dev, registry, cmd,
                 q_buf, wqn, q_buf,
-                cfg.head_dim, cfg.n_heads, /* m = */ 1,
+                head_dim, cfg.n_heads, /* m = */ 1,
                 cfg.rms_norm_eps, "rms_norm_mul_rope_q",
             );
             self.run_rms_norm_mul_rope(
                 dev, registry, cmd,
                 k_buf, wkn, k_buf,
-                cfg.head_dim, cfg.n_kv_heads, /* m = */ 1,
+                head_dim, cfg.n_kv_heads, /* m = */ 1,
                 cfg.rms_norm_eps, "rms_norm_mul_rope_k",
             );
         } else {
             self.run_rope_neox(dev, registry, cmd, q_buf, q_buf,
-                               cfg.head_dim, cfg.n_heads, position, "rope_q");
+                               head_dim, cfg.n_heads, position, "rope_q");
             self.run_rope_neox(dev, registry, cmd, k_buf, k_buf,
-                               cfg.head_dim, cfg.n_kv_heads, position, "rope_k");
+                               head_dim, cfg.n_kv_heads, position, "rope_k");
         }
         self.mark_written(&[q_buf, k_buf]);
         // Next: (e) KV-write reads k_buf, v_buf.
@@ -2449,6 +2458,11 @@ impl Forward {
         // Sprint 9d.3: when the cache is FP16-allocated, dispatch the
         // FP32 → packed-FP16 conversion compute shader. Otherwise the
         // cheap vkCmdCopyBuffer transfer (FP32 → FP32) wins.
+        // Sprint 43C — for Gemma-4 sliding layers (head_dim=256), only
+        // `kv_dim` valid bytes are written into a slot allocated for
+        // `cfg.n_kv_heads * cfg.head_dim` (uniform max=512). The upper
+        // half is unused; subsequent attention reads honour the per-
+        // layer head_dim push-constant and never touch the unused tail.
         let row_bytes = self.kv_cache.row_bytes();
         let dst_off = self.kv_cache.pos_offset_bytes(layer, position);
         let k_src = self.cur().k_buf.handle;
@@ -2456,7 +2470,7 @@ impl Forward {
         let k_dst = self.kv_cache.k_buffer.handle;
         let v_dst = self.kv_cache.v_buffer.handle;
         if self.kv_cache.is_fp8() {
-            let kv_elements = cfg.n_kv_heads * cfg.head_dim;
+            let kv_elements = kv_dim;
             self.run_kv_store_fp8(
                 dev, registry, cmd, k_src, k_dst, kv_elements, dst_off, "kv_store_fp8_k",
             );
@@ -2464,7 +2478,7 @@ impl Forward {
                 dev, registry, cmd, v_src, v_dst, kv_elements, dst_off, "kv_store_fp8_v",
             );
         } else if self.kv_cache.is_fp16() {
-            let kv_elements = cfg.n_kv_heads * cfg.head_dim;
+            let kv_elements = kv_dim;
             self.run_kv_copy_fp16(
                 dev, registry, cmd, k_src, k_dst, kv_elements, dst_off, "kv_copy_fp16_k",
             );
@@ -2511,11 +2525,11 @@ impl Forward {
         let sb_o = layer_weight_scale_buf(model, layer, "attn_output.weight");
         if let Some(s) = sb_o {
             self.run_gemv_fp8_dispatch(dev, cmd, wo, s, attn_out, o_buf,
-                cfg.n_heads * cfg.head_dim, cfg.hidden_dim,
+                q_dim, cfg.hidden_dim,
                 layer_weight_scale_block(model, layer, "attn_output.weight"), "gemv_o");
         } else {
             self.run_gemv(dev, registry, cmd, so, wo, attn_out, o_buf,
-                cfg.n_heads * cfg.head_dim, cfg.hidden_dim, scale_o, "gemv_o");
+                q_dim, cfg.hidden_dim, scale_o, "gemv_o");
         }
         self.mark_written(&[o_buf]);
         // Next: (h+i) reads input + o_buf.
@@ -2548,19 +2562,19 @@ impl Forward {
         let sb_u = layer_weight_scale_buf(model, layer, "ffn_up.weight");
         if let Some(s) = sb_g {
             self.run_gemv_fp8_dispatch(dev, cmd, wg, s, hidden_norm, gate_buf,
-                cfg.hidden_dim, cfg.ffn_dim,
+                cfg.hidden_dim, ffn_dim,
                 layer_weight_scale_block(model, layer, "ffn_gate.weight"), "gemv_gate");
         } else {
             self.run_gemv(dev, registry, cmd, sg, wg, hidden_norm, gate_buf,
-                cfg.hidden_dim, cfg.ffn_dim, scale_g, "gemv_gate");
+                cfg.hidden_dim, ffn_dim, scale_g, "gemv_gate");
         }
         if let Some(s) = sb_u {
             self.run_gemv_fp8_dispatch(dev, cmd, wu, s, hidden_norm, up_buf,
-                cfg.hidden_dim, cfg.ffn_dim,
+                cfg.hidden_dim, ffn_dim,
                 layer_weight_scale_block(model, layer, "ffn_up.weight"), "gemv_up");
         } else {
             self.run_gemv(dev, registry, cmd, su, wu, hidden_norm, up_buf,
-                cfg.hidden_dim, cfg.ffn_dim, scale_u, "gemv_up");
+                cfg.hidden_dim, ffn_dim, scale_u, "gemv_up");
         }
         self.mark_written(&[gate_buf, up_buf]);
         // Next: (k+l) swiglu reads gate_buf + up_buf.
@@ -2572,7 +2586,7 @@ impl Forward {
         self.run_swiglu(
             dev, registry, cmd,
             gate_buf, up_buf, ffn_hidden,
-            cfg.ffn_dim, "swiglu",
+            ffn_dim, "swiglu",
         );
         self.mark_written(&[ffn_hidden]);
         // Next: (m) FFN down reads ffn_hidden.
@@ -2585,11 +2599,11 @@ impl Forward {
         let sb_d = layer_weight_scale_buf(model, layer, "ffn_down.weight");
         if let Some(s) = sb_d {
             self.run_gemv_fp8_dispatch(dev, cmd, wd, s, ffn_hidden, ffn_out,
-                cfg.ffn_dim, cfg.hidden_dim,
+                ffn_dim, cfg.hidden_dim,
                 layer_weight_scale_block(model, layer, "ffn_down.weight"), "gemv_down");
         } else {
             self.run_gemv(dev, registry, cmd, sd, wd, ffn_hidden, ffn_out,
-                cfg.ffn_dim, cfg.hidden_dim, scale_d, "gemv_down");
+                ffn_dim, cfg.hidden_dim, scale_d, "gemv_down");
         }
         self.mark_written(&[ffn_out]);
         // Next: (n) residual2 reads res1 + ffn_out.
@@ -3683,6 +3697,14 @@ impl Forward {
         position: u32,
     ) {
         let cfg = self.config.clone();
+        // Sprint 43C — KV-cache layout is uniform (cfg.head_dim across
+        // all layers); the attention shader's `head_dim` push-const
+        // doubles as the per-position stride, so it MUST stay uniform
+        // even for Gemma-4 sliding layers (256 valid + 256 stale per
+        // pos in the cache slot). The math is correct iff the upper
+        // 256 elements are zero — see the Forward::new zero-fill of
+        // the KV buffers + per-dispatch zero-pad below for sliding-
+        // layer Q/K/V projections.
         // Phase 4C: pick the multi-WG split-K path when there are
         // enough tiles to amortise the second dispatch + barrier.
         // Threshold of 2 means seq_len > TILE (= 64) goes through
@@ -5180,9 +5202,11 @@ impl Forward {
     ) {
         let cfg = self.config.clone();
         let hidden = cfg.hidden_dim;
-        let kv_dim = cfg.n_kv_heads * cfg.head_dim;
-        let q_dim = cfg.n_heads * cfg.head_dim;
-        let ffn = cfg.ffn_dim;
+        // Sprint 43C — per-layer head_dim / ffn_dim for Gemma-4. Falls
+        // back to cfg uniform on every other architecture.
+        let (head_dim, ffn, _rope_theta, _rotary_dim) = layer_dims(&cfg, layer);
+        let kv_dim = cfg.n_kv_heads * head_dim;
+        let q_dim = cfg.n_heads * head_dim;
         let kv_bytes = (kv_dim as u64) * 4;
         let q_bytes = (q_dim as u64) * 4;
         let ffn_bytes = (ffn as u64) * 4;
@@ -5433,13 +5457,13 @@ impl Forward {
                 self.run_rms_norm_mul_rope(
                     dev, registry, cmd,
                     self.batch_q.handle, wqn, self.batch_q.handle,
-                    cfg.head_dim, cfg.n_heads, seq_len,
+                    head_dim, cfg.n_heads, seq_len,
                     cfg.rms_norm_eps, "rms_norm_mul_rope_q_b",
                 );
                 self.run_rms_norm_mul_rope(
                     dev, registry, cmd,
                     self.batch_k.handle, wkn, self.batch_k.handle,
-                    cfg.head_dim, cfg.n_kv_heads, seq_len,
+                    head_dim, cfg.n_kv_heads, seq_len,
                     cfg.rms_norm_eps, "rms_norm_mul_rope_k_b",
                 );
             } else {
@@ -5447,13 +5471,13 @@ impl Forward {
                 self.run_rope_batch(
                     dev, registry, cmd,
                     self.batch_q.handle, self.batch_q.handle,
-                    cfg.head_dim, cfg.n_heads, seq_len,
+                    head_dim, cfg.n_heads, seq_len,
                     "rope_q_batch",
                 );
                 self.run_rope_batch(
                     dev, registry, cmd,
                     self.batch_k.handle, self.batch_k.handle,
-                    cfg.head_dim, cfg.n_kv_heads, seq_len,
+                    head_dim, cfg.n_kv_heads, seq_len,
                     "rope_k_batch",
                 );
             }
@@ -5471,7 +5495,7 @@ impl Forward {
             // FP32 → packed-FP16 element-wise. FP32 cache stays on
             // the cheap vkCmdCopyBuffer path.
             let dst_off = self.kv_cache.pos_offset_bytes(layer, base_pos);
-            let kv_elements = (seq_len as u32) * cfg.n_kv_heads * cfg.head_dim;
+            let kv_elements = (seq_len as u32) * kv_dim;
             if self.kv_cache.is_fp8() {
                 self.run_kv_store_fp8(
                     dev, registry, cmd,
@@ -5560,22 +5584,22 @@ impl Forward {
             if let Some((wqn, wkn)) = qk_norm_weights {
                 self.run_rms_norm(
                     dev, registry, cmd, self.cur().q_buf.handle, wqn, self.cur().q_buf.handle,
-                    cfg.head_dim, cfg.n_heads, cfg.rms_norm_eps, "rms_norm_q_b",
+                    head_dim, cfg.n_heads, cfg.rms_norm_eps, "rms_norm_q_b",
                 );
                 self.run_rms_norm(
                     dev, registry, cmd, self.cur().k_buf.handle, wkn, self.cur().k_buf.handle,
-                    cfg.head_dim, cfg.n_kv_heads, cfg.rms_norm_eps, "rms_norm_k_b",
+                    head_dim, cfg.n_kv_heads, cfg.rms_norm_eps, "rms_norm_k_b",
                 );
                 compute_barrier(dev, cmd);
             }
             // RoPE — each dispatch reads its OWN position slot.
             self.run_rope_neox_with_pos_offset(
                 dev, registry, cmd, self.cur().q_buf.handle, self.cur().q_buf.handle,
-                cfg.head_dim, cfg.n_heads, pos, rope_pos_offset, "rope_q_b",
+                head_dim, cfg.n_heads, pos, rope_pos_offset, "rope_q_b",
             );
             self.run_rope_neox_with_pos_offset(
                 dev, registry, cmd, self.cur().k_buf.handle, self.cur().k_buf.handle,
-                cfg.head_dim, cfg.n_kv_heads, pos, rope_pos_offset, "rope_k_b",
+                head_dim, cfg.n_kv_heads, pos, rope_pos_offset, "rope_k_b",
             );
             compute_barrier(dev, cmd);
             // KV-cache write at this token's position. Sprint 9d.3 —
@@ -5586,7 +5610,7 @@ impl Forward {
             let row_bytes = self.kv_cache.row_bytes();
             let dst_off = self.kv_cache.pos_offset_bytes(layer, pos);
             if self.kv_cache.is_fp8() {
-                let kv_elements = cfg.n_kv_heads * cfg.head_dim;
+                let kv_elements = kv_dim;
                 self.run_kv_store_fp8(
                     dev, registry, cmd,
                     self.cur().k_buf.handle, self.kv_cache.k_buffer.handle,
@@ -5598,7 +5622,7 @@ impl Forward {
                     kv_elements, dst_off, "kv_store_fp8_v_t",
                 );
             } else if self.kv_cache.is_fp16() {
-                let kv_elements = cfg.n_kv_heads * cfg.head_dim;
+                let kv_elements = kv_dim;
                 self.run_kv_copy_fp16(
                     dev, registry, cmd,
                     self.cur().k_buf.handle, self.kv_cache.k_buffer.handle,
@@ -6143,6 +6167,53 @@ fn layer_weight_shader_mmq(model: &LoadedModel, layer: u32, suffix: &str) -> Sha
     {
         GgmlType::Q6K => ShaderId::MulMmqQ6K,
         _ => ShaderId::MulMmqQ4K,
+    }
+}
+
+/// Sprint 43C — per-layer (head_dim, ffn_dim, rope_theta) override for
+/// Gemma-4. Returns the layer-specific values when `cfg.gemma4` is
+/// `Some`; otherwise the uniform `cfg.head_dim` / `cfg.ffn_dim` /
+/// `cfg.rope_freq_base`. The dispatch paths thread these through their
+/// per-call push-constants so a single `Forward` instance covers a
+/// stack with mixed `head_dim ∈ {256, 512}` and
+/// `intermediate_size ∈ {6144, 12288}` correctly.
+///
+/// Note on the rotary-dim: `rope_partial_factor = Some(0.25)` for full-
+/// attention layers in E2B → only the first 25 % of the head dim is
+/// rotated (p-RoPE). When `None` the full head_dim is rotated (default
+/// RoPE). The push-constant on the RoPE shader was extended to take
+/// `rotary_dim` for this exact reason.
+fn layer_dims(cfg: &ModelConfig, layer: u32) -> (u32, u32, f32, u32) {
+    if let Some(g) = cfg.gemma4.as_ref() {
+        let s = &g.layers[layer as usize];
+        let rotary_dim = match s.rope_partial_factor {
+            Some(f) => ((s.head_dim as f32) * f).round() as u32,
+            None => s.head_dim,
+        };
+        (s.head_dim, s.intermediate_size, s.rope_theta, rotary_dim)
+    } else {
+        (cfg.head_dim, cfg.ffn_dim, cfg.rope_freq_base, cfg.head_dim)
+    }
+}
+
+/// Sprint 43C — Gemma-4 final logit soft-cap. Applied CPU-side
+/// after the lm_head GEMV (or CPU lm_head Q6_K GEMV) and before
+/// sampling. No-op for every other architecture (`config.gemma4 ==
+/// None` or `final_logit_softcapping == None`).
+///
+/// Formula: `logits[i] = cap × tanh(logits[i] / cap)` — caps the
+/// magnitude of every logit at `cap` (≈ 30.0 for Gemma-4 E2B). At
+/// greedy temperature this shouldn't change the argmax for typical
+/// post-`lm_head` distributions, but it keeps top-k / top-p / temp ≠ 0
+/// sampling consistent with HF reference behaviour.
+fn apply_final_logit_softcap(config: &ModelConfig, logits: &mut [f32]) {
+    let cap = match config.gemma4.as_ref().and_then(|g| g.final_logit_softcapping) {
+        Some(c) if c > 0.0 => c,
+        _ => return,
+    };
+    let inv = 1.0 / cap;
+    for x in logits.iter_mut() {
+        *x = cap * (*x * inv).tanh();
     }
 }
 

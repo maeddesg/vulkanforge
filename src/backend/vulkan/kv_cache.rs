@@ -172,6 +172,39 @@ impl KvCache {
         })
     }
 
+    /// Sprint 43C — one-shot device-local zero-fill of both KV
+    /// buffers. Required for Gemma-4: the cache layout is uniform
+    /// (`cfg.head_dim = max(256, 512) = 512`), but sliding layers
+    /// only write the first 256 elements of each per-position slot.
+    /// Without zero-fill, the upper 256 elements of each pos would
+    /// contain undefined memory; attention reads them with a
+    /// uniform-stride push-const and pollutes the dot product. With
+    /// the upper half initialised to zero, `Q[h, 256..512] × 0 = 0`
+    /// — the attention math reduces to the head_dim=256 form
+    /// arithmetically, even though the shader runs over the full
+    /// uniform stride.
+    ///
+    /// This costs one vkCmdFillBuffer per buffer at startup. Llama /
+    /// Qwen models call it too (uniform head_dim → zero-fill is a
+    /// no-op semantically; the upper region is fully written by every
+    /// layer), but the explicit zero gives all paths the same defined
+    /// initial state.
+    pub fn zero_fill(
+        &self,
+        dev: &super::device::VulkanDevice,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cmd_ctx = super::commands::CommandContext::new(
+            &dev.device,
+            dev.queue_family_index,
+        )?;
+        let bytes = self.bytes_per_buffer();
+        cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| unsafe {
+            dev.device.cmd_fill_buffer(cmd, self.k_buffer.handle, 0, bytes, 0);
+            dev.device.cmd_fill_buffer(cmd, self.v_buffer.handle, 0, bytes, 0);
+        })?;
+        Ok(())
+    }
+
     /// Bytes per (layer × kv_head × max_seq × head_dim × f32) buffer.
     pub fn bytes_per_buffer(&self) -> u64 {
         self.k_buffer.size
