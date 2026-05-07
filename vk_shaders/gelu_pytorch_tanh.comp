@@ -1,0 +1,42 @@
+#version 450
+
+// Sprint 43D-2 — GELU(pytorch_tanh)-GLU activation for Gemma-4.
+//
+//   out[i] = gelu_pytorch_tanh(gate[i]) * up[i]
+//
+// where
+//   gelu_pytorch_tanh(x) = 0.5 * x *
+//       (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+//
+// (= PyTorch's nn.GELU(approximate='tanh'); HF transformers'
+//  ACT2FN["gelu_pytorch_tanh"]).
+//
+// Shape / dispatch / bindings mirror swiglu.comp exactly so the
+// dispatch helper just swaps ShaderId. 256 invocations / WG, 1 element
+// per invocation, FP32 buffers throughout.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer Gate { float data_gate[]; };
+layout (binding = 1) readonly  buffer Up   { float data_up[];   };
+layout (binding = 2) writeonly buffer Out  { float data_out[];  };
+
+layout (push_constant) uniform parameter {
+    uint n;
+} p;
+
+const float SQRT_2_OVER_PI = 0.7978845608028654;
+const float TANH_K0        = 0.044715;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.n) return;
+
+    const float g = data_gate[idx];
+    const float u = data_up[idx];
+    // gelu_pytorch_tanh(g) — tanh form
+    const float x3   = g * g * g;
+    const float arg  = SQRT_2_OVER_PI * (g + TANH_K0 * x3);
+    const float gelu = 0.5 * g * (1.0 + tanh(arg));
+    data_out[idx] = gelu * u;
+}

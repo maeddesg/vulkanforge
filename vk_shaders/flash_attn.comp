@@ -84,6 +84,13 @@ float load_v(uint idx) { return v[idx]; }
 layout (binding = 3) writeonly buffer O { float o[]; };  // [n_heads, head_dim]
 
 // Drop-in compatible push-constant block (`ScalarAttnPushConstants`).
+//
+// Sprint 43D-2 — added `kv_start` (sliding-window-attention support).
+// Pre-43D-2 the shader looped from 0 to seq_len; with the new field it
+// loops from `kv_start` to `seq_len` instead. For non-sliding layers the
+// host passes `kv_start = 0` and the math is bit-identical to pre-43D-2.
+// For Gemma-4 sliding layers the host passes
+// `kv_start = max(0, seq_len - sliding_window)`.
 layout (push_constant) uniform Params {
     uint  n_heads;
     uint  n_kv_heads;
@@ -91,6 +98,7 @@ layout (push_constant) uniform Params {
     uint  seq_len;
     uint  max_seq;     // unused at runtime, kept for binary compat
     float scale;
+    uint  kv_start;    // Sprint 43D-2 — sliding-window lower bound
 } p;
 
 // Shared scores buffer holds the per-tile p values so the V-sum pass
@@ -133,9 +141,13 @@ void main() {
     float my_sum  = 0.0;
 
     // ---- Tile loop over the cached K/V history ----
-    for (uint tile_base = 0; tile_base < p.seq_len; tile_base += TILE) {
+    // Sprint 43D-2: align tile start to TILE-multiple boundary at or
+    // before kv_start so per-thread tid offsets remain TILE-aligned;
+    // mask out positions in [tile_base, kv_start) below.
+    uint window_lo = (p.kv_start / TILE) * TILE;
+    for (uint tile_base = window_lo; tile_base < p.seq_len; tile_base += TILE) {
         uint t = tile_base + tid;
-        bool valid = t < p.seq_len;
+        bool valid = (t < p.seq_len) && (t >= p.kv_start);
 
         // Per-thread score = Q·K[t] · scale.
         float score = -1e30;

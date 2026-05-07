@@ -323,7 +323,12 @@ pub struct RopePushConstants {
 }
 const _: () = assert!(std::mem::size_of::<RopePushConstants>() == 108);
 
-/// `scalar_attn.comp` push block. 5 × u32 + 1 × f32 = 24 B.
+/// `scalar_attn.comp` push block. 5 × u32 + 1 × f32 + 1 × u32 = 28 B.
+///
+/// Sprint 43D-2 — `kv_start` added for Gemma-4 sliding-window attention.
+/// Pre-43D-2 callers that don't care about the window pass `kv_start = 0`
+/// (the field is shared by `flash_attn.comp` and the FP16/FP8-KV
+/// variants since they all read this same struct via push_constants).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ScalarAttnPushConstants {
@@ -333,8 +338,9 @@ pub struct ScalarAttnPushConstants {
     pub seq_len: u32,
     pub max_seq: u32,
     pub scale: f32,
+    pub kv_start: u32,
 }
-const _: () = assert!(std::mem::size_of::<ScalarAttnPushConstants>() == 24);
+const _: () = assert!(std::mem::size_of::<ScalarAttnPushConstants>() == 28);
 
 /// `mul_mmq.comp` push block (non-MUL_MAT_ID variant). 16 × u32 = 64 B.
 /// Field order matches the GLSL `parameter` block exactly — see
@@ -415,8 +421,13 @@ pub struct FlashAttnSplitPushConstants {
     pub max_seq: u32,
     pub scale: f32,
     pub n_tiles: u32,
+    /// Sprint 43D-2 — sliding-window lower bound. Tiles entirely below
+    /// `kv_start` short-circuit to zero partials; partial-boundary tiles
+    /// mask their below-window lanes' scores to `-inf`. Pass `0` when
+    /// the layer attends to the full history (non-sliding / non-Gemma-4).
+    pub kv_start: u32,
 }
-const _: () = assert!(std::mem::size_of::<FlashAttnSplitPushConstants>() == 28);
+const _: () = assert!(std::mem::size_of::<FlashAttnSplitPushConstants>() == 32);
 
 /// Phase-4C split-K reducer (`flash_attn_reduce.comp`) push block.
 /// 3 × u32 = 12 B.

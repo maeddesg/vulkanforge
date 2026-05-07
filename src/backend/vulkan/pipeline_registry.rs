@@ -204,6 +204,7 @@ impl PipelineRegistry {
                 // rope_neox: no spec consts.
                 ShaderId::Silu
                 | ShaderId::SwiGLU
+                | ShaderId::GeluPytorchTanhGlu
                 | ShaderId::MultiAddRms
                 | ShaderId::Copy
                 | ShaderId::RopeNorm

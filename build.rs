@@ -289,6 +289,15 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "swiglu.comp",
         defines: &[],
     },
+    // Sprint 43D-2 — GELU(pytorch_tanh)-GLU for Gemma-4 FFNs. Same
+    // bindings + push block as SwiGLU; the GLU mul-with-up step is
+    // identical, only the activation on `gate` differs. Routed when
+    // `cfg.gemma4.is_some() && hidden_activation == "gelu_pytorch_tanh"`.
+    ShaderJob {
+        out_name: "gelu_pytorch_tanh_f32.spv",
+        entry_source: "gelu_pytorch_tanh.comp",
+        defines: &[],
+    },
     // v0.2 Sprint 9b — fused residual-add + RMSNorm-mul. 5 SSBOs
     // (a, b, weight, sum, norm_out); 1 WG per row, BLOCK_SIZE=512.
     // Replaces (add → barrier → rms_norm) at Stelle 1 (add_res1 +

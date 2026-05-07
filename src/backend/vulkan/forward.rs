@@ -34,7 +34,7 @@ use gpu_allocator::vulkan::Allocator;
 use super::buffers::GpuBuffer;
 use super::commands::CommandContext;
 use super::device::VulkanDevice;
-use super::gguf::{GgmlType, ModelConfig};
+use super::gguf::{GgmlType, Gemma4KvSource, Gemma4LayerKind, ModelConfig};
 use super::kv_cache::KvCache;
 use super::loader::LoadedModel;
 use super::pipeline::{
@@ -2473,10 +2473,21 @@ impl Forward {
         // rotary_dim. Falls back to cfg uniform for non-Gemma-4
         // architectures (Llama / Qwen / etc.) — same numbers as
         // before, no behaviour change on the existing path.
-        let (head_dim, ffn_dim, rope_theta, rotary_dim) = layer_dims(&cfg, layer);
+        let (head_dim, ffn_dim, _rope_theta, _rotary_dim) = layer_dims(&cfg, layer);
+        // Sprint 43D-2 — per-layer RoPE (head_dim, rotary_dim, freq_base,
+        // theta_scale). Gemma-4 sliding: rotary_dim=256, θ=10 000.
+        // Gemma-4 full: rotary_dim=128 (= 0.25 × 512), θ=1 000 000. Other
+        // archs: uniform cfg values + the precomputed self.rope_theta_scale.
+        let (rope_head_dim, rope_rotary_dim, rope_freq_base, rope_theta_scale) =
+            rope_params_for_layer(&cfg, self.rope_theta_scale, layer);
+        let _ = rope_head_dim; // Phys head_dim already captured as `head_dim`.
         let q_dim = cfg.n_heads * head_dim;
         let kv_dim = cfg.n_kv_heads * head_dim;
-        let _ = (rope_theta, rotary_dim); // referenced via run_rope_neox_with_theta below
+        // Sprint 43D-2 — KV-share: layers in the Gemma-4 tail subscribe
+        // to a publisher's slab instead of computing their own K/V. Skip
+        // the K/V GEMV + KV-write for them (saves compute) and route
+        // attention reads to the publisher's slab.
+        let layer_owns_kv = gemma4_layer_owns_kv(&cfg, layer);
 
         let q_buf = self.cur().q_buf.handle;
         let k_buf = self.cur().k_buf.handle;
@@ -2498,21 +2509,15 @@ impl Forward {
         // Next: (b) reads hidden_norm.
         self.maybe_compute_barrier(dev, cmd, &[hidden_norm]);
 
-        // (b) Q/K/V projections
+        // (b) Q/K/V projections. Sprint 43D-2 — Gemma-4 SubscribesXxx
+        // layers skip the K/V projections (and the KV-cache write below)
+        // because attention reads K/V from the publisher's slab. Q is
+        // always projected, since Q rotates in the *current* layer's
+        // RoPE space — never shared.
         let wq = layer_weight(model, layer, "attn_q.weight");
-        let wk = layer_weight(model, layer, "attn_k.weight");
-        let wv = layer_weight(model, layer, "attn_v.weight");
-        // attn_v.weight is Q6_K in Q4_K_M (mixed-quant) — pick the
-        // matching GEMV pipeline per tensor's actual ggml_type.
         let sq = layer_weight_shader(model, layer, "attn_q.weight", self.mul_mat_vec_subgroup_enabled);
-        let sk = layer_weight_shader(model, layer, "attn_k.weight", self.mul_mat_vec_subgroup_enabled);
-        let sv = layer_weight_shader(model, layer, "attn_v.weight", self.mul_mat_vec_subgroup_enabled);
         let scale_q = layer_weight_scale_scalar(model, layer, "attn_q.weight");
-        let scale_k = layer_weight_scale_scalar(model, layer, "attn_k.weight");
-        let scale_v = layer_weight_scale_scalar(model, layer, "attn_v.weight");
         let sb_q = layer_weight_scale_buf(model, layer, "attn_q.weight");
-        let sb_k = layer_weight_scale_buf(model, layer, "attn_k.weight");
-        let sb_v = layer_weight_scale_buf(model, layer, "attn_v.weight");
         if let Some(s) = sb_q {
             self.run_gemv_fp8_dispatch(dev, cmd, wq, s, hidden_norm, q_buf,
                 cfg.hidden_dim, q_dim,
@@ -2521,23 +2526,37 @@ impl Forward {
             self.run_gemv(dev, registry, cmd, sq, wq, hidden_norm, q_buf,
                 cfg.hidden_dim, q_dim, scale_q, "gemv_q");
         }
-        if let Some(s) = sb_k {
-            self.run_gemv_fp8_dispatch(dev, cmd, wk, s, hidden_norm, k_buf,
-                cfg.hidden_dim, kv_dim,
-                layer_weight_scale_block(model, layer, "attn_k.weight"), "gemv_k");
+        if layer_owns_kv {
+            // attn_v.weight is Q6_K in Q4_K_M (mixed-quant) — pick the
+            // matching GEMV pipeline per tensor's actual ggml_type.
+            let wk = layer_weight(model, layer, "attn_k.weight");
+            let wv = layer_weight(model, layer, "attn_v.weight");
+            let sk = layer_weight_shader(model, layer, "attn_k.weight", self.mul_mat_vec_subgroup_enabled);
+            let sv = layer_weight_shader(model, layer, "attn_v.weight", self.mul_mat_vec_subgroup_enabled);
+            let scale_k = layer_weight_scale_scalar(model, layer, "attn_k.weight");
+            let scale_v = layer_weight_scale_scalar(model, layer, "attn_v.weight");
+            let sb_k = layer_weight_scale_buf(model, layer, "attn_k.weight");
+            let sb_v = layer_weight_scale_buf(model, layer, "attn_v.weight");
+            if let Some(s) = sb_k {
+                self.run_gemv_fp8_dispatch(dev, cmd, wk, s, hidden_norm, k_buf,
+                    cfg.hidden_dim, kv_dim,
+                    layer_weight_scale_block(model, layer, "attn_k.weight"), "gemv_k");
+            } else {
+                self.run_gemv(dev, registry, cmd, sk, wk, hidden_norm, k_buf,
+                    cfg.hidden_dim, kv_dim, scale_k, "gemv_k");
+            }
+            if let Some(s) = sb_v {
+                self.run_gemv_fp8_dispatch(dev, cmd, wv, s, hidden_norm, v_buf,
+                    cfg.hidden_dim, kv_dim,
+                    layer_weight_scale_block(model, layer, "attn_v.weight"), "gemv_v");
+            } else {
+                self.run_gemv(dev, registry, cmd, sv, wv, hidden_norm, v_buf,
+                    cfg.hidden_dim, kv_dim, scale_v, "gemv_v");
+            }
+            self.mark_written(&[q_buf, k_buf, v_buf]);
         } else {
-            self.run_gemv(dev, registry, cmd, sk, wk, hidden_norm, k_buf,
-                cfg.hidden_dim, kv_dim, scale_k, "gemv_k");
+            self.mark_written(&[q_buf]);
         }
-        if let Some(s) = sb_v {
-            self.run_gemv_fp8_dispatch(dev, cmd, wv, s, hidden_norm, v_buf,
-                cfg.hidden_dim, kv_dim,
-                layer_weight_scale_block(model, layer, "attn_v.weight"), "gemv_v");
-        } else {
-            self.run_gemv(dev, registry, cmd, sv, wv, hidden_norm, v_buf,
-                cfg.hidden_dim, kv_dim, scale_v, "gemv_v");
-        }
-        self.mark_written(&[q_buf, k_buf, v_buf]);
 
         // Sprint 25 — Q/K/V bias-add (Qwen2 attention biases). MUST run
         // before RoPE / QK-norm: q_proj.bias is conceptually part of
@@ -2550,19 +2569,25 @@ impl Forward {
         let q_bias = layer_weight_opt(model, layer, "attn_q.bias");
         let k_bias = layer_weight_opt(model, layer, "attn_k.bias");
         let v_bias = layer_weight_opt(model, layer, "attn_v.bias");
-        if q_bias.is_some() || k_bias.is_some() || v_bias.is_some() {
+        if q_bias.is_some() || (layer_owns_kv && (k_bias.is_some() || v_bias.is_some())) {
             // GEMV → bias-add hazard: bias reads what GEMV just wrote.
             self.maybe_compute_barrier(dev, cmd, &[q_buf, k_buf, v_buf]);
             if let Some(b) = q_bias {
                 self.run_bias_add(dev, registry, cmd, q_buf, b, q_buf, q_dim, 1, "bias_q");
             }
-            if let Some(b) = k_bias {
-                self.run_bias_add(dev, registry, cmd, k_buf, b, k_buf, kv_dim, 1, "bias_k");
+            if layer_owns_kv {
+                if let Some(b) = k_bias {
+                    self.run_bias_add(dev, registry, cmd, k_buf, b, k_buf, kv_dim, 1, "bias_k");
+                }
+                if let Some(b) = v_bias {
+                    self.run_bias_add(dev, registry, cmd, v_buf, b, v_buf, kv_dim, 1, "bias_v");
+                }
             }
-            if let Some(b) = v_bias {
-                self.run_bias_add(dev, registry, cmd, v_buf, b, v_buf, kv_dim, 1, "bias_v");
+            if layer_owns_kv {
+                self.mark_written(&[q_buf, k_buf, v_buf]);
+            } else {
+                self.mark_written(&[q_buf]);
             }
-            self.mark_written(&[q_buf, k_buf, v_buf]);
         }
 
         // Next: (c) reads q_buf, k_buf (or (d) RoPE if no qk_norm).
@@ -2577,30 +2602,55 @@ impl Forward {
         //
         // Models without `has_qk_norm` keep the original
         // separate-rope-only path (no norm step to fuse with).
+        //
+        // Sprint 43D-2 — pass per-layer (rotary_dim, freq_base,
+        // theta_scale) so Gemma-4 sliding (rotary=256, θ=10 000) and
+        // Gemma-4 full (rotary=128, θ=1 000 000, p-RoPE) use the
+        // correct rotation. SubscribesXxx layers skip the K-rotate
+        // (their k_buf is stale anyway — they read from the publisher's
+        // already-rotated KV slab).
         if cfg.has_qk_norm {
             let wqn = layer_weight(model, layer, "attn_q_norm.weight");
-            let wkn = layer_weight(model, layer, "attn_k_norm.weight");
             self.run_rms_norm_mul_rope(
                 dev, registry, cmd,
                 q_buf, wqn, q_buf,
-                head_dim, cfg.n_heads, /* m = */ 1,
+                head_dim, rope_rotary_dim, rope_freq_base, rope_theta_scale,
+                cfg.n_heads, /* m = */ 1,
                 cfg.rms_norm_eps, "rms_norm_mul_rope_q",
             );
-            self.run_rms_norm_mul_rope(
-                dev, registry, cmd,
-                k_buf, wkn, k_buf,
-                head_dim, cfg.n_kv_heads, /* m = */ 1,
-                cfg.rms_norm_eps, "rms_norm_mul_rope_k",
-            );
+            if layer_owns_kv {
+                let wkn = layer_weight(model, layer, "attn_k_norm.weight");
+                self.run_rms_norm_mul_rope(
+                    dev, registry, cmd,
+                    k_buf, wkn, k_buf,
+                    head_dim, rope_rotary_dim, rope_freq_base, rope_theta_scale,
+                    cfg.n_kv_heads, /* m = */ 1,
+                    cfg.rms_norm_eps, "rms_norm_mul_rope_k",
+                );
+            }
         } else {
-            self.run_rope_neox(dev, registry, cmd, q_buf, q_buf,
-                               head_dim, cfg.n_heads, position, "rope_q");
-            self.run_rope_neox(dev, registry, cmd, k_buf, k_buf,
-                               head_dim, cfg.n_kv_heads, position, "rope_k");
+            self.run_rope_neox_with_pos_offset(
+                dev, registry, cmd, q_buf, q_buf,
+                head_dim, rope_rotary_dim, rope_freq_base, rope_theta_scale,
+                cfg.n_heads, position, /* pos_buf_offset = */ 0, "rope_q",
+            );
+            if layer_owns_kv {
+                self.run_rope_neox_with_pos_offset(
+                    dev, registry, cmd, k_buf, k_buf,
+                    head_dim, rope_rotary_dim, rope_freq_base, rope_theta_scale,
+                    cfg.n_kv_heads, position, /* pos_buf_offset = */ 0, "rope_k",
+                );
+            }
         }
-        self.mark_written(&[q_buf, k_buf]);
+        if layer_owns_kv {
+            self.mark_written(&[q_buf, k_buf]);
+        } else {
+            self.mark_written(&[q_buf]);
+        }
         // Next: (e) KV-write reads k_buf, v_buf.
-        self.maybe_compute_barrier(dev, cmd, &[k_buf, v_buf]);
+        if layer_owns_kv {
+            self.maybe_compute_barrier(dev, cmd, &[k_buf, v_buf]);
+        }
 
         // (e) KV-cache write — pos-major.
         // Sprint 9d.3: when the cache is FP16-allocated, dispatch the
@@ -2611,54 +2661,69 @@ impl Forward {
         // `cfg.n_kv_heads * cfg.head_dim` (uniform max=512). The upper
         // half is unused; subsequent attention reads honour the per-
         // layer head_dim push-constant and never touch the unused tail.
-        let row_bytes = self.kv_cache.row_bytes(layer);
-        let dst_off = self.kv_cache.pos_offset_bytes(layer, position);
-        let k_src = self.cur().k_buf.handle;
-        let v_src = self.cur().v_buf.handle;
-        let k_dst = self.kv_cache.k_buffer.handle;
-        let v_dst = self.kv_cache.v_buffer.handle;
-        if self.kv_cache.is_fp8() {
-            let kv_elements = kv_dim;
-            self.run_kv_store_fp8(
-                dev, registry, cmd, k_src, k_dst, kv_elements, dst_off, "kv_store_fp8_k",
-            );
-            self.run_kv_store_fp8(
-                dev, registry, cmd, v_src, v_dst, kv_elements, dst_off, "kv_store_fp8_v",
-            );
-        } else if self.kv_cache.is_fp16() {
-            let kv_elements = kv_dim;
-            self.run_kv_copy_fp16(
-                dev, registry, cmd, k_src, k_dst, kv_elements, dst_off, "kv_copy_fp16_k",
-            );
-            self.run_kv_copy_fp16(
-                dev, registry, cmd, v_src, v_dst, kv_elements, dst_off, "kv_copy_fp16_v",
-            );
+        // Sprint 43D-2 — Gemma-4 SubscribesXxx layers skip the cache
+        // write entirely (they have no own K/V to publish; the
+        // attention dispatch reads the publisher's slab via
+        // `gemma4_kv_read_layer`).
+        if layer_owns_kv {
+            let row_bytes = self.kv_cache.row_bytes(layer);
+            let dst_off = self.kv_cache.pos_offset_bytes(layer, position);
+            let k_src = self.cur().k_buf.handle;
+            let v_src = self.cur().v_buf.handle;
+            let k_dst = self.kv_cache.k_buffer.handle;
+            let v_dst = self.kv_cache.v_buffer.handle;
+            if self.kv_cache.is_fp8() {
+                let kv_elements = kv_dim;
+                self.run_kv_store_fp8(
+                    dev, registry, cmd, k_src, k_dst, kv_elements, dst_off, "kv_store_fp8_k",
+                );
+                self.run_kv_store_fp8(
+                    dev, registry, cmd, v_src, v_dst, kv_elements, dst_off, "kv_store_fp8_v",
+                );
+            } else if self.kv_cache.is_fp16() {
+                let kv_elements = kv_dim;
+                self.run_kv_copy_fp16(
+                    dev, registry, cmd, k_src, k_dst, kv_elements, dst_off, "kv_copy_fp16_k",
+                );
+                self.run_kv_copy_fp16(
+                    dev, registry, cmd, v_src, v_dst, kv_elements, dst_off, "kv_copy_fp16_v",
+                );
+            } else {
+                let copy = vk::BufferCopy::default()
+                    .src_offset(0).dst_offset(dst_off).size(row_bytes);
+                self.profile("kv_write", dev, cmd, |dev, cmd| unsafe {
+                    dev.device.cmd_copy_buffer(cmd, k_src, k_dst, std::slice::from_ref(&copy));
+                    dev.device.cmd_copy_buffer(cmd, v_src, v_dst, std::slice::from_ref(&copy));
+                });
+            }
+            // (e) inline kv_bar — TRANSFER+COMPUTE → COMPUTE. Always
+            // emitted (not elided): it's the only barrier with a TRANSFER
+            // stage in this layer, the elision tracker only governs pure
+            // compute_barrier sites. After this barrier the dirty set
+            // also clears (a global VkMemoryBarrier covers everything).
+            let kv_bar = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            unsafe {
+                dev.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&kv_bar), &[], &[],
+                );
+            }
+            self.pending_writes.clear();
         } else {
-            let copy = vk::BufferCopy::default()
-                .src_offset(0).dst_offset(dst_off).size(row_bytes);
-            self.profile("kv_write", dev, cmd, |dev, cmd| unsafe {
-                dev.device.cmd_copy_buffer(cmd, k_src, k_dst, std::slice::from_ref(&copy));
-                dev.device.cmd_copy_buffer(cmd, v_src, v_dst, std::slice::from_ref(&copy));
-            });
+            // Subscribes layer: emit a pure compute→compute barrier so
+            // that the upcoming attention dispatch sees Q-RoPE writes
+            // committed (the publisher's KV slab was written in an
+            // earlier layer's KV-write block — that path emitted its
+            // own kv_bar at the time). The publisher's slab is stable
+            // by the time we reach this layer, so no fresh KV barrier
+            // is needed; we only need a barrier for q_buf.
+            self.maybe_compute_barrier(dev, cmd, &[q_buf]);
         }
-        // (e) inline kv_bar — TRANSFER+COMPUTE → COMPUTE. Always
-        // emitted (not elided): it's the only barrier with a TRANSFER
-        // stage in this layer, the elision tracker only governs pure
-        // compute_barrier sites. After this barrier the dirty set
-        // also clears (a global VkMemoryBarrier covers everything).
-        let kv_bar = vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ);
-        unsafe {
-            dev.device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                std::slice::from_ref(&kv_bar), &[], &[],
-            );
-        }
-        self.pending_writes.clear();
 
         // (f) Attention.
         self.run_scalar_attn(dev, registry, cmd, layer, position);
@@ -2764,14 +2829,29 @@ impl Forward {
         // Next: (k+l) swiglu reads gate_buf + up_buf.
         self.maybe_compute_barrier(dev, cmd, &[gate_buf, up_buf]);
 
-        // (k+l) Fused SwiGLU: ffn_hidden = silu(gate) * up. v0.2
-        // Sprint 9a folds the previous silu(gate→gate) + barrier +
-        // mul(gate, up→ffn_hidden) into one dispatch.
-        self.run_swiglu(
-            dev, registry, cmd,
-            gate_buf, up_buf, ffn_hidden,
-            ffn_dim, "swiglu",
-        );
+        // (k+l) Fused activation-GLU: ffn_hidden = act(gate) * up.
+        // v0.2 Sprint 9a folds silu(gate→gate) + mul(gate, up→ffn_hidden)
+        // into one dispatch. Sprint 43D-2 — Gemma-4 substitutes the
+        // pytorch-tanh GELU for SiLU (HF `gelu_pytorch_tanh`); same
+        // dispatch shape + bindings, only the activation differs.
+        let use_gelu_pytorch_tanh = cfg
+            .gemma4
+            .as_ref()
+            .map(|g| g.hidden_activation == "gelu_pytorch_tanh")
+            .unwrap_or(false);
+        if use_gelu_pytorch_tanh {
+            self.run_gelu_pytorch_tanh_glu(
+                dev, registry, cmd,
+                gate_buf, up_buf, ffn_hidden,
+                ffn_dim, "gelu_pt_glu",
+            );
+        } else {
+            self.run_swiglu(
+                dev, registry, cmd,
+                gate_buf, up_buf, ffn_hidden,
+                ffn_dim, "swiglu",
+            );
+        }
         self.mark_written(&[ffn_hidden]);
         // Next: (m) FFN down reads ffn_hidden.
         self.maybe_compute_barrier(dev, cmd, &[ffn_hidden]);
@@ -3947,11 +4027,14 @@ impl Forward {
         position: u32,
         label: &str,
     ) {
+        let theta_scale = self.rope_theta_scale;
+        let freq_base = self.config.rope_freq_base;
         // Bind rope_pos_buf at slot 0 (the legacy single-position
         // path used by forward_token). prefill_batch uses
         // run_rope_neox_with_pos_offset to read its own slot.
         self.run_rope_neox_with_pos_offset(
-            dev, registry, cmd, input, output, head_dim, n_rows,
+            dev, registry, cmd, input, output, head_dim, head_dim,
+            freq_base, theta_scale, n_rows,
             position, /* pos_buf_offset = */ 0, label,
         );
     }
@@ -3959,6 +4042,14 @@ impl Forward {
     /// Variant of `run_rope_neox` that binds `rope_pos_buf` starting
     /// at `pos_buf_offset` bytes — required by `prefill_batch` to give
     /// each per-token RoPE dispatch its own pre-staged position slot.
+    ///
+    /// Sprint 43D-2 — `rotary_dim`, `freq_base`, `theta_scale` lifted to
+    /// per-call so Gemma-4's per-layer p-RoPE (rotary_dim = 0.25×head_dim
+    /// for full layers, full head_dim for sliding layers) and per-layer
+    /// θ (10 000 sliding / 1 000 000 full) can be threaded through. For
+    /// non-Gemma-4 callers (`rotary_dim == head_dim`, `freq_base ==
+    /// cfg.rope_freq_base`, `theta_scale == self.rope_theta_scale`)
+    /// the math is bit-identical to pre-43D-2.
     #[allow(clippy::too_many_arguments)]
     fn run_rope_neox_with_pos_offset(
         &mut self,
@@ -3968,6 +4059,9 @@ impl Forward {
         input: vk::Buffer,
         output: vk::Buffer,
         head_dim: u32,
+        rotary_dim: u32,
+        freq_base: f32,
+        theta_scale: f32,
         n_rows: u32,
         position: u32,
         pos_buf_offset: u64,
@@ -3996,13 +4090,13 @@ impl Forward {
         let pc = RopePushConstants {
             rope_mode, // 0 = NORM, 2 = NEOX
             nrows: n_rows,
-            n_dims: head_dim,
+            n_dims: rotary_dim,
             freq_scale: 1.0,
-            freq_base: self.config.rope_freq_base,
+            freq_base,
             ext_factor: 0.0,
             attn_factor: 1.0,
             corr_dims: [0.0, 0.0],
-            theta_scale: self.rope_theta_scale,
+            theta_scale,
             has_ff: 0,
             sections: [0; 4],
             is_imrope: 0,
@@ -4041,6 +4135,13 @@ impl Forward {
         position: u32,
     ) {
         let cfg = self.config.clone();
+        // Sprint 43D-2 — KV-share for Gemma-4: read K/V from the
+        // publisher's slab when this layer subscribes; for non-shared
+        // layers `kv_layer == layer` so the slab math is unchanged.
+        let kv_layer = gemma4_kv_read_layer(&cfg, layer);
+        // Sprint 43D-2 — sliding-window-attention lower bound. 0 for
+        // every non-Gemma-4 / non-sliding layer.
+        let kv_start = gemma4_kv_start(&cfg, layer, position);
         // Sprint 43D-1 — heterogeneous KV-cache layout. The shader's
         // `head_dim` push-const drives both the per-head loop bound and
         // the per-position stride; with the cumulative offset table in
@@ -4064,7 +4165,9 @@ impl Forward {
         let seq_len = position + 1;
         let n_tiles = (seq_len + FA_TILE - 1) / FA_TILE;
         if n_tiles >= MULTI_WG_MIN_TILES {
-            self.run_flash_attn_split_reduce(dev, registry, cmd, layer, position, n_tiles);
+            self.run_flash_attn_split_reduce(
+                dev, registry, cmd, layer, position, n_tiles, kv_layer, kv_start,
+            );
             return;
         }
         // Phase 4B: forward path now dispatches the online-softmax
@@ -4078,10 +4181,10 @@ impl Forward {
         } else {
             ShaderId::FlashAttn
         });
-        let layer_off = self.kv_cache.layer_offset_bytes(layer);
+        let layer_off = self.kv_cache.layer_offset_bytes(kv_layer);
         // v0.2 Sprint 9d.1 — KvCache::layer_size_bytes scales by
         // the configured KV element size (FP32 = 4 B by default).
-        let layer_size = self.kv_cache.layer_size_bytes(layer);
+        let layer_size = self.kv_cache.layer_size_bytes(kv_layer);
         let set = self.alloc_or_get_set(
             dev, kernel.descriptor_set_layout,
             &[
@@ -4098,6 +4201,7 @@ impl Forward {
             seq_len: position + 1,
             max_seq: self.kv_cache.config.max_seq_len,
             scale: attn_scale_layer,
+            kv_start,
         };
         let layout = kernel.pipeline_layout;
         let pipeline = kernel.pipeline;
@@ -4127,6 +4231,7 @@ impl Forward {
     /// `i3 / i2 / i1` decomposition; we just feed it the right
     /// strides.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn run_rope_batch(
         &mut self,
         dev: &VulkanDevice,
@@ -4135,6 +4240,9 @@ impl Forward {
         input: vk::Buffer,
         output: vk::Buffer,
         head_dim: u32,
+        rotary_dim: u32,
+        freq_base: f32,
+        theta_scale: f32,
         heads_per_token: u32,
         m: u32,
         label: &str,
@@ -4161,13 +4269,13 @@ impl Forward {
         let pc = RopePushConstants {
             rope_mode,
             nrows,
-            n_dims: head_dim,
+            n_dims: rotary_dim,
             freq_scale: 1.0,
-            freq_base: self.config.rope_freq_base,
+            freq_base,
             ext_factor: 0.0,
             attn_factor: 1.0,
             corr_dims: [0.0, 0.0],
-            theta_scale: self.rope_theta_scale,
+            theta_scale,
             has_ff: 0,
             sections: [0; 4],
             is_imrope: 0,
@@ -4406,6 +4514,7 @@ impl Forward {
     /// correction.  Inserts the required compute→compute barrier
     /// between the two passes (the reducer reads the worker's writes
     /// out of `fa_scratch_*`).
+    #[allow(clippy::too_many_arguments)]
     fn run_flash_attn_split_reduce(
         &mut self,
         dev: &VulkanDevice,
@@ -4414,12 +4523,14 @@ impl Forward {
         layer: u32,
         position: u32,
         n_tiles: u32,
+        kv_layer: u32,
+        kv_start: u32,
     ) {
         let cfg = self.config.clone();
-        let layer_off = self.kv_cache.layer_offset_bytes(layer);
+        let layer_off = self.kv_cache.layer_offset_bytes(kv_layer);
         // v0.2 Sprint 9d.1 — KvCache::layer_size_bytes scales by
         // the configured KV element size (FP32 = 4 B by default).
-        let layer_size = self.kv_cache.layer_size_bytes(layer);
+        let layer_size = self.kv_cache.layer_size_bytes(kv_layer);
         // Sprint 43D-1 — per-layer head_dim for Gemma-4 heterogeneous.
         let head_dim_layer = self.kv_cache.head_dim_for(layer);
         let attn_scale_layer = if head_dim_layer != cfg.head_dim {
@@ -4459,6 +4570,7 @@ impl Forward {
             max_seq: self.kv_cache.config.max_seq_len,
             scale: attn_scale_layer,
             n_tiles,
+            kv_start,
         };
         let split_layout = split_kernel.pipeline_layout;
         let split_pipeline = split_kernel.pipeline;
@@ -4776,6 +4888,9 @@ impl Forward {
         weight: vk::Buffer,
         qk_out: vk::Buffer,
         head_dim: u32,
+        rotary_dim: u32,
+        freq_base: f32,
+        theta_scale: f32,
         heads_per_token: u32,
         m: u32,
         eps: f32,
@@ -4837,13 +4952,13 @@ impl Forward {
             rope: RopePushConstants {
                 rope_mode,
                 nrows: heads_per_token * m,
-                n_dims: head_dim,
+                n_dims: rotary_dim,
                 freq_scale: 1.0,
-                freq_base: self.config.rope_freq_base,
+                freq_base,
                 ext_factor: 0.0,
                 attn_factor: 1.0,
                 corr_dims: [0.0, 0.0],
-                theta_scale: self.rope_theta_scale,
+                theta_scale,
                 has_ff: 0,
                 sections: [0; 4],
                 is_imrope: 0,
@@ -4899,6 +5014,42 @@ impl Forward {
         );
         let pc = SwigluPushConstants { n };
         // local_size_x = 256 in swiglu.comp, 1 element per thread.
+        let dispatch_x = (n + 255) / 256;
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
+        });
+    }
+
+    /// Sprint 43D-2 — GELU(pytorch_tanh)-GLU dispatch (Gemma-4 FFN).
+    /// Same shape / bindings / push-block as SwiGLU; the only difference
+    /// is the activation on `gate` (pytorch-tanh GELU vs SiLU).
+    #[allow(clippy::too_many_arguments)]
+    fn run_gelu_pytorch_tanh_glu(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        gate: vk::Buffer,
+        up: vk::Buffer,
+        out: vk::Buffer,
+        n: u32,
+        label: &str,
+    ) {
+        let kernel = registry.get(ShaderId::GeluPytorchTanhGlu);
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[(0, gate, 0, 0), (1, up, 0, 0), (2, out, 0, 0)],
+        );
+        let pc = SwigluPushConstants { n };
         let dispatch_x = (n + 255) / 256;
         let layout = kernel.pipeline_layout;
         let pipeline = kernel.pipeline;
@@ -5575,6 +5726,11 @@ impl Forward {
         // Sprint 43C — per-layer head_dim / ffn_dim for Gemma-4. Falls
         // back to cfg uniform on every other architecture.
         let (head_dim, ffn, _rope_theta, _rotary_dim) = layer_dims(&cfg, layer);
+        // Sprint 43D-2 — per-layer RoPE bundle. Non-Gemma-4 stacks get
+        // (head_dim, head_dim, cfg.rope_freq_base, self.rope_theta_scale)
+        // — bit-identical to pre-43D-2.
+        let (_rope_head_dim, rope_rotary_dim, rope_freq_base, rope_theta_scale) =
+            rope_params_for_layer(&cfg, self.rope_theta_scale, layer);
         let kv_dim = cfg.n_kv_heads * head_dim;
         let q_dim = cfg.n_heads * head_dim;
         let kv_bytes = (kv_dim as u64) * 4;
@@ -5892,13 +6048,15 @@ impl Forward {
                 self.run_rms_norm_mul_rope(
                     dev, registry, cmd,
                     self.batch_q.handle, wqn, self.batch_q.handle,
-                    head_dim, cfg.n_heads, seq_len,
+                    head_dim, rope_rotary_dim, rope_freq_base, rope_theta_scale,
+                    cfg.n_heads, seq_len,
                     cfg.rms_norm_eps, "rms_norm_mul_rope_q_b",
                 );
                 self.run_rms_norm_mul_rope(
                     dev, registry, cmd,
                     self.batch_k.handle, wkn, self.batch_k.handle,
-                    head_dim, cfg.n_kv_heads, seq_len,
+                    head_dim, rope_rotary_dim, rope_freq_base, rope_theta_scale,
+                    cfg.n_kv_heads, seq_len,
                     cfg.rms_norm_eps, "rms_norm_mul_rope_k_b",
                 );
             } else {
@@ -5906,13 +6064,15 @@ impl Forward {
                 self.run_rope_batch(
                     dev, registry, cmd,
                     self.batch_q.handle, self.batch_q.handle,
-                    head_dim, cfg.n_heads, seq_len,
+                    head_dim, rope_rotary_dim, rope_freq_base, rope_theta_scale,
+                    cfg.n_heads, seq_len,
                     "rope_q_batch",
                 );
                 self.run_rope_batch(
                     dev, registry, cmd,
                     self.batch_k.handle, self.batch_k.handle,
-                    head_dim, cfg.n_kv_heads, seq_len,
+                    head_dim, rope_rotary_dim, rope_freq_base, rope_theta_scale,
+                    cfg.n_kv_heads, seq_len,
                     "rope_k_batch",
                 );
             }
@@ -6032,11 +6192,13 @@ impl Forward {
             // RoPE — each dispatch reads its OWN position slot.
             self.run_rope_neox_with_pos_offset(
                 dev, registry, cmd, self.cur().q_buf.handle, self.cur().q_buf.handle,
-                head_dim, cfg.n_heads, pos, rope_pos_offset, "rope_q_b",
+                head_dim, rope_rotary_dim, rope_freq_base, rope_theta_scale,
+                cfg.n_heads, pos, rope_pos_offset, "rope_q_b",
             );
             self.run_rope_neox_with_pos_offset(
                 dev, registry, cmd, self.cur().k_buf.handle, self.cur().k_buf.handle,
-                head_dim, cfg.n_kv_heads, pos, rope_pos_offset, "rope_k_b",
+                head_dim, rope_rotary_dim, rope_freq_base, rope_theta_scale,
+                cfg.n_kv_heads, pos, rope_pos_offset, "rope_k_b",
             );
             compute_barrier(dev, cmd);
             // KV-cache write at this token's position. Sprint 9d.3 —
@@ -6390,16 +6552,30 @@ impl Forward {
         stage_dump(self, cmd, self.batch_gate.handle, 10);
         stage_dump(self, cmd, self.batch_up.handle, 11);
 
-        // ---- (j) Fused SwiGLU: batch_ffn_hidden = silu(gate) * up. ----
-        // v0.2 Sprint 9a — replaces the silu(gate→gate) + barrier +
-        // mul(gate, up→ffn_hidden) pair with a single dispatch.
-        self.run_swiglu(
-            dev, registry, cmd,
-            self.batch_gate.handle, self.batch_up.handle, self.batch_ffn_hidden.handle,
-            seq_len * ffn, "swiglu_b",
-        );
+        // ---- (j) Fused activation-GLU: batch_ffn_hidden = act(gate) * up.
+        // v0.2 Sprint 9a — replaces silu(gate→gate) + mul(gate, up→
+        // ffn_hidden) with a single dispatch. Sprint 43D-2 — Gemma-4
+        // substitutes pytorch-tanh GELU (HF `gelu_pytorch_tanh`).
+        let use_gelu_pytorch_tanh = cfg
+            .gemma4
+            .as_ref()
+            .map(|g| g.hidden_activation == "gelu_pytorch_tanh")
+            .unwrap_or(false);
+        if use_gelu_pytorch_tanh {
+            self.run_gelu_pytorch_tanh_glu(
+                dev, registry, cmd,
+                self.batch_gate.handle, self.batch_up.handle, self.batch_ffn_hidden.handle,
+                seq_len * ffn, "gelu_pt_glu_b",
+            );
+        } else {
+            self.run_swiglu(
+                dev, registry, cmd,
+                self.batch_gate.handle, self.batch_up.handle, self.batch_ffn_hidden.handle,
+                seq_len * ffn, "swiglu_b",
+            );
+        }
         compute_barrier(dev, cmd);
-        // Sprint 43F — Stage 12: post-SwiGLU.
+        // Sprint 43F — Stage 12: post-(Gemma-4-correct) GLU activation.
         stage_dump(self, cmd, self.batch_ffn_hidden.handle, 12);
 
         // ---- (k) Quantize ffn_hidden + Down-proj GEMM (Q4_K). ----
@@ -6731,6 +6907,104 @@ fn layer_dims(cfg: &ModelConfig, layer: u32) -> (u32, u32, f32, u32) {
     } else {
         (cfg.head_dim, cfg.ffn_dim, cfg.rope_freq_base, cfg.head_dim)
     }
+}
+
+/// Sprint 43D-2 — per-layer RoPE parameters. Returns
+/// `(head_dim_geom, rotary_dim, freq_base, theta_scale)` where:
+/// - `head_dim_geom` is the physical row stride (256 sliding / 512 full
+///   for Gemma-4 E2B; uniform `cfg.head_dim` otherwise);
+/// - `rotary_dim` is the rotation extent (= head_dim_geom × p_factor for
+///   p-RoPE full layers; 0.25 × 512 = 128 for E2B full layers);
+/// - `freq_base` is the per-layer θ (10 000 sliding / 1 000 000 full
+///   for Gemma-4 E2B; `cfg.rope_freq_base` otherwise);
+/// - `theta_scale` = `(1/freq_base)^(2/rotary_dim)`, i.e. the RoPE
+///   per-pair frequency scale matching `freq_base` and `rotary_dim`.
+///
+/// Falls back to the uniform `(head_dim, head_dim, rope_freq_base,
+/// rope_theta_scale)` for non-Gemma-4 stacks. Bit-identical math on
+/// the existing Llama / Qwen path.
+fn rope_params_for_layer(
+    cfg: &ModelConfig,
+    rope_theta_scale_default: f32,
+    layer: u32,
+) -> (u32, u32, f32, f32) {
+    if let Some(g) = cfg.gemma4.as_ref() {
+        let s = &g.layers[layer as usize];
+        let rotary_dim = match s.rope_partial_factor {
+            Some(f) => ((s.head_dim as f32) * f).round() as u32,
+            None => s.head_dim,
+        };
+        let theta_scale = (1.0_f32 / s.rope_theta).powf(2.0 / rotary_dim as f32);
+        (s.head_dim, rotary_dim, s.rope_theta, theta_scale)
+    } else {
+        (
+            cfg.head_dim,
+            cfg.head_dim,
+            cfg.rope_freq_base,
+            rope_theta_scale_default,
+        )
+    }
+}
+
+/// Sprint 43D-2 — KV-source mapping for Gemma-4 cross-layer KV-sharing.
+/// Returns the layer index whose KV-cache slab this layer should read
+/// from. For "Own" / "OwnAndPublishesSliding" / "OwnAndPublishesFull"
+/// layers this is `layer` itself; for "SubscribesSliding" /
+/// "SubscribesFull" layers it's the publisher's layer index (the first
+/// layer with the matching `OwnAndPublishesXxx` source). Non-Gemma-4
+/// stacks always return `layer`.
+fn gemma4_kv_read_layer(cfg: &ModelConfig, layer: u32) -> u32 {
+    let g = match cfg.gemma4.as_ref() {
+        Some(g) => g,
+        None => return layer,
+    };
+    let s = &g.layers[layer as usize];
+    let want_publish = match s.kv_source {
+        Gemma4KvSource::Own
+        | Gemma4KvSource::OwnAndPublishesSliding
+        | Gemma4KvSource::OwnAndPublishesFull => return layer,
+        Gemma4KvSource::SubscribesSliding => Gemma4KvSource::OwnAndPublishesSliding,
+        Gemma4KvSource::SubscribesFull => Gemma4KvSource::OwnAndPublishesFull,
+    };
+    g.layers
+        .iter()
+        .enumerate()
+        .find(|(_, ls)| ls.kv_source == want_publish)
+        .map(|(i, _)| i as u32)
+        .unwrap_or(layer)
+}
+
+/// Sprint 43D-2 — does this layer compute and write its own K/V
+/// projections, or does it subscribe to a published slab from an
+/// earlier layer? Returns `true` for non-Gemma-4 stacks (they always
+/// own their KV) and for Gemma-4 layers in `Own` /
+/// `OwnAndPublishesSliding` / `OwnAndPublishesFull`.
+fn gemma4_layer_owns_kv(cfg: &ModelConfig, layer: u32) -> bool {
+    let g = match cfg.gemma4.as_ref() {
+        Some(g) => g,
+        None => return true,
+    };
+    !matches!(
+        g.layers[layer as usize].kv_source,
+        Gemma4KvSource::SubscribesSliding | Gemma4KvSource::SubscribesFull
+    )
+}
+
+/// Sprint 43D-2 — sliding-window-attention lower bound. For Gemma-4
+/// sliding layers returns `max(0, position+1 - sliding_window)`; for
+/// every other layer (Gemma-4 full layers AND non-Gemma-4 stacks)
+/// returns 0 (= attend to the full causal history).
+fn gemma4_kv_start(cfg: &ModelConfig, layer: u32, position: u32) -> u32 {
+    let g = match cfg.gemma4.as_ref() {
+        Some(g) => g,
+        None => return 0,
+    };
+    let s = &g.layers[layer as usize];
+    if !matches!(s.kind, Gemma4LayerKind::Sliding) {
+        return 0;
+    }
+    let seq_len = position + 1;
+    seq_len.saturating_sub(g.sliding_window)
 }
 
 /// Sprint 43D-1 diagnose helper — env-gated logit-distribution dump.

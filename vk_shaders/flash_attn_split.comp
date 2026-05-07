@@ -60,6 +60,12 @@ layout (binding = 3) writeonly buffer ScratchOut { float scratch_out[]; };
 layout (binding = 4) writeonly buffer ScratchMax { float scratch_max[]; };
 layout (binding = 5) writeonly buffer ScratchSum { float scratch_sum[]; };
 
+// Sprint 43D-2 — added `kv_start` (sliding-window-attention support).
+// Tiles entirely below `kv_start` write all-zero partials so the
+// reducer's online-softmax merge ignores them. Within a partially-
+// covered boundary tile, lanes with `t < kv_start` mask their score to
+// `-inf` so they contribute 0 to softmax. For non-sliding layers the
+// host passes `kv_start = 0` and the math is bit-identical to pre-43D-2.
 layout (push_constant) uniform Params {
     uint  n_heads;
     uint  n_kv_heads;
@@ -68,6 +74,7 @@ layout (push_constant) uniform Params {
     uint  max_seq;     // unused at runtime, kept for binary compat
     float scale;
     uint  n_tiles;     // total tile count = ceil(seq_len / TILE)
+    uint  kv_start;    // Sprint 43D-2 — sliding-window lower bound
 } p;
 
 shared float scores_lds[TILE];
@@ -89,7 +96,10 @@ void main() {
 
     uint tile_base = tile_idx * TILE;
     uint t         = tile_base + tid;
-    bool valid     = t < p.seq_len;
+    // Sprint 43D-2 — sliding-window lower bound. Positions below
+    // kv_start are masked out (score -inf → pscore 0). Tiles whose
+    // entire range is below kv_start contribute 0 partials.
+    bool valid     = (t < p.seq_len) && (t >= p.kv_start);
 
     // ---- Tile-local score = Q · K[t] · scale ----
     float score = -1e30;
