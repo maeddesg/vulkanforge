@@ -682,12 +682,56 @@ impl Forward {
                 let bytes = self.hidden_staging.read_bytes()?;
                 bytemuck::cast_slice::<u8, f32>(&bytes[..hidden_n * 4]).to_vec()
             };
+            maybe_dump_hidden_staging("wait_and_read_logits/cpu_lm_head", &hidden);
             let mut logits = vec![0.0_f32; cpu_lm.vocab_size];
             cpu_lm.forward(&hidden, &mut logits);
             maybe_dump_logits("cpu_lm_head pre-softcap", &logits);
             apply_final_logit_softcap(&self.config, &mut logits);
             maybe_dump_logits("cpu_lm_head post-softcap", &logits);
             return Ok(logits);
+        }
+        // Sprint 43F Block A§3 — dump hidden_staging contents in
+        // wait_and_read_logits (the *actual* prod read path; the
+        // earlier `forward_token` dump was unreachable for the async
+        // pipeline). When VF_FINAL_NORM_DUMP=1 the recorded CB has
+        // copied hidden_norm into hidden_staging at the position
+        // BEFORE lm_head; reading it here shows what hidden_norm
+        // ACTUALLY held at that point of the GPU execution timeline.
+        if std::env::var("VF_FINAL_NORM_DUMP").is_ok()
+            || std::env::var("VF_LAYER_DUMP").is_ok()
+            || std::env::var("VF_BATCH_INPUT_DUMP").is_ok()
+        {
+            let h = self.config.hidden_dim as usize;
+            let bytes = self.hidden_staging.read_bytes()?;
+            let hidden: &[f32] = bytemuck::cast_slice::<u8, f32>(&bytes[..h * 4]);
+            maybe_dump_hidden_staging("wait_and_read_logits/gpu_lm_head", hidden);
+        }
+        if std::env::var("VF_BATCH_STEP_DUMP").as_deref() == Ok("ALL") {
+            // Sprint 43F sub-bisect — read 6 hidden_staging slots, one per
+            // recorded stage in dispatch_layer_batch for layer 0.
+            let h = self.config.hidden_dim as usize;
+            let bytes = self.hidden_staging.read_bytes()?;
+            let labels = [
+                "BATCH-L0-0 entry batch_residual",
+                "BATCH-L0-1 entry batch_norm (post-attn-norm pre-seed)",
+                "BATCH-L0-2 post Q/K/V GEMM (pre-RoPE batch_q)",
+                "BATCH-L0-3 post-RoPE batch_q",
+                "BATCH-L0-4 post-attention batch_attn_out",
+                "BATCH-L0-5 post-residual2 batch_residual (layer output)",
+                "BATCH-L0-6 post (f+g) batch_norm (= MLP input)",
+                "BATCH-L0-7 post (f+g) batch_residual (post attn-residual)",
+                "BATCH-L0-8 post-MLP batch_ffn_out (entry to (l) fork)",
+                "BATCH-L0-9 post (l) step1 = ffn_normed scratch",
+                "BATCH-L0-10 post-Gate GEMM (batch_gate)",
+                "BATCH-L0-11 post-Up GEMM (batch_up)",
+                "BATCH-L0-12 post-SwiGLU (batch_ffn_hidden)",
+            ];
+            for stage in 0..13 {
+                let off = stage * h * 4;
+                let slice: &[f32] =
+                    bytemuck::cast_slice::<u8, f32>(&bytes[off..off + h * 4]);
+                maybe_dump_hidden_staging(labels[stage], slice);
+            }
         }
         // Sprint 27 — read from host-mapped staging copy.
         let bytes = self.logits_staging.read_bytes()?;
@@ -843,8 +887,14 @@ impl Forward {
         // active; keeps the buffer-management code path uniform.
         let hidden_bytes_size: u64 =
             (config.hidden_dim as u64) * std::mem::size_of::<f32>() as u64;
+        // Sprint 43F — bump hidden_staging to 8× hidden_dim slots so
+        // VF_BATCH_STEP_DUMP can capture 6+ intra-layer stages of
+        // Layer 0's dispatch_layer_batch in a single run. The CPU
+        // lm_head path only reads the first hidden_dim slot — extra
+        // capacity is harmless when unused.
+        let hidden_staging_size = hidden_bytes_size * 16;
         let hidden_staging = mk_storage(
-            hidden_bytes_size,
+            hidden_staging_size,
             MemoryLocation::GpuToCpu,
             "hidden_staging",
         )?;
@@ -1755,6 +1805,9 @@ impl Forward {
         position: u32,
     ) -> Result<ForwardStats, Box<dyn std::error::Error>> {
         let started = std::time::Instant::now();
+        if std::env::var("VF_TRACE_FT").is_ok() {
+            eprintln!("[VF_TRACE_FT] forward_token entry pos={position}");
+        }
         if embedding.len() != self.config.hidden_dim as usize {
             return Err(format!(
                 "embedding length {} != hidden_dim {}",
@@ -2403,6 +2456,19 @@ impl Forward {
         output: vk::Buffer,
     ) {
         let cfg = self.config.clone();
+        // Sprint 43F Block A — log hidden_norm identity at first /
+        // last layer to detect slot-pointer drift.
+        if std::env::var("VF_BUF_ID").is_ok()
+            && (layer == 0 || layer == cfg.n_layers - 1)
+        {
+            let hn = self.cur().hidden_norm.handle;
+            let hn_size = self.cur().hidden_norm.size;
+            eprintln!(
+                "[BUF-ID] dispatch_layer entry layer={layer}: slot={} \
+                 input={:?} output={:?} hidden_norm={:?} hidden_norm_size={hn_size}",
+                self.current_slot, input, output, hn,
+            );
+        }
         // Sprint 43C — per-layer head_dim / ffn_dim / rope_theta /
         // rotary_dim. Falls back to cfg uniform for non-Gemma-4
         // architectures (Llama / Qwen / etc.) — same numbers as
@@ -2867,11 +2933,26 @@ impl Forward {
         let lm_scale = lm.weight_scale.unwrap_or(1.0);
 
         let hidden_norm = self.cur().hidden_norm.handle;
+        let hidden_norm_size = self.cur().hidden_norm.size;
+        if std::env::var("VF_BUF_ID").is_ok() {
+            eprintln!(
+                "[BUF-ID] dispatch_final entry: slot={} input={:?} hidden_norm={:?} \
+                 hidden_norm_size={} w_norm={:?}",
+                self.current_slot, input, hidden_norm, hidden_norm_size, w_norm,
+            );
+        }
         self.run_rms_norm(
             dev, registry, cmd,
             input, w_norm, hidden_norm,
             self.config.hidden_dim, 1, self.config.rms_norm_eps, "rms_norm_final",
         );
+        if std::env::var("VF_BUF_ID").is_ok() {
+            eprintln!(
+                "[BUF-ID] dispatch_final after rms_norm_final: hidden_norm={:?} \
+                 mark_written queued for hidden_norm",
+                hidden_norm,
+            );
+        }
         self.mark_written(&[hidden_norm]);
         // Sprint 43E-2 — force-barrier hidden_norm before lm_head /
         // diagnose ops below. The default `maybe_compute_barrier` path
@@ -2934,6 +3015,13 @@ impl Forward {
         // forward_token can dump it. Used to bisect whether NaN enters
         // in the final RMSNorm or in the lm_head GEMV.
         if std::env::var("VF_FINAL_NORM_DUMP").is_ok() {
+            if std::env::var("VF_BUF_ID").is_ok() {
+                eprintln!(
+                    "[BUF-ID] VF_FINAL_NORM_DUMP read: src(hidden_norm)={:?} \
+                     dst(hidden_staging)={:?} hidden_staging_size={}",
+                    hidden_norm, self.hidden_staging.handle, self.hidden_staging.size,
+                );
+            }
             let bytes = (self.config.hidden_dim as u64) * 4;
             let copy = vk::BufferCopy::default()
                 .src_offset(0).dst_offset(0).size(bytes);
@@ -2973,13 +3061,14 @@ impl Forward {
         } else if std::env::var("VF_LM_COPY_HIDDEN").is_ok() {
             // Sprint 43E-2 — replace lm_head GEMV with a literal
             // cmd_copy_buffer of hidden_norm into the *first*
-            // hidden_dim slots of logits_buf. Reading those back
-            // should yield the same bytes that VF_FINAL_NORM_DUMP
-            // showed. If logits[0..hidden_dim] are NaN here, the
-            // entire copy-and-readback chain is broken (not the GEMV).
-            // If logits[0..hidden_dim] are the same sane values that
-            // VF_FINAL_NORM_DUMP showed, the readback is fine and
-            // the bug is *inside the lm_head GEMV itself*.
+            // hidden_dim slots of logits_buf.
+            if std::env::var("VF_BUF_ID").is_ok() {
+                eprintln!(
+                    "[BUF-ID] VF_LM_COPY_HIDDEN: src(hidden_norm)={:?} \
+                     dst(logits_buf)={:?} logits_buf_size={}",
+                    hidden_norm, self.logits_buf.handle, self.logits_buf.size,
+                );
+            }
             let bytes = (self.config.hidden_dim as u64) * 4;
             let copy = vk::BufferCopy::default()
                 .src_offset(0).dst_offset(0).size(bytes);
@@ -2990,11 +3079,25 @@ impl Forward {
                 );
             }
         } else if use_harness {
+            if std::env::var("VF_BUF_ID").is_ok() {
+                eprintln!(
+                    "[BUF-ID] lm_head harness: w_lm={:?} hidden_norm={:?} logits_buf={:?}",
+                    w_lm, hidden_norm, self.logits_buf.handle,
+                );
+            }
             self.run_gemv_lmhead_dedicated(
                 dev, cmd, w_lm, hidden_norm, self.logits_buf.handle,
                 self.config.hidden_dim, self.config.vocab_size, lm_scale,
             );
         } else {
+            if std::env::var("VF_BUF_ID").is_ok() {
+                eprintln!(
+                    "[BUF-ID] lm_head GEMV: shader={:?} w_lm={:?} hidden_norm={:?} \
+                     logits_buf={:?} k={} m={} scale={:.4}",
+                    lm_shader, w_lm, hidden_norm, self.logits_buf.handle,
+                    self.config.hidden_dim, self.config.vocab_size, lm_scale,
+                );
+            }
             self.run_gemv(
                 dev, registry, cmd, lm_shader,
                 w_lm, hidden_norm, self.logits_buf.handle,
@@ -5478,6 +5581,68 @@ impl Forward {
         let q_bytes = (q_dim as u64) * 4;
         let ffn_bytes = (ffn as u64) * 4;
 
+        // Sprint 43F — VF_BATCH_INPUT_DUMP=N (single-buffer at slot 0)
+        // and VF_BATCH_STEP_DUMP=ALL (6-stage at slots 0..5) within
+        // dispatch_layer_batch for `layer == N` / `layer == 0`. Both
+        // share `hidden_staging` (sized 8× hidden_dim post-43F bump);
+        // the post-submit read in wait_and_read_logits + this run's
+        // sub-bisect script picks slots out by offset.
+        let batch_step_dump = std::env::var("VF_BATCH_STEP_DUMP").ok();
+        let do_step_dump = batch_step_dump.as_deref() == Some("ALL") && layer == 0;
+        let stage_dump = |this: &Self, c: vk::CommandBuffer, src: vk::Buffer, stage: u32| {
+            if !do_step_dump { return; }
+            let bytes = (this.config.hidden_dim as u64) * 4;
+            let dst_off = (stage as u64) * bytes;
+            let copy = vk::BufferCopy::default()
+                .src_offset(0).dst_offset(dst_off).size(bytes);
+            let bar = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            unsafe {
+                dev.device.cmd_pipeline_barrier(
+                    c,
+                    vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&bar), &[], &[],
+                );
+                dev.device.cmd_copy_buffer(
+                    c, src, this.hidden_staging.handle,
+                    std::slice::from_ref(&copy),
+                );
+            }
+        };
+        // Stage 0 — batch_residual at function entry (= initial residual
+        // for layer 0 = embedding). Already seeded by prefill_batch.
+        stage_dump(self, cmd, self.batch_residual.handle, 0);
+        // Stage 1 — batch_norm at function entry (= pre-seeded post-
+        // attn-norm output for layer 0 by prefill_batch).
+        stage_dump(self, cmd, self.batch_norm.handle, 1);
+
+        let batch_input_dump_layer: i32 = std::env::var("VF_BATCH_INPUT_DUMP")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(-1);
+        if batch_input_dump_layer == (layer as i32) {
+            let bytes = (hidden as u64) * 4;
+            let copy = vk::BufferCopy::default()
+                .src_offset(0).dst_offset(0).size(bytes);
+            let bar = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            unsafe {
+                dev.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&bar), &[], &[],
+                );
+                dev.device.cmd_copy_buffer(
+                    cmd, self.batch_residual.handle, self.hidden_staging.handle,
+                    std::slice::from_ref(&copy),
+                );
+            }
+        }
+
         // ---- (a) attn_norm: per-token RMSNorm into batch_norm. ----
         // Sprint 9b.2 — this used to dispatch run_rms_norm(batch_residual,
         // attn_norm.weight → batch_norm). Now `batch_norm` is pre-seeded
@@ -5684,6 +5849,9 @@ impl Forward {
             compute_barrier(dev, cmd);
         }
 
+        // Sprint 43F sub-bisect — Stage 2: post Q/K/V GEMM (pre-RoPE).
+        stage_dump(self, cmd, self.batch_q.handle, 2);
+
         // ---- (d) Q/K-norm + RoPE + KV-cache write ----
         //
         // Two paths:
@@ -5749,6 +5917,8 @@ impl Forward {
                 );
             }
             compute_barrier(dev, cmd);
+            // Sprint 43F sub-bisect — Stage 3: post-RoPE Q (pre-attn).
+            stage_dump(self, cmd, self.batch_q.handle, 3);
 
             // 3. Bulk KV-cache write. K and V are M contiguous rows of
             //    `[n_kv_heads, head_dim]` in batch_k / batch_v; the
@@ -5989,6 +6159,8 @@ impl Forward {
             }
             compute_barrier(dev, cmd);
         }
+        // Sprint 43F sub-bisect — Stage 4: post-attention.
+        stage_dump(self, cmd, self.batch_attn_out.handle, 4);
 
         // ---- (e) Output projection: GEMM(attn_out → o_batch). ----
         let wo = layer_weight(model, layer, "attn_output.weight");
@@ -6054,20 +6226,70 @@ impl Forward {
         }
         compute_barrier(dev, cmd);
 
-        // ---- (f+g) Fused residual-add + ffn_norm. v0.2 Sprint 9b
-        // folds add_res1_b (batch_residual += batch_o, in-place) with
-        // rms_norm_ffn_b (batch_norm = rms_norm(batch_residual) *
-        // ffn_norm.weight) into one dispatch. `sum_out` aliases `a`
-        // (both = batch_residual) for the in-place residual update.
-        let w_ffn_norm = layer_weight(model, layer, "ffn_norm.weight");
-        self.run_multi_add_rms(
-            dev, registry, cmd,
-            self.batch_residual.handle, self.batch_o.handle, w_ffn_norm,
-            /* sum_out  = */ self.batch_residual.handle,
-            /* norm_out = */ self.batch_norm.handle,
-            hidden, seq_len, cfg.rms_norm_eps, "add_rms_ffn_b",
-        );
-        compute_barrier(dev, cmd);
+        // ---- (f+g) Norms around the attention residual.
+        //
+        // Llama / Qwen layout (one norm):
+        //   batch_residual += batch_o
+        //   batch_norm     = rms_norm(batch_residual) * ffn_norm.weight
+        // — fused into multi_add_rms via Sprint 9b.
+        //
+        // Sprint 43F (port of dispatch_layer's 43D-1 fork into the
+        // batch path) — Gemma-4 layout (TWO norms; different residual
+        // structure). Memory `feedback_layer_dispatch_paths`: the
+        // fork must land in dispatch_layer + dispatch_layer_batch +
+        // dispatch_layer_partial — only dispatch_layer was forked in
+        // 43D-1, leaving the prefill path silently broken.
+        //
+        //   o_normed       = rms_norm(batch_o) * post_attention_layernorm.w
+        //   batch_residual = batch_residual + o_normed     (in-place)
+        //   batch_norm     = rms_norm(batch_residual) * pre_feedforward_layernorm.w
+        //
+        // (post_attention_layernorm is mapped to `ffn_norm.weight` in
+        //  VF's hf_to_vf_name table; pre_feedforward_layernorm is the
+        //  Sprint 43B-1 added `ffn_pre_norm.weight`.)
+        if cfg.gemma4.is_some() {
+            // batch_attn_out has been consumed by O-proj already and
+            // is sized [max_pp × q_dim × 4]. For Gemma-4 worst-case
+            // q_dim=4096 (full attention), so the [seq_len × hidden=
+            // 1536] worth of bytes we need (≤ max_pp × 4096 × 4)
+            // fits with plenty of headroom.
+            let scratch = self.batch_attn_out.handle;
+            let post_attn_w = layer_weight(model, layer, "ffn_norm.weight");
+            self.run_rms_norm(
+                dev, registry, cmd,
+                self.batch_o.handle, post_attn_w, scratch,
+                hidden, seq_len, cfg.rms_norm_eps, "rms_norm_post_attn_b",
+            );
+            compute_barrier(dev, cmd);
+            self.run_binary(
+                dev, registry, cmd, ShaderId::Add,
+                self.batch_residual.handle, scratch, self.batch_residual.handle,
+                seq_len * hidden, "add_res1_gemma4_b",
+            );
+            compute_barrier(dev, cmd);
+            let pre_ffn_w = layer_weight(model, layer, "ffn_pre_norm.weight");
+            self.run_rms_norm(
+                dev, registry, cmd,
+                self.batch_residual.handle, pre_ffn_w, self.batch_norm.handle,
+                hidden, seq_len, cfg.rms_norm_eps, "rms_norm_pre_ffn_b",
+            );
+            compute_barrier(dev, cmd);
+            // Sprint 43F sub-bisect — Stage 6: post (f+g) Gemma-4 fork
+            // = batch_norm (input to gate/up GEMM) + batch_residual
+            // (post attn-residual update, pre MLP).
+            stage_dump(self, cmd, self.batch_norm.handle, 6);
+            stage_dump(self, cmd, self.batch_residual.handle, 7);
+        } else {
+            let w_ffn_norm = layer_weight(model, layer, "ffn_norm.weight");
+            self.run_multi_add_rms(
+                dev, registry, cmd,
+                self.batch_residual.handle, self.batch_o.handle, w_ffn_norm,
+                /* sum_out  = */ self.batch_residual.handle,
+                /* norm_out = */ self.batch_norm.handle,
+                hidden, seq_len, cfg.rms_norm_eps, "add_rms_ffn_b",
+            );
+            compute_barrier(dev, cmd);
+        }
 
         // ---- (h) Quantize FFN-norm output (mul_mmq path only). ----
         let gemm_input_ffn = if use_mul_mm {
@@ -6164,6 +6386,9 @@ impl Forward {
             );
         }
         compute_barrier(dev, cmd);
+        // Sprint 43F — Stages 10/11: post Gate/Up GEMMs.
+        stage_dump(self, cmd, self.batch_gate.handle, 10);
+        stage_dump(self, cmd, self.batch_up.handle, 11);
 
         // ---- (j) Fused SwiGLU: batch_ffn_hidden = silu(gate) * up. ----
         // v0.2 Sprint 9a — replaces the silu(gate→gate) + barrier +
@@ -6174,6 +6399,8 @@ impl Forward {
             seq_len * ffn, "swiglu_b",
         );
         compute_barrier(dev, cmd);
+        // Sprint 43F — Stage 12: post-SwiGLU.
+        stage_dump(self, cmd, self.batch_ffn_hidden.handle, 12);
 
         // ---- (k) Quantize ffn_hidden + Down-proj GEMM (Q4_K). ----
         // NOTE: gemm_down is left on mul_mmq even when coopmat is on.
@@ -6227,26 +6454,69 @@ impl Forward {
         // the next layer's pre-attn norm into batch_norm in the same
         // dispatch (and saving 1 dispatch + 1 barrier per layer
         // boundary). For the final layer, fall back to a plain add.
-        match next_attn_norm_weight {
-            Some(w_next) => {
-                self.run_multi_add_rms(
+        // Sprint 43F — Gemma-4 has post_feedforward_layernorm
+        // applied to ffn_out *before* the final residual add, plus
+        // the (next-layer pre-attn) seed when non-last. Llama / Qwen
+        // path is unchanged (single fused multi_add_rms or plain add).
+        if cfg.gemma4.is_some() {
+            // Sprint 43F sub-bisect — Stage 8: batch_ffn_out at entry to (l)
+            // = MLP output before post-FFN-norm.
+            stage_dump(self, cmd, self.batch_ffn_out.handle, 8);
+
+            // 1) ffn_out_normed = rms_norm(batch_ffn_out) * ffn_post_norm.weight
+            let post_ffn_w = layer_weight(model, layer, "ffn_post_norm.weight");
+            // Reuse batch_attn_out as scratch (consumed by O-proj earlier).
+            let scratch = self.batch_attn_out.handle;
+            self.run_rms_norm(
+                dev, registry, cmd,
+                self.batch_ffn_out.handle, post_ffn_w, scratch,
+                hidden, seq_len, cfg.rms_norm_eps, "rms_norm_post_ffn_b",
+            );
+            compute_barrier(dev, cmd);
+            // Sprint 43F sub-bisect — Stage 9: post-(l)-step1 scratch
+            // (= post post_feedforward_layernorm, pre add).
+            stage_dump(self, cmd, scratch, 9);
+            // 2) batch_residual = batch_residual + scratch
+            self.run_binary(
+                dev, registry, cmd, ShaderId::Add,
+                self.batch_residual.handle, scratch, self.batch_residual.handle,
+                seq_len * hidden, "add_res2_gemma4_b",
+            );
+            compute_barrier(dev, cmd);
+            // 3) (non-last only) batch_norm = rms_norm(batch_residual)
+            //    × next_attn_norm.weight   (= layer N+1's input_layernorm).
+            if let Some(w_next) = next_attn_norm_weight {
+                self.run_rms_norm(
                     dev, registry, cmd,
-                    self.batch_residual.handle, self.batch_ffn_out.handle, w_next,
-                    /* sum_out  = */ self.batch_residual.handle,
-                    /* norm_out = */ self.batch_norm.handle,
-                    hidden, seq_len, cfg.rms_norm_eps, "add_rms_attn_next_b",
+                    self.batch_residual.handle, w_next, self.batch_norm.handle,
+                    hidden, seq_len, cfg.rms_norm_eps, "rms_norm_next_attn_b",
                 );
+                compute_barrier(dev, cmd);
             }
-            None => {
-                self.run_binary(
-                    dev, registry, cmd, ShaderId::Add,
-                    self.batch_residual.handle, self.batch_ffn_out.handle,
-                    self.batch_residual.handle,
-                    seq_len * hidden, "add_res2_b",
-                );
+        } else {
+            match next_attn_norm_weight {
+                Some(w_next) => {
+                    self.run_multi_add_rms(
+                        dev, registry, cmd,
+                        self.batch_residual.handle, self.batch_ffn_out.handle, w_next,
+                        /* sum_out  = */ self.batch_residual.handle,
+                        /* norm_out = */ self.batch_norm.handle,
+                        hidden, seq_len, cfg.rms_norm_eps, "add_rms_attn_next_b",
+                    );
+                }
+                None => {
+                    self.run_binary(
+                        dev, registry, cmd, ShaderId::Add,
+                        self.batch_residual.handle, self.batch_ffn_out.handle,
+                        self.batch_residual.handle,
+                        seq_len * hidden, "add_res2_b",
+                    );
+                }
             }
+            compute_barrier(dev, cmd);
         }
-        compute_barrier(dev, cmd);
+        // Sprint 43F sub-bisect — Stage 5: layer output (post-residual2).
+        stage_dump(self, cmd, self.batch_residual.handle, 5);
         let _ = (kv_bytes, ffn_bytes); // some bytes locals only used by debug paths
     }
 }
@@ -6530,6 +6800,31 @@ fn maybe_dump_logits(tag: &str, logits: &[f32]) {
         eprintln!("[VF_LOGIT_DUMP] {tag}: head16={head:?}");
         eprintln!("[VF_LOGIT_DUMP] {tag}: tail16={tail:?}");
     }
+}
+
+/// Sprint 43F Block A — dump stats of `hidden_staging` contents
+/// (= hidden_norm post-final-RMSNorm, copied via the in-CB
+/// VF_FINAL_NORM_DUMP block). Always-on print when called; gating
+/// by env happens in the call sites.
+fn maybe_dump_hidden_staging(tag: &str, hidden: &[f32]) {
+    let mut nan = 0u32; let mut inf = 0u32;
+    let mut mn = f32::INFINITY; let mut mx = f32::NEG_INFINITY;
+    let mut sum: f64 = 0.0;
+    for &v in hidden {
+        if v.is_nan() { nan += 1; continue; }
+        if v.is_infinite() { inf += 1; continue; }
+        if v < mn { mn = v; }
+        if v > mx { mx = v; }
+        sum += v as f64;
+    }
+    let valid = (hidden.len() as u32) - nan - inf;
+    let mean = if valid > 0 { sum / (valid as f64) } else { 0.0 };
+    eprintln!(
+        "[MAIN-CB-DUMP] {tag}: n={} nan={} inf={} min={:.4} max={:.4} mean={:.4}",
+        hidden.len(), nan, inf, mn, mx, mean,
+    );
+    let head: Vec<f32> = hidden.iter().take(8).copied().collect();
+    eprintln!("[MAIN-CB-DUMP] {tag}: first8 = {:?}", head);
 }
 
 /// Sprint 43C — Gemma-4 final logit soft-cap. Applied CPU-side
