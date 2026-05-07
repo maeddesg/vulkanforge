@@ -1,6 +1,6 @@
 [package]
 name = "vulkanforge"
-version = "0.3.14"
+version = "0.3.12"
 edition = "2024"
 rust-version = "1.85"
 license = "GPL-3.0-only"
