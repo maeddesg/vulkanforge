@@ -502,6 +502,16 @@ impl LoadedModel {
                 }
                 TensorDtype::BF16 => {
                     let fp32 = bf16_to_f32_vec(raw, info, hf_name)?;
+                    // Sprint 43E investigation note — earlier hypothesis
+                    // was that Gemma-4 RMSNorm uses `(1 + weight)` and
+                    // requires a load-time +1.0 fix. Verification against
+                    // HF transformers `Gemma3nRMSNorm` (Gemma-4 inherits
+                    // from this) showed the semantics are *Llama-style*
+                    // again (`x * weight / sqrt(...)`, init=`torch.ones`).
+                    // The +1 patch was WRONG and got reverted. The NaN
+                    // root cause is *not* in RMSNorm semantics; further
+                    // bisect needed (lm_head GEMV with vocab=262144
+                    // remains the prime suspect).
                     (GgmlType::F32, Source::Owned(fp32))
                 }
                 TensorDtype::F8E5M2 => {
