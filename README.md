@@ -32,8 +32,11 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
   **14B FP8 it's 32 % faster than the GPU baseline**
   (17.8 vs 13.5 tok/s).
 - **2× better power efficiency** (tok/s/W) on decode vs llama.cpp.
-- **Llama-3, Qwen2.5, Qwen3, Mistral, DeepSeek-R1-Distill** model
-  families covered (see [docs/MODELS.md](docs/MODELS.md)).
+- **Llama-3, Qwen2.5, Qwen3, Mistral, DeepSeek-R1-Distill, Gemma-4**
+  model families covered (Gemma-4 SafeTensors path produces coherent
+  English with full Markdown structure post-v0.3.13; see
+  [docs/MODELS.md](docs/MODELS.md) and the Unreleased section in
+  [CHANGELOG.md](CHANGELOG.md) for the 8-bug coherence fix-up).
 - **90 / 90 coherent (100 %)** on the deterministic 15-prompt suite
   across all six production configurations — GGUF, FP8 native WMMA
   (per-tensor / per-channel / block-wise), and CPU `lm_head` offload

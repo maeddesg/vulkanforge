@@ -1,5 +1,136 @@
 # Changelog
 
+## Unreleased — Gemma-4 Coherence (post-v0.3.13)
+
+Sprints 43D-1, 43D-2, 43D-3, 43F, 43D-4, and 44A together turn the
+Gemma-4 SafeTensors path from "loads but emits NaN logits / multilingual
+gibberish" into "produces coherent English with Markdown structure".
+Eight independent math bugs were identified by layer-by-layer comparison
+against a CPU FP32 HuggingFace `transformers` reference (`modular_gemma4.py`)
+and fixed.
+
+### Headline
+
+```bash
+vulkanforge chat --model ~/models/gemma-4-E2B-it/ --max-tokens 150
+> Tell me about cats
+
+## 🐈 Key Characteristics of Cats
+
+### 1. Physical Traits
+* **Agility and Flexibility:** Cats are incredibly athletic. Their bodies
+  are built for stealth, allowing them to move with silent, fluid grace,
+  capable of incredible leaps, balance, and precision.
+* **Sleek Movement:** Their movements are characterized by a fluid, almost
+  liquid motion. They are masters of stealth, capable [...]
+
+  [13 prompt, 150 gen, prefill 33.9 tok/s, decode 34.2 tok/s]
+```
+
+`--system` defaults to empty (matches HF `apply_chat_template` without an
+explicit system role); pass `--system "..."` or set `VF_SYSTEM=...` to
+inject one.
+
+### Coherence-blocker fixes (the 8-bug inventory)
+
+| # | Bug | Sprint | Fix | Effect on output |
+|---|-----|--------|-----|------------------|
+| 1 | `layer_scalar` parsed but stored as `vec![1.0; n]`; on-disk values 0.018..0.871 (mean 0.527) never loaded — layer-0 output 56× too large | 43D-4 P1 | Use the existing `blk.{N}.layer_scalar` tensor via a broadcast `Mul` against the layer output | gibberish → English fragments |
+| 2 | `per_layer_projection_norm` RMSNorm applied to wrong tensor (token-identity instead of context-projection) | 43D-4 P2 | Move RMSNorm to the context-projection branch in `PleData::build_per_layer_inputs` | math closer to HF |
+| 3 | `per_layer_model_projection` (8960 × 1536, ~55 MB) never loaded; PLE missing its context-aware component | 43D-4 P2 | Load BF16→FP32 host vec; CPU GEMV per token; merge `(token_id + ctx_proj_normed) × (1/√2)` | math closer to HF |
+| 4 | Async-decode path (`fill_embed_and_submit`) bypassed `forward_token`'s Gemma-4 prep — first decode token sampled on stale `per_layer_inputs` from last prefill token | 43D-4 P2 | Replicate `embed_scale` + PLE build in `fill_embed_and_submit`; thread `model + token_id` through `decode.rs` | unblocks async decode (was 0-gen on most prompts) |
+| 5 | `forward.logits()` skipped `final_logit_softcap` while `wait_and_read_logits` applied it — last prefill token vs decode tokens used different distributions | 43D-4 P2 | Apply softcap consistently in both readers | sampling math now matches HF ordering |
+| 6 | Default chat-template `--system` = `"You are a helpful assistant."` injected an 11-token system block HF's `apply_chat_template` without explicit `system` role does not produce — biased the model | 43D-4 P2 | Default to empty; opt-in via `--system "..."` or `VF_SYSTEM=...` | first prompt that produced an argmax of `EOS=1` now produces a real token |
+| 7 | **`v_norm` missing entirely.** HF Gemma-4 attention applies `Gemma4RMSNorm(head_dim, with_scale=False)` to V after V-projection — parameterless, so no tensor on disk; VF never applied any V-normalization. Cosine-similarity analysis of layer outputs vs HF showed direction drift starting at layer 2 (cos 0.95 → 0.57) and worsening to near-orthogonal by layer 11 (cos 0.16) | 43D-4 P3 | Synthesize an all-ones gamma buffer (`vnorm_ones`, sized to max-head_dim) and reuse the standard `run_rms_norm` shader — `v / sqrt(mean(v²) + eps)` | "How can you're looking for me?" — first near-grammatical English |
+| 8 | **Double-scaling in attention.** HF `Gemma4TextAttention` sets `self.scaling = 1.0` (Q-norm absorbs the standard `1/√head_dim`); VF was applying `1/√head_dim` on top — halving QK scores and breaking attention math | 43D-4 P3 | `attn_scale_layer = 1.0` for `cfg.gemma4.is_some()` in `run_scalar_attn`, `run_flash_attn_split_reduce`, `run_flash_attn_batch`, `run_flash_attn_tiled` | **"Hi! How can I help you today?"** — fully coherent English |
+
+Bugs 7 and 8 are the coherence-unlockers: combined they transform
+"How can you're looking for me?" → "Hi! How can I help you today?".
+
+### Earlier Gemma-4 wiring (Sprints 43D-1 / 43D-2 / 43D-3 / 43F)
+
+Sprint 43F (NaN-cascade fix in batch prefill) and Sprints 43D-1..43D-3
+landed the architectural plumbing the bug-fixes above relied on:
+
+* **43D-1** — heterogeneous KV-cache layout (per-layer head_dim ∈ {256,
+  512} for E2B sliding vs full attention; cumulative byte-offset table
+  in `KvCache`).
+* **43D-2** — GELU(`pytorch_tanh`)-GLU activation, partial-RoPE
+  (rotary_dim = 0.25 × head_dim for full layers), sliding-window mask
+  (`kv_start` push-constant in `flash_attn` + `flash_attn_split`),
+  KV-share (Subscribes-layers in tail skip K/V GEMV + KV-write, attention
+  reads from publisher's slab via `gemma4_kv_read_layer`).
+* **43D-3** — Per-Layer Embeddings: load `embed_tokens_per_layer` (4.7 GB
+  BF16 → host `Vec<u8>`) + `per_layer_projection_norm` (host `Vec<f32>`)
+  into `LoadedModel.ple_data`; per-slot `per_layer_inputs` CpuToGpu staging
+  buffer; 5-step PLE block at end of `dispatch_layer`. Plus `embed_scale`
+  (= sqrt(hidden_size)) finally applied to the initial token embedding.
+* **43F** — NaN-cascade fix in `dispatch_layer_batch` (port the Gemma-4
+  4-norm fork from 43D-1 — the prefill batch path was silently broken).
+  Plus `force_per_token_prefill = true` for Gemma-4 as a workaround for
+  the missing F32 `mul_mm` shader family (deferred to a future sprint).
+
+### Validation
+
+| Test | Wert | Gate | Status |
+|------|------|------|--------|
+| Gemma-4-E2B-it: NaN-frei über 150-Token-Generation | — | — | ✓ |
+| Gemma-4-E2B-it: kohärenter englischer Markdown-Output | "## 🐈 Key Characteristics of Cats..." | — | ✓ |
+| Qwen3-8B Q4_K_M decode | 105.7 t/s | ≥ 100 | ✓ |
+| Qwen3-8B FP8 decode | 61.7 t/s | ≥ 55 | ✓ |
+| 52/52 lib tests | pass | — | ✓ |
+
+### Diagnostics (env-gated, zero cost when unset, intentionally retained)
+
+The bisect work added a permanent diagnostic surface that has paid off
+in every Gemma-4 sprint and stays for future use:
+
+* `VF_LAYER_DUMP_ALL=1` + `VF_LAYER_DUMP_OUT=path` — write all per-layer
+  hidden states (last position) of one forward pass as a binary blob.
+* `VF_DUMP_LAYER34_STAGES=1` — capture 7 intra-layer stages of the last
+  layer (post-attn-norm, post-attention, post-res1, post-MLP, post-res2,
+  post-PLE, post-layer_scalar) into hidden_staging slots 36..42.
+* `VF_DISABLE_KV_SHARE=1` / `VF_DISABLE_SLIDING_WINDOW=1` /
+  `VF_DISABLE_PROPE=1` — bisect feature-toggles for layer-by-layer
+  divergence isolation.
+* `VF_TRACE_PROMPT_TOKENS=1` — log chat-template token decomposition
+  (used to find the default-system-prompt bug).
+* (existing) `VF_LOGIT_DUMP`, `VF_LAYER_DUMP=N`, `VF_FINAL_NORM_DUMP`,
+  `VF_BUF_ID`, `VF_BATCH_STEP_DUMP=ALL`, `VF_LM_COPY_HIDDEN`, ...
+
+### Sprint 44A — `forward.rs` refactor analysis (read-only)
+
+`forward.rs` has grown to 7816 LOC with 98 functions. Three parallel
+`dispatch_layer*` bodies (`dispatch_layer` 663 LOC, `dispatch_layer_batch`
+1000 LOC, `dispatch_layer_partial` 165 LOC) implement the same algorithm
+across decode / batch-prefill / debug — and seven of the eight bugs
+above were direct consequences of "feature added to one path, forgotten
+in another". A read-only architecture analysis (`results/v0314_sprint44a_forward_refactor_analyse.md`)
+documents the duplication map (~1249 LOC duplicated, 16 % of file) and
+proposes a 2-sprint refactor — first a low-risk module split, then a
+`LayerStep` enum + per-arch builder + 3 `LayerExecutor` impls that make
+the bug-class structurally impossible (Rust's match-exhaustivity forces
+every executor to handle every step). Implementation is reserved for
+v0.3.14 (the planned forward.rs refactor release).
+
+### Limitations
+
+* Coherence improves dramatically but isn't bit-identical to HF. AltUp
+  / Laurel mechanisms in `gemma3n` don't apply to `gemma4`; small math
+  details may still differ (last-layer cosine similarity vs HF reference
+  drops to ~0.49 with magnitude ratio ~0.49 — partially explainable by
+  cumulative direction drift through 35 layers, partially TBD).
+* Gemma-4 currently uses `force_per_token_prefill` because VF doesn't
+  ship an F32 `mul_mm` shader family. Prefill collapses to decode rate
+  (~50 tok/s on E2B). The F32 shader family is a future sprint.
+* `dispatch_layer_partial` (debug-only path, used by
+  `forward_layer_debug_intermediate`) does not have any of the Gemma-4
+  fixes. Production paths are unaffected; the debug path would mislead
+  if used to investigate Gemma-4 layer outputs. Listed as work for the
+  44C refactor.
+
+---
+
 ## v0.3.13 — `tokenizer.json` auto-load + multi-turn SafeTensors REPL (2026-05-09)
 
 ### Headline
