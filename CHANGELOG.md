@@ -1,72 +1,13 @@
 # Changelog
 
-## v0.3.14 — Multi-turn REPL on the SafeTensors path (2026-05-10)
-
-`run_chat_safetensors` was a single-shot path inherited from
-Sprint 20-M3: it read one prompt (from `VF_PROMPT` or the first
-stdin line), generated one reply, and exited. The GGUF path
-(`run_chat`) has had a real multi-turn REPL via `ChatSession` since
-v0.1.0; the SafeTensors path lagged behind.
-
-v0.3.14 brings parity. After rendering the reply, `vulkanforge
-chat --model <fp8-dir>/` returns to the `> ` prompt and waits for
-the next turn, with KV cache state preserved across turns.
-
-### Behavior
-
-* **`VF_PROMPT="..."` mode** unchanged — runs one turn and exits
-  (preserves CI / regression-test semantics).
-* **Interactive (no `VF_PROMPT`)** — `rustyline` REPL with the
-  same slash-commands as the GGUF path:
-    * `/quit` (or `/q` / `/exit`) — exit cleanly.
-    * `/reset` — clear KV cache, restart at turn 1.
-    * `/think` — toggle the `<think>...</think>` filter.
-    * `/help` — list commands.
-* Turn 0 renders via `template.render_first_turn` (full
-  system + user + assistant priming). Turn ≥ 1 renders via
-  `template.render_continuation` (just the boundary specials +
-  user + assistant priming) — same convention as the GGUF
-  `ChatSession`.
-* Context overflow is reported with a hint to `/reset` instead of
-  panicking.
-
-### Smoke
-
-```bash
-$ printf '%s\n' "Hi." "What is 2+2?" "/quit" | \
-    VF_FP8=auto vulkanforge chat --model ~/models/Qwen3-8B-FP8/
-…
-[21 prompt, 10 gen, prefill 306 t/s, decode 62.4 t/s]   # turn 1
-[17 prompt, 10 gen, prefill 367 t/s, decode 60.8 t/s]   # turn 2 (continuation)
-```
-
-Turn 2's 17 prompt tokens vs turn 1's 21 confirms the
-continuation-form template fired (no system re-render, no extra
-BOS).
-
-### What changed
-
-* `src/main.rs` — `run_chat_safetensors` reuses the rustyline +
-  command-dispatch shape from `run_chat`. KV cache position is
-  tracked manually via `current_pos` / `turn_count` (the
-  SafeTensors path doesn't go through `ChatSession` because the
-  latter hard-wires `EmbeddingSource::Gguf` — refactoring
-  `ChatSession` to take an `EmbeddingSource` would be a larger
-  change for no benefit in this release). Optional
-  `<think>` filter wraps the per-token callback the same way
-  `ChatSession::send_streaming` does.
-
-48 lib tests pass (no test-surface change).
-
----
-
-## v0.3.13 — `tokenizer.json` auto-load from model dir (2026-05-10)
+## v0.3.13 — `tokenizer.json` auto-load + multi-turn SafeTensors REPL (2026-05-09)
 
 ### Headline
 
 `--tokenizer-from <gguf>` is no longer required for FP8 SafeTensors
 models. The tokenizer + chat template are loaded straight from the
-HuggingFace model directory:
+HuggingFace model directory, and the SafeTensors chat path is now
+a real multi-turn REPL:
 
 ```bash
 # v0.3.12
@@ -76,6 +17,11 @@ VF_FP8=auto vulkanforge chat \
 
 # v0.3.13
 VF_FP8=auto vulkanforge chat --model ~/models/Qwen3-8B-FP8/
+> hi
+…
+> what is 2 + 2?       # ← stays in the REPL across turns
+…
+> /quit
 ```
 
 Combined with v0.3.12's `VF_FP8=auto`, this collapses the four
@@ -141,17 +87,56 @@ same specials, same flavour, same chat_template renderer):
 | Qwen3-8B-FP8       |                  61.3 tok/s |             61.3 tok/s |
 | Qwen2.5-14B-FP8    |                  19.1 tok/s |             19.0 tok/s |
 
+### Multi-turn REPL on the SafeTensors path
+
+`run_chat_safetensors` was a single-shot path inherited from
+Sprint 20-M3: it read one prompt (from `VF_PROMPT` or the first
+stdin line), generated one reply, and exited. The GGUF path
+(`run_chat`) has had a real multi-turn REPL via `ChatSession` since
+v0.1.0; the SafeTensors path lagged behind. v0.3.13 brings parity.
+After rendering the reply, `vulkanforge chat --model <fp8-dir>/`
+returns to the `> ` prompt and waits for the next turn, with KV
+cache state preserved across turns.
+
+* **`VF_PROMPT="..."` mode** unchanged — runs one turn and exits
+  (preserves CI / regression-test semantics).
+* **Interactive (no `VF_PROMPT`)** — `rustyline` REPL with the
+  same slash-commands as the GGUF path: `/quit` (or `/q` /
+  `/exit`), `/reset` (clear KV cache), `/think` (toggle
+  `<think>...</think>` filter), `/help`.
+* Turn 0 renders via `template.render_first_turn` (full
+  system + user + assistant priming). Turn ≥ 1 renders via
+  `template.render_continuation` (just the boundary specials +
+  user + assistant priming) — same convention as the GGUF
+  `ChatSession`.
+* Empty input continues the REPL instead of exiting.
+* Context overflow is reported with a hint to `/reset` instead of
+  panicking.
+
+Smoke (multi-turn via stdin pipe):
+
+```bash
+$ printf '%s\n' "Hi." "What is 2+2?" "/quit" | \
+    VF_FP8=auto vulkanforge chat --model ~/models/Qwen3-8B-FP8/
+…
+[21 prompt, 10 gen, prefill 306 t/s, decode 62.4 t/s]   # turn 1
+[17 prompt, 10 gen, prefill 367 t/s, decode 60.8 t/s]   # turn 2 (continuation)
+```
+
+Turn 2's 17 prompt tokens vs turn 1's 21 confirms the
+continuation-form template fired (no system re-render, no extra
+BOS).
+
 ### Sprint 42C — fully delivered
 
-Sprint 42C planned four items; all four shipped over three
-releases:
+Sprint 42C planned four items; all four shipped:
 
-| Brief item                         | Shipped in |
-|------------------------------------|-----------:|
-| Llama-FP8 activation-range fix     |    v0.3.11 |
-| `VF_FP8=auto` + auto-detect chain  |    v0.3.12 |
-| Mesa 26.0.x graceful FP8 fallback  |    v0.3.12 |
-| `tokenizer.json` auto-load         |    v0.3.13 |
+| Brief item                                    | Shipped in |
+|-----------------------------------------------|-----------:|
+| Llama-FP8 activation-range fix                |    v0.3.11 |
+| `VF_FP8=auto` + auto-detect chain             |    v0.3.12 |
+| Mesa 26.0.x graceful FP8 fallback             |    v0.3.12 |
+| `tokenizer.json` auto-load + multi-turn REPL  |    v0.3.13 |
 
 ### What changed
 
@@ -165,7 +150,15 @@ releases:
 * `src/main.rs` — `run_chat_safetensors` and
   `run_bench_safetensors` now branch on `tokenizer_from`: `Some`
   → existing GGUF path; `None` → HF auto-load. The banner reports
-  the actual source.
+  the actual source. `run_chat_safetensors` also reuses the
+  rustyline + command-dispatch shape from `run_chat`; KV cache
+  position is tracked manually via `current_pos` / `turn_count`
+  (the SafeTensors path doesn't go through `ChatSession` because
+  the latter hard-wires `EmbeddingSource::Gguf` — refactoring
+  `ChatSession` to take an `EmbeddingSource` would be a larger
+  change for no benefit in this release). Optional `<think>`
+  filter wraps the per-token callback the same way
+  `ChatSession::send_streaming` does.
 
 48 lib tests pass — same set as v0.3.12, no new tests
 (behavior-equivalence with the GGUF path is what we verify).
