@@ -250,7 +250,40 @@ impl SafeTensorsFile {
 /// `None` for tensors we don't (yet) consume — most notably FP8
 /// `*_scale_inv` / `*_scale` calibration tensors that vLLM emits but
 /// VulkanForge ignores in M1.
+///
+/// Sprint 43B-1: Gemma-4 nests every text-decoder tensor under
+/// `model.language_model.*` and adds layer-locals VF doesn't yet
+/// consume (`layer_scalar`, `pre_feedforward_layernorm`, the
+/// `per_layer_*` PLE tensors). The big PLE table
+/// `embed_tokens_per_layer` (4.7 GB on E2B) and the projection /
+/// gate / norm tensors return `None` here — they get loaded by the
+/// PLE-aware path landing in Sprint 43D. The vision and audio towers
+/// are skipped wholesale (text-only path).
 pub fn hf_to_vf_name(hf: &str) -> Option<String> {
+    // Gemma-4: strip the `model.language_model.` prefix and recurse
+    // into the standard mapping. The recursive call may add Gemma-4
+    // specific suffixes via the `gemma4_extra_layer_suffix` branch.
+    if let Some(rest) = hf.strip_prefix("model.language_model.") {
+        // Multimodal / PLE top-level tensors that VF doesn't (yet)
+        // consume — return None so the loader skips them silently.
+        if rest == "embed_tokens_per_layer.weight"
+            || rest == "per_layer_model_projection.weight"
+            || rest == "per_layer_projection_norm.weight"
+        {
+            return None;
+        }
+        // Re-route as if it were a flat `model.*` name.
+        return hf_to_vf_name(&format!("model.{rest}"));
+    }
+    // Skip everything in the vision / audio towers (Gemma-4 multimodal).
+    if hf.starts_with("model.vision_tower.")
+        || hf.starts_with("model.audio_tower.")
+        || hf.starts_with("model.embed_vision.")
+        || hf.starts_with("model.embed_audio.")
+    {
+        return None;
+    }
+
     match hf {
         "model.embed_tokens.weight" => return Some("token_embd.weight".into()),
         "model.norm.weight" => return Some("output_norm.weight".into()),
@@ -279,6 +312,19 @@ pub fn hf_to_vf_name(hf: &str) -> Option<String> {
         "self_attn.q_proj.bias" => "attn_q.bias",
         "self_attn.k_proj.bias" => "attn_k.bias",
         "self_attn.v_proj.bias" => "attn_v.bias",
+        // Sprint 43B-1 — Gemma-4-specific extra layer norms +
+        // residual scalar. Mapped here so the loader uploads them
+        // alongside the standard tensors; Sprint 43B-2 forward will
+        // consume them.
+        "pre_feedforward_layernorm.weight" => "ffn_pre_norm.weight",
+        "post_feedforward_layernorm.weight" => "ffn_post_norm.weight",
+        "self_attn.v_norm.weight" => "attn_v_norm.weight",
+        "layer_scalar" => "layer_scalar",
+        // Sprint 43B-1 — Gemma-4 per-layer-input modulation pieces.
+        // VF skips them in 43B-1 (Sprint 43D wires the PLE forward).
+        "per_layer_input_gate.weight"
+        | "per_layer_projection.weight"
+        | "post_per_layer_input_norm.weight" => return None,
         _ => return None,
     };
     Some(format!("blk.{layer}.{vf_suffix}"))
@@ -320,5 +366,86 @@ mod tests {
         );
         assert_eq!(hf_to_vf_name("model.layers.0.self_attn.q_proj.weight_scale"), None);
         assert_eq!(hf_to_vf_name("lm_head.weight").as_deref(), Some("output.weight"));
+    }
+
+    #[test]
+    fn gemma4_prefix_stripping() {
+        // Gemma-4 nests every text-decoder tensor under `language_model`.
+        assert_eq!(
+            hf_to_vf_name("model.language_model.embed_tokens.weight").as_deref(),
+            Some("token_embd.weight"),
+        );
+        assert_eq!(
+            hf_to_vf_name("model.language_model.norm.weight").as_deref(),
+            Some("output_norm.weight"),
+        );
+        assert_eq!(
+            hf_to_vf_name("model.language_model.layers.4.self_attn.q_proj.weight").as_deref(),
+            Some("blk.4.attn_q.weight"),
+        );
+        assert_eq!(
+            hf_to_vf_name("model.language_model.layers.7.mlp.down_proj.weight").as_deref(),
+            Some("blk.7.ffn_down.weight"),
+        );
+    }
+
+    #[test]
+    fn gemma4_new_per_layer_suffixes() {
+        assert_eq!(
+            hf_to_vf_name("model.language_model.layers.0.pre_feedforward_layernorm.weight").as_deref(),
+            Some("blk.0.ffn_pre_norm.weight"),
+        );
+        assert_eq!(
+            hf_to_vf_name("model.language_model.layers.34.post_feedforward_layernorm.weight").as_deref(),
+            Some("blk.34.ffn_post_norm.weight"),
+        );
+        assert_eq!(
+            hf_to_vf_name("model.language_model.layers.0.layer_scalar").as_deref(),
+            Some("blk.0.layer_scalar"),
+        );
+        // q_norm + k_norm exist on Gemma-4 too (per-head dim).
+        assert_eq!(
+            hf_to_vf_name("model.language_model.layers.0.self_attn.q_norm.weight").as_deref(),
+            Some("blk.0.attn_q_norm.weight"),
+        );
+        assert_eq!(
+            hf_to_vf_name("model.language_model.layers.0.self_attn.v_norm.weight").as_deref(),
+            Some("blk.0.attn_v_norm.weight"),
+        );
+    }
+
+    #[test]
+    fn gemma4_skips_ple_and_multimodal() {
+        // PLE top-level table — defer to Sprint 43D.
+        assert_eq!(
+            hf_to_vf_name("model.language_model.embed_tokens_per_layer.weight"),
+            None,
+        );
+        assert_eq!(
+            hf_to_vf_name("model.language_model.per_layer_model_projection.weight"),
+            None,
+        );
+        assert_eq!(
+            hf_to_vf_name("model.language_model.per_layer_projection_norm.weight"),
+            None,
+        );
+        // PLE per-layer pieces.
+        assert_eq!(
+            hf_to_vf_name("model.language_model.layers.5.per_layer_input_gate.weight"),
+            None,
+        );
+        assert_eq!(
+            hf_to_vf_name("model.language_model.layers.5.per_layer_projection.weight"),
+            None,
+        );
+        assert_eq!(
+            hf_to_vf_name("model.language_model.layers.5.post_per_layer_input_norm.weight"),
+            None,
+        );
+        // Vision / audio towers — never wanted in text-only mode.
+        assert_eq!(hf_to_vf_name("model.vision_tower.layers.0.attn.weight"), None);
+        assert_eq!(hf_to_vf_name("model.audio_tower.encoder.0.weight"), None);
+        assert_eq!(hf_to_vf_name("model.embed_vision.embedding_projection.weight"), None);
+        assert_eq!(hf_to_vf_name("model.embed_audio.embedding_projection.weight"), None);
     }
 }

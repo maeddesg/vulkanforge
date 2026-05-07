@@ -1037,10 +1037,37 @@ fn hf_to_model_config(hf: &HfConfig) -> Result<ModelConfig, LoaderError> {
         // gated on the actual presence of `attn_*.bias` tensors in the
         // SafeTensors archive (Qwen3 omits them, Qwen2.5 carries them).
         "qwen3" => "qwen3",
+        // Sprint 43B-1 — Gemma-4 architecture detection lands now;
+        // the heterogeneous-head_dim forward path + sliding/full
+        // attention dispatch + PLE ship in 43B-2 / 43D. We bail out
+        // early so the loader doesn't half-load tensors of shapes the
+        // forward can't yet route. Sprint 43A's analysis ships in
+        // results/v0314_sprint43_gemma4_e2b_analysis.md.
+        "gemma4" => {
+            return Err(LoaderError::Buffer(format!(
+                "Gemma-4 architecture detected (text_config: hidden={}, \
+                 layers={}, sliding_window={}, kv_shared={}). The text \
+                 decoder lands in Sprint 43B-2 (forward + 4 new shaders); \
+                 PLE ships in Sprint 43D. Loader stub bails here to avoid \
+                 half-running an unsupported pipeline.",
+                hf.hidden_size,
+                hf.num_hidden_layers,
+                hf.gemma4
+                    .as_ref()
+                    .map(|g| g.sliding_window)
+                    .unwrap_or(0),
+                hf.gemma4
+                    .as_ref()
+                    .map(|g| g.num_kv_shared_layers)
+                    .unwrap_or(0),
+            )));
+        }
         other => {
             return Err(LoaderError::Buffer(format!(
                 "SafeTensors model_type '{other}' not yet supported \
-                 (have: 'llama', 'qwen2', 'qwen3')"
+                 (have: 'llama', 'qwen2', 'qwen3'; \
+                 'gemma4' detected but text-decoder support arrives \
+                 in Sprint 43B-2)"
             )));
         }
     };
