@@ -31,7 +31,11 @@
 //! Env vars:
 //!   VF_MODEL_PATH        path to GGUF (default ~/models/Qwen3-8B-Q4_K_M.gguf)
 //!   VF_MAX_TOKENS        per-turn cap (default 400)
-//!   VF_SYSTEM            system prompt (default "You are a helpful assistant.")
+//!   VF_SYSTEM            system prompt (default empty — matches HF
+//!                        `apply_chat_template(messages,
+//!                        add_generation_prompt=True)`. Set to a string
+//!                        to inject; pass `--system "..."` on the CLI
+//!                        for one-shot use.)
 //!   VF_NO_THINK_FILTER   set to disable the think-filter
 //!   VF_PROMPT="..."     run a single turn non-interactively (CI / regression)
 //!   VF_TEMPERATURE       sampling temperature (default 0.0 = greedy)
@@ -62,6 +66,11 @@ use vulkanforge::backend::vulkan::pipeline_registry::{default_cache_path, Pipeli
 use vulkanforge::backend::vulkan::tokenizer::Tokenizer;
 
 const MAX_SEQ_LEN: u32 = 2048;
+/// Sprint 43D-4 — kept as documentation of the *opt-in* default. The
+/// actual chat default is now empty (matches HF `apply_chat_template`
+/// without explicit `system` role). Callers that want this preamble
+/// pass it via `--system` or `VF_SYSTEM`.
+#[allow(dead_code)]
 const DEFAULT_SYSTEM: &str = "You are a helpful assistant.";
 
 /// Default model path: $VF_MODEL_PATH or ~/models/Qwen3-8B-Q4_K_M.gguf.
@@ -177,9 +186,16 @@ fn main() {
                 model: model.unwrap_or_else(default_model_path),
                 tokenizer_from,
                 max_context,
+                // Sprint 43D-4 — default to empty system prompt to match
+                // HF `apply_chat_template(messages, add_generation_prompt=True)`.
+                // Pre-43D-4 the default was DEFAULT_SYSTEM ("You are a helpful
+                // assistant.") which injected an 11-token system block that
+                // HF wouldn't produce, biasing the model away from training-
+                // distribution chat behavior. Pass `--system "..."` or set
+                // `VF_SYSTEM=...` to inject one explicitly.
                 system: system
                     .or_else(|| std::env::var("VF_SYSTEM").ok())
-                    .unwrap_or_else(|| DEFAULT_SYSTEM.to_string()),
+                    .unwrap_or_default(),
                 max_tokens: max_tokens.unwrap_or_else(|| {
                     std::env::var("VF_MAX_TOKENS").ok()
                         .and_then(|s| s.parse().ok()).unwrap_or(400)
@@ -791,6 +807,25 @@ fn run_chat_safetensors(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>
         } else {
             template.render_continuation(&tokenizer, user_prompt)
         };
+        // Sprint 43D-4 — env-gated prompt-token trace. Set
+        // VF_TRACE_PROMPT_TOKENS=1 to log the prefill token IDs +
+        // their decoded surface forms (one token per line). Used to
+        // compare VF's chat-template output against HF's
+        // `apply_chat_template`. No-op when unset.
+        if std::env::var("VF_TRACE_PROMPT_TOKENS").is_ok() {
+            eprintln!(
+                "[VF_TRACE_PROMPT_TOKENS] prefill tokens (turn={}, len={}):",
+                *turn_count, prefill.len(),
+            );
+            for (i, &tid) in prefill.iter().enumerate() {
+                let bytes = tokenizer.decode_token_bytes(tid);
+                let s = String::from_utf8_lossy(&bytes);
+                eprintln!(
+                    "  [{:>2}] id={:<6} bytes={:?} decode={:?}",
+                    i, tid, &bytes[..bytes.len().min(16)], s,
+                );
+            }
+        }
         let need = prefill.len() as u32 + cfg_g.max_tokens;
         if *current_pos + need > max_seq {
             eprintln!(

@@ -565,7 +565,7 @@ pub fn generate_from_tokens(
 
             let embd = embed_lookup(&embed_src, cfg, first_id)?;
             forward.pre_record(dev, registry, model, 0, pos)?;
-            forward.fill_embed_and_submit(dev, 0, &embd, pos)?;
+            forward.fill_embed_and_submit(dev, 0, &embd, pos, model, first_id)?;
             let mut cur_slot = 1usize;
             pos += 1;
 
@@ -597,7 +597,7 @@ pub fn generate_from_tokens(
 
                 // Stage 3: write embedding + submit.
                 let embd = embed_lookup(&embed_src, cfg, next_id)?;
-                forward.fill_embed_and_submit(dev, cur_slot, &embd, pos)?;
+                forward.fill_embed_and_submit(dev, cur_slot, &embd, pos, model, next_id)?;
 
                 cur_slot = 1 - cur_slot;
                 pos += 1;

@@ -287,6 +287,15 @@ pub struct Forward {
     fuse1: GpuBuffer,
     rope_ff_buf: GpuBuffer,     // 16 B unused (has_ff=0)
     rope_idx_buf: GpuBuffer,    // 16 B unused (set_rows_stride=0)
+    /// Sprint 43D-4 — Gemma-4 V-norm gamma buffer. HF Gemma4 attention
+    /// applies a parameterless `Gemma4RMSNorm(head_dim, with_scale=False)`
+    /// to V after the V-projection: `v / sqrt(mean(v²) + eps)`. No
+    /// weight tensor on disk (with_scale=False has no `weight`), so
+    /// VF synthesises an all-ones gamma buffer here and feeds it to
+    /// the existing run_rms_norm shader. Sized for the maximum
+    /// per-layer head_dim (512 on Gemma-4-E2B full layers; 128 on
+    /// Llama / Qwen). Filled with 1.0 floats once at construction.
+    vnorm_ones: GpuBuffer,
 
     pub kv_cache: KvCache,
     pub config: ModelConfig,
@@ -544,12 +553,26 @@ impl Forward {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(-1);
+        // Sprint 43D-4 — VF_LAYER_DUMP_ALL=1 copies every layer's output
+        // into hidden_staging at slot[layer], producing 35 (or whatever
+        // n_layers is) consecutive `hidden_dim`-element FP32 chunks. The
+        // host reads them after wait_and_read_logits via the existing
+        // `hidden_staging.read_bytes()` path.
+        let dump_all_layers = std::env::var("VF_LAYER_DUMP_ALL").is_ok();
+        let bytes_per_slot = (self.config.hidden_dim as u64) * 4;
         for layer in 0..self.config.n_layers {
             self.dispatch_layer(dev, registry, cmd, model, layer, position, input, output);
-            if dump_layer == (layer as i32) {
-                let bytes = (self.config.hidden_dim as u64) * 4;
+            let want_dump = dump_layer == (layer as i32) || dump_all_layers;
+            if want_dump {
+                // VF_LAYER_DUMP=N writes to slot 0; VF_LAYER_DUMP_ALL=1
+                // writes to slot[layer]. The two modes don't intersect —
+                // when ALL is set, slot 0 holds layer 0 anyway, so a
+                // `VF_LAYER_DUMP=0` test still resolves to slot 0.
+                let dst_slot = if dump_all_layers { layer as u64 } else { 0 };
                 let copy = vk::BufferCopy::default()
-                    .src_offset(0).dst_offset(0).size(bytes);
+                    .src_offset(0)
+                    .dst_offset(dst_slot * bytes_per_slot)
+                    .size(bytes_per_slot);
                 let bar = vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
@@ -643,6 +666,8 @@ impl Forward {
         slot: usize,
         embedding: &[f32],
         position: u32,
+        model: &LoadedModel,
+        token_id: u32,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if embedding.len() != self.config.hidden_dim as usize {
             return Err(format!(
@@ -650,7 +675,29 @@ impl Forward {
                 embedding.len(), self.config.hidden_dim
             ).into());
         }
-        self.slots[slot].scratch_a.write_bytes(bytemuck::cast_slice(embedding))?;
+        // Sprint 43D-3 + 43D-4 — Gemma-4 embed_scale (= sqrt(hidden_size))
+        // applied to the initial token embedding, plus per-token PLE
+        // build (token_identity + context_proj merge). Without this the
+        // async decode path (Sprint 15E pipeline) bypassed `forward_token`'s
+        // Gemma-4 prep and per_layer_inputs would hold stale values from
+        // the last prefill token — causing the first decode token to
+        // sample on a half-correct hidden state.
+        if let Some(g) = self.config.gemma4.as_ref() {
+            let s = g.embed_scale;
+            let mut scaled = Vec::with_capacity(embedding.len());
+            for &v in embedding {
+                scaled.push(v * s);
+            }
+            self.slots[slot].scratch_a.write_bytes(bytemuck::cast_slice(&scaled))?;
+            if let Some(ple) = model.ple_data.as_ref() {
+                let v = ple.build_per_layer_inputs(token_id, &scaled);
+                self.slots[slot]
+                    .per_layer_inputs
+                    .write_bytes(bytemuck::cast_slice(&v))?;
+            }
+        } else {
+            self.slots[slot].scratch_a.write_bytes(bytemuck::cast_slice(embedding))?;
+        }
         self.slots[slot].rope_pos_buf.write_bytes(bytemuck::bytes_of(&(position as u32)))?;
 
         let cb = self.async_cbs[slot];
@@ -713,6 +760,44 @@ impl Forward {
             let bytes = self.hidden_staging.read_bytes()?;
             let hidden: &[f32] = bytemuck::cast_slice::<u8, f32>(&bytes[..h * 4]);
             maybe_dump_hidden_staging("wait_and_read_logits/gpu_lm_head", hidden);
+        }
+        // Sprint 43D-4 — VF_LAYER_DUMP_ALL=1 dumps all-layer hidden states
+        // staged earlier in record_decode_dispatches. Each layer N's
+        // post-dispatch_layer output occupies slot N (= bytes
+        // [N*h*4, (N+1)*h*4)) of the hidden_staging buffer (Sprint 43D-4
+        // bumped capacity to 64 slots). When `VF_LAYER_DUMP_OUT=path`
+        // is set, the full N_LAYERS×hidden FP32 blob is appended to
+        // `path` (binary, little-endian); otherwise per-layer stats are
+        // printed to stderr.
+        if std::env::var("VF_LAYER_DUMP_ALL").is_ok() {
+            let h = self.config.hidden_dim as usize;
+            let nl = self.config.n_layers as usize;
+            let bytes = self.hidden_staging.read_bytes()?;
+            let need = nl * h * 4;
+            if bytes.len() < need {
+                eprintln!(
+                    "[VF_LAYER_DUMP_ALL] WARNING: hidden_staging only {} bytes, need {} \
+                     (n_layers={nl} × hidden={h} × 4) — dumping what fits",
+                    bytes.len(), need,
+                );
+            }
+            let out_path = std::env::var("VF_LAYER_DUMP_OUT").ok();
+            if let Some(path) = out_path {
+                let take = bytes.len().min(need);
+                std::fs::write(&path, &bytes[..take])?;
+                eprintln!(
+                    "[VF_LAYER_DUMP_ALL] wrote {} bytes ({} layers × {} × 4) to {}",
+                    take, take / (h * 4), h, path,
+                );
+            } else {
+                for layer in 0..nl {
+                    let off = layer * h * 4;
+                    if off + h * 4 > bytes.len() { break; }
+                    let slice: &[f32] =
+                        bytemuck::cast_slice::<u8, f32>(&bytes[off..off + h * 4]);
+                    maybe_dump_hidden_staging(&format!("layer{layer:02}"), slice);
+                }
+            }
         }
         if std::env::var("VF_BATCH_STEP_DUMP").as_deref() == Ok("ALL") {
             // Sprint 43F sub-bisect — read 6 hidden_staging slots, one per
@@ -910,12 +995,15 @@ impl Forward {
         // active; keeps the buffer-management code path uniform.
         let hidden_bytes_size: u64 =
             (config.hidden_dim as u64) * std::mem::size_of::<f32>() as u64;
-        // Sprint 43F — bump hidden_staging to 8× hidden_dim slots so
+        // Sprint 43F — bump hidden_staging to 16× hidden_dim slots so
         // VF_BATCH_STEP_DUMP can capture 6+ intra-layer stages of
-        // Layer 0's dispatch_layer_batch in a single run. The CPU
-        // lm_head path only reads the first hidden_dim slot — extra
-        // capacity is harmless when unused.
-        let hidden_staging_size = hidden_bytes_size * 16;
+        // Layer 0's dispatch_layer_batch in a single run.
+        // Sprint 43D-4 — bump again to 64 slots so VF_LAYER_DUMP_ALL
+        // can capture every per-layer output (≤64 layers — covers all
+        // shipped configs incl. Gemma-4-E2B at 35 + final-norm slot).
+        // The CPU lm_head path only reads the first hidden_dim slot —
+        // extra capacity is harmless when unused.
+        let hidden_staging_size = hidden_bytes_size * 64;
         let hidden_staging = mk_storage(
             hidden_staging_size,
             MemoryLocation::GpuToCpu,
@@ -928,6 +1016,23 @@ impl Forward {
         //  inside `alloc_slot`; rope_pos is also per-slot.)
         let rope_ff_buf = mk_storage(16, MemoryLocation::GpuOnly, "rope_ff_dummy")?;
         let rope_idx_buf = mk_storage(16, MemoryLocation::GpuOnly, "rope_idx_dummy")?;
+        // Sprint 43D-4 — Gemma-4 V-norm gamma. Single buffer of 1.0
+        // floats, length = max per-layer head_dim. Used as the gamma
+        // operand to `run_rms_norm` so the shader effectively reduces
+        // to the parameterless `v / rms(v)` formula HF applies.
+        let vnorm_max_dim = config.head_dim.max(
+            config.gemma4.as_ref()
+                .and_then(|g| g.layers.iter().map(|l| l.head_dim).max())
+                .unwrap_or(0),
+        );
+        let vnorm_bytes = (vnorm_max_dim as u64) * 4;
+        let mut vnorm_ones = mk_storage(
+            vnorm_bytes.max(4), MemoryLocation::CpuToGpu, "vnorm_ones",
+        )?;
+        {
+            let ones: Vec<f32> = vec![1.0_f32; vnorm_max_dim as usize];
+            vnorm_ones.write_bytes(bytemuck::cast_slice(&ones))?;
+        }
 
         // ---- Phase-3E batch-prefill scratch buffers ----
         // Allocations sized for the largest prompt we'll batch in one
@@ -1573,7 +1678,7 @@ impl Forward {
             logits_staging,
             hidden_staging,
             fuse0, fuse1,
-            rope_ff_buf, rope_idx_buf,
+            rope_ff_buf, rope_idx_buf, vnorm_ones,
             kv_cache, config,
             descriptor_pool,
             set_cache: HashMap::new(),
@@ -1841,7 +1946,7 @@ impl Forward {
             .into());
         }
         // Sprint 43D-3 — Gemma-4 embedding scale: HF
-        // `Gemma3nTextModel.forward` does
+        // `Gemma4TextModel.forward` does
         // `hidden_states = inputs_embeds * sqrt(hidden_size)` before the
         // first decoder layer. `Gemma4Spec.embed_scale` was parsed in
         // 43B-2 but never applied — without this multiplier the initial
@@ -1849,6 +1954,10 @@ impl Forward {
         // and every downstream RMSNorm runs against the wrong magnitude.
         // Non-Gemma-4 architectures (Llama / Qwen / Mistral) write the
         // embedding through unmodified — same as before.
+        //
+        // Sprint 43D-4 — the scaled vector is also fed to the PLE build
+        // as `inputs_embeds` for the context-aware projection
+        // (per_layer_model_projection @ inputs_embeds → ctx_proj).
         if let Some(g) = self.config.gemma4.as_ref() {
             let s = g.embed_scale;
             let mut scaled = Vec::with_capacity(embedding.len());
@@ -1856,19 +1965,24 @@ impl Forward {
                 scaled.push(v * s);
             }
             self.cur_mut().scratch_a.write_bytes(bytemuck::cast_slice(&scaled))?;
+            // Pre-write the RoPE position buffer (Gemma-4 path).
+            self.cur_mut().rope_pos_buf
+                .write_bytes(bytemuck::bytes_of(&(position as u32)))?;
+            // Sprint 43D-4 — Gemma-4 PLE build:
+            //   per_layer_inputs = (ctx_proj_normed + token_identity) × 1/√2
+            // ctx_proj depends on the *scaled* embedding (HF's
+            // `inputs_embeds`), so feed `scaled` directly. Skipped for
+            // models without ple_data (= non-Gemma-4 or any Gemma-4
+            // checkpoint that lacks the PLE tensors).
+            if let Some(ple) = model.ple_data.as_ref() {
+                let v = ple.build_per_layer_inputs(token_id, &scaled);
+                self.cur_mut().per_layer_inputs.write_bytes(bytemuck::cast_slice(&v))?;
+            }
         } else {
             self.cur_mut().scratch_a.write_bytes(bytemuck::cast_slice(embedding))?;
-        }
-        // Pre-write the RoPE position buffer.
-        self.cur_mut().rope_pos_buf
-            .write_bytes(bytemuck::bytes_of(&(position as u32)))?;
-        // Sprint 43D-3 — Gemma-4 PLE: lookup + scale + projection_norm
-        // on the host, write the [num_layers × hps] FP32 vector into
-        // the current slot's per_layer_inputs buffer. dispatch_layer
-        // reads slice [layer*hps..(layer+1)*hps] per layer.
-        if let Some(ple) = model.ple_data.as_ref() {
-            let v = ple.build_per_layer_inputs(token_id);
-            self.cur_mut().per_layer_inputs.write_bytes(bytemuck::cast_slice(&v))?;
+            // Pre-write the RoPE position buffer (non-Gemma-4 path).
+            self.cur_mut().rope_pos_buf
+                .write_bytes(bytemuck::bytes_of(&(position as u32)))?;
         }
 
         // Reset descriptor pool for fresh allocations this forward —
@@ -1914,6 +2028,47 @@ impl Forward {
             }
             self.record_decode_dispatches(dev, registry, cmd, model, cur_slot, position);
         })?;
+
+        // Sprint 43D-4 — VF_LAYER_DUMP_ALL=1 in the forward_token path
+        // (force_per_token prefill). Mirrors the wait_and_read_logits
+        // version so SafeTensors models that route through forward_token
+        // get the same all-layer dump on the LAST prefill token. The
+        // VF_LAYER_DUMP_OUT path is overwritten on every call — drivers
+        // running multi-token prompts will get the LAST token's layer
+        // outputs (which is exactly what HF's
+        // output_hidden_states[-1, last_pos, :] compares against).
+        //
+        // VF_DUMP_LAYER34_STAGES=1 additionally fills slots 36..42 with
+        // 7 intra-layer-34 stages — extend the read window so they land
+        // in the output blob too. Layout becomes:
+        //   slot 0..n_layers-1 = post-layer-N hidden state
+        //   slot 35            = (unused; we write to 36..42)
+        //   slot 36..42        = 7 stages of layer 34 (1..=7)
+        if std::env::var("VF_LAYER_DUMP_ALL").is_ok() {
+            let h = self.config.hidden_dim as usize;
+            let nl = self.config.n_layers as usize;
+            let bytes = self.hidden_staging.read_bytes()?;
+            let need_layers = nl * h * 4;
+            let stage_slot_max: usize =
+                if std::env::var("VF_DUMP_LAYER34_STAGES").is_ok() { 43 } else { nl };
+            let need = stage_slot_max * h * 4;
+            let take = bytes.len().min(need.max(need_layers));
+            if let Some(path) = std::env::var("VF_LAYER_DUMP_OUT").ok() {
+                std::fs::write(&path, &bytes[..take])?;
+                eprintln!(
+                    "[VF_LAYER_DUMP_ALL] forward_token wrote {} bytes ({} slots × {} × 4) to {}",
+                    take, take / (h * 4), h, path,
+                );
+            } else {
+                for layer in 0..nl {
+                    let off = layer * h * 4;
+                    if off + h * 4 > take { break; }
+                    let slice: &[f32] =
+                        bytemuck::cast_slice::<u8, f32>(&bytes[off..off + h * 4]);
+                    maybe_dump_hidden_staging(&format!("forward_token_layer{layer:02}"), slice);
+                }
+            }
+        }
 
         // Sprint 43D Bisect — read + dump hidden_staging if VF_LAYER_DUMP
         // selected a layer or VF_FINAL_NORM_DUMP is on. Logged once per
@@ -2396,10 +2551,22 @@ impl Forward {
     pub fn logits(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         // Sprint 27 — read from host-mapped staging copy.
         let bytes = self.logits_staging.read_bytes()?;
-        Ok(bytemuck::cast_slice::<u8, f32>(
+        let mut logits: Vec<f32> = bytemuck::cast_slice::<u8, f32>(
             &bytes[..(self.config.vocab_size as usize) * 4],
         )
-        .to_vec())
+        .to_vec();
+        // Sprint 43D-4 — match `wait_and_read_logits` semantics: apply
+        // the final-logit softcap (Gemma-4) before returning. Without
+        // this the prefill-final logits (read via `forward.logits()`
+        // after force_per_token loops) skip the softcap that the async
+        // decode path applies, so the first sampled token comes off the
+        // un-capped distribution while every subsequent decode token
+        // comes off the capped one. Matches HF's ordering (softcap is
+        // a single output transform, not per-token-conditional).
+        maybe_dump_logits("logits()/forward_token-prefill pre-softcap", &logits);
+        apply_final_logit_softcap(&self.config, &mut logits);
+        maybe_dump_logits("logits()/forward_token-prefill post-softcap", &logits);
+        Ok(logits)
     }
 
     pub fn destroy(self, device: &ash::Device, allocator: &mut Allocator) {
@@ -2472,6 +2639,7 @@ impl Forward {
         self.fuse1.destroy(device, allocator);
         self.rope_ff_buf.destroy(device, allocator);
         self.rope_idx_buf.destroy(device, allocator);
+        self.vnorm_ones.destroy(device, allocator);
         self.batch_input.destroy(device, allocator);
         self.batch_residual.destroy(device, allocator);
         self.batch_norm.destroy(device, allocator);
@@ -2520,6 +2688,42 @@ impl Forward {
                 self.current_slot, input, output, hn,
             );
         }
+        // Sprint 43D-4 — VF_DUMP_LAYER34_STAGES=1 captures 7 intra-layer
+        // stages of layer 34 into hidden_staging slots 35..41 (since
+        // slots 0..34 hold the all-layer dump). Read out via the
+        // existing VF_LAYER_DUMP_ALL = 1 path; this gate just adds the
+        // extra cmd_copy_buffer dispatches inside dispatch_layer.
+        let dump_l34_stages =
+            std::env::var("VF_DUMP_LAYER34_STAGES").is_ok() && layer == cfg.n_layers - 1;
+        let hs_handle = self.hidden_staging.handle;
+        let hs_size_bytes = (cfg.hidden_dim as u64) * 4;
+        let mut stage_dump = |this_dev: &VulkanDevice,
+                              cmd_buf: vk::CommandBuffer,
+                              stage: u32,
+                              src: vk::Buffer| {
+            if !dump_l34_stages {
+                return;
+            }
+            // Slots 35..41 (7 stages); offset = (35 + stage) * hidden × 4.
+            let dst_off = (35 + stage as u64) * hs_size_bytes;
+            let copy = vk::BufferCopy::default()
+                .src_offset(0).dst_offset(dst_off).size(hs_size_bytes);
+            let bar = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            unsafe {
+                this_dev.device.cmd_pipeline_barrier(
+                    cmd_buf,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&bar), &[], &[],
+                );
+                this_dev.device.cmd_copy_buffer(
+                    cmd_buf, src, hs_handle, std::slice::from_ref(&copy),
+                );
+            }
+        };
         // Sprint 43C — per-layer head_dim / ffn_dim / rope_theta /
         // rotary_dim. Falls back to cfg uniform for non-Gemma-4
         // architectures (Llama / Qwen / etc.) — same numbers as
@@ -2557,6 +2761,8 @@ impl Forward {
         self.run_rms_norm(dev, registry, cmd, input, w, hidden_norm,
                          cfg.hidden_dim, 1, cfg.rms_norm_eps, "rms_norm_attn");
         self.mark_written(&[hidden_norm]);
+        // Sprint 43D-4 STAGE 1 — post-attn-norm (= input_layernorm output).
+        stage_dump(dev, cmd, 1, hidden_norm);
         // Next: (b) reads hidden_norm.
         self.maybe_compute_barrier(dev, cmd, &[hidden_norm]);
 
@@ -2698,6 +2904,26 @@ impl Forward {
         } else {
             self.mark_written(&[q_buf]);
         }
+        // Sprint 43D-4 — Gemma-4 V-norm. HF Gemma4TextAttention applies a
+        // parameterless RMSNorm to V (head_dim axis, with_scale=False)
+        // BEFORE the KV-cache write. Without this the V projection
+        // direction drifts steeply across early layers (cosine-similarity
+        // analysis showed 0.95 → 0.57 between layer 1 → 2 on Gemma-4-E2B
+        // for prompt "Hi"). The shader is the standard `run_rms_norm`
+        // with a synthetic `vnorm_ones` gamma vector — equivalent to
+        // `v * rsqrt(mean(v²) + eps)` per HF.
+        // Subscribers don't compute their own V (they read publisher's
+        // already-normed cache slab) — skip.
+        if cfg.gemma4.is_some() && layer_owns_kv {
+            self.maybe_compute_barrier(dev, cmd, &[v_buf]);
+            self.run_rms_norm(
+                dev, registry, cmd,
+                v_buf, self.vnorm_ones.handle, v_buf,
+                head_dim, cfg.n_kv_heads,
+                cfg.rms_norm_eps, "rms_norm_v",
+            );
+            self.mark_written(&[v_buf]);
+        }
         // Next: (e) KV-write reads k_buf, v_buf.
         if layer_owns_kv {
             self.maybe_compute_barrier(dev, cmd, &[k_buf, v_buf]);
@@ -2796,6 +3022,8 @@ impl Forward {
                 q_dim, cfg.hidden_dim, scale_o, "gemv_o");
         }
         self.mark_written(&[o_buf]);
+        // Sprint 43D-4 STAGE 2 — post-attention (o_buf, after O-projection).
+        stage_dump(dev, cmd, 2, o_buf);
         // Next: (h+i) reads input + o_buf.
         self.maybe_compute_barrier(dev, cmd, &[input, o_buf]);
 
@@ -2829,6 +3057,8 @@ impl Forward {
                             input, gate_buf, res1,
                             cfg.hidden_dim, "add_res1_gemma4");
             self.mark_written(&[res1]);
+            // Sprint 43D-4 STAGE 3 — post-residual1 (= input + post_attn_norm(attn)).
+            stage_dump(dev, cmd, 3, res1);
             self.maybe_compute_barrier(dev, cmd, &[res1]);
 
             // Step 3: hidden_norm = rms_norm(res1) * pre_feedforward_layernorm
@@ -2921,6 +3151,8 @@ impl Forward {
                 ffn_dim, cfg.hidden_dim, scale_d, "gemv_down");
         }
         self.mark_written(&[ffn_out]);
+        // Sprint 43D-4 STAGE 4 — post-MLP (ffn_out, after ffn_down GEMV).
+        stage_dump(dev, cmd, 4, ffn_out);
         // Sprint 43D Diagnose — Gemma-4 has a post_feedforward_layernorm
         // applied to ffn_out *before* the final residual add.
         if cfg.gemma4.is_some() {
@@ -2936,6 +3168,8 @@ impl Forward {
             self.run_binary(dev, registry, cmd, ShaderId::Add,
                             res1, gate_buf, output,
                             cfg.hidden_dim, "add_res2_gemma4");
+            // Sprint 43D-4 STAGE 5 — post-residual2 (output = res1 + post_ffn_norm(ffn_out)).
+            stage_dump(dev, cmd, 5, output);
         } else {
             self.maybe_compute_barrier(dev, cmd, &[res1, ffn_out]);
             // (n) Residual2 = res1 + ffn_out → output
@@ -3060,6 +3294,31 @@ impl Forward {
                 cfg.hidden_dim, "add_ple",
             );
             self.mark_written(&[output]);
+            // Sprint 43D-4 STAGE 6 — post-PLE (output, after ple-add).
+            stage_dump(dev, cmd, 6, output);
+        }
+
+        // Sprint 43D-4 — Gemma-4 per-layer scalar (HF
+        // `Gemma4TextDecoderLayer.forward` final line:
+        // `hidden_states *= self.layer_scalar`). The scalar is a learned
+        // [1] tensor per layer with values 0.018..0.871 (mean 0.527 on
+        // E2B). Without this multiply, layer-0 output is 56× too large,
+        // layer-14 35× — the cascade through residual additions in
+        // subsequent layers overwhelms the actual signal and forces
+        // the logit distribution to collapse to a few high-freq tokens
+        // (Sprint 43D-3 mode-collapse symptom). Applied as the very
+        // last op before the layer returns. Non-Gemma-4 stacks skip
+        // this entirely.
+        if cfg.gemma4.is_some() {
+            self.maybe_compute_barrier(dev, cmd, &[output]);
+            let scalar = layer_weight(model, layer, "layer_scalar");
+            self.run_mul_scalar_b(
+                dev, registry, cmd, output, scalar, output,
+                cfg.hidden_dim, "layer_scalar_mul",
+            );
+            self.mark_written(&[output]);
+            // Sprint 43D-4 STAGE 7 — post-layer_scalar (= final layer output).
+            stage_dump(dev, cmd, 7, output);
         }
 
         // Next: next layer's attn_norm reads `output` (= its `input`),
@@ -4319,7 +4578,17 @@ impl Forward {
         // correct per-layer value. Default path (uniform layout)
         // resolves to cfg.head_dim and self.attn_scale unchanged.
         let head_dim_layer = self.kv_cache.head_dim_for(layer);
-        let attn_scale_layer = if head_dim_layer != cfg.head_dim {
+        let attn_scale_layer = if cfg.gemma4.is_some() {
+            // Sprint 43D-4 — HF Gemma4TextAttention sets `self.scaling
+            // = 1.0` (line 972 of modular_gemma4.py). The standard
+            // `1/√head_dim` is absorbed into the post-Q-norm magnitude
+            // (Q-norm normalizes Q to unit-rms-per-head, so Q·Kᵀ stays
+            // bounded without an explicit scale). VF pre-43D-4 was
+            // applying `1/√head_dim` on top, double-scaling the scores
+            // and damaging attention math — visible as cosine cliff at
+            // Layer 2 in the layer-by-layer divergence analysis.
+            1.0_f32
+        } else if head_dim_layer != cfg.head_dim {
             1.0_f32 / (head_dim_layer as f32).sqrt()
         } else {
             self.attn_scale
@@ -4524,7 +4793,11 @@ impl Forward {
         let layer_size = self.kv_cache.layer_size_bytes(layer);
         // Sprint 43D-1 — per-layer head_dim for Gemma-4 heterogeneous.
         let head_dim_layer = self.kv_cache.head_dim_for(layer);
-        let attn_scale_layer = if head_dim_layer != cfg.head_dim {
+        // Sprint 43D-4 — see decode-path comment: Gemma-4 attention
+        // uses scaling=1.0 (Q-norm absorbs the 1/√d).
+        let attn_scale_layer = if cfg.gemma4.is_some() {
+            1.0_f32
+        } else if head_dim_layer != cfg.head_dim {
             1.0_f32 / (head_dim_layer as f32).sqrt()
         } else {
             self.attn_scale
@@ -4636,7 +4909,11 @@ impl Forward {
         let layer_size = self.kv_cache.layer_size_bytes(layer);
         // Sprint 43D-1 — per-layer head_dim for Gemma-4 heterogeneous.
         let head_dim_layer = self.kv_cache.head_dim_for(layer);
-        let attn_scale_layer = if head_dim_layer != cfg.head_dim {
+        // Sprint 43D-4 — see decode-path comment: Gemma-4 attention
+        // uses scaling=1.0 (Q-norm absorbs the 1/√d).
+        let attn_scale_layer = if cfg.gemma4.is_some() {
+            1.0_f32
+        } else if head_dim_layer != cfg.head_dim {
             1.0_f32 / (head_dim_layer as f32).sqrt()
         } else {
             self.attn_scale
@@ -4702,7 +4979,11 @@ impl Forward {
         let layer_size = self.kv_cache.layer_size_bytes(kv_layer);
         // Sprint 43D-1 — per-layer head_dim for Gemma-4 heterogeneous.
         let head_dim_layer = self.kv_cache.head_dim_for(layer);
-        let attn_scale_layer = if head_dim_layer != cfg.head_dim {
+        // Sprint 43D-4 — see decode-path comment: Gemma-4 attention
+        // uses scaling=1.0 (Q-norm absorbs the 1/√d).
+        let attn_scale_layer = if cfg.gemma4.is_some() {
+            1.0_f32
+        } else if head_dim_layer != cfg.head_dim {
             1.0_f32 / (head_dim_layer as f32).sqrt()
         } else {
             self.attn_scale
@@ -4869,6 +5150,59 @@ impl Forward {
             nb00: 1, nb01: n, nb02: n, nb03: n,
             ne10: n, ne11: 1, ne12: 1, ne13: 1,
             nb10: 1, nb11: n, nb12: n, nb13: n,
+            ne20: n, ne21: 1, ne22: 1, ne23: 1,
+            nb20: 1, nb21: n, nb22: n, nb23: n,
+            misalign_offsets: 0,
+            param1: 0.0, param2: 0.0, param3: 0,
+        };
+        let dispatch_y = (n + 511) / 512;
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, 1, dispatch_y, 1);
+        });
+    }
+
+    /// Sprint 43D-4 — broadcast-Mul where `b` is a single-scalar buffer.
+    /// Computes `d[i] = a[i] * b[0]`. Implemented by routing through the
+    /// existing `Mul` shader with `ne1*=1, nb1*=0` so the broadcast
+    /// `src1_idx(...)` resolves to 0 for every output index. Used for
+    /// Gemma-4's per-layer `layer_scalar` final multiply: each decoder
+    /// layer's output gets `output *= layer_scalar[layer]` with a
+    /// learned 0.018..0.871 scalar (HF
+    /// `Gemma4TextDecoderLayer.forward` end of layer).
+    #[allow(clippy::too_many_arguments)]
+    fn run_mul_scalar_b(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        a: vk::Buffer,
+        b_scalar: vk::Buffer,
+        d: vk::Buffer,
+        n: u32,
+        label: &str,
+    ) {
+        let kernel = registry.get(ShaderId::Mul);
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[(0, a, 0, 0), (1, b_scalar, 0, 0), (2, d, 0, 0)],
+        );
+        let pc = GenericBinaryPushConstants {
+            ne: n,
+            ne00: n, ne01: 1, ne02: 1, ne03: 1,
+            nb00: 1, nb01: n, nb02: n, nb03: n,
+            // Broadcast: b is a single scalar. ne1*=1, nb1*=0 makes
+            // src1_idx(...) = fastmod(i, 1)*0 + ... = 0 for every i.
+            ne10: 1, ne11: 1, ne12: 1, ne13: 1,
+            nb10: 0, nb11: 0, nb12: 0, nb13: 0,
             ne20: n, ne21: 1, ne22: 1, ne23: 1,
             nb20: 1, nb21: n, nb22: n, nb23: n,
             misalign_offsets: 0,
@@ -6828,6 +7162,22 @@ impl Forward {
                 seq_len * hidden, "add_res2_gemma4_b",
             );
             compute_barrier(dev, cmd);
+            // Sprint 43D-4 — Gemma-4 per-layer scalar applied to
+            // batch_residual BEFORE the next-layer attn_norm seed below.
+            // (Gemma-4 currently routes through force_per_token_prefill
+            // and never reaches this batch path, but the order here
+            // matters for correctness if a future sprint re-enables
+            // batch prefill: the next layer's input_layernorm must see
+            // the scaled residual, not the un-scaled one.)
+            // TODO: 44-batch — exercise this path once F32 mul_mm shader
+            // family lands and force_per_token_prefill can be lifted.
+            let scalar = layer_weight(model, layer, "layer_scalar");
+            self.run_mul_scalar_b(
+                dev, registry, cmd,
+                self.batch_residual.handle, scalar, self.batch_residual.handle,
+                seq_len * hidden, "layer_scalar_mul_b",
+            );
+            compute_barrier(dev, cmd);
             // 3) (non-last only) batch_norm = rms_norm(batch_residual)
             //    × next_attn_norm.weight   (= layer N+1's input_layernorm).
             if let Some(w_next) = next_attn_norm_weight {
@@ -7099,9 +7449,17 @@ fn rope_params_for_layer(
 ) -> (u32, u32, f32, f32) {
     if let Some(g) = cfg.gemma4.as_ref() {
         let s = &g.layers[layer as usize];
-        let rotary_dim = match s.rope_partial_factor {
-            Some(f) => ((s.head_dim as f32) * f).round() as u32,
-            None => s.head_dim,
+        // Sprint 43D-4 bisect — `VF_DISABLE_PROPE=1` rotates the FULL
+        // head_dim (no partial-RoPE). All other Gemma-4 RoPE params
+        // (per-layer θ for sliding vs. full layers) are preserved.
+        let disable_prope = std::env::var("VF_DISABLE_PROPE").is_ok();
+        let rotary_dim = if disable_prope {
+            s.head_dim
+        } else {
+            match s.rope_partial_factor {
+                Some(f) => ((s.head_dim as f32) * f).round() as u32,
+                None => s.head_dim,
+            }
         };
         let theta_scale = (1.0_f32 / s.rope_theta).powf(2.0 / rotary_dim as f32);
         (s.head_dim, rotary_dim, s.rope_theta, theta_scale)
@@ -7122,7 +7480,15 @@ fn rope_params_for_layer(
 /// "SubscribesFull" layers it's the publisher's layer index (the first
 /// layer with the matching `OwnAndPublishesXxx` source). Non-Gemma-4
 /// stacks always return `layer`.
+///
+/// Sprint 43D-4 bisect — `VF_DISABLE_KV_SHARE=1` forces every layer to
+/// read its own slab (Subscribe layers get treated as Own). Useful to
+/// isolate whether a coherence regression comes from cross-layer KV-
+/// sharing semantics vs. some other feature.
 fn gemma4_kv_read_layer(cfg: &ModelConfig, layer: u32) -> u32 {
+    if std::env::var("VF_DISABLE_KV_SHARE").is_ok() {
+        return layer;
+    }
     let g = match cfg.gemma4.as_ref() {
         Some(g) => g,
         None => return layer,
@@ -7148,7 +7514,13 @@ fn gemma4_kv_read_layer(cfg: &ModelConfig, layer: u32) -> u32 {
 /// earlier layer? Returns `true` for non-Gemma-4 stacks (they always
 /// own their KV) and for Gemma-4 layers in `Own` /
 /// `OwnAndPublishesSliding` / `OwnAndPublishesFull`.
+///
+/// Sprint 43D-4 bisect — `VF_DISABLE_KV_SHARE=1` forces every layer to
+/// own its KV (= compute + write its own K/V projections every step).
 fn gemma4_layer_owns_kv(cfg: &ModelConfig, layer: u32) -> bool {
+    if std::env::var("VF_DISABLE_KV_SHARE").is_ok() {
+        return true;
+    }
     let g = match cfg.gemma4.as_ref() {
         Some(g) => g,
         None => return true,
@@ -7163,7 +7535,13 @@ fn gemma4_layer_owns_kv(cfg: &ModelConfig, layer: u32) -> bool {
 /// sliding layers returns `max(0, position+1 - sliding_window)`; for
 /// every other layer (Gemma-4 full layers AND non-Gemma-4 stacks)
 /// returns 0 (= attend to the full causal history).
+///
+/// Sprint 43D-4 bisect — `VF_DISABLE_SLIDING_WINDOW=1` always returns 0
+/// (= every layer attends to the full causal history, no window mask).
 fn gemma4_kv_start(cfg: &ModelConfig, layer: u32, position: u32) -> u32 {
+    if std::env::var("VF_DISABLE_SLIDING_WINDOW").is_ok() {
+        return 0;
+    }
     let g = match cfg.gemma4.as_ref() {
         Some(g) => g,
         None => return 0,

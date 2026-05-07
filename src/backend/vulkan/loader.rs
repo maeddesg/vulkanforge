@@ -118,19 +118,30 @@ pub struct LoadedModel {
     pub ple_data: Option<PleData>,
 }
 
-/// Sprint 43D-3 — Per-Layer Embeddings runtime state for Gemma-4.
+/// Sprint 43D-3 + 43D-4 — Per-Layer Embeddings runtime state for Gemma-4.
 ///
-/// HF transformers `Gemma3nTextModel.get_per_layer_inputs` formula:
-/// 1. Lookup row from `embed_tokens_per_layer[token_id]` (BF16, shape
-///    `[num_layers × hps]`).
-/// 2. Scale by `embed_per_layer_scale = sqrt(hps)`.
-/// 3. RMSNorm each per-layer slice with `per_layer_projection_norm.weight`.
+/// HF transformers `Gemma4TextModel.{get,project}_per_layer_inputs`:
 ///
-/// All of this happens CPU-side per token (35 × 256 = 8960 floats — too
-/// small to be worth a GPU shader). The result is a [num_layers × hps]
-/// FP32 vector that gets uploaded to a per-slot CpuToGpu staging buffer
-/// and consumed by `Forward::dispatch_layer` via per-layer GEMV /
-/// activation / RMSNorm dispatches.
+/// 1. **token_identity** = `embed_tokens_per_layer[token_id]` × √hps.
+///    Reshape to `[num_layers, hps]`. NO RMSNorm here. (The
+///    `Gemma4TextScaledWordEmbedding` applies the √hps scale inline.)
+/// 2. **context_projection** =
+///       `per_layer_model_projection @ inputs_embeds`     # [num_layers × hps]
+///       × (1 / √hidden_size)
+///       reshape `[num_layers, hps]`
+///       per-row RMSNorm with `per_layer_projection_norm.weight`.
+///    The `× 1/√hidden_size` before RMSNorm is mathematically a no-op
+///    (RMSNorm normalises out any constant scalar) — VF skips it.
+/// 3. **merge** = `(context_projection + token_identity) × (1 / √2)`.
+///
+/// All CPU-side per token (35 × 256 = 8960 floats; the GEMV is
+/// 13.8 M MACs / token = ~50 µs on AVX-512 — negligible vs. per-token
+/// GPU forward).
+///
+/// The result is a `[num_layers × hps]` FP32 vector that gets uploaded
+/// to a per-slot CpuToGpu staging buffer and consumed by
+/// `Forward::dispatch_layer`'s PLE block at slice
+/// `[layer * hps .. (layer+1) * hps]`.
 pub struct PleData {
     /// `embed_tokens_per_layer.weight` raw BF16 bytes, owned (cloned
     /// from the SafeTensors mmap at load). Shape:
@@ -145,34 +156,73 @@ pub struct PleData {
     pub num_layers: u32,
     /// 256 for E2B (`hidden_size_per_layer_input`).
     pub hps: u32,
-    /// `sqrt(hps)` — applied to the BF16→F32 lookup before RMSNorm.
+    /// `hidden_size` (1536 on E2B). Needed as the GEMV input dim.
+    pub hidden_size: u32,
+    /// `sqrt(hps)` — applied to the BF16→F32 token-identity lookup.
     pub embed_per_layer_scale: f32,
     /// `per_layer_projection_norm.weight` host vector, length `hps`.
+    /// Sprint 43D-4 — applied to the context_projection (row-major
+    /// per-layer slice), NOT to the token_identity (43D-3 wrong place).
     pub projection_norm_gamma: Vec<f32>,
     /// `cfg.rms_norm_eps` — same eps as the main RMSNorms in the layer.
     pub rms_norm_eps: f32,
+    /// Sprint 43D-4 — `per_layer_model_projection.weight` expanded to
+    /// FP32, row-major `[num_layers × hps, hidden_size]` =
+    /// `[8960, 1536]`. Used as the context-aware GEMV that combines
+    /// with the token-identity lookup. Sized ~55 MB on E2B.
+    pub per_layer_model_projection: Vec<f32>,
 }
 
 impl PleData {
-    /// CPU-side per-token PLE prep. Returns the
-    /// `[num_layers × hps]`-element FP32 buffer ready for GPU upload.
-    /// Cost: ~9 K BF16-conversions + 35 × 256 RMSNorm scalars =
-    /// ~30 K FLOPs / token. Negligible vs. one decode-step GEMV.
-    pub fn build_per_layer_inputs(&self, token_id: u32) -> Vec<f32> {
+    /// CPU-side per-token PLE prep (Sprint 43D-4 build).
+    ///
+    /// Inputs:
+    /// - `token_id`: current token's id (drives the `embed_tokens_per_layer` lookup).
+    /// - `inputs_embeds`: the post-`embed_scale` token embedding for the
+    ///   current token (length = `hidden_size`). Matches HF's `inputs_embeds`
+    ///   = `embed_tokens(input_ids) * sqrt(hidden_size)`.
+    ///
+    /// Returns a `[num_layers × hps]` FP32 vector ready for GPU upload.
+    pub fn build_per_layer_inputs(
+        &self,
+        token_id: u32,
+        inputs_embeds: &[f32],
+    ) -> Vec<f32> {
         let nl = self.num_layers as usize;
         let hps = self.hps as usize;
+        let h = self.hidden_size as usize;
         let row_elems = nl * hps;
+        debug_assert_eq!(inputs_embeds.len(), h);
+
+        // (1) token_identity = embed_tokens_per_layer[token_id] × √hps.
         let row_off = (token_id as usize) * row_elems * 2;
         let row_bytes = &self.embed_table_bf16[row_off..row_off + row_elems * 2];
-        let mut out = vec![0.0_f32; row_elems];
+        let mut token_id_part = vec![0.0_f32; row_elems];
         for (i, chunk) in row_bytes.chunks_exact(2).enumerate() {
             let bf = u16::from_le_bytes([chunk[0], chunk[1]]);
-            out[i] = bf16_to_f32(bf) * self.embed_per_layer_scale;
+            token_id_part[i] = bf16_to_f32(bf) * self.embed_per_layer_scale;
         }
-        // RMSNorm each layer-slice independently with the shared gamma.
+
+        // (2) context_projection = per_layer_model_projection @ inputs_embeds.
+        //     Weight shape [out=row_elems, in=hidden_size], row-major. Output
+        //     is [row_elems] FP32. Skip the HF `× 1/√hidden_size` scale —
+        //     RMSNorm below makes it a no-op.
+        let mut ctx = vec![0.0_f32; row_elems];
+        let w = self.per_layer_model_projection.as_slice();
+        debug_assert_eq!(w.len(), row_elems * h);
+        for out_i in 0..row_elems {
+            let row = &w[out_i * h..(out_i + 1) * h];
+            let mut acc = 0.0_f64;
+            for j in 0..h {
+                acc += (row[j] as f64) * (inputs_embeds[j] as f64);
+            }
+            ctx[out_i] = acc as f32;
+        }
+
+        //     Per-row RMSNorm with projection_norm_gamma (length = hps).
         let eps = self.rms_norm_eps as f64;
         for layer in 0..nl {
-            let slice = &mut out[layer * hps..(layer + 1) * hps];
+            let slice = &mut ctx[layer * hps..(layer + 1) * hps];
             let mut sum_sq = 0.0_f64;
             for &v in slice.iter() {
                 sum_sq += (v as f64) * (v as f64);
@@ -182,6 +232,13 @@ impl PleData {
             for (i, v) in slice.iter_mut().enumerate() {
                 *v = ((*v as f64) * scale * (self.projection_norm_gamma[i] as f64)) as f32;
             }
+        }
+
+        // (3) merge = (ctx + token_id_part) × (1/√2).
+        let inv_sqrt2 = 1.0_f32 / std::f32::consts::SQRT_2;
+        let mut out = vec![0.0_f32; row_elems];
+        for i in 0..row_elems {
+            out[i] = (ctx[i] + token_id_part[i]) * inv_sqrt2;
         }
         out
     }
@@ -1025,8 +1082,11 @@ impl LoadedModel {
         let ple_data = if hf.gemma4.is_some() {
             let pl_table_info = st.tensor("model.language_model.embed_tokens_per_layer.weight");
             let pl_norm_info = st.tensor("model.language_model.per_layer_projection_norm.weight");
-            match (pl_table_info, pl_norm_info, hf.gemma4.as_ref()) {
-                (Some(table_info), Some(norm_info), Some(gm)) => {
+            // Sprint 43D-4 — context-aware projection. Required for the
+            // (token_identity + context) merge inside PLE.
+            let pl_proj_info = st.tensor("model.language_model.per_layer_model_projection.weight");
+            match (pl_table_info, pl_norm_info, pl_proj_info, hf.gemma4.as_ref()) {
+                (Some(table_info), Some(norm_info), Some(proj_info), Some(gm)) => {
                     if !matches!(table_info.dtype, TensorDtype::BF16) {
                         return Err(LoaderError::Buffer(format!(
                             "embed_tokens_per_layer dtype {:?} not supported (BF16 only)",
@@ -1037,6 +1097,7 @@ impl LoadedModel {
                     let nl = config.n_layers;
                     let hps = gm.hidden_size_per_layer_input;
                     let vocab = gm.vocab_size_per_layer_input;
+                    let hidden = config.hidden_dim;
                     let expected = (vocab as u64) * (nl as u64) * (hps as u64) * 2;
                     if table_bytes.len() as u64 != expected {
                         return Err(LoaderError::Buffer(format!(
@@ -1076,6 +1137,50 @@ impl LoadedModel {
                             projection_norm_gamma.len(), hps,
                         )));
                     }
+                    // Sprint 43D-4 — context-aware projection weight.
+                    // Shape: [num_layers × hps, hidden_size] = [8960, 1536].
+                    // Validate dtype + size; expand BF16 → FP32 host vec.
+                    let proj_expected_elems =
+                        (nl as u64) * (hps as u64) * (hidden as u64);
+                    let per_layer_model_projection: Vec<f32> = match proj_info.dtype {
+                        TensorDtype::BF16 => {
+                            let raw = st.tensor_bytes(proj_info);
+                            if (raw.len() as u64) != proj_expected_elems * 2 {
+                                return Err(LoaderError::Buffer(format!(
+                                    "per_layer_model_projection size {} != expected {} \
+                                     (out={}×{}={}, in={}, BF16 ⇒ ×2 B)",
+                                    raw.len(), proj_expected_elems * 2,
+                                    nl, hps, nl * hps, hidden,
+                                )));
+                            }
+                            let bytes = bf16_to_f32_vec(
+                                raw, proj_info, "per_layer_model_projection.weight",
+                            )?;
+                            bytes
+                                .chunks_exact(4)
+                                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                .collect()
+                        }
+                        TensorDtype::F32 => {
+                            let raw = st.tensor_bytes(proj_info);
+                            if (raw.len() as u64) != proj_expected_elems * 4 {
+                                return Err(LoaderError::Buffer(format!(
+                                    "per_layer_model_projection size {} != expected {} \
+                                     (out={}×{}={}, in={}, F32 ⇒ ×4 B)",
+                                    raw.len(), proj_expected_elems * 4,
+                                    nl, hps, nl * hps, hidden,
+                                )));
+                            }
+                            raw.chunks_exact(4)
+                                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                .collect()
+                        }
+                        other => {
+                            return Err(LoaderError::Buffer(format!(
+                                "per_layer_model_projection dtype {other:?} not supported"
+                            )));
+                        }
+                    };
                     let t0 = Instant::now();
                     let embed_table_bf16 = table_bytes.to_vec();
                     eprintln!(
@@ -1083,14 +1188,22 @@ impl LoadedModel {
                         embed_table_bf16.len() as f64 / 1e9,
                         t0.elapsed().as_secs_f64() * 1000.0,
                     );
+                    eprintln!(
+                        "Sprint 43D-4 PLE: per_layer_model_projection expanded \
+                         ({:.1} MB FP32 host, [{}, {}])",
+                        (per_layer_model_projection.len() * 4) as f64 / 1e6,
+                        nl * hps, hidden,
+                    );
                     Some(PleData {
                         embed_table_bf16,
                         vocab,
                         num_layers: nl,
                         hps,
+                        hidden_size: hidden,
                         embed_per_layer_scale: (hps as f32).sqrt(),
                         projection_norm_gamma,
                         rms_norm_eps: config.rms_norm_eps,
+                        per_layer_model_projection,
                     })
                 }
                 _ => None,
