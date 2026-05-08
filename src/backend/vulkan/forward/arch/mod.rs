@@ -13,10 +13,15 @@
 //! `forward/mod.rs` can reach them via `use arch::*;`.
 
 pub(super) mod common;
+pub(super) mod gemma4;
 
 pub(super) use common::{
     GemmKind, compute_barrier, is_fp8_layer_weight, layer_dims, layer_weight,
     layer_weight_opt, layer_weight_scale_block, layer_weight_scale_buf,
     layer_weight_scale_scalar, layer_weight_shader, layer_weight_shader_gemm,
     transfer_to_compute_barrier,
+};
+pub(super) use gemma4::{
+    apply_final_logit_softcap, gemma4_kv_read_layer, gemma4_kv_start,
+    gemma4_layer_owns_kv, rope_params_for_layer,
 };
