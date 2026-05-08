@@ -8,4 +8,5 @@ VP_VULKANINFO_*.json
 docs/vulkanforge_*
 docs/vulkaninfo_*
 docs/wmma_*
+docs/vf_forward_coding_standards.md
 results/

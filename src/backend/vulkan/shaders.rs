@@ -330,6 +330,14 @@ pub enum ShaderId {
     // divisible by 4; runtime falls back to mul_mmq otherwise.
     MulMmQ4KAligned,
     MulMmQ6KAligned,
+    // Sprint 46B — F32×F32 mul_mm. Built from mul_mm.comp with
+    // DATA_A_F32 (LOAD_VEC_A=1 unaligned, =4 aligned). Routes Gemma-4
+    // SafeTensors batch-prefill weights through a real F32 GEMM
+    // instead of the Q4_K coopmat shader (which interpreted the
+    // bytes as Q4_K blocks and produced NaN — Sprint 43F root cause).
+    // Wired into BatchExec in Sprint 46C.
+    MulMmF32,
+    MulMmF32Aligned,
     // v0.2 Sprint 3A — Q4_K dequant-fusion coopmat GEMM with forward-
     // pass-compatible memory layout (B = [N, K] activations, C = [N, M]
     // output). Three BN variants for the per-shape selector. Default
@@ -456,6 +464,8 @@ impl ShaderId {
             ShaderId::MulMmQ6K => "mul_mm_q6_k_f32",
             ShaderId::MulMmQ4KAligned => "mul_mm_q4_k_f32_aligned",
             ShaderId::MulMmQ6KAligned => "mul_mm_q6_k_f32_aligned",
+            ShaderId::MulMmF32 => "mul_mm_f32",
+            ShaderId::MulMmF32Aligned => "mul_mm_f32_aligned",
             ShaderId::MulCoopmatQ4KFwdBn64 => "mul_coopmat_q4k_fwd_bn64",
             ShaderId::MulCoopmatQ4KFwdBn32 => "mul_coopmat_q4k_fwd_bn32",
             ShaderId::MulCoopmatQ4KFwdBn16 => "mul_coopmat_q4k_fwd_bn16",
@@ -531,6 +541,8 @@ impl ShaderId {
             ShaderId::MulMmQ6K => MUL_MM_Q6_K_F32,
             ShaderId::MulMmQ4KAligned => MUL_MM_Q4_K_F32_ALIGNED,
             ShaderId::MulMmQ6KAligned => MUL_MM_Q6_K_F32_ALIGNED,
+            ShaderId::MulMmF32 => MUL_MM_F32,
+            ShaderId::MulMmF32Aligned => MUL_MM_F32_ALIGNED,
             ShaderId::MulMmQ4KCoopmat => MUL_MM_Q4_K_F32_COOPMAT,
             ShaderId::MulMmQ6KCoopmat => MUL_MM_Q6_K_F32_COOPMAT,
             ShaderId::MulMmQ4KAlignedCoopmat => MUL_MM_Q4_K_F32_ALIGNED_COOPMAT,
@@ -693,6 +705,10 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::MulMmQ6K,
     ShaderId::MulMmQ4KAligned,
     ShaderId::MulMmQ6KAligned,
+    // Sprint 46B — F32 mul_mm: always-instantiated like the K-quant
+    // mul_mm family. Wired into BatchExec (Gemma-4 path) in 46C.
+    ShaderId::MulMmF32,
+    ShaderId::MulMmF32Aligned,
 ];
 
 /// Sprint 16C — Sprint-3 era Q4_K coopmat GEMM variants gated behind
@@ -835,6 +851,11 @@ pub const MUL_MM_Q4_K_F32_ALIGNED: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q4_k_f32_aligned.spv"));
 pub const MUL_MM_Q6_K_F32_ALIGNED: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q6_k_f32_aligned.spv"));
+// Sprint 46B — F32×F32 mul_mm SPVs (DATA_A_F32 path).
+pub const MUL_MM_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_f32.spv"));
+pub const MUL_MM_F32_ALIGNED: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_f32_aligned.spv"));
 pub const MUL_MM_Q4_K_F32_COOPMAT: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q4_k_f32_coopmat.spv"));
 pub const MUL_MM_Q6_K_F32_COOPMAT: &[u8] =

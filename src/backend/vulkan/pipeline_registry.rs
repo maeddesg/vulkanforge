@@ -389,7 +389,14 @@ impl PipelineRegistry {
                 ShaderId::MulMmQ4K | ShaderId::MulMmQ6K
                 | ShaderId::MulMmQ4KAligned | ShaderId::MulMmQ6KAligned
                 | ShaderId::MulMmQ3K | ShaderId::MulMmQ3KAligned
-                | ShaderId::MulMmQ5K | ShaderId::MulMmQ5KAligned => {
+                | ShaderId::MulMmQ5K | ShaderId::MulMmQ5KAligned
+                // Sprint 46B — F32×F32 mul_mm shares the same scalar-tile
+                // spec block. The shader's own `#define BK 32` (mul_mm.comp:115)
+                // overrides the spec-constant for the F32 path; the
+                // BLOCK_SIZE / BM / BN / WM / WN / WMITER / TM / TN /
+                // TK / WARP values map 1:1 to the K-quant pipelines so
+                // the LDS footprint and warp geometry stay consistent.
+                | ShaderId::MulMmF32 | ShaderId::MulMmF32Aligned => {
                     // Phase 6 v0.1.2 — mul_mm.comp port. Same spec-
                     // constant layout as MulMmqQ4K/Q6K but no
                     // ACC_TYPEV2 (the build defines that as `vec2` —

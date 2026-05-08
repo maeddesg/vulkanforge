@@ -690,6 +690,33 @@ const JOBS: &[ShaderJob] = &[
             ("LOAD_VEC_A", "4"),
         ],
     },
+    // Sprint 46B — F32×F32 mul_mm. Mirrors llama.cpp's
+    // vulkan-shaders-gen.cpp:582 path (`shader_name + "_f32_f32"` with
+    // tname="f32"): DATA_A_F32, LOAD_VEC_A=1 (`load_vec_a_unaligned=1`
+    // for f32 in gen.cpp:569), B_TYPE=float, D_TYPE=float. Used by
+    // Gemma-4 SafeTensors batch prefill (Sprint 43F's NaN root cause
+    // was F32 weights being routed through the Q4_K path; this is
+    // the proper F32 lane). Tile-size lands on the same 64×64 shape
+    // as the K-quant variants — pipeline_registry.rs reuses the
+    // MulMmQ4K spec-constant block.
+    ShaderJob {
+        out_name: "mul_mm_f32.spv",
+        entry_source: "mul_mm.comp",
+        defines: &[
+            // `A_TYPE` is auto-defined by types.glsl based on DATA_A_F32
+            // + LOAD_VEC_A (vec4 / mat2x4 / float) — passing it from
+            // here would trip glslang's macro-redefinition check.
+            ("DATA_A_F32", "1"),
+            ("B_TYPE", "float"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("FLOAT_TYPEV4", "vec4"),
+            ("ACC_TYPE", "float"),
+            ("ACC_TYPEV2", "vec2"),
+            ("LOAD_VEC_A", "1"),
+        ],
+    },
     ShaderJob {
         out_name: "mul_mm_q6_k_f32.spv",
         entry_source: "mul_mm.comp",
@@ -725,6 +752,29 @@ const JOBS: &[ShaderJob] = &[
             ("DATA_A_Q4_K", "1"),
             ("A_TYPE", "block_q4_K"),
             ("A_TYPE_PACKED32", "block_q4_K_packed32"),
+            ("B_TYPE", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("FLOAT_TYPEV4", "vec4"),
+            ("ACC_TYPE", "float"),
+            ("ACC_TYPEV2", "vec2"),
+            ("LOAD_VEC_A", "4"),
+            ("LOAD_VEC_B", "4"),
+            ("ALIGNED", "1"),
+        ],
+    },
+    // Sprint 46B — F32×F32 aligned mul_mm. Mirrors gen.cpp:583 with
+    // tname="f32": LOAD_VEC_A=load_vec=4 (`load_vec_a` for f32 in
+    // gen.cpp:571), LOAD_VEC_B=4, B_TYPE=vec4, ALIGNED=1. Selected
+    // when seq_len % 4 == 0; falls back to mul_mm_f32 (unaligned)
+    // otherwise.
+    ShaderJob {
+        out_name: "mul_mm_f32_aligned.spv",
+        entry_source: "mul_mm.comp",
+        defines: &[
+            // `A_TYPE` auto-defined by types.glsl (= vec4 for LOAD_VEC_A=4).
+            ("DATA_A_F32", "1"),
             ("B_TYPE", "vec4"),
             ("D_TYPE", "float"),
             ("FLOAT_TYPE", "float"),
