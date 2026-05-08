@@ -44,9 +44,10 @@ use super::super::pipeline_registry::PipelineRegistry;
 use super::super::shaders::ShaderId;
 
 use super::arch::{
-    apply_final_logit_softcap, compute_barrier, layer_weight, layer_weight_opt,
-    layer_weight_scale_block, layer_weight_scale_buf, layer_weight_scale_scalar,
-    layer_weight_shader,
+    GemmKind, apply_final_logit_softcap, compute_barrier, is_fp8_layer_weight,
+    layer_weight, layer_weight_opt, layer_weight_scale_block, layer_weight_scale_buf,
+    layer_weight_scale_scalar, layer_weight_shader, layer_weight_shader_gemm,
+    transfer_to_compute_barrier,
 };
 use super::layer_plan::{ActivationKind, LayerPlan, LayerStep};
 use super::state::Forward;
@@ -817,6 +818,802 @@ impl DecodeExec {
             cfg.hidden_dim, "layer_scalar_mul",
         );
         fwd.mark_written(&[output]);
+    }
+}
+
+// ── BatchExec (Phase B of Sprint 44C-2) ───────────────────────────────
+//
+// State-less per-prompt prefill executor. Mirrors the existing
+// `dispatch_layer_batch` (prefill.rs) line-for-line into a `match
+// LayerStep` over all 26 variants.
+//
+// Differences vs DecodeExec:
+// - GEMV → GEMM for every projection (run_gemm / run_gemm_fp8_* /
+//   run_gemm_coopmat_q4k).
+// - scalar_attn → flash_attn_batch / flash_attn_tiled (driven by
+//   `fa_tiled_enabled`).
+// - Per-token slot buffers → `batch_*` slabs.
+// - Unconditional `compute_barrier(dev, cmd)` between dispatches —
+//   the elision tracker is decode-only (the original prefill path
+//   never calls `mark_written` / `maybe_compute_barrier`).
+// - `AttnNorm` is a no-op: `batch_norm` is pre-seeded by
+//   `record_prefill_seed` (layer 0) or by the previous layer's
+//   Sprint-9b.2 multi_add_rms fusion (layers 1+).
+// - `FfnResidualAdd`'s match arm reads `next_attn_norm_weight` from
+//   `ExecMode::Batch`; on the Llama path it dispatches multi_add_rms
+//   to fuse with the next layer's pre-seed (matching the legacy
+//   call-site contract). Gemma-4 falls back to plain add and emits
+//   the seed RMSNorm separately after `LayerScalarMul` (handled in
+//   `execute_layer`'s loop tail).
+// - **`batch_attn = false` legacy per-token loop is dropped**:
+//   `BatchExec` always uses the batched-attention path. Owner
+//   confirmed in 44C-2 brief.
+// - **Quantize state-less**: each MMQ-routed projection re-quantizes
+//   its input. Bit-identical (deterministic re-quantize); 3-extra
+//   `quantize_q8_1` dispatches per layer when MMQ is selected.
+
+pub(super) struct BatchExec;
+
+impl BatchExec {
+    /// Drive a complete batched-prefill layer plan. The caller invokes
+    /// this once per layer; cross-layer fusion (Sprint 9b.2 +
+    /// Gemma-4 next-attn-norm seed) is handled here using
+    /// `next_attn_norm_weight` from `ExecMode::Batch`.
+    pub(super) fn execute_layer(
+        &self,
+        fwd: &mut Forward,
+        plan: &LayerPlan,
+        ctx: &ExecCtx,
+    ) {
+        let cfg = fwd.config.clone();
+        let mut i = 0;
+        while i < plan.len() {
+            // Llama-path lookahead: AttnResidualAdd + PreFfnNorm →
+            // single multi_add_rms (Sprint 9b). Skipped on Gemma-4
+            // (the plan has PostAttnNorm preceding AttnResidualAdd, so
+            // the residual reads scratch instead of batch_o, and the
+            // fusion shader can't model that).
+            if cfg.gemma4.is_none()
+                && matches!(plan.get(i), Some(LayerStep::AttnResidualAdd))
+                && matches!(plan.get(i + 1), Some(LayerStep::PreFfnNorm))
+            {
+                self.b_fused_attn_residual_norm(fwd, &cfg, ctx);
+                i += 2;
+                continue;
+            }
+            self.execute_step(fwd, &plan[i], &cfg, ctx);
+            i += 1;
+        }
+        // Gemma-4 cross-layer seed: emit a separate rms_norm to seed
+        // the next layer's `batch_norm` from the (post-LayerScalarMul)
+        // batch_residual. Llama fuses this into the FfnResidualAdd
+        // match arm via multi_add_rms, so this only fires on Gemma-4.
+        if cfg.gemma4.is_some() {
+            let next_w = match ctx.mode {
+                ExecMode::Batch { next_attn_norm_weight, .. } => next_attn_norm_weight,
+                _ => unreachable!("BatchExec invoked with Decode mode"),
+            };
+            if let Some(w_next) = next_w {
+                let seq_len = batch_seq_len(ctx);
+                fwd.run_rms_norm(
+                    ctx.dev, ctx.registry, ctx.cmd,
+                    fwd.batch_residual.handle, w_next, fwd.batch_norm.handle,
+                    cfg.hidden_dim, seq_len, cfg.rms_norm_eps, "rms_norm_next_attn_b",
+                );
+                compute_barrier(ctx.dev, ctx.cmd);
+            }
+        }
+    }
+
+    fn execute_step(
+        &self,
+        fwd: &mut Forward,
+        step: &LayerStep,
+        cfg: &ModelConfig,
+        ctx: &ExecCtx,
+    ) {
+        match step {
+            LayerStep::AttnNorm => self.b_step_attn_norm(fwd, cfg, ctx),
+            LayerStep::QProj => self.b_step_q_proj(fwd, cfg, ctx),
+            LayerStep::KProj => self.b_step_k_proj(fwd, cfg, ctx),
+            LayerStep::VProj => self.b_step_v_proj(fwd, cfg, ctx),
+            LayerStep::QBiasAdd => self.b_step_q_bias(fwd, cfg, ctx),
+            LayerStep::KBiasAdd => self.b_step_k_bias(fwd, cfg, ctx),
+            LayerStep::VBiasAdd => self.b_step_v_bias(fwd, cfg, ctx),
+            LayerStep::QNormRope { rotary_dim, freq_base, theta_scale } => {
+                self.b_step_q_norm_rope(fwd, cfg, ctx, *rotary_dim, *freq_base, *theta_scale)
+            }
+            LayerStep::KNormRope { rotary_dim, freq_base, theta_scale } => {
+                self.b_step_k_norm_rope(fwd, cfg, ctx, *rotary_dim, *freq_base, *theta_scale)
+            }
+            LayerStep::QRope { rotary_dim, freq_base, theta_scale } => {
+                self.b_step_q_rope(fwd, cfg, ctx, *rotary_dim, *freq_base, *theta_scale)
+            }
+            LayerStep::KRope { rotary_dim, freq_base, theta_scale } => {
+                self.b_step_k_rope(fwd, cfg, ctx, *rotary_dim, *freq_base, *theta_scale)
+            }
+            LayerStep::VNorm => self.b_step_v_norm(fwd, cfg, ctx),
+            LayerStep::KvWrite => self.b_step_kv_write(fwd, cfg, ctx),
+            LayerStep::Attention { kv_layer: _, kv_start: _ } => {
+                self.b_step_attention(fwd, cfg, ctx)
+            }
+            LayerStep::OProj => self.b_step_o_proj(fwd, cfg, ctx),
+            LayerStep::PostAttnNorm => self.b_step_post_attn_norm(fwd, cfg, ctx),
+            LayerStep::AttnResidualAdd => self.b_step_attn_residual_add(fwd, cfg, ctx),
+            LayerStep::PreFfnNorm => self.b_step_pre_ffn_norm(fwd, cfg, ctx),
+            LayerStep::GateProj => self.b_step_gate_proj(fwd, cfg, ctx),
+            LayerStep::UpProj => self.b_step_up_proj(fwd, cfg, ctx),
+            LayerStep::Activation { kind } => self.b_step_activation(fwd, cfg, ctx, *kind),
+            LayerStep::DownProj => self.b_step_down_proj(fwd, cfg, ctx),
+            LayerStep::PostFfnNorm => self.b_step_post_ffn_norm(fwd, cfg, ctx),
+            LayerStep::FfnResidualAdd => self.b_step_ffn_residual_add(fwd, cfg, ctx),
+            LayerStep::PleBlock => self.b_step_ple_block(fwd, cfg, ctx),
+            LayerStep::LayerScalarMul => self.b_step_layer_scalar_mul(fwd, cfg, ctx),
+        }
+    }
+
+    // ── per-step impls ────────────────────────────────────────────────
+
+    /// Llama-path Sprint-9b fusion: `multi_add_rms(batch_residual,
+    /// batch_o, ffn_norm.weight → batch_residual, batch_norm)`.
+    /// Replaces the AttnResidualAdd + PreFfnNorm pair when the
+    /// loop driver detects the Llama pattern (no PostAttnNorm
+    /// preceding).
+    fn b_fused_attn_residual_norm(
+        &self,
+        fwd: &mut Forward,
+        cfg: &ModelConfig,
+        ctx: &ExecCtx,
+    ) {
+        let seq_len = batch_seq_len(ctx);
+        let w_ffn = layer_weight(ctx.model, ctx.layer, "ffn_norm.weight");
+        fwd.run_multi_add_rms(
+            ctx.dev, ctx.registry, ctx.cmd,
+            fwd.batch_residual.handle, fwd.batch_o.handle, w_ffn,
+            fwd.batch_residual.handle, fwd.batch_norm.handle,
+            cfg.hidden_dim, seq_len, cfg.rms_norm_eps, "add_rms_ffn_b",
+        );
+        compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    fn b_step_attn_norm(&self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx) {
+        // No-op. `batch_norm` is pre-seeded:
+        // - layer 0: by `prefill_batch::record_prefill_seed`,
+        // - layers 1+: by the previous layer's FfnResidualAdd
+        //   (Llama: multi_add_rms with this layer's attn_norm.weight;
+        //    Gemma-4: separate rms_norm in `execute_layer` tail).
+    }
+
+    fn b_step_q_proj(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        let seq_len = batch_seq_len(ctx);
+        let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
+        let q_dim = cfg.n_heads * head_dim;
+        // First proj of attn stage — quantize batch_norm into batch_q8.
+        self.b_run_proj(
+            fwd, cfg, ctx,
+            "attn_q.weight",
+            fwd.batch_norm.handle,
+            fwd.batch_q.handle,
+            q_dim, cfg.hidden_dim, seq_len, "gemm_q",
+            /* quantize_input = */ true,
+        );
+    }
+
+    fn b_step_k_proj(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        let seq_len = batch_seq_len(ctx);
+        let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
+        let kv_dim = cfg.n_kv_heads * head_dim;
+        self.b_run_proj(
+            fwd, cfg, ctx,
+            "attn_k.weight",
+            fwd.batch_norm.handle,
+            fwd.batch_k.handle,
+            kv_dim, cfg.hidden_dim, seq_len, "gemm_k",
+            /* quantize_input = */ false,
+        );
+    }
+
+    fn b_step_v_proj(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        let seq_len = batch_seq_len(ctx);
+        let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
+        let kv_dim = cfg.n_kv_heads * head_dim;
+        self.b_run_proj(
+            fwd, cfg, ctx,
+            "attn_v.weight",
+            fwd.batch_norm.handle,
+            fwd.batch_v.handle,
+            kv_dim, cfg.hidden_dim, seq_len, "gemm_v",
+            /* quantize_input = */ false,
+        );
+        // After Q+K+V finished, emit a single barrier (matches the
+        // legacy `compute_barrier` after the GEMM block).
+        compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    fn b_step_q_bias(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        let seq_len = batch_seq_len(ctx);
+        let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
+        let q_dim = cfg.n_heads * head_dim;
+        let b = layer_weight_opt(ctx.model, ctx.layer, "attn_q.bias")
+            .expect("QBiasAdd emitted but attn_q.bias missing");
+        fwd.run_bias_add(
+            ctx.dev, ctx.registry, ctx.cmd,
+            fwd.batch_q.handle, b, fwd.batch_q.handle,
+            q_dim, seq_len, "bias_q_b",
+        );
+    }
+
+    fn b_step_k_bias(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        let seq_len = batch_seq_len(ctx);
+        let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
+        let kv_dim = cfg.n_kv_heads * head_dim;
+        let b = layer_weight_opt(ctx.model, ctx.layer, "attn_k.bias")
+            .expect("KBiasAdd emitted but attn_k.bias missing");
+        fwd.run_bias_add(
+            ctx.dev, ctx.registry, ctx.cmd,
+            fwd.batch_k.handle, b, fwd.batch_k.handle,
+            kv_dim, seq_len, "bias_k_b",
+        );
+    }
+
+    fn b_step_v_bias(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        let seq_len = batch_seq_len(ctx);
+        let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
+        let kv_dim = cfg.n_kv_heads * head_dim;
+        let b = layer_weight_opt(ctx.model, ctx.layer, "attn_v.bias")
+            .expect("VBiasAdd emitted but attn_v.bias missing");
+        fwd.run_bias_add(
+            ctx.dev, ctx.registry, ctx.cmd,
+            fwd.batch_v.handle, b, fwd.batch_v.handle,
+            kv_dim, seq_len, "bias_v_b",
+        );
+        compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    fn b_step_q_norm_rope(
+        &self,
+        fwd: &mut Forward,
+        cfg: &ModelConfig,
+        ctx: &ExecCtx,
+        rotary_dim: u32,
+        freq_base: f32,
+        theta_scale: f32,
+    ) {
+        let seq_len = batch_seq_len(ctx);
+        let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
+        let wqn = layer_weight(ctx.model, ctx.layer, "attn_q_norm.weight");
+        fwd.run_rms_norm_mul_rope(
+            ctx.dev, ctx.registry, ctx.cmd,
+            fwd.batch_q.handle, wqn, fwd.batch_q.handle,
+            head_dim, rotary_dim, freq_base, theta_scale,
+            cfg.n_heads, seq_len,
+            cfg.rms_norm_eps, "rms_norm_mul_rope_q_b",
+        );
+    }
+
+    fn b_step_k_norm_rope(
+        &self,
+        fwd: &mut Forward,
+        cfg: &ModelConfig,
+        ctx: &ExecCtx,
+        rotary_dim: u32,
+        freq_base: f32,
+        theta_scale: f32,
+    ) {
+        let seq_len = batch_seq_len(ctx);
+        let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
+        let wkn = layer_weight(ctx.model, ctx.layer, "attn_k_norm.weight");
+        fwd.run_rms_norm_mul_rope(
+            ctx.dev, ctx.registry, ctx.cmd,
+            fwd.batch_k.handle, wkn, fwd.batch_k.handle,
+            head_dim, rotary_dim, freq_base, theta_scale,
+            cfg.n_kv_heads, seq_len,
+            cfg.rms_norm_eps, "rms_norm_mul_rope_k_b",
+        );
+        compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    fn b_step_q_rope(
+        &self,
+        fwd: &mut Forward,
+        cfg: &ModelConfig,
+        ctx: &ExecCtx,
+        rotary_dim: u32,
+        freq_base: f32,
+        theta_scale: f32,
+    ) {
+        let seq_len = batch_seq_len(ctx);
+        let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
+        fwd.run_rope_batch(
+            ctx.dev, ctx.registry, ctx.cmd,
+            fwd.batch_q.handle, fwd.batch_q.handle,
+            head_dim, rotary_dim, freq_base, theta_scale,
+            cfg.n_heads, seq_len, "rope_q_batch",
+        );
+    }
+
+    fn b_step_k_rope(
+        &self,
+        fwd: &mut Forward,
+        cfg: &ModelConfig,
+        ctx: &ExecCtx,
+        rotary_dim: u32,
+        freq_base: f32,
+        theta_scale: f32,
+    ) {
+        let seq_len = batch_seq_len(ctx);
+        let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
+        fwd.run_rope_batch(
+            ctx.dev, ctx.registry, ctx.cmd,
+            fwd.batch_k.handle, fwd.batch_k.handle,
+            head_dim, rotary_dim, freq_base, theta_scale,
+            cfg.n_kv_heads, seq_len, "rope_k_batch",
+        );
+        compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    fn b_step_v_norm(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        // Gemma-4-only. The legacy `dispatch_layer_batch` doesn't emit
+        // V-norm because Gemma-4 currently force-routes through
+        // per-token prefill. This impl is included for future
+        // batch-prefill activation; not exercised by Qwen3 paths.
+        let seq_len = batch_seq_len(ctx);
+        let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
+        fwd.run_rms_norm(
+            ctx.dev, ctx.registry, ctx.cmd,
+            fwd.batch_v.handle, fwd.vnorm_ones.handle, fwd.batch_v.handle,
+            head_dim, cfg.n_kv_heads * seq_len,
+            cfg.rms_norm_eps, "rms_norm_v_b",
+        );
+        compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    fn b_step_kv_write(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        let (seq_len, base_pos) = batch_seq_pos(ctx);
+        let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
+        let kv_dim = cfg.n_kv_heads * head_dim;
+        let dst_off = fwd.kv_cache.pos_offset_bytes(ctx.layer, base_pos);
+        let kv_elements = seq_len * kv_dim;
+        if fwd.kv_cache.is_fp8() {
+            fwd.run_kv_store_fp8(
+                ctx.dev, ctx.registry, ctx.cmd,
+                fwd.batch_k.handle, fwd.kv_cache.k_buffer.handle,
+                kv_elements, dst_off, "kv_store_fp8_k_b",
+            );
+            fwd.run_kv_store_fp8(
+                ctx.dev, ctx.registry, ctx.cmd,
+                fwd.batch_v.handle, fwd.kv_cache.v_buffer.handle,
+                kv_elements, dst_off, "kv_store_fp8_v_b",
+            );
+        } else if fwd.kv_cache.is_fp16() {
+            fwd.run_kv_copy_fp16(
+                ctx.dev, ctx.registry, ctx.cmd,
+                fwd.batch_k.handle, fwd.kv_cache.k_buffer.handle,
+                kv_elements, dst_off, "kv_copy_fp16_k_b",
+            );
+            fwd.run_kv_copy_fp16(
+                ctx.dev, ctx.registry, ctx.cmd,
+                fwd.batch_v.handle, fwd.kv_cache.v_buffer.handle,
+                kv_elements, dst_off, "kv_copy_fp16_v_b",
+            );
+        } else {
+            let kv_row_bytes = fwd.kv_cache.row_bytes(ctx.layer);
+            let bulk_size = (seq_len as u64) * kv_row_bytes;
+            let copy = vk::BufferCopy::default()
+                .src_offset(0).dst_offset(dst_off).size(bulk_size);
+            unsafe {
+                ctx.dev.device.cmd_copy_buffer(
+                    ctx.cmd, fwd.batch_k.handle, fwd.kv_cache.k_buffer.handle,
+                    std::slice::from_ref(&copy),
+                );
+                ctx.dev.device.cmd_copy_buffer(
+                    ctx.cmd, fwd.batch_v.handle, fwd.kv_cache.v_buffer.handle,
+                    std::slice::from_ref(&copy),
+                );
+            }
+        }
+        let kv_bar = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ);
+        unsafe {
+            ctx.dev.device.cmd_pipeline_barrier(
+                ctx.cmd,
+                vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                std::slice::from_ref(&kv_bar), &[], &[],
+            );
+        }
+    }
+
+    fn b_step_attention(&self, fwd: &mut Forward, _cfg: &ModelConfig, ctx: &ExecCtx) {
+        let (seq_len, base_pos) = batch_seq_pos(ctx);
+        if fwd.fa_tiled_enabled {
+            fwd.run_flash_attn_tiled(
+                ctx.dev, ctx.registry, ctx.cmd,
+                ctx.layer,
+                fwd.batch_q.handle,
+                fwd.batch_attn_out.handle,
+                seq_len, base_pos, base_pos + seq_len,
+            );
+        } else {
+            fwd.run_flash_attn_batch(
+                ctx.dev, ctx.registry, ctx.cmd,
+                ctx.layer,
+                fwd.batch_q.handle,
+                fwd.batch_attn_out.handle,
+                seq_len, base_pos, base_pos + seq_len,
+            );
+        }
+        compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    fn b_step_o_proj(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        let seq_len = batch_seq_len(ctx);
+        let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
+        let q_dim = cfg.n_heads * head_dim;
+        // O-proj reads attn_out (seq_len × q_dim) and writes (seq_len × hidden).
+        // Stage of one — always quantizes its own input.
+        self.b_run_proj(
+            fwd, cfg, ctx,
+            "attn_output.weight",
+            fwd.batch_attn_out.handle,
+            fwd.batch_o.handle,
+            cfg.hidden_dim, q_dim, seq_len, "gemm_o",
+            /* quantize_input = */ true,
+        );
+        compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    fn b_step_post_attn_norm(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        let seq_len = batch_seq_len(ctx);
+        let post_attn_w = layer_weight(ctx.model, ctx.layer, "ffn_norm.weight");
+        // Reuse `batch_attn_out` as scratch (consumed by O-proj earlier).
+        let scratch = fwd.batch_attn_out.handle;
+        fwd.run_rms_norm(
+            ctx.dev, ctx.registry, ctx.cmd,
+            fwd.batch_o.handle, post_attn_w, scratch,
+            cfg.hidden_dim, seq_len, cfg.rms_norm_eps, "rms_norm_post_attn_b",
+        );
+        compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    fn b_step_attn_residual_add(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        // Gemma-4 path: batch_residual += scratch (the post-attn-normed o,
+        // written by PostAttnNorm). On Llama BatchExec doesn't actually
+        // see this variant solo because the loop driver fuses with
+        // PreFfnNorm.
+        let seq_len = batch_seq_len(ctx);
+        let scratch = if cfg.gemma4.is_some() {
+            fwd.batch_attn_out.handle
+        } else {
+            fwd.batch_o.handle
+        };
+        fwd.run_binary(
+            ctx.dev, ctx.registry, ctx.cmd, ShaderId::Add,
+            fwd.batch_residual.handle, scratch, fwd.batch_residual.handle,
+            seq_len * cfg.hidden_dim, "add_res1_b",
+        );
+        compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    fn b_step_pre_ffn_norm(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        // Gemma-4 path; Llama fuses via multi_add_rms in execute_layer's
+        // lookahead — but BatchExec doesn't have that lookahead today,
+        // so this also fires on Llama (matches the legacy 2-step path
+        // when batch path runs unfused). Use ffn_norm.weight for Llama,
+        // ffn_pre_norm.weight for Gemma-4.
+        let seq_len = batch_seq_len(ctx);
+        let suffix = if cfg.gemma4.is_some() {
+            "ffn_pre_norm.weight"
+        } else {
+            "ffn_norm.weight"
+        };
+        let w = layer_weight(ctx.model, ctx.layer, suffix);
+        fwd.run_rms_norm(
+            ctx.dev, ctx.registry, ctx.cmd,
+            fwd.batch_residual.handle, w, fwd.batch_norm.handle,
+            cfg.hidden_dim, seq_len, cfg.rms_norm_eps, "rms_norm_pre_ffn_b",
+        );
+        compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    fn b_step_gate_proj(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        let seq_len = batch_seq_len(ctx);
+        let (_, ffn_dim, _, _) = layer_dims_local(cfg, ctx.layer);
+        // First proj of FFN stage — quantize batch_norm.
+        self.b_run_proj(
+            fwd, cfg, ctx,
+            "ffn_gate.weight",
+            fwd.batch_norm.handle,
+            fwd.batch_gate.handle,
+            ffn_dim, cfg.hidden_dim, seq_len, "gemm_gate",
+            /* quantize_input = */ true,
+        );
+    }
+
+    fn b_step_up_proj(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        let seq_len = batch_seq_len(ctx);
+        let (_, ffn_dim, _, _) = layer_dims_local(cfg, ctx.layer);
+        self.b_run_proj(
+            fwd, cfg, ctx,
+            "ffn_up.weight",
+            fwd.batch_norm.handle,
+            fwd.batch_up.handle,
+            ffn_dim, cfg.hidden_dim, seq_len, "gemm_up",
+            /* quantize_input = */ false,
+        );
+        compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    fn b_step_activation(
+        &self,
+        fwd: &mut Forward,
+        cfg: &ModelConfig,
+        ctx: &ExecCtx,
+        kind: ActivationKind,
+    ) {
+        let seq_len = batch_seq_len(ctx);
+        let (_, ffn_dim, _, _) = layer_dims_local(cfg, ctx.layer);
+        let n = seq_len * ffn_dim;
+        match kind {
+            ActivationKind::SwiGlu => fwd.run_swiglu(
+                ctx.dev, ctx.registry, ctx.cmd,
+                fwd.batch_gate.handle, fwd.batch_up.handle, fwd.batch_ffn_hidden.handle,
+                n, "swiglu_b",
+            ),
+            ActivationKind::GeluPytorchTanhGlu => fwd.run_gelu_pytorch_tanh_glu(
+                ctx.dev, ctx.registry, ctx.cmd,
+                fwd.batch_gate.handle, fwd.batch_up.handle, fwd.batch_ffn_hidden.handle,
+                n, "gelu_pt_glu_b",
+            ),
+        }
+        compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    fn b_step_down_proj(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        let seq_len = batch_seq_len(ctx);
+        let (_, ffn_dim, _, _) = layer_dims_local(cfg, ctx.layer);
+        // Stage of one — always quantizes its own input.
+        self.b_run_proj(
+            fwd, cfg, ctx,
+            "ffn_down.weight",
+            fwd.batch_ffn_hidden.handle,
+            fwd.batch_ffn_out.handle,
+            cfg.hidden_dim, ffn_dim, seq_len, "gemm_down",
+            /* quantize_input = */ true,
+        );
+        compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    fn b_step_post_ffn_norm(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        // Gemma-4 only.
+        let seq_len = batch_seq_len(ctx);
+        let post_ffn_w = layer_weight(ctx.model, ctx.layer, "ffn_post_norm.weight");
+        let scratch = fwd.batch_attn_out.handle;
+        fwd.run_rms_norm(
+            ctx.dev, ctx.registry, ctx.cmd,
+            fwd.batch_ffn_out.handle, post_ffn_w, scratch,
+            cfg.hidden_dim, seq_len, cfg.rms_norm_eps, "rms_norm_post_ffn_b",
+        );
+        compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    fn b_step_ffn_residual_add(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        let (seq_len, _) = batch_seq_pos(ctx);
+        let next_w = match ctx.mode {
+            ExecMode::Batch { next_attn_norm_weight, .. } => next_attn_norm_weight,
+            _ => unreachable!("BatchExec invoked with Decode mode"),
+        };
+        if cfg.gemma4.is_some() {
+            // Gemma-4: plain add of (residual + post_ffn_normed_ffn_out).
+            // The next-attn-norm seed is emitted by execute_layer's tail.
+            let scratch = fwd.batch_attn_out.handle;
+            fwd.run_binary(
+                ctx.dev, ctx.registry, ctx.cmd, ShaderId::Add,
+                fwd.batch_residual.handle, scratch, fwd.batch_residual.handle,
+                seq_len * cfg.hidden_dim, "add_res2_gemma4_b",
+            );
+            compute_barrier(ctx.dev, ctx.cmd);
+        } else {
+            // Llama: Sprint 9b.2 fused residual-add + next-layer attn-norm
+            // when there's a next layer. Plain add otherwise.
+            match next_w {
+                Some(w_next) => {
+                    fwd.run_multi_add_rms(
+                        ctx.dev, ctx.registry, ctx.cmd,
+                        fwd.batch_residual.handle, fwd.batch_ffn_out.handle, w_next,
+                        fwd.batch_residual.handle,
+                        fwd.batch_norm.handle,
+                        cfg.hidden_dim, seq_len, cfg.rms_norm_eps, "add_rms_attn_next_b",
+                    );
+                }
+                None => {
+                    fwd.run_binary(
+                        ctx.dev, ctx.registry, ctx.cmd, ShaderId::Add,
+                        fwd.batch_residual.handle, fwd.batch_ffn_out.handle,
+                        fwd.batch_residual.handle,
+                        seq_len * cfg.hidden_dim, "add_res2_b",
+                    );
+                }
+            }
+            compute_barrier(ctx.dev, ctx.cmd);
+        }
+    }
+
+    fn b_step_ple_block(&self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx) {
+        // Gemma-4 PLE — not currently exercised in batch path because
+        // Gemma-4 routes through `force_per_token_prefill`. Implementing
+        // it would require porting the 5-dispatch GEMV chain to GEMM
+        // shapes, but those GEMV calls are over [hps] / [hidden] dims
+        // which are small enough that the GEMV impl works for any
+        // seq_len (n_rows = seq_len). Placeholder: panic if reached so
+        // a future regression catches this rather than producing
+        // silently-wrong output.
+        unreachable!(
+            "BatchExec saw PleBlock; Gemma-4 batch prefill is gated by \
+             force_per_token_prefill — lifting that requires implementing \
+             this match arm with batched PLE dispatches"
+        );
+    }
+
+    fn b_step_layer_scalar_mul(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        // Gemma-4 only.
+        let seq_len = batch_seq_len(ctx);
+        let scalar = layer_weight(ctx.model, ctx.layer, "layer_scalar");
+        fwd.run_mul_scalar_b(
+            ctx.dev, ctx.registry, ctx.cmd,
+            fwd.batch_residual.handle, scalar, fwd.batch_residual.handle,
+            seq_len * cfg.hidden_dim, "layer_scalar_mul_b",
+        );
+        compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    // ── shared GEMM-routing helper ───────────────────────────────────
+
+    /// Dispatch a single batched GEMM projection. Routes through one of:
+    /// - `run_gemm_coopmat_q4k` (when `coopmat_q4k_enabled` for K-quant
+    ///   weights),
+    /// - `run_gemm_fp8_blockwise` / `run_gemm_fp8_naive` (FP8 weights),
+    /// - `run_gemm` with the right `mul_mm` / `mul_mmq` shader.
+    ///
+    /// State-less: each MMQ call re-quantises its input. Bit-identical
+    /// to the legacy gather-once pattern; pays 3 extra `quantize_q8_1`
+    /// dispatches per layer in MMQ mode (negligible against the GEMM
+    /// cost itself).
+    /// `quantize_input = true` for the *first* projection of a stage
+    /// (QProj for the attn stage, OProj alone, GateProj for the FFN
+    /// stage, DownProj alone). The follow-up projections in the same
+    /// stage (KProj/VProj after QProj; UpProj after GateProj) call
+    /// with `false` and reuse the `batch_q8` buffer the first
+    /// projection populated. This matches the legacy
+    /// `dispatch_layer_batch` "quantize-once-per-stage" pattern and
+    /// avoids the WAR hazard a per-projection re-quantize would
+    /// introduce on `batch_q8`.
+    #[allow(clippy::too_many_arguments)]
+    fn b_run_proj(
+        &self,
+        fwd: &mut Forward,
+        cfg: &ModelConfig,
+        ctx: &ExecCtx,
+        suffix: &str,
+        input_fp32: vk::Buffer,
+        output: vk::Buffer,
+        m: u32,
+        k: u32,
+        n: u32,
+        label: &'static str,
+        quantize_input: bool,
+    ) {
+        let _ = cfg;
+        let weight = layer_weight(ctx.model, ctx.layer, suffix);
+
+        // Sprint 17B/17C/17D — Q4_0 forces MMQ (no MulMm SPV shipped).
+        let attn_q_type = ctx
+            .model
+            .tensor(&format!("blk.{}.attn_q.weight", ctx.layer))
+            .map(|t| t.ggml_type);
+        let force_mmq = matches!(attn_q_type, Some(GgmlType::Q4_0));
+        let gemm_kind = if force_mmq {
+            GemmKind::Mmq
+        } else if fwd.mul_mm_coopmat_enabled {
+            GemmKind::MulMm
+        } else if fwd.mul_mm_enabled {
+            if n % 4 == 0 { GemmKind::MulMmAligned } else { GemmKind::Mmq }
+        } else {
+            GemmKind::Mmq
+        };
+        let use_mul_mm = matches!(gemm_kind, GemmKind::MulMm | GemmKind::MulMmAligned);
+
+        // Coopmat path takes FP32 directly; pad seq_len up to tile.
+        // Padding only fires on the first proj of a stage — the tail
+        // zero-fill is idempotent (covers the same range to the same
+        // value) but emitting it once keeps the legacy dispatch count.
+        if fwd.coopmat_q4k_enabled && !is_fp8_layer_weight(ctx.model, ctx.layer, suffix) {
+            let n_padded = Forward::pad_to_tile(n, 16);
+            if quantize_input {
+                fwd.zero_activation_tail(
+                    ctx.dev, ctx.cmd, input_fp32,
+                    n, n_padded, k,
+                );
+                transfer_to_compute_barrier(ctx.dev, ctx.cmd);
+            }
+            let (shader, bm, bn) = if n <= 64 {
+                (fwd.coopmat_naive_padded_shader(), 16u32, 16u32)
+            } else if n <= 128 {
+                (ShaderId::MulCoopmatQ4KFwdBn32, 64u32, 32u32)
+            } else {
+                (ShaderId::MulCoopmatQ4KFwdBn64, 64u32, 64u32)
+            };
+            fwd.run_gemm_coopmat_q4k(
+                ctx.dev, ctx.registry, ctx.cmd, shader, weight,
+                input_fp32, output,
+                m, n_padded, k, bm, bn, label,
+            );
+            return;
+        }
+
+        // FP8 routing — always reads FP32 input directly, no quantize.
+        if is_fp8_layer_weight(ctx.model, ctx.layer, suffix) {
+            let scale = layer_weight_scale_buf(ctx.model, ctx.layer, suffix)
+                .expect("FP8 GEMM requires a scale buffer");
+            let blk = layer_weight_scale_block(ctx.model, ctx.layer, suffix);
+            if let Some((bn, bk)) = blk {
+                fwd.run_gemm_fp8_blockwise(
+                    ctx.dev, ctx.cmd, weight, scale,
+                    input_fp32, output,
+                    m, n, k, bn, bk, label,
+                );
+            } else {
+                fwd.run_gemm_fp8_naive(
+                    ctx.dev, ctx.registry, ctx.cmd, weight, scale,
+                    input_fp32, output,
+                    m, n, k, label,
+                );
+            }
+            return;
+        }
+
+        // Standard GEMM path. Quantize once per stage; follow-up
+        // projections reuse the populated `batch_q8`.
+        let gemm_input = if use_mul_mm {
+            input_fp32
+        } else {
+            if quantize_input {
+                fwd.run_quantize_q8_1(
+                    ctx.dev, ctx.registry, ctx.cmd,
+                    input_fp32, fwd.batch_q8.handle,
+                    n * k, "quantize_proj",
+                );
+                compute_barrier(ctx.dev, ctx.cmd);
+            }
+            fwd.batch_q8.handle
+        };
+        let shader = layer_weight_shader_gemm(
+            ctx.model, ctx.layer, suffix, gemm_kind, m, n,
+            fwd.mul_mm_coopmat_enabled, fwd.mul_mm_coopmat_f16acc_enabled,
+        );
+        fwd.run_gemm(
+            ctx.dev, ctx.registry, ctx.cmd, shader, weight,
+            gemm_input, output,
+            m, n, k, label,
+        );
+    }
+}
+
+/// Helper: extract `seq_len` from a Batch ExecCtx.
+fn batch_seq_len(ctx: &ExecCtx) -> u32 {
+    match ctx.mode {
+        ExecMode::Batch { seq_len, .. } => seq_len,
+        _ => unreachable!("BatchExec invoked with Decode mode"),
+    }
+}
+
+/// Helper: extract `(seq_len, base_pos)` from a Batch ExecCtx.
+fn batch_seq_pos(ctx: &ExecCtx) -> (u32, u32) {
+    match ctx.mode {
+        ExecMode::Batch { seq_len, base_pos, .. } => (seq_len, base_pos),
+        _ => unreachable!("BatchExec invoked with Decode mode"),
     }
 }
 

@@ -311,6 +311,26 @@ impl Forward {
         base_pos: u32,
         next_attn_norm_weight: Option<vk::Buffer>,
     ) {
+        // Sprint 44C-2 Phase B — env-gated LayerPlan executor for the
+        // batched-prefill path. Default OFF; set `VF_USE_LAYER_PLAN=1`
+        // to route through BatchExec (always uses flash-attn; legacy
+        // batch_attn=false per-token loop is dropped on this path per
+        // owner direction).
+        if std::env::var("VF_USE_LAYER_PLAN").ok().as_deref() == Some("1") {
+            let plan = super::layer_plan::build_layer_plan(
+                &self.config, model, layer, self.rope_theta_scale,
+            );
+            let ctx = super::executor::ExecCtx {
+                dev, registry, cmd, model, layer,
+                mode: super::executor::ExecMode::Batch {
+                    seq_len, base_pos, next_attn_norm_weight,
+                },
+            };
+            let exec = super::executor::BatchExec;
+            exec.execute_layer(self, &plan, &ctx);
+            return;
+        }
+
         let cfg = self.config.clone();
         let hidden = cfg.hidden_dim;
         // Sprint 43C — per-layer head_dim / ffn_dim for Gemma-4. Falls
