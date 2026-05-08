@@ -1,18 +1,19 @@
-//! Forward-pass orchestration for Qwen3 decode.
+//! Forward-pass orchestration for Qwen3 / Llama / Gemma-4 decode.
 //!
-//! Phase 2C. One [`Forward`] instance owns:
+//! One [`Forward`] instance owns:
 //! - per-token scratch buffers (ping-pong + per-projection slots),
 //! - the K/V cache,
 //! - one long-lived descriptor pool, reset between forwards,
 //! - tiny RoPE auxiliary buffers (pos / ff / indices),
-//! - an optional [`ShaderProfiler`].
+//! - an optional [`crate::backend::vulkan::profiler::ShaderProfiler`].
 //!
-//! [`Forward::forward_token`] dispatches the embedding lookup → 36
+//! [`Forward::forward_token`] dispatches the embedding lookup → N
 //! transformer layers → final RMSNorm → LM head and reads the logits
 //! back. Each shader path gets a method on `Forward` that allocates
 //! a descriptor set from the pool, writes it, and dispatches.
 //!
-//! Layer ordering (Qwen3 with QK-norm):
+//! Layer ordering (Qwen3 with QK-norm — Llama / Gemma-4 differ in the
+//! per-layer pre/post-norm + V-norm + sliding-window mask):
 //! ```text
 //! input ─→ attn_norm ─→ Wq/Wk/Wv (3× GEMV)
 //!         q ─→ q_norm ─→ RoPE-NeoX
@@ -22,6 +23,35 @@
 //!         ffn_norm ─→ gate, up (2× GEMV) ─→ silu(gate)·up ─→ Wdown
 //!         residual1 + Wdown_out ──→ next-layer input
 //! ```
+//!
+//! ## Module layout (Sprint 44B)
+//!
+//! The implementation is split across sibling files under this directory.
+//! Each file holds an `impl Forward { ... }` block; Rust merges them at
+//! typecheck time.
+//!
+//! - [`state`]    — `Forward`, `IntermediateSlot`, `DebugTarget`,
+//!   profile / stats structs, and the descriptor-set cache key.
+//! - [`harness`]  — `HarnessPipeline` (the four FP8 / lm_head dedicated
+//!   pipeline quintuples).
+//! - [`setup`]    — `Forward::new` / `new_with_prefill` / `destroy` /
+//!   feature-flag setters.
+//! - [`runs`]     — 33 per-shader GPU-dispatch helpers (`run_gemv`,
+//!   `run_rms_norm`, `run_flash_attn_*`, …).
+//! - [`decode`]   — per-token forward path (`forward_token`,
+//!   `dispatch_layer`, `dispatch_final`, async-decode pipeline).
+//! - [`prefill`]  — batched-prompt path (`prefill_batch`,
+//!   `dispatch_layer_batch`).
+//! - [`debug`]    — single-layer drivers + env-gated dump helpers.
+//! - [`arch`]     — architecture-specific helpers (Gemma-4 KV-share /
+//!   p-RoPE / sliding-window, layer_weight family, GEMM picker,
+//!   barriers).
+//!
+//! This file (`mod.rs`) keeps only the bits every path needs: the
+//! active-slot accessors (`cur` / `cur_mut`), descriptor-set allocation
+//! + caching (`alloc_or_get_set`, `write_bindings`), barrier-elision
+//! (`maybe_compute_barrier`, `mark_written`, `reset_barrier_state`),
+//! the `profile` timestamp wrapper, and `reset_descriptor_pool_and_cache`.
 
 use ash::vk;
 use ash::vk::Handle;
@@ -61,7 +91,7 @@ impl Forward {
 
 
     // -------------------------------------------------------------
-    // Per-shader dispatch methods.
+    // Descriptor-set allocation + caching, barrier elision, profiling.
     // -------------------------------------------------------------
 
     fn alloc_set(&self, dev: &VulkanDevice, layout: vk::DescriptorSetLayout) -> vk::DescriptorSet {
