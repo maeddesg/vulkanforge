@@ -345,30 +345,6 @@ impl DecodeExec {
             cfg.rms_norm_eps, "rms_norm_mul_rope_q",
         );
         fwd.mark_written(&[q_buf]);
-        // Sprint 46F bisect — dump decode q_buf at layer 0 pos 0 after
-        // QNormRope. Slot 62, first hidden_dim*4 bytes.
-        let pos = decode_position(ctx);
-        if ctx.layer == 0 && pos == 0 && std::env::var("VF_LAYER_DUMP_ALL").is_ok() {
-            let copy_bytes = (cfg.hidden_dim as u64) * 4;
-            let copy = vk::BufferCopy::default()
-                .src_offset(0)
-                .dst_offset(62 * (cfg.hidden_dim as u64) * 4)
-                .size(copy_bytes);
-            let bar = vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-            unsafe {
-                ctx.dev.device.cmd_pipeline_barrier(
-                    ctx.cmd, vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(),
-                    std::slice::from_ref(&bar), &[], &[],
-                );
-                ctx.dev.device.cmd_copy_buffer(
-                    ctx.cmd, q_buf, fwd.hidden_staging.handle,
-                    std::slice::from_ref(&copy),
-                );
-            }
-        }
     }
 
     fn step_k_norm_rope(
@@ -1019,6 +995,17 @@ impl BatchExec {
             q_dim, cfg.hidden_dim, seq_len, "gemm_q",
             /* quantize_input = */ true,
         );
+        // Sprint 46H — barrier between Q-proj and the next stage. For
+        // OWNER layers the trailing `compute_barrier` in `b_step_v_proj`
+        // covers Q/K/V writes uniformly, so this is redundant. For
+        // SUBSCRIBER layers (Gemma-4 KV-share, layers >= num_kv_shared)
+        // the plan skips KProj/VProj/biases entirely and the next step
+        // is QNormRope, which reads batch_q — without this barrier
+        // QNormRope races with Q-proj's writes, surfacing as garbage Q
+        // values for q_idx>0 (the bug manifested as compressed final
+        // logits in 46F's bit-ID test). Latent until 46F lifted
+        // force_per_token_prefill for Gemma-4.
+        compute_barrier(ctx.dev, ctx.cmd);
     }
 
     fn b_step_k_proj(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
@@ -1111,6 +1098,12 @@ impl BatchExec {
             cfg.n_heads, seq_len,
             cfg.rms_norm_eps, "rms_norm_mul_rope_q_b",
         );
+        // Sprint 46H — see b_step_q_proj. Owner layers' trailing
+        // barrier in `b_step_k_norm_rope` covers Q+K, but subscribers
+        // skip the K side and the Attention step reads batch_q
+        // directly — without this barrier the Q write races with the
+        // attention read.
+        compute_barrier(ctx.dev, ctx.cmd);
     }
 
     fn b_step_k_norm_rope(
@@ -1152,6 +1145,10 @@ impl BatchExec {
             head_dim, rotary_dim, freq_base, theta_scale,
             cfg.n_heads, seq_len, "rope_q_batch",
         );
+        // Sprint 46H — same as b_step_q_norm_rope. Subscribers skip
+        // the matching K-side rope; without this trailing barrier
+        // attention races with Q's writes.
+        compute_barrier(ctx.dev, ctx.cmd);
     }
 
     fn b_step_k_rope(
