@@ -62,6 +62,7 @@ mod arch;
 mod debug;
 mod decode;
 mod harness;
+mod layer_plan;
 mod prefill;
 mod runs;
 mod setup;
