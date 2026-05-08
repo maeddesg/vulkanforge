@@ -1,5 +1,114 @@
 # Changelog
 
+## v0.3.15 — Gemma-4 Batch Prefill (2026-05-08)
+
+Lifts the Sprint 43F `force_per_token_prefill` workaround for Gemma-4.
+Batched prefill is now mathematically valid for the heterogeneous
+KV-share / sliding-window / PLE / per-layer-head_dim layout. Decode path
+is unchanged; only Gemma-4 prefill throughput is affected.
+
+### What works now (vs v0.3.14)
+
+| Metric (Gemma-4-E2B-it, 15-prompt suite avg)       | v0.3.14   | v0.3.15   | Δ        |
+|----------------------------------------------------|-----------|-----------|----------|
+| Prefill throughput                                 | ~33 t/s   | **89 t/s** | **2.7×** |
+| Decode throughput                                  | 34 t/s    | 34 t/s    | unchanged|
+| Avg power (hwmon, 10 Hz, full bench)               | 66 W      | 68 W      | +3 %     |
+| Bit-ID vs `VULKANFORGE_FORCE_PER_TOKEN=1`          | n/a       | argmax + top5 match (FP32 reduction noise only) | — |
+
+`VULKANFORGE_FORCE_PER_TOKEN=1` remains a one-line bisect fallback to
+v0.3.14's path. The previous Gemma-4 auto-on (`if cfg.gemma4.is_some()
+{ force_per_token = true; }` in `main.rs`) is removed.
+
+### Sprint chain
+
+The release lands as 7 incremental commits (no squash) so each fix
+stays bisectable:
+
+- **46B** `1dae3e3` — F32 `mul_mm` SPV variants (`mul_mm_f32`,
+  `mul_mm_f32_aligned`). Ports llama.cpp's `tname="f32"` defines into
+  `build.rs`. 0 lines of new GLSL — same `mul_mm.comp` source rebuilt
+  with `-DDATA_A_F32`.
+
+- **46C** `9126bd3` — F32 routing in `BatchExec::b_run_proj`. F32
+  weights take the `MulMmF32` / `MulMmF32Aligned` lane (skip the K-quant
+  coopmat path, skip `quantize_q8_1`).
+
+- **46D** `6df5117` — Batch PLE plumbing for Gemma-4. `per_layer_inputs`
+  resized to `[max_pp × num_layers × hps × 4]`, `token_ids` plumbed
+  through `prefill_batch`, host pre-stage builds all M tokens' PLE
+  slabs before CB record (CPU writes during record are not serialised
+  with GPU reads — see `results/v0315_sprint46c_f32_wiring.md`).
+  `BatchExec::b_step_ple_block` per-token GEMV chain.
+
+- **46E** `4789534` — `flash_attn_batch.comp` /
+  `flash_attn_tiled.comp` / `flash_attn_coopmat.comp` push block grows
+  `kv_start` (sliding-window lower bound, mirrors decode-path
+  Sprint 43D-2). `run_flash_attn_batch` / `run_flash_attn_tiled`
+  take `kv_layer` / `kv_start` parameters and route KV bindings
+  through the publisher's slab.
+
+- **46F** `253024c` — `force_per_token_prefill` Gemma-4 auto-on
+  removed. `embed_scale = sqrt(hidden_size)` applied to `batch_input`
+  (mirrors `forward_token`'s scratch_a write). `BatchExec::b_step_attention`
+  routes `head_dim != 128` layers through `run_flash_attn_batch`
+  instead of `run_flash_attn_tiled` / `flash_attn_coopmat`, both of
+  which hardcode `HEAD_DIM = 128` and would silently leave dims
+  128..head_dim-1 zero.
+
+- **46G** (no commit) — KV-slab content bisect. Confirmed K, V values
+  read by attention are bit-identical between batch and decode paths.
+  Bug NOT in KV-binding; localized to attention-stage ordering.
+
+- **46H** `0a9b33c` — three trailing `compute_barrier()` calls added
+  to `BatchExec::b_step_q_proj` / `b_step_q_norm_rope` / `b_step_q_rope`.
+  For OWNER layers each Q+K[+V] stage already emits a trailing barrier
+  on its LAST step (V-proj, V-bias, K-norm-rope). For SUBSCRIBER
+  layers (Gemma-4 KV-share, layers 15..34 on E2B) those K/V steps are
+  skipped — none of the trailing barriers fire and Q's writes race with
+  the next read. The races showed up as `argmax 236777` (vs reference
+  `236778`, adjacent vocab IDs) with magnitude-compressed final logits
+  in 46F. With these three barriers in place the batch path is
+  bit-identical to `force_per_token_prefill` modulo FP32 reduction
+  order.
+
+### Regression gates
+
+```
+cargo test --release --lib                        67/67   ✅
+Qwen3-8B Q4_K_M decode bit-ID vs v0.3.14         match    ✅
+Qwen3-8B Q4_K_M decode                           111 t/s  (≥100 gate)
+Qwen3-8B FP8 decode                               63 t/s  (≥55 gate)
+Llama-3.1-8B Q4_K_M decode                       115 t/s  (≥100 gate)
+Gemma-4-E2B batch coherence smoke                "2 + 2 = 4"
+Gemma-4-E2B batch bit-ID vs force_per_token      argmax + top5 match
+```
+
+### Files touched (across 46B-H)
+
+```
+build.rs                                  +60   (F32 mul_mm jobs)
+src/main.rs                               -25   (force_per_token lift)
+src/backend/vulkan/decode.rs              +1    (chunk slice → token_ids)
+src/backend/vulkan/pipeline.rs            +10   (FlashAttnBatch.kv_start)
+src/backend/vulkan/forward/setup.rs       +20   (per_layer_inputs resize)
+src/backend/vulkan/forward/prefill.rs     +60   (token_ids, embed_scale,
+                                                 PLE pre-stage)
+src/backend/vulkan/forward/runs.rs        +25   (kv_layer/kv_start args)
+src/backend/vulkan/forward/executor.rs    +280  (b_step_ple_block,
+                                                 b_step_attention routing,
+                                                 Q-side barriers)
+vk_shaders/flash_attn_batch.comp          +10   (kv_start)
+vk_shaders/flash_attn_tiled.comp          +12   (kv_start)
+vk_shaders/flash_attn_coopmat.comp        +12   (kv_start)
+```
+
+No external API breakage: `prefill_batch` grew a `token_ids: &[u32]`
+parameter (non-Gemma callers pass `&[]`); examples + tests under
+`examples/` and `tests/` updated.
+
+---
+
 ## v0.3.14 — `forward.rs` Refactor + Gemma-4 Coherence (2026-05-08)
 
 The Phase-2C `forward.rs` (7816 LOC, 100 + impl-Forward methods) gets

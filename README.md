@@ -110,12 +110,14 @@ numbers are below `tg128`.
 | Qwen3-8B Q4_K_M        |     719 t/s |   **105.2 t/s** |  241 W |  0.437  | 15/15 ✓ |
 | Llama-3.1-8B Q4_K_M    |     585 t/s |   **110.3 t/s** |  251 W | **0.440** | 15/15 ✓ |
 | Qwen3-8B FP8           |     388 t/s |    60.8 t/s   |  191 W |  0.319  | 15/15 ✓ |
-| **Gemma-4-E2B-it**     |    33 t/s ¹ |    34.1 t/s   | **66 W** | **0.513** | 14/15 ✓ |
+| **Gemma-4-E2B-it**     |    89 t/s ¹ |    34.0 t/s   | **68 W** | **0.500** | 14/15 ✓ |
 
-¹ Gemma-4 prefill is currently bounded by `force_per_token_prefill`
-(F32 mul_mm shader family pending). Decode-side is on par with the
+¹ v0.3.15 lifted the v0.3.14 `force_per_token_prefill` workaround
+(33 → 89 t/s, **2.7×**). The batch path is now bit-identical to the
+per-token reference (`VULKANFORGE_FORCE_PER_TOKEN=1` keeps the v0.3.14
+path available as a bisect fallback). Decode-side is on par with the
 larger models on a tok/s/W basis (best in the test) thanks to the
-2 B parameter count keeping power draw at 66 W.
+2 B parameter count keeping power draw at 68 W.
 
 ### Native FP8 prefill pp=512 (Mesa 26.1+, `VF_FP8_NATIVE_WMMA=1`)
 
