@@ -49,6 +49,7 @@ use super::profiler::ShaderProfiler;
 use super::shaders::ShaderId;
 
 mod arch;
+mod harness;
 mod state;
 pub use state::{
     DebugTarget, Forward, ForwardStats, ForwardTokenProfile, IntermediateSlot,
