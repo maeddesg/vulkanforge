@@ -1,6 +1,79 @@
 # Changelog
 
-## Unreleased — Gemma-4 Coherence (post-v0.3.13)
+## v0.3.14 — `forward.rs` Refactor
+
+The Phase-2C `forward.rs` (7816 LOC, 100 + impl-Forward methods) gets
+factored into 11 sibling modules. Sprint 44C ships a `LayerStep` enum +
+two `LayerExecutor` impls (`DecodeExec`, `BatchExec`) so per-layer
+operations live in exhaustive `match` arms — adding a new step is a
+compile error in both executors until handled.
+
+### Module split (Sprint 44B-1 → 44B-4)
+
+```
+src/backend/vulkan/forward/
+├── mod.rs        290 LOC   (cur, alloc_or_get_set, barrier elision, profile)
+├── state.rs      465 LOC   (Forward struct, IntermediateSlot, BindingSignature)
+├── harness.rs    200 LOC   (HarnessPipeline — 4× FP8/lm_head DRY-collapse)
+├── setup.rs      770 LOC   (Forward::new / destroy / setters)
+├── runs.rs      2074 LOC   (33 per-shader run_* helpers)
+├── decode.rs    1170 LOC   (forward_token, dispatch_layer, dispatch_final)
+├── prefill.rs    315 LOC   (prefill_batch, dispatch_layer_batch wrapper)
+├── debug.rs      505 LOC   (forward_layer_debug + maybe_dump_*)
+├── executor.rs  1655 LOC   (LayerStep + ExecCtx + DecodeExec + BatchExec)
+├── layer_plan.rs 778 LOC   (LayerStep enum + arch builders + 15 unit tests)
+└── arch/         600 LOC   (layer_weight family, GemmKind, Gemma-4 helpers)
+```
+
+`mod.rs` shrunk **7816 → 290 LOC (-96 %)**. No file > 2100 LOC.
+
+### Bug-class prevention (Sprint 44C-1 / 44C-2 / 44C-3)
+
+`LayerStep` (26 variants) is the source-of-truth taxonomy. A per-arch
+builder (`build_qwen3_layer`, `build_gemma4_layer`) emits a
+`Vec<LayerStep>` for each layer; both executors then `match`
+exhaustively over the variants.
+
+The Sprint 43D-4 / 43F bug class — "added a per-layer step in
+dispatch_layer but forgot dispatch_layer_batch / dispatch_layer_partial"
+(memory `feedback_layer_dispatch_paths`) — becomes structurally
+unrepresentable: a future variant addition (e.g. AltUp / Laurel for
+Gemma-3n) breaks compilation in **both** executors until each handles
+the new variant.
+
+### Validated bit-identical with v0.3.13 logits
+
+Across decode and batched-prefill paths, all three model families:
+
+| Model              | argmax | top5 vs v0.3.13 |
+|--------------------|--------|-----------------|
+| Qwen3-8B-Q4_K_M    | 151667 | identical       |
+| Qwen3-8B-FP8       | 198    | identical       |
+| Gemma-4-E2B-it     | 993    | identical       |
+
+No performance regression: Qwen3-GGUF 107 t/s decode, Qwen3-FP8 61 t/s,
+Gemma-4 36 t/s — all within run-to-run noise.
+
+### Other Sprint 44C-3 cleanup
+
+- `batch_attn = false` legacy per-token attention loop in
+  `dispatch_layer_batch` is gone. `BatchExec` always uses flash-attn.
+  `set_batch_attn_enabled` setter and the underlying flag removed.
+  `VULKANFORGE_BATCH_ATTN` env var becomes a no-op.
+- `arch::gemma4::rope_params_for_layer` and
+  `arch::gemma4::gemma4_layer_owns_kv` removed — the layer-plan builder
+  duplicates their logic at plan-build time, and no runtime call site
+  remains.
+
+### Test count
+
+67 lib tests (52 baseline + 15 `layer_plan` builder unit tests added in
+44C-1, asserting plan invariants like "Qwen3 plan never contains
+Gemma-4 steps", "Gemma-4 subscriber layer omits K/V/VNorm/KvWrite",
+"Attention routes to publisher slab", "sliding layers carry the
+window length").
+
+### Plus the Gemma-4 coherence work that landed post-v0.3.13 tag
 
 Sprints 43D-1, 43D-2, 43D-3, 43F, 43D-4, and 44A together turn the
 Gemma-4 SafeTensors path from "loads but emits NaN logits / multilingual
