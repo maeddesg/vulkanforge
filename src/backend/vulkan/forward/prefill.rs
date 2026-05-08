@@ -86,8 +86,21 @@ impl Forward {
             return Err("prefill_batch: embeddings length mismatch".into());
         }
 
-        // CPU → batch_input (host-visible).
-        self.batch_input.write_bytes(bytemuck::cast_slice(embeddings))?;
+        // CPU → batch_input (host-visible). Sprint 46F — apply Gemma-4
+        // `embed_scale = sqrt(hidden_size)` here, mirroring the decode
+        // path (decode.rs:197-201). Without this the first decoder
+        // layer of the Gemma-4 batch path would see un-scaled
+        // embeddings — the v0.3.14 force_per_token workaround masked
+        // this because forward_token applied the scale before its own
+        // initial-embedding write.
+        let scaled_embeddings: Option<Vec<f32>> = cfg.gemma4.as_ref().map(|g| {
+            let s = g.embed_scale;
+            embeddings.iter().map(|v| v * s).collect()
+        });
+        let batch_input_src: &[f32] = scaled_embeddings
+            .as_deref()
+            .unwrap_or(embeddings);
+        self.batch_input.write_bytes(bytemuck::cast_slice(batch_input_src))?;
 
         // Pre-stage RoPE positions for every token in the batch.
         // CRITICAL: all GPU dispatches in this submit run AFTER all
@@ -115,13 +128,12 @@ impl Forward {
         //
         // No-op for non-Gemma-4 / Gemma-4-without-PLE (the buffer is a
         // 4-byte placeholder in those cases — see setup.rs).
-        if let Some(g) = cfg.gemma4.as_ref() {
+        if let Some(_g) = cfg.gemma4.as_ref() {
             if let Some(ple) = model.ple_data.as_ref() {
                 let h = hidden as usize;
                 let nl = cfg.n_layers as usize;
-                let hps = g.hidden_size_per_layer_input as usize;
+                let hps = _g.hidden_size_per_layer_input as usize;
                 let row_bytes = (nl * hps * 4) as u64;
-                let scale = g.embed_scale;
                 if (token_ids.len() as u32) != seq_len {
                     return Err(format!(
                         "prefill_batch: Gemma-4 PLE requires token_ids.len() == seq_len; \
@@ -129,16 +141,16 @@ impl Forward {
                         token_ids.len()
                     ).into());
                 }
-                let mut scaled = vec![0.0_f32; h];
+                // Sprint 46F — reuse the already-scaled embedding from
+                // `scaled_embeddings` (built above for the batch_input
+                // copy). Single source of truth means the decode-path
+                // per-token PLE and the batch-path per-token PLE see
+                // identical bits for the same token.
+                let scaled_src = scaled_embeddings.as_deref()
+                    .expect("Gemma-4 path missing scaled_embeddings");
                 for t in 0..seq_len as usize {
-                    // Apply embed_scale to the t-th token row of `embeddings`
-                    // before passing to build_per_layer_inputs (matches
-                    // decode.rs:204 which scales embedding before the call).
-                    let src = &embeddings[t * h..(t + 1) * h];
-                    for i in 0..h {
-                        scaled[i] = src[i] * scale;
-                    }
-                    let v = ple.build_per_layer_inputs(token_ids[t], &scaled);
+                    let scaled = &scaled_src[t * h..(t + 1) * h];
+                    let v = ple.build_per_layer_inputs(token_ids[t], scaled);
                     let off = (t as u64) * row_bytes;
                     self.cur_mut().per_layer_inputs
                         .write_bytes_at(off, bytemuck::cast_slice(&v))?;

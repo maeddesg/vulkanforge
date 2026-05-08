@@ -345,6 +345,30 @@ impl DecodeExec {
             cfg.rms_norm_eps, "rms_norm_mul_rope_q",
         );
         fwd.mark_written(&[q_buf]);
+        // Sprint 46F bisect — dump decode q_buf at layer 0 pos 0 after
+        // QNormRope. Slot 62, first hidden_dim*4 bytes.
+        let pos = decode_position(ctx);
+        if ctx.layer == 0 && pos == 0 && std::env::var("VF_LAYER_DUMP_ALL").is_ok() {
+            let copy_bytes = (cfg.hidden_dim as u64) * 4;
+            let copy = vk::BufferCopy::default()
+                .src_offset(0)
+                .dst_offset(62 * (cfg.hidden_dim as u64) * 4)
+                .size(copy_bytes);
+            let bar = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            unsafe {
+                ctx.dev.device.cmd_pipeline_barrier(
+                    ctx.cmd, vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&bar), &[], &[],
+                );
+                ctx.dev.device.cmd_copy_buffer(
+                    ctx.cmd, q_buf, fwd.hidden_staging.handle,
+                    std::slice::from_ref(&copy),
+                );
+            }
+        }
     }
 
     fn step_k_norm_rope(
@@ -1252,7 +1276,15 @@ impl BatchExec {
         } else {
             (base_pos + seq_len).saturating_sub(kv_start_window)
         };
-        if fwd.fa_tiled_enabled {
+        // Sprint 46F — flash_attn_tiled.comp / flash_attn_coopmat.comp
+        // hardcode HEAD_DIM=128 (Qwen3 / Llama-3.1 / Mistral / DSR1). For
+        // Gemma-4 (head_dim=256) those shaders would silently leave dims
+        // 128..head_dim-1 zero in the attention output. Route Gemma-4
+        // through `run_flash_attn_batch`, which uses per-thread striped
+        // accumulators (Sprint 43D-2) and handles head_dim up to 512.
+        let head_dim_layer = fwd.kv_cache.head_dim_for(ctx.layer);
+        let force_fa_batch = head_dim_layer != 128;
+        if fwd.fa_tiled_enabled && !force_fa_batch {
             fwd.run_flash_attn_tiled(
                 ctx.dev, ctx.registry, ctx.cmd,
                 ctx.layer,
@@ -1763,6 +1795,7 @@ impl BatchExec {
         // dispatch). Skips coopmat_q4k path because that shader assumes
         // packed K-quant blocks.
         let f32_weight = is_f32_layer_weight(ctx.model, ctx.layer, suffix);
+
 
         // Sprint 17B/17C/17D — Q4_0 forces MMQ (no MulMm SPV shipped).
         let attn_q_type = ctx

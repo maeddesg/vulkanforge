@@ -752,37 +752,20 @@ fn run_chat_safetensors(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>
             seed: args.seed,
         },
     };
-    // Sprint 20-Wire — FP8 GEMM is now wired through
-    // `dispatch_layer_batch` (the 7 layer GEMM call sites branch on
-    // `is_fp8_layer_weight`), so SafeTensors prefill no longer needs
-    // the per-token GEMV fallback. Override via
-    // `VULKANFORGE_FORCE_PER_TOKEN=1` if a regression bisect needs
-    // to re-test the M3 reference path.
-    let mut force_per_token_prefill = std::env::var("VULKANFORGE_FORCE_PER_TOKEN")
+    // Sprint 20-Wire — FP8 GEMM is wired through `dispatch_layer_batch`
+    // and (Sprint 46B-E) Gemma-4 F32 batch prefill is too. Per-token
+    // prefill is now an opt-in regression-bisect path; set
+    // `VULKANFORGE_FORCE_PER_TOKEN=1` to keep the v0.3.14 path for
+    // comparison.
+    //
+    // Sprint 46F — the prior Gemma-4 auto-on (Sprint 43F) is removed:
+    // F32 mul_mm SPVs (46B), batch PleBlock plumbing (46D), and
+    // Gemma-4-aware batch flash-attn (46E) make the batch path
+    // mathematically valid. Bit-ID smoke against the env-var path is
+    // documented in results/v0315_sprint46f_*.md.
+    let force_per_token_prefill = std::env::var("VULKANFORGE_FORCE_PER_TOKEN")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    // Sprint 43F — Gemma-4 F32 weights cannot be consumed by the
-    // batch-path mul_mm shaders: VF only ships `DATA_A_Q{4,5,6}_K`
-    // and `DATA_A_F8` SPV variants (see build.rs); there is no
-    // `DATA_A_F32` mul_mm. The Q4_K shader silently mis-interprets
-    // the F32 weight bytes as Q4_K-quantized blocks and produces
-    // values that are non-NaN but mathematically wrong, which then
-    // overflow into NaN through the FFN. The GEMV path
-    // (`MulMatVecF32`) does support F32 directly, so forcing the
-    // per-token prefill route gets Gemma-4 onto a working code path
-    // without needing a brand-new F32 mul_mm shader family.
-    // Cost: prefill drops to decode-rate (~50 t/s vs ~500 t/s on
-    // batch); acceptable since Gemma-4 prefill correctness is the
-    // gate, not throughput. A proper F32 mul_mm shader is filed
-    // for a future sprint (see results/v0314_sprint43f_lm_head_fix.md).
-    if cfg.gemma4.is_some() && !force_per_token_prefill {
-        eprintln!(
-            "VulkanForge: Gemma-4 detected — forcing per-token prefill \
-             (batch-path mul_mm has no F32 weight variant; routing through \
-             GEMV-prefill keeps math on the supported MulMatVecF32 path)."
-        );
-        force_per_token_prefill = true;
-    }
 
     forward.kv_cache.reset();
     let mut current_pos: u32 = 0;
