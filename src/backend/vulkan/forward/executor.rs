@@ -37,7 +37,7 @@ use ash::vk;
 use super::super::device::VulkanDevice;
 use super::super::gguf::{GgmlType, ModelConfig};
 use super::super::loader::LoadedModel;
-use super::super::pipeline::SwigluPushConstants;
+use super::super::pipeline::{GenericBinaryPushConstants, MatVecPushConstants, SwigluPushConstants};
 use super::super::pipeline_registry::PipelineRegistry;
 use super::super::shaders::ShaderId;
 
@@ -1439,20 +1439,240 @@ impl BatchExec {
         }
     }
 
-    fn b_step_ple_block(&self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx) {
-        // Gemma-4 PLE — not currently exercised in batch path because
-        // Gemma-4 routes through `force_per_token_prefill`. Implementing
-        // it would require porting the 5-dispatch GEMV chain to GEMM
-        // shapes, but those GEMV calls are over [hps] / [hidden] dims
-        // which are small enough that the GEMV impl works for any
-        // seq_len (n_rows = seq_len). Placeholder: panic if reached so
-        // a future regression catches this rather than producing
-        // silently-wrong output.
-        unreachable!(
-            "BatchExec saw PleBlock; Gemma-4 batch prefill is gated by \
-             force_per_token_prefill — lifting that requires implementing \
-             this match arm with batched PLE dispatches"
+    fn b_step_ple_block(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        // Sprint 46D Step 4 — per-token PLE block for batch-prefill.
+        //
+        // Semantically identical to DecodeExec::step_ple_block but
+        // looped over `seq_len`. Each iteration binds the relevant
+        // per-token slice of `batch_residual` / scratch / per_layer_inputs
+        // via descriptor (offset, range) so the small GEMV / Add / RMSNorm
+        // shaders see a single 1×K vector. ~5 dispatches × seq_len ×
+        // 35 layers per Gemma-4 forward — slow but correct. An
+        // optimisation pass (single batched-GEMM PLE) is deferred until
+        // after Sprint 46F lifts `force_per_token_prefill`.
+        let seq_len = batch_seq_len(ctx);
+        let g = cfg.gemma4.as_ref().expect("PleBlock without gemma4 config");
+        let hps = g.hidden_size_per_layer_input;
+        let hps_bytes = (hps as u64) * 4;
+        let nl = cfg.n_layers as u64;
+        let row_bytes_per_token = nl * hps_bytes;
+        let layer_off_in_row = (ctx.layer as u64) * hps_bytes;
+        let hidden = cfg.hidden_dim;
+        let hidden_bytes = (hidden as u64) * 4;
+        let (head_dim, ffn_dim, _, _) = layer_dims_local(cfg, ctx.layer);
+        let q_dim = cfg.n_heads * head_dim;
+        let q_dim_bytes = (q_dim as u64) * 4;
+        let ffn_dim_bytes = (ffn_dim as u64) * 4;
+
+        let ple_inputs = fwd.cur().per_layer_inputs.handle;
+        let output = fwd.batch_residual.handle;
+        let scratch_gate = fwd.batch_gate.handle;
+        let scratch_proj = fwd.batch_o.handle;
+        let scratch_normed = fwd.batch_attn_out.handle;
+
+        let w_gate = layer_weight(ctx.model, ctx.layer, "per_layer_input_gate.weight");
+        let w_proj = layer_weight(ctx.model, ctx.layer, "per_layer_projection.weight");
+        let w_pln = layer_weight(ctx.model, ctx.layer, "post_per_layer_input_norm.weight");
+        let s_gate = layer_weight_shader(
+            ctx.model, ctx.layer, "per_layer_input_gate.weight",
+            fwd.mul_mat_vec_subgroup_enabled,
         );
+        let s_proj = layer_weight_shader(
+            ctx.model, ctx.layer, "per_layer_projection.weight",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
+        let scale_gate = layer_weight_scale_scalar(
+            ctx.model, ctx.layer, "per_layer_input_gate.weight",
+        );
+        let scale_proj = layer_weight_scale_scalar(
+            ctx.model, ctx.layer, "per_layer_projection.weight",
+        );
+
+        // batch_residual was just written by FfnResidualAdd /
+        // LayerScalarMul. Make those writes visible to step (1).
+        compute_barrier(ctx.dev, ctx.cmd);
+
+        for t in 0..seq_len {
+            let t_u64 = t as u64;
+            let out_off = t_u64 * hidden_bytes;
+            let gate_off = t_u64 * ffn_dim_bytes;
+            let proj_off = t_u64 * hidden_bytes;
+            let normed_off = t_u64 * q_dim_bytes;
+            let ple_off = t_u64 * row_bytes_per_token + layer_off_in_row;
+
+            // (1) gate_t = per_layer_input_gate @ output[t]  (1536 → 256).
+            {
+                let kernel = ctx.registry.get(s_gate);
+                let set = fwd.alloc_or_get_set(
+                    ctx.dev, kernel.descriptor_set_layout,
+                    &[
+                        (0, w_gate, 0, 0),
+                        (1, output, out_off, hidden_bytes),
+                        (2, scratch_gate, gate_off, hps_bytes),
+                    ],
+                );
+                let pc = MatVecPushConstants {
+                    ncols: hidden, stride_a: hidden, stride_b: hidden, stride_d: hps,
+                    batch_stride_a: hidden * hps, batch_stride_b: hidden, batch_stride_d: hps,
+                    fusion_flags: 0, base_work_group_y: 0,
+                    ne02: 1, ne12: 1, broadcast2: 1,
+                    broadcast3: scale_gate.to_bits(),
+                };
+                let layout = kernel.pipeline_layout;
+                let pipeline = kernel.pipeline;
+                fwd.profile("ple_gemv_gate_b", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
+                    dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                    dev.device.cmd_bind_descriptor_sets(
+                        cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+                    );
+                    dev.device.cmd_push_constants(
+                        cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+                    );
+                    dev.device.cmd_dispatch(cmd, hps, 1, 1);
+                });
+                compute_barrier(ctx.dev, ctx.cmd);
+            }
+
+            // (2) gate_t ← gelu_pytorch_tanh(gate_t) * per_layer_inputs[t, layer].
+            {
+                let kernel = ctx.registry.get(ShaderId::GeluPytorchTanhGlu);
+                let set = fwd.alloc_or_get_set(
+                    ctx.dev, kernel.descriptor_set_layout,
+                    &[
+                        (0, scratch_gate, gate_off, hps_bytes),
+                        (1, ple_inputs, ple_off, hps_bytes),
+                        (2, scratch_gate, gate_off, hps_bytes),
+                    ],
+                );
+                let pc = SwigluPushConstants { n: hps };
+                let dispatch_x = (hps + 255) / 256;
+                let layout = kernel.pipeline_layout;
+                let pipeline = kernel.pipeline;
+                fwd.profile("ple_gelu_glu_b", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
+                    dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                    dev.device.cmd_bind_descriptor_sets(
+                        cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+                    );
+                    dev.device.cmd_push_constants(
+                        cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+                    );
+                    dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
+                });
+                compute_barrier(ctx.dev, ctx.cmd);
+            }
+
+            // (3) proj_t = per_layer_projection @ gate_t  (256 → 1536).
+            {
+                let kernel = ctx.registry.get(s_proj);
+                let set = fwd.alloc_or_get_set(
+                    ctx.dev, kernel.descriptor_set_layout,
+                    &[
+                        (0, w_proj, 0, 0),
+                        (1, scratch_gate, gate_off, hps_bytes),
+                        (2, scratch_proj, proj_off, hidden_bytes),
+                    ],
+                );
+                let pc = MatVecPushConstants {
+                    ncols: hps, stride_a: hps, stride_b: hps, stride_d: hidden,
+                    batch_stride_a: hps * hidden, batch_stride_b: hps, batch_stride_d: hidden,
+                    fusion_flags: 0, base_work_group_y: 0,
+                    ne02: 1, ne12: 1, broadcast2: 1,
+                    broadcast3: scale_proj.to_bits(),
+                };
+                let layout = kernel.pipeline_layout;
+                let pipeline = kernel.pipeline;
+                fwd.profile("ple_gemv_proj_b", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
+                    dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                    dev.device.cmd_bind_descriptor_sets(
+                        cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+                    );
+                    dev.device.cmd_push_constants(
+                        cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+                    );
+                    dev.device.cmd_dispatch(cmd, hidden, 1, 1);
+                });
+                compute_barrier(ctx.dev, ctx.cmd);
+            }
+
+            // (4) normed_t = rms_norm(proj_t, post_per_layer_input_norm.weight).
+            {
+                let kernel = ctx.registry.get(ShaderId::RmsNorm);
+                let set = fwd.alloc_or_get_set(
+                    ctx.dev, kernel.descriptor_set_layout,
+                    &[
+                        (0, scratch_proj, proj_off, hidden_bytes),
+                        (1, w_pln, 0, 0),
+                        (2, scratch_normed, normed_off, hidden_bytes),
+                    ],
+                );
+                let pc = GenericBinaryPushConstants {
+                    ne: hidden,
+                    ne00: hidden, ne01: 1, ne02: 1, ne03: 1,
+                    nb00: 1, nb01: hidden, nb02: hidden, nb03: hidden,
+                    ne10: hidden, ne11: 1, ne12: 1, ne13: 1,
+                    nb10: 1, nb11: hidden, nb12: hidden, nb13: hidden,
+                    ne20: hidden, ne21: 1, ne22: 1, ne23: 1,
+                    nb20: 1, nb21: hidden, nb22: hidden, nb23: hidden,
+                    misalign_offsets: 0,
+                    param1: cfg.rms_norm_eps, param2: 0.0, param3: 0,
+                };
+                let layout = kernel.pipeline_layout;
+                let pipeline = kernel.pipeline;
+                fwd.profile("ple_rms_norm_b", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
+                    dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                    dev.device.cmd_bind_descriptor_sets(
+                        cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+                    );
+                    dev.device.cmd_push_constants(
+                        cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+                    );
+                    dev.device.cmd_dispatch(cmd, 1, 1, 1);
+                });
+                compute_barrier(ctx.dev, ctx.cmd);
+            }
+
+            // (5) output[t] += normed_t.
+            {
+                let kernel = ctx.registry.get(ShaderId::Add);
+                let set = fwd.alloc_or_get_set(
+                    ctx.dev, kernel.descriptor_set_layout,
+                    &[
+                        (0, output, out_off, hidden_bytes),
+                        (1, scratch_normed, normed_off, hidden_bytes),
+                        (2, output, out_off, hidden_bytes),
+                    ],
+                );
+                let pc = GenericBinaryPushConstants {
+                    ne: hidden,
+                    ne00: hidden, ne01: 1, ne02: 1, ne03: 1,
+                    nb00: 1, nb01: hidden, nb02: hidden, nb03: hidden,
+                    ne10: hidden, ne11: 1, ne12: 1, ne13: 1,
+                    nb10: 1, nb11: hidden, nb12: hidden, nb13: hidden,
+                    ne20: hidden, ne21: 1, ne22: 1, ne23: 1,
+                    nb20: 1, nb21: hidden, nb22: hidden, nb23: hidden,
+                    misalign_offsets: 0,
+                    param1: 0.0, param2: 0.0, param3: 0,
+                };
+                let dispatch_y = (hidden + 511) / 512;
+                let layout = kernel.pipeline_layout;
+                let pipeline = kernel.pipeline;
+                fwd.profile("ple_add_b", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
+                    dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                    dev.device.cmd_bind_descriptor_sets(
+                        cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+                    );
+                    dev.device.cmd_push_constants(
+                        cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+                    );
+                    dev.device.cmd_dispatch(cmd, 1, dispatch_y, 1);
+                });
+                // Cross-token barrier: token (t+1)'s step (1) reads
+                // batch_residual at out_off + hidden_bytes — independent
+                // range — but we still need WAW visibility for any
+                // future consumer of `output` past the loop tail.
+                compute_barrier(ctx.dev, ctx.cmd);
+            }
+        }
     }
 
     fn b_step_layer_scalar_mul(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {

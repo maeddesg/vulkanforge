@@ -88,7 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for &tid in &prompt_tokens {
         all_embeds.extend(embedding_row(&gguf, &cfg, tid)?);
     }
-    fwd_b.prefill_batch(&dev, &registry, &cmd_ctx, &model, &all_embeds, seq_len, 0)?;
+    fwd_b.prefill_batch(&dev, &registry, &cmd_ctx, &model, &all_embeds, seq_len, 0, &[])?;
     let logits_b = fwd_b.logits()?;
 
     println!("\n=== Logits comparison ===");

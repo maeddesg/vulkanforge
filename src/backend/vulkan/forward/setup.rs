@@ -146,12 +146,22 @@ impl Forward {
                 &format!("fa_scratch_sum{suf}"),
             )?;
             // Sprint 43D-3 — per-slot per-layer-inputs staging
-            // (Gemma-4 PLE). Sized `num_layers × hps × 4` for Gemma-4,
-            // 4 bytes (placeholder) otherwise. CpuToGpu so the host
-            // side `Forward::write_per_layer_inputs` writes directly
-            // and the layer dispatches read it via descriptor binding.
+            // (Gemma-4 PLE). CpuToGpu so the host-side build runs
+            // directly into the mapped page; layer dispatches read it
+            // via descriptor binding (per-token offset added in 46D).
+            //
+            // Sprint 46D — sized `max_prefill_tokens × num_layers × hps × 4`
+            // for Gemma-4 so the batch-prefill pre-stage can write all
+            // M tokens' PLE inputs before CB record (host writes during
+            // record are NOT serialised with GPU reads — see Sprint
+            // 46C blocker analysis). Decode (`forward_token`) keeps
+            // writing into the token-0 slot. 4-byte placeholder for
+            // every other architecture.
             let ple_bytes: u64 = match config.gemma4.as_ref() {
-                Some(g) => (config.n_layers as u64) * (g.hidden_size_per_layer_input as u64) * 4,
+                Some(g) => (max_prefill_tokens.max(1) as u64)
+                    * (config.n_layers as u64)
+                    * (g.hidden_size_per_layer_input as u64)
+                    * 4,
                 None => 4,
             };
             let per_layer_inputs = mk_storage(

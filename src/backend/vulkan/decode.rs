@@ -498,6 +498,7 @@ pub fn generate_from_tokens(
                 }
                 forward.prefill_batch(
                     dev, registry, cmd_ctx, model, &chunk_embeds, chunk_len, pos,
+                    chunk,
                 )?;
                 pos += chunk_len;
             }

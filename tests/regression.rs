@@ -690,7 +690,7 @@ fn phase3e_prefill_batch_matches_token_by_token_top5() {
         all_embeds.extend(embedding_row(&gguf, &cfg, tid).expect("embd"));
     }
     fwd_b.prefill_batch(
-        &dev, &registry, &cmd_ctx, &model, &all_embeds, seq_len, 0,
+        &dev, &registry, &cmd_ctx, &model, &all_embeds, seq_len, 0, &[],
     ).expect("prefill_batch");
     let logits_b = fwd_b.logits().expect("logits_b");
     fwd_b.destroy(&dev.device, &mut allocator);
@@ -799,14 +799,14 @@ fn sprint3a_coopmat_gemm_q_logits_parity() {
 
     // Path A: mul_mmq baseline.
     let mut fwd_a = make_forward(&mut allocator, false);
-    fwd_a.prefill_batch(&dev, &registry, &cmd_ctx, &model, &all_embeds, seq_len, 0)
+    fwd_a.prefill_batch(&dev, &registry, &cmd_ctx, &model, &all_embeds, seq_len, 0, &[])
         .expect("prefill mmq");
     let logits_a = fwd_a.logits().expect("logits_a");
     fwd_a.destroy(&dev.device, &mut allocator);
 
     // Path B: gemm_q via coopmat (rest stays mul_mmq).
     let mut fwd_b = make_forward(&mut allocator, true);
-    fwd_b.prefill_batch(&dev, &registry, &cmd_ctx, &model, &all_embeds, seq_len, 0)
+    fwd_b.prefill_batch(&dev, &registry, &cmd_ctx, &model, &all_embeds, seq_len, 0, &[])
         .expect("prefill coopmat");
     let logits_b = fwd_b.logits().expect("logits_b");
     fwd_b.destroy(&dev.device, &mut allocator);
@@ -1475,7 +1475,7 @@ fn batched_prefill_logits(
         all_embeds.extend(embedding_row(&gguf, &cfg, tid).expect("embd"));
     }
     fwd.prefill_batch(
-        &dev, &registry, &cmd_ctx, &model, &all_embeds, seq_len, 0,
+        &dev, &registry, &cmd_ctx, &model, &all_embeds, seq_len, 0, &[],
     ).expect("prefill_batch");
     let logits = fwd.logits().expect("logits");
 
@@ -1712,7 +1712,7 @@ fn sprint5b_chunked_logits(
             chunk_embeds.extend(embedding_row(&gguf, &cfg, tid).expect("embd"));
         }
         fwd.prefill_batch(
-            &dev, &registry, &cmd_ctx, &model, &chunk_embeds, chunk_len, pos,
+            &dev, &registry, &cmd_ctx, &model, &chunk_embeds, chunk_len, pos, &[],
         ).expect("prefill_batch chunk");
         pos += chunk_len;
     }

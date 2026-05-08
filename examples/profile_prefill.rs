@@ -96,7 +96,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // next_query starts at 0 because nothing else has used it.
     forward.kv_cache.reset();
     let t0 = Instant::now();
-    forward.prefill_batch(&dev, &registry, &cmd_ctx, &model, &embeds, pp, 0)?;
+    forward.prefill_batch(&dev, &registry, &cmd_ctx, &model, &embeds, pp, 0, &[])?;
     let wall = t0.elapsed();
 
     // Collect.

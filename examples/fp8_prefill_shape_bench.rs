@@ -111,7 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let slice = &prefill_embeds[..(pp as usize) * hidden];
         let t = Instant::now();
-        forward.prefill_batch(&dev, &registry, &cmd_ctx, &model, slice, pp, 0)?;
+        forward.prefill_batch(&dev, &registry, &cmd_ctx, &model, slice, pp, 0, &[])?;
         // prefill_batch's last submit completes before the function
         // returns (cmd_ctx.one_shot blocks on the fence), so all
         // timestamps are visible by here.

@@ -162,7 +162,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             for _ in 0..this {
                 embeds.extend_from_slice(&one_embd);
             }
-            fwd.prefill_batch(&dev, &registry, &cmd_ctx, &model, &embeds, this, pos)?;
+            fwd.prefill_batch(&dev, &registry, &cmd_ctx, &model, &embeds, this, pos, &[])?;
             pos += this;
             remaining -= this;
         }

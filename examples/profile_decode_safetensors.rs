@@ -106,7 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let start = (tid as usize) * cfg.hidden_dim as usize;
             chunk_embeds.extend_from_slice(&host_embed[start..start + cfg.hidden_dim as usize]);
         }
-        forward.prefill_batch(&dev, &registry, &cmd_ctx, &model, &chunk_embeds, chunk.len() as u32, pos)?;
+        forward.prefill_batch(&dev, &registry, &cmd_ctx, &model, &chunk_embeds, chunk.len() as u32, pos, &[])?;
         pos += chunk.len() as u32;
     }
     println!("prefilled to pos={}\n", pos);

@@ -53,7 +53,18 @@ impl Forward {
         embeddings: &[f32],
         seq_len: u32,
         base_pos: u32,
+        // Sprint 46D — per-token IDs for Gemma-4 PLE pre-stage. Length
+        // must equal `seq_len`. Other architectures pass an empty slice
+        // (or any slice of correct length) and the PLE pre-stage is a
+        // no-op (gated by `model.ple_data.is_some()`).
+        token_ids: &[u32],
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if !token_ids.is_empty() && (token_ids.len() as u32) != seq_len {
+            return Err(format!(
+                "prefill_batch: token_ids.len() {} != seq_len {seq_len}",
+                token_ids.len()
+            ).into());
+        }
         if seq_len == 0 {
             return Ok(());
         }
@@ -87,6 +98,53 @@ impl Forward {
         let positions: Vec<u32> = (0..seq_len).map(|t| base_pos + t).collect();
         self.cur_mut().rope_pos_buf
             .write_bytes(bytemuck::cast_slice(&positions))?;
+
+        // Sprint 46D — Gemma-4 PLE pre-stage. `build_per_layer_inputs`
+        // expects the *scaled* embedding (`embed_per_layer * sqrt(hidden)`)
+        // — the same input `forward_token` feeds it on the decode path
+        // (decode.rs:204). For each prefill token t we build the
+        // `[num_layers × hps]` slice and pack them contiguously into
+        // `per_layer_inputs` at offset `t * num_layers * hps * 4`.
+        // The buffer was resized to `max_prefill_tokens × num_layers ×
+        // hps × 4` in Sprint 46D step 1, so all M slots fit.
+        //
+        // Host-visible writes happen NOW (before CB record + submit).
+        // Per the Sprint 46C blocker analysis, building the slot inside
+        // a per-CB-step loop wouldn't work because CPU writes during
+        // record are not serialised with GPU reads.
+        //
+        // No-op for non-Gemma-4 / Gemma-4-without-PLE (the buffer is a
+        // 4-byte placeholder in those cases — see setup.rs).
+        if let Some(g) = cfg.gemma4.as_ref() {
+            if let Some(ple) = model.ple_data.as_ref() {
+                let h = hidden as usize;
+                let nl = cfg.n_layers as usize;
+                let hps = g.hidden_size_per_layer_input as usize;
+                let row_bytes = (nl * hps * 4) as u64;
+                let scale = g.embed_scale;
+                if (token_ids.len() as u32) != seq_len {
+                    return Err(format!(
+                        "prefill_batch: Gemma-4 PLE requires token_ids.len() == seq_len; \
+                         got {} vs {seq_len}",
+                        token_ids.len()
+                    ).into());
+                }
+                let mut scaled = vec![0.0_f32; h];
+                for t in 0..seq_len as usize {
+                    // Apply embed_scale to the t-th token row of `embeddings`
+                    // before passing to build_per_layer_inputs (matches
+                    // decode.rs:204 which scales embedding before the call).
+                    let src = &embeddings[t * h..(t + 1) * h];
+                    for i in 0..h {
+                        scaled[i] = src[i] * scale;
+                    }
+                    let v = ple.build_per_layer_inputs(token_ids[t], &scaled);
+                    let off = (t as u64) * row_bytes;
+                    self.cur_mut().per_layer_inputs
+                        .write_bytes_at(off, bytemuck::cast_slice(&v))?;
+                }
+            }
+        }
 
         // prefill_batch's per-token attention loop binds varying
         // pos_buf sub-ranges, so cached sets from a prior decode
