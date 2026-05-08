@@ -61,6 +61,7 @@ use super::device::VulkanDevice;
 mod arch;
 mod debug;
 mod decode;
+mod executor;
 mod harness;
 mod layer_plan;
 mod prefill;

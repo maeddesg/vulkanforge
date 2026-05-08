@@ -828,6 +828,27 @@ impl Forward {
         input: vk::Buffer,
         output: vk::Buffer,
     ) {
+        // Sprint 44C-2 Phase A — env-gated LayerPlan executor. Default
+        // OFF; set `VF_USE_LAYER_PLAN=1` to route through DecodeExec.
+        // The legacy inline body below remains the production path
+        // until bit-identity validation passes.
+        if std::env::var("VF_USE_LAYER_PLAN").ok().as_deref() == Some("1") {
+            let plan = super::layer_plan::build_layer_plan(
+                &self.config, model, layer, self.rope_theta_scale,
+            );
+            let ctx = super::executor::ExecCtx {
+                dev, registry, cmd, model, layer,
+                mode: super::executor::ExecMode::Decode { position, input, output },
+            };
+            let exec = super::executor::DecodeExec;
+            exec.execute_layer(self, &plan, &ctx);
+            // The legacy path's trailing maybe_compute_barrier on the
+            // output buffer is replicated here so the next layer (or
+            // dispatch_final) sees the same hand-off state.
+            self.maybe_compute_barrier(dev, cmd, &[output]);
+            return;
+        }
+
         let cfg = self.config.clone();
         // Sprint 43F Block A — log hidden_norm identity at first /
         // last layer to detect slot-pointer drift.
