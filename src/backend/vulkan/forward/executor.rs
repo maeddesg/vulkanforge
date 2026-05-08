@@ -932,8 +932,8 @@ impl BatchExec {
             }
             LayerStep::VNorm => self.b_step_v_norm(fwd, cfg, ctx),
             LayerStep::KvWrite => self.b_step_kv_write(fwd, cfg, ctx),
-            LayerStep::Attention { kv_layer: _, kv_start: _ } => {
-                self.b_step_attention(fwd, cfg, ctx)
+            LayerStep::Attention { kv_layer, kv_start } => {
+                self.b_step_attention(fwd, cfg, ctx, *kv_layer, *kv_start)
             }
             LayerStep::OProj => self.b_step_o_proj(fwd, cfg, ctx),
             LayerStep::PostAttnNorm => self.b_step_post_attn_norm(fwd, cfg, ctx),
@@ -1224,8 +1224,34 @@ impl BatchExec {
         }
     }
 
-    fn b_step_attention(&self, fwd: &mut Forward, _cfg: &ModelConfig, ctx: &ExecCtx) {
+    fn b_step_attention(
+        &self,
+        fwd: &mut Forward,
+        _cfg: &ModelConfig,
+        ctx: &ExecCtx,
+        kv_layer: u32,
+        kv_start_window: u32,
+    ) {
         let (seq_len, base_pos) = batch_seq_pos(ctx);
+        // Sprint 46E — `kv_start_window` carries the layer-static window
+        // size (0 for full-attention / non-Gemma stacks, `sliding_window`
+        // for Gemma-4 sliding layers). Convert to the global lower-bound
+        // shape the shader consumes: `max(0, last_pos+1 - window_size)`.
+        // For Qwen3 / Llama / Mistral / DSR1 (window=0) this resolves to
+        // 0 → math is bit-identical to pre-46E.
+        //
+        // The "last_pos+1" target intentionally takes the LAST query's
+        // window. Earlier queries in the batch attend to slightly fewer
+        // positions than HF reference would — a known approximation
+        // documented in `FlashAttnBatchPushConstants::kv_start`. Sprint
+        // 46F's `force_per_token_prefill` lift will bisect against the
+        // decode path and surface this if it matters in practice;
+        // refining to per-query masking is a Sprint 46F follow-up.
+        let kv_start = if kv_start_window == 0 {
+            0
+        } else {
+            (base_pos + seq_len).saturating_sub(kv_start_window)
+        };
         if fwd.fa_tiled_enabled {
             fwd.run_flash_attn_tiled(
                 ctx.dev, ctx.registry, ctx.cmd,
@@ -1233,6 +1259,7 @@ impl BatchExec {
                 fwd.batch_q.handle,
                 fwd.batch_attn_out.handle,
                 seq_len, base_pos, base_pos + seq_len,
+                kv_layer, kv_start,
             );
         } else {
             fwd.run_flash_attn_batch(
@@ -1241,6 +1268,7 @@ impl BatchExec {
                 fwd.batch_q.handle,
                 fwd.batch_attn_out.handle,
                 seq_len, base_pos, base_pos + seq_len,
+                kv_layer, kv_start,
             );
         }
         compute_barrier(ctx.dev, ctx.cmd);

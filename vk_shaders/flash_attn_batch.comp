@@ -81,8 +81,13 @@ float load_v(uint idx) { return v[idx]; }
 #endif
 layout (binding = 3) writeonly buffer O { float o[]; };  // [m, n_heads, head_dim]
 
-// 7 × 4 = 28 B push block. Field order matches `FlashAttnBatchPushConstants`
+// 8 × 4 = 32 B push block. Field order matches `FlashAttnBatchPushConstants`
 // in pipeline.rs and is asserted there at compile time.
+//
+// Sprint 46E — added `kv_start` for sliding-window-attention support
+// (Gemma-4). Non-sliding layers / non-Gemma stacks pass kv_start=0 →
+// math is bit-identical to pre-46E (the `t >= kv_start` mask trivially
+// passes and `window_lo = 0`).
 layout (push_constant) uniform Params {
     uint  n_heads;
     uint  n_kv_heads;
@@ -91,6 +96,7 @@ layout (push_constant) uniform Params {
     uint  n_kv;       // Total KV positions populated (= q_start + m).
     uint  q_start;    // KV position of the first query in this batch.
     float scale;      // Typically 1 / sqrt(head_dim).
+    uint  kv_start;   // Sprint 46E — sliding-window lower bound.
 } p;
 
 const uint TILE = WGSIZE;
@@ -132,10 +138,14 @@ void main() {
     float my_max  = -1e30;
     float my_sum  = 0.0;
 
-    // Tile loop over visible KV positions [0, causal_len).
-    for (uint tile_base = 0; tile_base < causal_len; tile_base += TILE) {
+    // Tile loop over visible KV positions [window_lo, causal_len).
+    // Sprint 46E — `window_lo` skips entire tiles below `kv_start`;
+    // remaining tile-internal masking is via `t >= p.kv_start` in
+    // `valid`. For kv_start=0 this is a no-op.
+    uint window_lo = (p.kv_start / TILE) * TILE;
+    for (uint tile_base = window_lo; tile_base < causal_len; tile_base += TILE) {
         uint t = tile_base + tid;
-        bool valid = t < causal_len;
+        bool valid = (t < causal_len) && (t >= p.kv_start);
 
         // Per-thread score = scale * Q[q_idx, h] · K[t, kvh].
         float score = -1e30;

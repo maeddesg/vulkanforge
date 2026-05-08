@@ -460,8 +460,16 @@ pub struct FlashAttnBatchPushConstants {
     pub n_kv: u32,
     pub q_start: u32,
     pub scale: f32,
+    /// Sprint 46E — sliding-window lower bound. 0 for non-sliding /
+    /// non-Gemma stacks (math is bit-identical to pre-46E in that case).
+    /// For Gemma-4 batch prefill this carries the *last query's*
+    /// `max(0, last_pos+1 - sliding_window)` as a global lower bound;
+    /// per-query refinement is left for Sprint 46F (where the
+    /// `force_per_token_prefill` lift's bit-ID bisect against the decode
+    /// path will surface the approximation if it matters).
+    pub kv_start: u32,
 }
-const _: () = assert!(std::mem::size_of::<FlashAttnBatchPushConstants>() == 28);
+const _: () = assert!(std::mem::size_of::<FlashAttnBatchPushConstants>() == 32);
 
 /// llama.cpp's `init_fastdiv_values`. Used by [`GenericUnaryPushConstants`]
 /// to populate the `ne*_*mp/L` fields — without these, `copy`'s SPIR-V

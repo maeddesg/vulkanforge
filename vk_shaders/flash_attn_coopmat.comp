@@ -77,7 +77,9 @@ float load_v(uint idx) { return v[idx]; }
 #endif
 layout (binding = 3) writeonly buffer O { float o[]; };
 
-// 28 B push block — same as flash_attn_tiled.
+// 32 B push block — same as flash_attn_tiled.
+// Sprint 46E — `kv_start` for sliding-window (Gemma-4); kv_start=0
+// reproduces pre-46E math bit-identically.
 layout (push_constant) uniform Params {
     uint  n_heads;
     uint  n_kv_heads;
@@ -86,6 +88,7 @@ layout (push_constant) uniform Params {
     uint  n_kv;
     uint  q_start;
     float scale;
+    uint  kv_start;
 } p;
 
 // Q and K LDS in FP16 (coopmat A/B fragment type). Sprint 10B's
@@ -143,8 +146,11 @@ void main() {
     uint causal_len_max = p.q_start + q_base + actual_br;
     causal_len_max = min(causal_len_max, p.n_kv);
 
-    // (2) Tile loop over visible KV positions [0, causal_len_max).
-    for (uint tile_base = 0; tile_base < causal_len_max; tile_base += TILE) {
+    // (2) Tile loop over visible KV positions [window_lo, causal_len_max).
+    // Sprint 46E — `window_lo` skips entire tiles below kv_start;
+    // per-thread mask via `t_global >= p.kv_start` below.
+    uint window_lo = (p.kv_start / TILE) * TILE;
+    for (uint tile_base = window_lo; tile_base < causal_len_max; tile_base += TILE) {
         // (2a) Stage K-tile into FP16 LDS — wave-coalesced load.
         for (uint local_pos = 0; local_pos < TILE; ++local_pos) {
             uint global_t = tile_base + local_pos;
@@ -195,9 +201,11 @@ void main() {
         bool t_in_range = tid_in_tile && t_global < causal_len_max;
         [[unroll]] for (uint qi = 0; qi < BR; ++qi) {
             uint q_pos_qi = p.q_start + q_base + qi;
+            // Sprint 46E — sliding-window lower bound; kv_start=0 → no-op.
             bool valid = t_in_range
                       && qi < actual_br
-                      && t_global <= q_pos_qi;
+                      && t_global <= q_pos_qi
+                      && t_global >= p.kv_start;
 
             float score = -1e30;
             if (valid) {

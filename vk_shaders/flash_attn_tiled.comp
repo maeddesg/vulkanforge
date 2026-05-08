@@ -91,7 +91,9 @@ float load_v(uint idx) { return v[idx]; }
 #endif
 layout (binding = 3) writeonly buffer O { float o[]; };   // [m, n_heads, head_dim]
 
-// 28 B push block — same as flash_attn_batch.
+// 32 B push block — same as flash_attn_batch.
+// Sprint 46E — added `kv_start` for sliding-window support (Gemma-4).
+// kv_start=0 reproduces pre-46E math bit-identically.
 layout (push_constant) uniform Params {
     uint  n_heads;
     uint  n_kv_heads;
@@ -100,6 +102,7 @@ layout (push_constant) uniform Params {
     uint  n_kv;
     uint  q_start;
     float scale;
+    uint  kv_start;
 } p;
 
 shared float q_lds[BR * HEAD_DIM];
@@ -151,8 +154,12 @@ void main() {
     uint causal_len_max = p.q_start + q_base + actual_br;
     causal_len_max = min(causal_len_max, p.n_kv);
 
-    // (2) Tile loop over visible KV positions [0, causal_len_max).
-    for (uint tile_base = 0; tile_base < causal_len_max; tile_base += TILE) {
+    // (2) Tile loop over visible KV positions [window_lo, causal_len_max).
+    // Sprint 46E — `window_lo` skips entire tiles below `kv_start`;
+    // per-thread masking via `t_global >= p.kv_start` below. kv_start=0
+    // → window_lo=0, no-op vs pre-46E.
+    uint window_lo = (p.kv_start / TILE) * TILE;
+    for (uint tile_base = window_lo; tile_base < causal_len_max; tile_base += TILE) {
         // (2a) Stage K-tile into LDS — wave-coalesced load. Each
         // thread loads dim `tid` and `tid+64` of every K row in the
         // tile. Threads 0..63 access adjacent dims of the same row,
@@ -179,9 +186,12 @@ void main() {
         bool t_in_range = tid_in_tile && t_global < causal_len_max;
         [[unroll]] for (uint qi = 0; qi < BR; ++qi) {
             uint q_pos_qi = p.q_start + q_base + qi;
+            // Sprint 46E — `t_global >= p.kv_start` masks sliding-window
+            // lower bound; for kv_start=0 this is a no-op.
             bool valid = t_in_range
                       && qi < actual_br
-                      && t_global <= q_pos_qi;
+                      && t_global <= q_pos_qi
+                      && t_global >= p.kv_start;
 
             float score = -1e30;
             if (valid) {

@@ -900,6 +900,8 @@ impl Forward {
         m: u32,
         q_start: u32,
         n_kv: u32,
+        kv_layer: u32,
+        kv_start: u32,
     ) {
         let cfg = self.config.clone();
         // v0.2 Sprint 9d.2 — pick the FP16-KV-aware variant when the
@@ -912,10 +914,13 @@ impl Forward {
         } else {
             ShaderId::FlashAttnBatch
         });
-        let layer_off = self.kv_cache.layer_offset_bytes(layer);
-        // v0.2 Sprint 9d.1 — KvCache::layer_size_bytes scales by
-        // the configured KV element size (FP32 = 4 B by default).
-        let layer_size = self.kv_cache.layer_size_bytes(layer);
+        // Sprint 46E — KV-share for Gemma-4 batch prefill: read K/V
+        // from the publisher's slab when this layer subscribes. For
+        // non-shared layers `kv_layer == layer` so the slab math is
+        // unchanged. Mirrors the decode-path `run_flash_attn_split_reduce`
+        // pattern (which already uses kv_layer for the binding offset).
+        let layer_off = self.kv_cache.layer_offset_bytes(kv_layer);
+        let layer_size = self.kv_cache.layer_size_bytes(kv_layer);
         // Sprint 43D-1 — per-layer head_dim for Gemma-4 heterogeneous.
         let head_dim_layer = self.kv_cache.head_dim_for(layer);
         // Sprint 43D-4 — see decode-path comment: Gemma-4 attention
@@ -946,6 +951,7 @@ impl Forward {
             n_kv,
             q_start,
             scale: attn_scale_layer,
+            kv_start,
         };
         let layout = kernel.pipeline_layout;
         let pipeline = kernel.pipeline;
@@ -979,6 +985,8 @@ impl Forward {
         m: u32,
         q_start: u32,
         n_kv: u32,
+        kv_layer: u32,
+        kv_start: u32,
     ) {
         // v0.2 Sprint 10C — coopmat shader takes priority when
         // VULKANFORGE_COOPMAT_ATTN=1 is set. Forces Br=16 (the only
@@ -1028,10 +1036,10 @@ impl Forward {
         };
         let cfg = self.config.clone();
         let kernel = registry.get(shader_id);
-        let layer_off = self.kv_cache.layer_offset_bytes(layer);
-        // v0.2 Sprint 9d.1 — KvCache::layer_size_bytes scales by
-        // the configured KV element size (FP32 = 4 B by default).
-        let layer_size = self.kv_cache.layer_size_bytes(layer);
+        // Sprint 46E — KV-share: bind publisher's slab via kv_layer
+        // (mirrors the decode split-reduce path).
+        let layer_off = self.kv_cache.layer_offset_bytes(kv_layer);
+        let layer_size = self.kv_cache.layer_size_bytes(kv_layer);
         // Sprint 43D-1 — per-layer head_dim for Gemma-4 heterogeneous.
         let head_dim_layer = self.kv_cache.head_dim_for(layer);
         // Sprint 43D-4 — see decode-path comment: Gemma-4 attention
@@ -1062,6 +1070,7 @@ impl Forward {
             n_kv,
             q_start,
             scale: attn_scale_layer,
+            kv_start,
         };
         let layout = kernel.pipeline_layout;
         let pipeline = kernel.pipeline;
