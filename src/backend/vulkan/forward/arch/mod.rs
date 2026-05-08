@@ -23,5 +23,4 @@ pub(super) use common::{
 };
 pub(super) use gemma4::{
     apply_final_logit_softcap, gemma4_kv_read_layer, gemma4_kv_start,
-    gemma4_layer_owns_kv, rope_params_for_layer,
 };

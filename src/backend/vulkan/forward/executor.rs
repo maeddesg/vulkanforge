@@ -33,9 +33,7 @@
 #![allow(dead_code)]
 
 use ash::vk;
-use ash::vk::Handle;
 
-use super::super::commands::CommandContext;
 use super::super::device::VulkanDevice;
 use super::super::gguf::{GgmlType, ModelConfig};
 use super::super::loader::LoadedModel;
@@ -44,10 +42,9 @@ use super::super::pipeline_registry::PipelineRegistry;
 use super::super::shaders::ShaderId;
 
 use super::arch::{
-    GemmKind, apply_final_logit_softcap, compute_barrier, is_fp8_layer_weight,
-    layer_weight, layer_weight_opt, layer_weight_scale_block, layer_weight_scale_buf,
-    layer_weight_scale_scalar, layer_weight_shader, layer_weight_shader_gemm,
-    transfer_to_compute_barrier,
+    GemmKind, compute_barrier, is_fp8_layer_weight, layer_weight, layer_weight_opt,
+    layer_weight_scale_block, layer_weight_scale_buf, layer_weight_scale_scalar,
+    layer_weight_shader, layer_weight_shader_gemm, transfer_to_compute_barrier,
 };
 use super::layer_plan::{ActivationKind, LayerPlan, LayerStep};
 use super::state::Forward;
@@ -1633,29 +1630,6 @@ fn decode_position(ctx: &ExecCtx) -> u32 {
     }
 }
 
-/// Mirror of `arch::common::layer_dims` — duplicated locally so this
-/// module doesn't need a `pub(super)` re-export. Returns
-/// `(head_dim, ffn_dim, rope_theta, rotary_dim)` per layer.
-fn layer_dims_local(cfg: &ModelConfig, layer: u32) -> (u32, u32, f32, u32) {
-    if let Some(g) = cfg.gemma4.as_ref() {
-        let s = &g.layers[layer as usize];
-        let rotary_dim = match s.rope_partial_factor {
-            Some(f) => ((s.head_dim as f32) * f).round() as u32,
-            None => s.head_dim,
-        };
-        (s.head_dim, s.intermediate_size, s.rope_theta, rotary_dim)
-    } else {
-        (cfg.head_dim, cfg.ffn_dim, cfg.rope_freq_base, cfg.head_dim)
-    }
-}
-
-// Suppress unused-import warnings for items only used by the dispatch
-// path (added to keep the file self-contained for 44C-2 review).
-#[allow(unused_imports)]
-use {
-    apply_final_logit_softcap as _,
-    compute_barrier as _,
-    CommandContext as _,
-    GgmlType as _,
-    Handle as _,
-};
+/// Re-export of `arch::common::layer_dims` for the per-step helpers.
+/// Returns `(head_dim, ffn_dim, rope_theta, rotary_dim)` per layer.
+use super::arch::layer_dims as layer_dims_local;

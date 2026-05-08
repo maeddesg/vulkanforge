@@ -20,16 +20,11 @@ use super::super::commands::CommandContext;
 use super::super::device::VulkanDevice;
 use super::super::gguf::GgmlType;
 use super::super::loader::LoadedModel;
-use super::super::pipeline::SwigluPushConstants;
 use super::super::pipeline_registry::PipelineRegistry;
 use super::super::profiler::ShaderProfiler;
 use super::super::shaders::ShaderId;
 
-use super::arch::{
-    apply_final_logit_softcap, gemma4_layer_owns_kv, layer_dims, layer_weight,
-    layer_weight_opt, layer_weight_scale_block, layer_weight_scale_buf,
-    layer_weight_scale_scalar, layer_weight_shader, rope_params_for_layer,
-};
+use super::arch::apply_final_logit_softcap;
 use super::debug::{maybe_dump_hidden_staging, maybe_dump_logits};
 use super::state::{Forward, ForwardStats, ForwardTokenProfile};
 

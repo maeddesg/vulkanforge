@@ -21,16 +21,11 @@ use ash::vk;
 
 use super::super::commands::CommandContext;
 use super::super::device::VulkanDevice;
-use super::super::gguf::{GgmlType, ModelConfig};
+use super::super::gguf::ModelConfig;
 use super::super::loader::LoadedModel;
 use super::super::pipeline_registry::PipelineRegistry;
-use super::super::shaders::ShaderId;
 
-use super::arch::{
-    GemmKind, compute_barrier, is_fp8_layer_weight, layer_dims, layer_weight,
-    layer_weight_opt, layer_weight_scale_block, layer_weight_scale_buf,
-    layer_weight_shader_gemm, rope_params_for_layer, transfer_to_compute_barrier,
-};
+use super::arch::{compute_barrier, layer_weight};
 use super::state::Forward;
 
 impl Forward {

@@ -277,13 +277,6 @@ pub struct Forward {
     pub config: ModelConfig,
 
     pub(super) descriptor_pool: vk::DescriptorPool,
-    /// Phase 5A-2 Stage 2D: descriptor-set cache for the
-    /// Phase 5B.2 toggle for the batched-Q prefill attention path.
-    /// `true` (default; `VULKANFORGE_BATCH_ATTN=0` opts out) replaces
-    /// the per-token attention dispatch loop in `dispatch_layer_batch`
-    /// with a single `flash_attn_batch` dispatch reading post-RoPE Q
-    /// from `batch_q` and writing to `batch_attn_out`.
-    pub(super) batch_attn_enabled: bool,
 
     /// Phase 6 v0.1.2 toggle for the mul_mm.comp port. `true`
     /// (default; `VULKANFORGE_USE_MUL_MM=0` opts out) routes the

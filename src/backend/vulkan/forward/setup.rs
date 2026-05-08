@@ -351,14 +351,10 @@ impl Forward {
             _ => true,
         };
 
-        // Phase 5B.2: batched-Q prefill attention is ON by default; set
-        // `VULKANFORGE_BATCH_ATTN=0` to fall back to the per-token
-        // attention loop. The phase5b_2 parity test confirms argmax
-        // identity against the per-token path on all 4 supported models.
-        let batch_attn_enabled = match std::env::var("VULKANFORGE_BATCH_ATTN") {
-            Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
-            _ => true,
-        };
+        // Sprint 44C-3 — `batch_attn_enabled` was the toggle for the
+        // per-token attention fallback in `dispatch_layer_batch`. The
+        // executor (BatchExec) always uses flash-attn; the fallback is
+        // gone. The `VULKANFORGE_BATCH_ATTN` env var is now a no-op.
 
         // Phase 6 v0.1.2: mul_mm.comp port is OFF by default — the
         // Phase 7 — mul_mm.comp is now bit-exact across all 11 unit
@@ -620,7 +616,6 @@ impl Forward {
             descriptor_pool,
             set_cache: HashMap::new(),
             cache_enabled,
-            batch_attn_enabled,
             mul_mm_enabled,
             coopmat_q4k_enabled,
             mul_mm_coopmat_enabled,
@@ -742,17 +737,11 @@ impl Forward {
         self.cache_enabled
     }
 
-    /// Phase 5B.2 test escape hatch — toggle the batched-Q prefill
-    /// attention path independently of `VULKANFORGE_BATCH_ATTN`. The
-    /// `phase5b2_*` parity tests build two Forward instances with
-    /// explicit batch-attn settings; not part of the normal lifecycle.
-    pub fn set_batch_attn_enabled(&mut self, enabled: bool) {
-        self.batch_attn_enabled = enabled;
-    }
-
-    pub fn batch_attn_enabled(&self) -> bool {
-        self.batch_attn_enabled
-    }
+    // Sprint 44C-3 — set_batch_attn_enabled / batch_attn_enabled
+    // setter+getter removed: the per-token attention fallback the
+    // toggle gated is gone. Tests that previously called the setter
+    // either pass through the LayerExecutor unconditionally or were
+    // removed alongside the legacy dispatch path.
 
     /// Phase 6 v0.1.2 test escape hatch — toggle the mul_mm.comp
     /// path independently of `VULKANFORGE_USE_MUL_MM`.
