@@ -34,13 +34,19 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
 - **2× better power efficiency** (tok/s/W) on decode vs llama.cpp.
 - **Llama-3, Qwen2.5, Qwen3, Mistral, DeepSeek-R1-Distill, Gemma-4**
   model families covered (Gemma-4 SafeTensors path produces coherent
-  English with full Markdown structure post-v0.3.13; see
-  [docs/MODELS.md](docs/MODELS.md) and the Unreleased section in
-  [CHANGELOG.md](CHANGELOG.md) for the 8-bug coherence fix-up).
-- **90 / 90 coherent (100 %)** on the deterministic 15-prompt suite
-  across all six production configurations — GGUF, FP8 native WMMA
-  (per-tensor / per-channel / block-wise), and CPU `lm_head` offload
-  (see [Quality](#quality-15-prompt-benchmark) below).
+  English with full Markdown structure as of v0.3.14; see
+  [docs/MODELS.md](docs/MODELS.md) and the v0.3.14 entry in
+  [CHANGELOG.md](CHANGELOG.md) for the 8-bug coherence fix-up plus
+  the `forward.rs` refactor that ships alongside it).
+- **`forward.rs` Refactor (v0.3.14):** the 7816-LOC dispatch file
+  splits into 13 sibling modules with a `LayerStep` enum + two
+  `LayerExecutor` impls. The Sprint 43F bug class — "added a
+  per-layer step in decode but forgot prefill" — becomes a compile
+  error in both executors until the new variant is handled.
+- **104 / 105 coherent** on the deterministic 15-prompt suite across
+  all production configurations — six 8B+ paths plus Gemma-4-E2B
+  SafeTensors (14/15; the one miss is a Gemma-tokenizer-emoji
+  surrogate). See [Quality](#quality-15-prompt-benchmark) below.
 
 ## Quick start
 
@@ -90,6 +96,26 @@ RADV unless noted. Full tables with power data and methodology in
 | **VF v0.3.9** | 8B Llama     | Q4_K_M | Vulkan   |      **121** | **0.58** |
 | llama.cpp     | 8B Llama     | Q4_K_M | Vulkan   |          114 |   0.37  |
 | llama.cpp     | 8B Llama     | Q4_K_M | ROCm     |           94 |   0.30  |
+
+### v0.3.14 15-prompt mixed-workload benchmark
+
+The v0.3.9 row above is `vulkanforge bench tg128` (1-token prompt,
+constant-low KV). The 15-prompt suite is a real-workload mix (smoke /
+code / prose / reasoning / context-stress / numerics / tokenizer) with
+generations up to 1024 tokens — KV grows during decode, so steady-state
+numbers are below `tg128`.
+
+| Model                  | Prefill avg | Decode avg | Avg W | tok/s/W | Quality |
+|------------------------|------------:|-----------:|------:|--------:|--------:|
+| Qwen3-8B Q4_K_M        |     719 t/s |   **105.2 t/s** |  241 W |  0.437  | 15/15 ✓ |
+| Llama-3.1-8B Q4_K_M    |     585 t/s |   **110.3 t/s** |  251 W | **0.440** | 15/15 ✓ |
+| Qwen3-8B FP8           |     388 t/s |    60.8 t/s   |  191 W |  0.319  | 15/15 ✓ |
+| **Gemma-4-E2B-it**     |    33 t/s ¹ |    34.1 t/s   | **66 W** | **0.513** | 14/15 ✓ |
+
+¹ Gemma-4 prefill is currently bounded by `force_per_token_prefill`
+(F32 mul_mm shader family pending). Decode-side is on par with the
+larger models on a tok/s/W basis (best in the test) thanks to the
+2 B parameter count keeping power draw at 66 W.
 
 ### Native FP8 prefill pp=512 (Mesa 26.1+, `VF_FP8_NATIVE_WMMA=1`)
 
@@ -151,14 +177,20 @@ on all six production paths:
 
 | Configuration                                    | Coherent   | Median decode |
 |--------------------------------------------------|-----------:|--------------:|
-| Qwen3-8B Q4_K_M GGUF                             |  **15/15** |     109 tok/s |
+| Qwen3-8B Q4_K_M GGUF                             |  **15/15** |     107 tok/s |
 | Llama-3.1-8B Q4_K_M GGUF                         |  **15/15** |     112 tok/s |
 | Qwen3-8B-FP8 native WMMA + activation quant      |  **15/15** |      62 tok/s |
 | Qwen2.5-14B-FP8 native WMMA + CPU `lm_head`      |  **15/15** |      17 tok/s |
 | Llama-3.1-8B-FP8 native WMMA                     |  **15/15** |      70 tok/s |
 | Llama-3.1-8B-FP8 native WMMA + CPU `lm_head`     |  **15/15** |      46 tok/s |
+| **Gemma-4-E2B-it SafeTensors** (v0.3.14, new)    |    **14/15** |      34 tok/s |
 
-**90 / 90 prompts (100 %) coherent across the full suite.**
+**104 / 105 prompts (99 %) coherent across the full suite.**
+v0.3.14 adds the Gemma-4-E2B-it SafeTensors path; 14/15 coherent on
+the suite, the single miss is the emoji-identification prompt where
+the Gemma-4 tokenizer's surrogate-pair handling drops the input
+emojis before the model sees them.
+
 v0.3.11 closes the v0.3.10 Llama-FP8 per-tensor edge case (2/15
 code-gen prompts collapsing to `!`) by porting the Sprint 39
 per-block activation-absmax + rescale pattern to the per-tensor

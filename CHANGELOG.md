@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.3.14 — `forward.rs` Refactor
+## v0.3.14 — `forward.rs` Refactor + Gemma-4 Coherence (2026-05-08)
 
 The Phase-2C `forward.rs` (7816 LOC, 100 + impl-Forward methods) gets
 factored into 11 sibling modules. Sprint 44C ships a `LayerStep` enum +
@@ -53,6 +53,22 @@ Across decode and batched-prefill paths, all three model families:
 
 No performance regression: Qwen3-GGUF 107 t/s decode, Qwen3-FP8 61 t/s,
 Gemma-4 36 t/s — all within run-to-run noise.
+
+### 15-Prompt benchmark (Sprint 45A, RX 9070 XT)
+
+| Model                | Prefill | Decode | Avg W | tok/s/W | Quality |
+|----------------------|--------:|-------:|------:|--------:|--------:|
+| Qwen3-8B Q4_K_M      | 719 t/s |  105.2 t/s | 241 W |  0.437  | 15/15 ✓ |
+| Qwen3-8B FP8         | 388 t/s |   60.8 t/s | 191 W |  0.319  | 15/15 ✓ |
+| Llama-3.1-8B Q4_K_M  | 585 t/s |  110.3 t/s | 251 W |  0.440  | 15/15 ✓ |
+| Gemma-4-E2B-it       |  33 t/s |   34.1 t/s |  66 W |  0.513  | 14/15 ✓ |
+
+Mixed prompt sizes (smoke / code / prose / reasoning / context-stress /
+numerics / tokenizer), `--temperature 0.0`, `--no-think-filter`, empty
+system prompt. Gemma-4 prefill is bounded by `force_per_token_prefill`
+(F32 mul_mm shader pending). vs llama.cpp Vulkan on Llama-3.1-Q4_K_M:
++45 % tok/s/W (250 W vs 312 W, comparable decode tok/s).
+Full per-prompt + power-CSV in `results/v0314_sprint45a_15prompt_bench.md`.
 
 ### Other Sprint 44C-3 cleanup
 
