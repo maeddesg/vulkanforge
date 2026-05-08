@@ -61,6 +61,22 @@ pub(crate) fn layer_weight_shader_gemm(
     let q3 = ggml_type == GgmlType::Q3K;
     let q5 = ggml_type == GgmlType::Q5K;
     let q40 = ggml_type == GgmlType::Q4_0;
+    // Sprint 46C — F32 weight (Gemma-4 SafeTensors) routes through the
+    // F32×F32 mul_mm SPVs added in Sprint 46B. There is no Mmq variant
+    // (mul_mmq always quantises activations to Q8_1 — F32 weights have
+    // no dequant path that matches that contract). Caller's gemm_kind
+    // is forced to MulMm{,Aligned} in BatchExec when an F32 weight is
+    // detected, so the Mmq arm here is unreachable.
+    if ggml_type == GgmlType::F32 {
+        return match gemm_kind {
+            GemmKind::MulMmAligned => ShaderId::MulMmF32Aligned,
+            GemmKind::MulMm => ShaderId::MulMmF32,
+            GemmKind::Mmq => unreachable!(
+                "F32 weights cannot use the Mmq path; BatchExec must \
+                 force MulMm/MulMmAligned for F32 layers"
+            ),
+        };
+    }
     let prefer_l = m > 128 && n > 256
         && std::env::var("VULKANFORGE_DISABLE_L_TILE")
             .map(|s| s != "1").unwrap_or(true);
@@ -295,6 +311,19 @@ pub(crate) fn is_fp8_layer_weight(model: &LoadedModel, layer: u32, suffix: &str)
     model
         .tensor(&key)
         .map(|t| t.ggml_type == GgmlType::F8E4M3)
+        .unwrap_or(false)
+}
+
+/// Sprint 46C — `true` iff a layer's weight tensor is FP32. Used by
+/// `BatchExec::b_run_proj` to route Gemma-4 SafeTensors weights
+/// through the dedicated `mul_mm_f32{,_aligned}.spv` SPVs (added in
+/// Sprint 46B) instead of the Q4_K coopmat / Mmq path. GGUF models
+/// always return `false`.
+pub(crate) fn is_f32_layer_weight(model: &LoadedModel, layer: u32, suffix: &str) -> bool {
+    let key = format!("blk.{layer}.{suffix}");
+    model
+        .tensor(&key)
+        .map(|t| t.ggml_type == GgmlType::F32)
         .unwrap_or(false)
 }
 

@@ -42,9 +42,10 @@ use super::super::pipeline_registry::PipelineRegistry;
 use super::super::shaders::ShaderId;
 
 use super::arch::{
-    GemmKind, compute_barrier, is_fp8_layer_weight, layer_weight, layer_weight_opt,
-    layer_weight_scale_block, layer_weight_scale_buf, layer_weight_scale_scalar,
-    layer_weight_shader, layer_weight_shader_gemm, transfer_to_compute_barrier,
+    GemmKind, compute_barrier, is_f32_layer_weight, is_fp8_layer_weight, layer_weight,
+    layer_weight_opt, layer_weight_scale_block, layer_weight_scale_buf,
+    layer_weight_scale_scalar, layer_weight_shader, layer_weight_shader_gemm,
+    transfer_to_compute_barrier,
 };
 use super::layer_plan::{ActivationKind, LayerPlan, LayerStep};
 use super::state::Forward;
@@ -1505,13 +1506,28 @@ impl BatchExec {
         let _ = cfg;
         let weight = layer_weight(ctx.model, ctx.layer, suffix);
 
+        // Sprint 46C — F32 weights (Gemma-4 SafeTensors) take the
+        // dedicated `mul_mm_f32{,_aligned}.spv` lane (Sprint 46B). No
+        // Mmq variant exists for F32 (mul_mmq quantises activations to
+        // Q8_1 and dequantises K-quant blocks per dispatch), so the
+        // gemm_kind decision below is forced to MulMm/MulMmAligned and
+        // the activation buffer stays FP32 (no `run_quantize_q8_1`
+        // dispatch). Skips coopmat_q4k path because that shader assumes
+        // packed K-quant blocks.
+        let f32_weight = is_f32_layer_weight(ctx.model, ctx.layer, suffix);
+
         // Sprint 17B/17C/17D — Q4_0 forces MMQ (no MulMm SPV shipped).
         let attn_q_type = ctx
             .model
             .tensor(&format!("blk.{}.attn_q.weight", ctx.layer))
             .map(|t| t.ggml_type);
         let force_mmq = matches!(attn_q_type, Some(GgmlType::Q4_0));
-        let gemm_kind = if force_mmq {
+        let gemm_kind = if f32_weight {
+            // F32 path: MulMmAligned when seq_len%4==0, MulMm otherwise.
+            // Mmq is not a valid choice (no F32 Mmq shader), so we don't
+            // even consider it.
+            if n % 4 == 0 { GemmKind::MulMmAligned } else { GemmKind::MulMm }
+        } else if force_mmq {
             GemmKind::Mmq
         } else if fwd.mul_mm_coopmat_enabled {
             GemmKind::MulMm
@@ -1526,7 +1542,9 @@ impl BatchExec {
         // Padding only fires on the first proj of a stage — the tail
         // zero-fill is idempotent (covers the same range to the same
         // value) but emitting it once keeps the legacy dispatch count.
-        if fwd.coopmat_q4k_enabled && !is_fp8_layer_weight(ctx.model, ctx.layer, suffix) {
+        // Sprint 46C — skip coopmat_q4k for F32 weights (the kernel
+        // expects packed Q4_K blocks, not raw float).
+        if fwd.coopmat_q4k_enabled && !is_fp8_layer_weight(ctx.model, ctx.layer, suffix) && !f32_weight {
             let n_padded = Forward::pad_to_tile(n, 16);
             if quantize_input {
                 fwd.zero_activation_tail(
