@@ -865,252 +865,58 @@ impl Forward {
         // built fresh here with PipelineCache::null and a dedicated
         // descriptor pool. EXACTLY mirrors the layout in
         // examples/fp8_gemv_standalone.rs that's known to PASS.
-        let (
-            fp8pc_shader_module,
-            fp8pc_dsl,
-            fp8pc_pipeline_layout,
-            fp8pc_pipeline,
-            fp8pc_pool,
-        ) = unsafe {
-            let words: Vec<u32> = MUL_MAT_VEC_FP8_PERCHANNEL
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            let module = device.create_shader_module(
-                &vk::ShaderModuleCreateInfo::default().code(&words),
-                None,
-            )?;
-
-            let dsl_bindings = [
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(0).descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(1).descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(2).descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(3).descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
-            ];
-            let dsl = device.create_descriptor_set_layout(
-                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&dsl_bindings),
-                None,
-            )?;
-
-            let push_range = vk::PushConstantRange::default()
-                .stage_flags(vk::ShaderStageFlags::COMPUTE)
-                .offset(0)
-                .size(std::mem::size_of::<MatVecPushConstants>() as u32);
-            let layouts_arr = [dsl];
-            let push_ranges = [push_range];
-            let pipeline_layout = device.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default()
-                    .set_layouts(&layouts_arr)
-                    .push_constant_ranges(&push_ranges),
-                None,
-            )?;
-
-            let block_size: u32 = 64;
-            let spec_entries = [vk::SpecializationMapEntry { constant_id: 0, offset: 0, size: 4 }];
-            let spec_data = bytemuck::bytes_of(&block_size);
-            let spec_info = vk::SpecializationInfo::default()
-                .map_entries(&spec_entries)
-                .data(spec_data);
-            let mut subgroup_info = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
-                .required_subgroup_size(64);
-            let stage = vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::COMPUTE)
-                .module(module)
-                .name(c"main")
-                .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
-                .specialization_info(&spec_info)
-                .push_next(&mut subgroup_info);
-            let pipeline = device.create_compute_pipelines(
-                vk::PipelineCache::null(),
-                &[vk::ComputePipelineCreateInfo::default()
-                    .stage(stage)
-                    .layout(pipeline_layout)],
-                None,
-            ).map_err(|(_, e)| e)?[0];
-
+        // Sprint 44B-2 — the {module, dsl, layout, pipeline, pool}
+        // tuple is now built by `harness::HarnessPipeline::new`.
+        let fp8pc = harness::HarnessPipeline::new(
+            device,
+            MUL_MAT_VEC_FP8_PERCHANNEL,
+            /* n_bindings */ 4,
+            /* push_size  */ std::mem::size_of::<MatVecPushConstants>() as u32,
+            /* spec const */ Some(64),
             // Sprint 30 — pool sized for the *cache*, not for
             // every-call-fresh-allocation. With ~336 unique
             // (weight, input, output, scale) keys per forward × 2
             // async slots, 1024 sets covers worst case with comfortable
             // headroom. Memory cost ~50 KiB descriptor-set metadata
             // (down from ~33 MiB at 524288 in v0.3.5).
-            let pool = device.create_descriptor_pool(
-                &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(1024)
-                    .pool_sizes(&[vk::DescriptorPoolSize {
-                        ty: vk::DescriptorType::STORAGE_BUFFER,
-                        descriptor_count: 1024 * 4,
-                    }])
-                    .flags(vk::DescriptorPoolCreateFlags::empty()),
-                None,
-            )?;
-
-            (module, dsl, pipeline_layout, pipeline, pool)
-        };
+            /* max_sets   */ 1024,
+        )?;
 
         // Sprint 35 — block-wise FP8 GEMV pipeline. Identical 4-binding
         // descriptor layout to fp8pc, different SPV + 6 × u32 push
         // constants (`Fp8BlockwiseGemvPushConstants`).
-        let (
-            fp8bw_shader_module,
-            fp8bw_dsl,
-            fp8bw_pipeline_layout,
-            fp8bw_pipeline,
-            fp8bw_pool,
-        ) = unsafe {
-            let words: Vec<u32> = MUL_MAT_VEC_FP8_BLOCKWISE
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            let module = device.create_shader_module(
-                &vk::ShaderModuleCreateInfo::default().code(&words),
-                None,
-            )?;
-            let dsl_bindings: Vec<_> = (0..4).map(|i| {
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(i).descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE)
-            }).collect();
-            let dsl = device.create_descriptor_set_layout(
-                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&dsl_bindings),
-                None,
-            )?;
-            let push_range = vk::PushConstantRange::default()
-                .stage_flags(vk::ShaderStageFlags::COMPUTE)
-                .offset(0)
-                .size(std::mem::size_of::<super::pipeline::Fp8BlockwiseGemvPushConstants>() as u32);
-            let layouts_arr = [dsl];
-            let push_ranges = [push_range];
-            let pipeline_layout = device.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default()
-                    .set_layouts(&layouts_arr)
-                    .push_constant_ranges(&push_ranges),
-                None,
-            )?;
-            let block_size: u32 = 64;
-            let spec_entries = [vk::SpecializationMapEntry { constant_id: 0, offset: 0, size: 4 }];
-            let spec_data = bytemuck::bytes_of(&block_size);
-            let spec_info = vk::SpecializationInfo::default()
-                .map_entries(&spec_entries)
-                .data(spec_data);
-            let mut subgroup_info = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
-                .required_subgroup_size(64);
-            let stage = vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::COMPUTE)
-                .module(module)
-                .name(c"main")
-                .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
-                .specialization_info(&spec_info)
-                .push_next(&mut subgroup_info);
-            let pipeline = device.create_compute_pipelines(
-                vk::PipelineCache::null(),
-                &[vk::ComputePipelineCreateInfo::default()
-                    .stage(stage)
-                    .layout(pipeline_layout)],
-                None,
-            ).map_err(|(_, e)| e)?[0];
-            // Pool sized like fp8pc: ~1024 sets cover the cache for
-            // (weight, input, output, scale) keys × async slots.
-            let pool = device.create_descriptor_pool(
-                &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(1024)
-                    .pool_sizes(&[vk::DescriptorPoolSize {
-                        ty: vk::DescriptorType::STORAGE_BUFFER,
-                        descriptor_count: 1024 * 4,
-                    }])
-                    .flags(vk::DescriptorPoolCreateFlags::empty()),
-                None,
-            )?;
-            (module, dsl, pipeline_layout, pipeline, pool)
-        };
+        // Pool sized like fp8pc: ~1024 sets cover the cache for
+        // (weight, input, output, scale) keys × async slots.
+        let fp8bw = harness::HarnessPipeline::new(
+            device,
+            MUL_MAT_VEC_FP8_BLOCKWISE,
+            /* n_bindings */ 4,
+            /* push_size  */ std::mem::size_of::<super::pipeline::Fp8BlockwiseGemvPushConstants>() as u32,
+            /* spec const */ Some(64),
+            /* max_sets   */ 1024,
+        )?;
 
         // Sprint 36 — block-wise FP8 GEMM (BN=32) pipeline. Same
         // 4-binding scheme as the GEMV variants; differs in the SPV
-        // and the 9-u32 push constant block. BLOCK_SIZE=512 spec,
-        // requiredSubgroupSize=64 (the BN=32 kernel is Wave64).
-        let (
-            fp8bwgemm_shader_module,
-            fp8bwgemm_dsl,
-            fp8bwgemm_pipeline_layout,
-            fp8bwgemm_pipeline,
-            fp8bwgemm_pool,
-        ) = unsafe {
-            let words: Vec<u32> = MUL_COOPMAT_FP8_BN32_BLOCKWISE
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            let module = device.create_shader_module(
-                &vk::ShaderModuleCreateInfo::default().code(&words),
-                None,
-            )?;
-            let dsl_bindings: Vec<_> = (0..4).map(|i| {
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(i).descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE)
-            }).collect();
-            let dsl = device.create_descriptor_set_layout(
-                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&dsl_bindings),
-                None,
-            )?;
-            let push_range = vk::PushConstantRange::default()
-                .stage_flags(vk::ShaderStageFlags::COMPUTE)
-                .offset(0)
-                .size(std::mem::size_of::<super::pipeline::Fp8BlockwiseGemmPushConstants>() as u32);
-            let layouts_arr = [dsl];
-            let push_ranges = [push_range];
-            let pipeline_layout = device.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default()
-                    .set_layouts(&layouts_arr)
-                    .push_constant_ranges(&push_ranges),
-                None,
-            )?;
-            // BN=32 kernel is Wave64; require full subgroups so the
-            // `gl_SubgroupID` derivation lands on the 8-subgroup grid.
-            let mut subgroup_info = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
-                .required_subgroup_size(64);
-            let stage = vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::COMPUTE)
-                .module(module)
-                .name(c"main")
-                .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
-                .push_next(&mut subgroup_info);
-            let pipeline = device.create_compute_pipelines(
-                vk::PipelineCache::null(),
-                &[vk::ComputePipelineCreateInfo::default()
-                    .stage(stage)
-                    .layout(pipeline_layout)],
-                None,
-            ).map_err(|(_, e)| e)?[0];
-            // Pool sized like fp8bw GEMV: prefill cache typically
-            // covers ~7 GEMMs × ~36 layers + retries, comfortably
-            // within 1024 sets.
-            let pool = device.create_descriptor_pool(
-                &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(1024)
-                    .pool_sizes(&[vk::DescriptorPoolSize {
-                        ty: vk::DescriptorType::STORAGE_BUFFER,
-                        descriptor_count: 1024 * 4,
-                    }])
-                    .flags(vk::DescriptorPoolCreateFlags::empty()),
-                None,
-            )?;
-            (module, dsl, pipeline_layout, pipeline, pool)
-        };
+        // and the 9-u32 push constant block. No spec constant — the
+        // BN=32 kernel hard-codes its tile shape. requiredSubgroupSize=64
+        // (the BN=32 kernel is Wave64). Pool sized like fp8bw GEMV.
+        let fp8bwgemm = harness::HarnessPipeline::new(
+            device,
+            MUL_COOPMAT_FP8_BN32_BLOCKWISE,
+            /* n_bindings */ 4,
+            /* push_size  */ std::mem::size_of::<super::pipeline::Fp8BlockwiseGemmPushConstants>() as u32,
+            /* spec const */ None,
+            /* max_sets   */ 1024,
+        )?;
 
         // Sprint 38 Part 2 — block-wise FP8 GEMM with native FP8 WMMA.
-        // Parallel pipeline that reuses fp8bwgemm_dsl / pipeline_layout
+        // Parallel pipeline that reuses fp8bwgemm.dsl / fp8bwgemm.layout
         // (identical descriptor + push-constant layout) but binds the
         // native FP8 SPV. Selected at dispatch time by env flag, so we
         // pay the build cost of one extra pipeline (cheap) and skip
-        // duplicating DSL/layout/pool.
+        // duplicating DSL/layout/pool. Stays inline (not a HarnessPipeline)
+        // because it's a 2-handle aux pair, not a full quintuple.
         let (fp8bwgemm_native_shader_module, fp8bwgemm_native_pipeline) = unsafe {
             let words: Vec<u32> = MUL_COOPMAT_FP8_NATIVE_BN32_BLOCKWISE
                 .chunks_exact(4)
@@ -1134,7 +940,7 @@ impl Forward {
                     vk::PipelineCache::null(),
                     &[vk::ComputePipelineCreateInfo::default()
                         .stage(stage)
-                        .layout(fp8bwgemm_pipeline_layout)],
+                        .layout(fp8bwgemm.layout)],
                     None,
                 )
                 .map_err(|(_, e)| e)?[0];
@@ -1146,83 +952,21 @@ impl Forward {
         // spec, requiredSubgroupSize=64, REQUIRE_FULL_SUBGROUPS, 5
         // bindings: weight + input + output + 2 fuse dummies) but with
         // `PipelineCache::null` and a small dedicated pool.
-        let (
-            lmhead_shader_module,
-            lmhead_dsl,
-            lmhead_pipeline_layout,
-            lmhead_pipeline,
-            lmhead_pool,
-        ) = unsafe {
-            let words: Vec<u32> = MUL_MAT_VEC_F16_LMHEAD
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            let module = device.create_shader_module(
-                &vk::ShaderModuleCreateInfo::default().code(&words),
-                None,
-            )?;
-            let dsl_bindings: Vec<_> = (0..5).map(|i| {
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(i).descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE)
-            }).collect();
-            let dsl = device.create_descriptor_set_layout(
-                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&dsl_bindings),
-                None,
-            )?;
-            let push_range = vk::PushConstantRange::default()
-                .stage_flags(vk::ShaderStageFlags::COMPUTE)
-                .offset(0)
-                .size(std::mem::size_of::<MatVecPushConstants>() as u32);
-            let layouts_arr = [dsl];
-            let push_ranges = [push_range];
-            let pipeline_layout = device.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default()
-                    .set_layouts(&layouts_arr)
-                    .push_constant_ranges(&push_ranges),
-                None,
-            )?;
-            let block_size: u32 = 64;
-            let spec_entries = [vk::SpecializationMapEntry { constant_id: 0, offset: 0, size: 4 }];
-            let spec_data = bytemuck::bytes_of(&block_size);
-            let spec_info = vk::SpecializationInfo::default()
-                .map_entries(&spec_entries)
-                .data(spec_data);
-            let mut subgroup_info = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
-                .required_subgroup_size(64);
-            let stage = vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::COMPUTE)
-                .module(module)
-                .name(c"main")
-                .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
-                .specialization_info(&spec_info)
-                .push_next(&mut subgroup_info);
-            let pipeline = device.create_compute_pipelines(
-                vk::PipelineCache::null(),
-                &[vk::ComputePipelineCreateInfo::default()
-                    .stage(stage)
-                    .layout(pipeline_layout)],
-                None,
-            ).map_err(|(_, e)| e)?[0];
-            // Pool: lm_head dispatched once per forward, but the
-            // async-decode pipeline (pre_record / fill_embed_and_submit)
-            // doesn't reset the pool between tokens — same issue as
-            // Sprint 25B's fp8pc_pool. Match that pool's sizing
-            // (524288 sets, ~25 MB) so a long generation can't exhaust
-            // it. Reset happens at all 3 sync forward sites + inside
-            // reset_descriptor_pool_and_cache (prefill).
-            let pool = device.create_descriptor_pool(
-                &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(524288)
-                    .pool_sizes(&[vk::DescriptorPoolSize {
-                        ty: vk::DescriptorType::STORAGE_BUFFER,
-                        descriptor_count: 524288 * 5,
-                    }])
-                    .flags(vk::DescriptorPoolCreateFlags::empty()),
-                None,
-            )?;
-            (module, dsl, pipeline_layout, pipeline, pool)
-        };
+        // Pool: lm_head dispatched once per forward, but the
+        // async-decode pipeline (pre_record / fill_embed_and_submit)
+        // doesn't reset the pool between tokens — same issue as
+        // Sprint 25B's fp8pc_pool. Match that pool's sizing
+        // (524288 sets, ~25 MB) so a long generation can't exhaust
+        // it. Reset happens at all 3 sync forward sites + inside
+        // reset_descriptor_pool_and_cache (prefill).
+        let lmhead = harness::HarnessPipeline::new(
+            device,
+            MUL_MAT_VEC_F16_LMHEAD,
+            /* n_bindings */ 5,
+            /* push_size  */ std::mem::size_of::<MatVecPushConstants>() as u32,
+            /* spec const */ Some(64),
+            /* max_sets   */ 524288,
+        )?;
 
         Ok(Self {
             slots: [slot0, slot1],
@@ -1268,31 +1012,15 @@ impl Forward {
                 .unwrap_or(false),
             barrier_stats_checked: 0,
             barrier_stats_issued: 0,
-            fp8pc_shader_module,
-            fp8pc_dsl,
-            fp8pc_pipeline_layout,
-            fp8pc_pipeline,
-            fp8pc_pool,
+            fp8pc,
             fp8pc_ds_cache: HashMap::new(),
-            fp8bw_shader_module,
-            fp8bw_dsl,
-            fp8bw_pipeline_layout,
-            fp8bw_pipeline,
-            fp8bw_pool,
+            fp8bw,
             fp8bw_ds_cache: HashMap::new(),
-            fp8bwgemm_shader_module,
-            fp8bwgemm_dsl,
-            fp8bwgemm_pipeline_layout,
-            fp8bwgemm_pipeline,
-            fp8bwgemm_pool,
+            fp8bwgemm,
             fp8bwgemm_ds_cache: HashMap::new(),
             fp8bwgemm_native_shader_module,
             fp8bwgemm_native_pipeline,
-            lmhead_shader_module,
-            lmhead_dsl,
-            lmhead_pipeline_layout,
-            lmhead_pipeline,
-            lmhead_pool,
+            lmhead,
         })
     }
 
@@ -1343,7 +1071,7 @@ impl Forward {
             // Sprint 29 — lm_head pool stays per-forward-resetted (its
             // bindings change with the cur() slot, no caching applied).
             dev.device.reset_descriptor_pool(
-                self.lmhead_pool, vk::DescriptorPoolResetFlags::empty(),
+                self.lmhead.pool, vk::DescriptorPoolResetFlags::empty(),
             )?;
         }
         let pre_setup = pre_start.elapsed();
@@ -1438,7 +1166,7 @@ impl Forward {
             // Sprint 29 — lm_head pool stays per-forward-resetted (its
             // bindings change with the cur() slot, no caching applied).
             dev.device.reset_descriptor_pool(
-                self.lmhead_pool, vk::DescriptorPoolResetFlags::empty(),
+                self.lmhead.pool, vk::DescriptorPoolResetFlags::empty(),
             )?;
         }
         let pre_setup = pre_start.elapsed();
@@ -1565,7 +1293,7 @@ impl Forward {
             // Sprint 29 — lm_head pool stays per-forward-resetted (its
             // bindings change with the cur() slot, no caching applied).
             dev.device.reset_descriptor_pool(
-                self.lmhead_pool, vk::DescriptorPoolResetFlags::empty(),
+                self.lmhead.pool, vk::DescriptorPoolResetFlags::empty(),
             )?;
         }
 
@@ -2131,35 +1859,21 @@ impl Forward {
     }
 
     pub fn destroy(self, device: &ash::Device, allocator: &mut Allocator) {
+        // Sprint 44B-2 — harness-pipeline teardown collapsed into one
+        // call per pipeline (Sprint 24-Inline / 35 / 36 / 29).
+        self.fp8pc.destroy(device);
+        self.fp8bw.destroy(device);
+        // Sprint 38 Part 2 — native FP8 block-wise pipeline shares
+        // dsl/layout/pool with fp8bwgemm; tear it down BEFORE the
+        // shared harness so the pipeline-layout destroy below sees no
+        // dangling pipeline.
         unsafe {
-            // Sprint 24-Inline cleanup
-            device.destroy_descriptor_pool(self.fp8pc_pool, None);
-            device.destroy_pipeline(self.fp8pc_pipeline, None);
-            device.destroy_pipeline_layout(self.fp8pc_pipeline_layout, None);
-            device.destroy_descriptor_set_layout(self.fp8pc_dsl, None);
-            device.destroy_shader_module(self.fp8pc_shader_module, None);
-            // Sprint 35 — block-wise FP8 GEMV cleanup
-            device.destroy_descriptor_pool(self.fp8bw_pool, None);
-            device.destroy_pipeline(self.fp8bw_pipeline, None);
-            device.destroy_pipeline_layout(self.fp8bw_pipeline_layout, None);
-            device.destroy_descriptor_set_layout(self.fp8bw_dsl, None);
-            device.destroy_shader_module(self.fp8bw_shader_module, None);
-            // Sprint 36 — block-wise FP8 GEMM cleanup
-            device.destroy_descriptor_pool(self.fp8bwgemm_pool, None);
-            device.destroy_pipeline(self.fp8bwgemm_pipeline, None);
-            // Sprint 38 Part 2 — native FP8 block-wise pipeline shares
-            // dsl/layout/pool with the BF16 cousin; only destroy the
-            // pipeline + module here.
             device.destroy_pipeline(self.fp8bwgemm_native_pipeline, None);
             device.destroy_shader_module(self.fp8bwgemm_native_shader_module, None);
-            device.destroy_pipeline_layout(self.fp8bwgemm_pipeline_layout, None);
-            device.destroy_descriptor_set_layout(self.fp8bwgemm_dsl, None);
-            device.destroy_shader_module(self.fp8bwgemm_shader_module, None);
-            device.destroy_descriptor_pool(self.lmhead_pool, None);
-            device.destroy_pipeline(self.lmhead_pipeline, None);
-            device.destroy_pipeline_layout(self.lmhead_pipeline_layout, None);
-            device.destroy_descriptor_set_layout(self.lmhead_dsl, None);
-            device.destroy_shader_module(self.lmhead_shader_module, None);
+        }
+        self.fp8bwgemm.destroy(device);
+        self.lmhead.destroy(device);
+        unsafe {
             device.destroy_descriptor_pool(self.descriptor_pool, None);
             // Sprint 15E — async CB pool + fences.
             for f in self.async_fences {
@@ -3337,22 +3051,22 @@ impl Forward {
             // alongside the main one. Sets allocated last forward become
             // free again.
             dev.device.reset_descriptor_pool(
-                self.fp8pc_pool,
+                self.fp8pc.pool,
                 vk::DescriptorPoolResetFlags::empty(),
             )?;
             // Sprint 35 — same for the block-wise FP8 pool.
             dev.device.reset_descriptor_pool(
-                self.fp8bw_pool,
+                self.fp8bw.pool,
                 vk::DescriptorPoolResetFlags::empty(),
             )?;
             // Sprint 36 — same for the block-wise FP8 GEMM pool.
             dev.device.reset_descriptor_pool(
-                self.fp8bwgemm_pool,
+                self.fp8bwgemm.pool,
                 vk::DescriptorPoolResetFlags::empty(),
             )?;
             // Sprint 29 — same for the lm_head dedicated pool.
             dev.device.reset_descriptor_pool(
-                self.lmhead_pool,
+                self.lmhead.pool,
                 vk::DescriptorPoolResetFlags::empty(),
             )?;
         }
@@ -3508,8 +3222,8 @@ impl Forward {
             cached
         } else {
             let alloc_info = vk::DescriptorSetAllocateInfo::default()
-                .descriptor_pool(self.fp8pc_pool)
-                .set_layouts(std::slice::from_ref(&self.fp8pc_dsl));
+                .descriptor_pool(self.fp8pc.pool)
+                .set_layouts(std::slice::from_ref(&self.fp8pc.dsl));
             let set = unsafe { dev.device.allocate_descriptor_sets(&alloc_info) }
                 .expect("fp8pc descriptor set alloc")[0];
 
@@ -3541,8 +3255,8 @@ impl Forward {
             ne02: 1, ne12: 1, broadcast2: 1,
             broadcast3: 1u32,
         };
-        let pipeline = self.fp8pc_pipeline;
-        let layout = self.fp8pc_pipeline_layout;
+        let pipeline = self.fp8pc.pipeline;
+        let layout = self.fp8pc.layout;
         self.profile(label, dev, cmd, |dev, cmd| unsafe {
             dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             dev.device.cmd_bind_descriptor_sets(
@@ -3608,8 +3322,8 @@ impl Forward {
             cached
         } else {
             let alloc_info = vk::DescriptorSetAllocateInfo::default()
-                .descriptor_pool(self.fp8bw_pool)
-                .set_layouts(std::slice::from_ref(&self.fp8bw_dsl));
+                .descriptor_pool(self.fp8bw.pool)
+                .set_layouts(std::slice::from_ref(&self.fp8bw.dsl));
             let set = unsafe { dev.device.allocate_descriptor_sets(&alloc_info) }
                 .expect("fp8bw descriptor set alloc")[0];
             let infos = [
@@ -3643,8 +3357,8 @@ impl Forward {
             input_off_floats,
             output_off_floats,
         };
-        let pipeline = self.fp8bw_pipeline;
-        let layout = self.fp8bw_pipeline_layout;
+        let pipeline = self.fp8bw.pipeline;
+        let layout = self.fp8bw.layout;
         self.profile(label, dev, cmd, |dev, cmd| unsafe {
             dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             dev.device.cmd_bind_descriptor_sets(
@@ -3702,8 +3416,8 @@ impl Forward {
             cached
         } else {
             let alloc_info = vk::DescriptorSetAllocateInfo::default()
-                .descriptor_pool(self.fp8bwgemm_pool)
-                .set_layouts(std::slice::from_ref(&self.fp8bwgemm_dsl));
+                .descriptor_pool(self.fp8bwgemm.pool)
+                .set_layouts(std::slice::from_ref(&self.fp8bwgemm.dsl));
             let set = unsafe { dev.device.allocate_descriptor_sets(&alloc_info) }
                 .expect("fp8bwgemm descriptor set alloc")[0];
             let infos = [
@@ -3752,9 +3466,9 @@ impl Forward {
         let pipeline = if native_fp8_wmma {
             self.fp8bwgemm_native_pipeline
         } else {
-            self.fp8bwgemm_pipeline
+            self.fp8bwgemm.pipeline
         };
-        let layout = self.fp8bwgemm_pipeline_layout;
+        let layout = self.fp8bwgemm.layout;
         self.profile(label, dev, cmd, |dev, cmd| unsafe {
             dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             dev.device.cmd_bind_descriptor_sets(
@@ -3845,8 +3559,8 @@ impl Forward {
         weight_scale: f32,
     ) {
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.lmhead_pool)
-            .set_layouts(std::slice::from_ref(&self.lmhead_dsl));
+            .descriptor_pool(self.lmhead.pool)
+            .set_layouts(std::slice::from_ref(&self.lmhead.dsl));
         let set = unsafe { dev.device.allocate_descriptor_sets(&alloc_info) }
             .expect("lmhead descriptor set alloc")[0];
         let infos = [
@@ -3875,8 +3589,8 @@ impl Forward {
             ne02: 1, ne12: 1, broadcast2: 1,
             broadcast3: weight_scale.to_bits(),
         };
-        let pipeline = self.lmhead_pipeline;
-        let layout = self.lmhead_pipeline_layout;
+        let pipeline = self.lmhead.pipeline;
+        let layout = self.lmhead.layout;
         self.profile("lm_head", dev, cmd, |dev, cmd| unsafe {
             dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             dev.device.cmd_bind_descriptor_sets(

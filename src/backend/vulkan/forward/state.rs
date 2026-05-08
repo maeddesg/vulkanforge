@@ -22,6 +22,7 @@ use super::super::buffers::GpuBuffer;
 use super::super::gguf::ModelConfig;
 use super::super::kv_cache::KvCache;
 use super::super::profiler::{ShaderProfiler, TimingSample};
+use super::harness::HarnessPipeline;
 
 // Sprint 24-Inline DEBUG — per-channel FP8 GEMV variant SPV. Compiled
 // by build.rs from `vk_shaders/mul_mat_vec_fp8_perchannel.comp`.
@@ -365,11 +366,12 @@ pub struct Forward {
     // resources, freshly created at Forward construction with the
     // perchannel SPV variant + null pipeline cache + dedicated
     // descriptor pool. Used for FP8 GEMV when scale_buffer is Some.
-    pub(super) fp8pc_shader_module: vk::ShaderModule,
-    pub(super) fp8pc_dsl: vk::DescriptorSetLayout,
-    pub(super) fp8pc_pipeline_layout: vk::PipelineLayout,
-    pub(super) fp8pc_pipeline: vk::Pipeline,
-    pub(super) fp8pc_pool: vk::DescriptorPool,
+    //
+    // Sprint 44B-2 — the {module, dsl, layout, pipeline, pool} quintuple
+    // is bundled into a `HarnessPipeline` (see `harness.rs`); the
+    // descriptor-set cache stays here so dispatch wrappers can `clear()`
+    // it on prefill without touching the harness.
+    pub(super) fp8pc: HarnessPipeline,
     /// Sprint 30 — descriptor-set cache for `run_gemv_fp8_perchannel`.
     /// Key: (weight, input, output, scale) buffer handles as `u64`.
     /// Hit  → reuse the cached set (no `vkAllocate` / `vkUpdate` calls).
@@ -382,17 +384,13 @@ pub struct Forward {
     /// every-call-fresh-alloc pattern).
     pub(super) fp8pc_ds_cache: HashMap<(u64, u64, u64, u64), vk::DescriptorSet>,
 
-    // Sprint 35 — block-wise FP8 GEMV resources. Mirror of fp8pc_* with
+    // Sprint 35 — block-wise FP8 GEMV resources. Mirror of fp8pc with
     // a different SPV (`mul_mat_vec_fp8_blockwise`) and a 6-u32 push
     // constant block (vs perchannel's 13-u32 MatVecPushConstants).
     // 4 storage-buffer bindings identical to perchannel so the loader
     // and the routing wrapper can share the descriptor-set cache key
     // shape. Activated when a layer weight has `scale_block.is_some()`.
-    pub(super) fp8bw_shader_module: vk::ShaderModule,
-    pub(super) fp8bw_dsl: vk::DescriptorSetLayout,
-    pub(super) fp8bw_pipeline_layout: vk::PipelineLayout,
-    pub(super) fp8bw_pipeline: vk::Pipeline,
-    pub(super) fp8bw_pool: vk::DescriptorPool,
+    pub(super) fp8bw: HarnessPipeline,
     pub(super) fp8bw_ds_cache: HashMap<(u64, u64, u64, u64), vk::DescriptorSet>,
 
     // Sprint 36 — block-wise FP8 GEMM resources (BN=32 prefill kernel).
@@ -400,11 +398,7 @@ pub struct Forward {
     // the SPV (`mul_coopmat_fp8_bn32_blockwise`) and a 9-u32 push
     // constant block. Replaces the Sprint 35 GEMV-loop fallback in
     // `dispatch_layer_batch`.
-    pub(super) fp8bwgemm_shader_module: vk::ShaderModule,
-    pub(super) fp8bwgemm_dsl: vk::DescriptorSetLayout,
-    pub(super) fp8bwgemm_pipeline_layout: vk::PipelineLayout,
-    pub(super) fp8bwgemm_pipeline: vk::Pipeline,
-    pub(super) fp8bwgemm_pool: vk::DescriptorPool,
+    pub(super) fp8bwgemm: HarnessPipeline,
     pub(super) fp8bwgemm_ds_cache: HashMap<(u64, u64, u64, u64), vk::DescriptorSet>,
 
     // Sprint 38 Part 2 — block-wise FP8 GEMM with native FP8 WMMA.
@@ -425,11 +419,7 @@ pub struct Forward {
     // shared cache is the cause; if it is, the harness pattern (same
     // approach that fixed Sprint 24-Inline's per-channel FP8 GEMV)
     // closes the gap.
-    pub(super) lmhead_shader_module: vk::ShaderModule,
-    pub(super) lmhead_dsl: vk::DescriptorSetLayout,
-    pub(super) lmhead_pipeline_layout: vk::PipelineLayout,
-    pub(super) lmhead_pipeline: vk::Pipeline,
-    pub(super) lmhead_pool: vk::DescriptorPool,
+    pub(super) lmhead: HarnessPipeline,
 
     pub(super) rope_theta_scale: f32,
     pub(super) attn_scale: f32,
