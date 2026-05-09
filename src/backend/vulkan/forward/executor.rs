@@ -197,24 +197,16 @@ impl DecodeExec {
             // so E2B / Qwen3 / Llama never hit them. Loader rejects
             // 26B-A4B with a clear error until Sprint 51D wires the
             // tensor upload + dispatch.
-            LayerStep::PostDenseMlpNorm => {
-                todo!("Sprint 51D — PostDenseMlpNorm: ffn_out → scratch_a (h1)")
+            LayerStep::PostDenseMlpNorm => self.step_post_dense_mlp_norm(fwd, cfg, ctx),
+            LayerStep::PreMoeNorm => self.step_pre_moe_norm(fwd, cfg, ctx),
+            LayerStep::MoeRoute { n_experts, top_k } => {
+                self.step_moe_route(fwd, cfg, ctx, *n_experts, *top_k)
             }
-            LayerStep::PreMoeNorm => {
-                todo!("Sprint 51D — PreMoeNorm: res1 → scratch_b (MoE input)")
+            LayerStep::MoeExpertFfn { n_experts, top_k, moe_intermediate } => {
+                self.step_moe_expert_ffn(fwd, cfg, ctx, *n_experts, *top_k, *moe_intermediate)
             }
-            LayerStep::MoeRoute { n_experts: _, top_k: _ } => {
-                todo!("Sprint 51D — MoeRoute: router GEMV + softmax + Top-K")
-            }
-            LayerStep::MoeExpertFfn { .. } => {
-                todo!("Sprint 51D — MoeExpertFfn: per-token K-expert dispatch")
-            }
-            LayerStep::PostMoeNorm => {
-                todo!("Sprint 51D — PostMoeNorm: ffn_hidden → ffn_out (h2)")
-            }
-            LayerStep::MoeBranchAdd => {
-                todo!("Sprint 51D — MoeBranchAdd: ffn_out += scratch_a (h1+h2)")
-            }
+            LayerStep::PostMoeNorm => self.step_post_moe_norm(fwd, cfg, ctx),
+            LayerStep::MoeBranchAdd => self.step_moe_branch_add(fwd, cfg, ctx),
         }
     }
 
@@ -865,6 +857,82 @@ impl DecodeExec {
         );
         fwd.mark_written(&[output]);
     }
+
+    // === Sprint 51D-B Block 1 — Gemma-4-26B-A4B MoE FFN-Block norms + add ===
+
+    /// `post_feedforward_layernorm_1` on Dense-MLP output.
+    /// Reads `ffn_out` (DownProj output), writes `scratch_a` (= h1).
+    fn step_post_dense_mlp_norm(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        let ffn_out = fwd.cur().ffn_out.handle;
+        let scratch_a = fwd.cur().scratch_a.handle;
+        let w = layer_weight(ctx.model, ctx.layer, "ffn_post_norm_1.weight");
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[ffn_out]);
+        fwd.run_rms_norm(
+            ctx.dev, ctx.registry, ctx.cmd, ffn_out, w, scratch_a,
+            cfg.hidden_dim, 1, cfg.rms_norm_eps, "rms_norm_post_dense_mlp",
+        );
+        fwd.mark_written(&[scratch_a]);
+    }
+
+    /// `pre_feedforward_layernorm_2` on the post-attention residual
+    /// (NOT on the Dense-MLP output — both branches read the same
+    /// residual). Reads `res1`, writes `scratch_b` (MoE input).
+    fn step_pre_moe_norm(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        let res1 = fwd.cur().res1.handle;
+        let scratch_b = fwd.cur().scratch_b.handle;
+        let w = layer_weight(ctx.model, ctx.layer, "ffn_pre_norm_2.weight");
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[res1]);
+        fwd.run_rms_norm(
+            ctx.dev, ctx.registry, ctx.cmd, res1, w, scratch_b,
+            cfg.hidden_dim, 1, cfg.rms_norm_eps, "rms_norm_pre_moe",
+        );
+        fwd.mark_written(&[scratch_b]);
+    }
+
+    /// `post_feedforward_layernorm_2` on MoE output.
+    /// Reads `ffn_hidden` (MoE expert weighted-sum), writes `ffn_out`
+    /// (= h2, aliasing the freed Dense-output slot).
+    fn step_post_moe_norm(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        let ffn_hidden = fwd.cur().ffn_hidden.handle;
+        let ffn_out = fwd.cur().ffn_out.handle;
+        let w = layer_weight(ctx.model, ctx.layer, "ffn_post_norm_2.weight");
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[ffn_hidden]);
+        fwd.run_rms_norm(
+            ctx.dev, ctx.registry, ctx.cmd, ffn_hidden, w, ffn_out,
+            cfg.hidden_dim, 1, cfg.rms_norm_eps, "rms_norm_post_moe",
+        );
+        fwd.mark_written(&[ffn_out]);
+    }
+
+    /// `ffn_out (h2) += scratch_a (h1)`. Distinct from
+    /// `step_ffn_residual_add` which reads `res1` instead of `scratch_a`.
+    fn step_moe_branch_add(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        let ffn_out = fwd.cur().ffn_out.handle;
+        let scratch_a = fwd.cur().scratch_a.handle;
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[ffn_out, scratch_a]);
+        fwd.run_binary(
+            ctx.dev, ctx.registry, ctx.cmd, ShaderId::Add,
+            ffn_out, scratch_a, ffn_out,
+            cfg.hidden_dim, "moe_branch_add",
+        );
+        fwd.mark_written(&[ffn_out]);
+    }
+
+    // === Sprint 51D-B Block 2 / 3 — stubs, real impl follows after Block 1 STOP-Gate ===
+
+    fn step_moe_route(
+        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx,
+        _n_experts: u32, _top_k: u32,
+    ) {
+        unimplemented!("Sprint 51D-B Block 2 — MoeRoute (router GEMV + softmax + Top-K)");
+    }
+
+    fn step_moe_expert_ffn(
+        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx,
+        _n_experts: u32, _top_k: u32, _moe_intermediate: u32,
+    ) {
+        unimplemented!("Sprint 51D-B Block 3 — MoeExpertFfn (per-token K-expert dispatch)");
+    }
 }
 
 // ── BatchExec (Phase B of Sprint 44C-2) ───────────────────────────────
@@ -1000,24 +1068,16 @@ impl BatchExec {
             // on the DecodeExec match-arm). BatchExec is loaded
             // through the same `enable_moe_block` gate; never hit on
             // E2B / Qwen3 / Llama.
-            LayerStep::PostDenseMlpNorm => {
-                todo!("Sprint 51D — b_step_post_dense_mlp_norm")
+            LayerStep::PostDenseMlpNorm => self.b_step_post_dense_mlp_norm(fwd, cfg, ctx),
+            LayerStep::PreMoeNorm => self.b_step_pre_moe_norm(fwd, cfg, ctx),
+            LayerStep::MoeRoute { n_experts, top_k } => {
+                self.b_step_moe_route(fwd, cfg, ctx, *n_experts, *top_k)
             }
-            LayerStep::PreMoeNorm => {
-                todo!("Sprint 51D — b_step_pre_moe_norm")
+            LayerStep::MoeExpertFfn { n_experts, top_k, moe_intermediate } => {
+                self.b_step_moe_expert_ffn(fwd, cfg, ctx, *n_experts, *top_k, *moe_intermediate)
             }
-            LayerStep::MoeRoute { n_experts: _, top_k: _ } => {
-                todo!("Sprint 51D — b_step_moe_route")
-            }
-            LayerStep::MoeExpertFfn { .. } => {
-                todo!("Sprint 51D — b_step_moe_expert_ffn")
-            }
-            LayerStep::PostMoeNorm => {
-                todo!("Sprint 51D — b_step_post_moe_norm")
-            }
-            LayerStep::MoeBranchAdd => {
-                todo!("Sprint 51D — b_step_moe_branch_add")
-            }
+            LayerStep::PostMoeNorm => self.b_step_post_moe_norm(fwd, cfg, ctx),
+            LayerStep::MoeBranchAdd => self.b_step_moe_branch_add(fwd, cfg, ctx),
         }
     }
 
@@ -1838,6 +1898,82 @@ impl BatchExec {
             seq_len * cfg.hidden_dim, "layer_scalar_mul_b",
         );
         compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    // === Sprint 51D-B Block 1 — Gemma-4-26B-A4B MoE FFN-Block (batch) ===
+    //
+    // Buffer aliasing on the existing batch buffers:
+    //   batch_ffn_out    Dense-MLP DownProj output (existing)
+    //                    -> after PostMoeNorm: h2 (alias the freed slot)
+    //                    -> after MoeBranchAdd: h1 + h2
+    //   batch_norm       PreFfnNorm output (existing, free after DownProj)
+    //                    -> h1 after PostDenseMlpNorm
+    //   batch_o          OProj output (existing, free after AttnResidualAdd)
+    //                    -> MoE input after PreMoeNorm
+    //   batch_ffn_hidden FFN intermediate (existing) -> MoE expert sum
+
+    fn b_step_post_dense_mlp_norm(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        let seq_len = batch_seq_len(ctx);
+        let w = layer_weight(ctx.model, ctx.layer, "ffn_post_norm_1.weight");
+        fwd.run_rms_norm(
+            ctx.dev, ctx.registry, ctx.cmd,
+            fwd.batch_ffn_out.handle, w, fwd.batch_norm.handle,
+            cfg.hidden_dim, seq_len, cfg.rms_norm_eps,
+            "rms_norm_post_dense_mlp_b",
+        );
+        compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    fn b_step_pre_moe_norm(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        // Reads batch_residual (NOT the Dense-MLP output) — both
+        // branches operate on the same post-attention residual.
+        let seq_len = batch_seq_len(ctx);
+        let w = layer_weight(ctx.model, ctx.layer, "ffn_pre_norm_2.weight");
+        fwd.run_rms_norm(
+            ctx.dev, ctx.registry, ctx.cmd,
+            fwd.batch_residual.handle, w, fwd.batch_o.handle,
+            cfg.hidden_dim, seq_len, cfg.rms_norm_eps,
+            "rms_norm_pre_moe_b",
+        );
+        compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    fn b_step_post_moe_norm(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        let seq_len = batch_seq_len(ctx);
+        let w = layer_weight(ctx.model, ctx.layer, "ffn_post_norm_2.weight");
+        fwd.run_rms_norm(
+            ctx.dev, ctx.registry, ctx.cmd,
+            fwd.batch_ffn_hidden.handle, w, fwd.batch_ffn_out.handle,
+            cfg.hidden_dim, seq_len, cfg.rms_norm_eps,
+            "rms_norm_post_moe_b",
+        );
+        compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    fn b_step_moe_branch_add(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        let seq_len = batch_seq_len(ctx);
+        fwd.run_binary(
+            ctx.dev, ctx.registry, ctx.cmd, ShaderId::Add,
+            fwd.batch_ffn_out.handle, fwd.batch_norm.handle, fwd.batch_ffn_out.handle,
+            seq_len * cfg.hidden_dim, "moe_branch_add_b",
+        );
+        compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    // === Block 2 / 3 stubs ===
+
+    fn b_step_moe_route(
+        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx,
+        _n_experts: u32, _top_k: u32,
+    ) {
+        unimplemented!("Sprint 51D-B Block 2 — b_step_moe_route");
+    }
+
+    fn b_step_moe_expert_ffn(
+        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx,
+        _n_experts: u32, _top_k: u32, _moe_intermediate: u32,
+    ) {
+        unimplemented!("Sprint 51D-B Block 3 — b_step_moe_expert_ffn");
     }
 
     // ── shared GEMM-routing helper ───────────────────────────────────
