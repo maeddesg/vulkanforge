@@ -180,6 +180,66 @@ pub enum LayerStep {
     /// Final per-layer scalar multiply (`Gemma4TextDecoderLayer.layer_scalar`).
     /// The scalar buffer is `blk.{layer}.layer_scalar`.
     LayerScalarMul,
+
+    // ============================================================
+    // Sprint 51C — Gemma-4-26B-A4B MoE block (`enable_moe_block: true`).
+    //
+    // Each layer runs Dense-MLP (existing PreFfnNorm / GateProj /
+    // UpProj / Activation / DownProj) AND a parallel MoE branch on
+    // the same residual; their outputs sum and the existing
+    // PostFfnNorm / FfnResidualAdd / LayerScalarMul finish the layer.
+    //
+    // The 6 variants below cover everything the Dense-MLP path
+    // doesn't already provide. Implementations come in Sprint 51D
+    // (`todo!()`-stubbed in both executors here).
+    //
+    // Buffer aliasing on the existing IntermediateSlot:
+    //   ffn_out      — Dense-MLP DownProj output (lives until
+    //                  PostDenseMlpNorm reads it; later reused for h2)
+    //   scratch_a    — h1 (PostDenseMlpNorm output, lives until MoeBranchAdd)
+    //   scratch_b    — MoE input (PreMoeNorm output of residual)
+    //   ffn_hidden   — MoE expert weighted sum (Dense path is done with it)
+    //   ffn_out      — h2 after PostMoeNorm (alias of Dense output slot)
+    //   ffn_out      — h1+h2 after MoeBranchAdd (in-place add)
+    // No new IntermediateSlot fields needed.
+    // ============================================================
+
+    /// Apply `post_feedforward_layernorm_1` to the Dense-MLP output.
+    /// Reads `ffn_out`, writes `scratch_a` (= h1).
+    PostDenseMlpNorm,
+
+    /// Apply `pre_feedforward_layernorm_2` to the post-attention
+    /// residual (the same one the Dense MLP read pre-`PreFfnNorm`).
+    /// Reads `res1`, writes `scratch_b` (= MoE input).
+    /// **Critical:** input is the residual, NOT the Dense MLP output.
+    PreMoeNorm,
+
+    /// MoE Router: `router.proj` GEMV [`hidden_size`→`n_experts`],
+    /// followed by softmax + Top-K. CPU-side selection of the K
+    /// active experts and their normalised weights.
+    /// Reads `scratch_b` (post `PreMoeNorm`); fills the router-
+    /// scratch with `[token_idx → (top_k_indices[K], top_k_weights[K])]`.
+    MoeRoute { n_experts: u32, top_k: u32 },
+
+    /// MoE Expert FFN: dispatch the K active experts per token and
+    /// accumulate `weight_e × (down_proj(act(gate_e × up_proj(x))))`
+    /// into `ffn_hidden`. Each expert is a `[moe_intermediate, hidden]`
+    /// linear pair packed in `moe_experts.gate_up_proj` /
+    /// `moe_experts.down_proj` (3D tensors over all 128 experts).
+    MoeExpertFfn {
+        n_experts: u32,
+        top_k: u32,
+        moe_intermediate: u32,
+    },
+
+    /// Apply `post_feedforward_layernorm_2` to the MoE branch output.
+    /// Reads `ffn_hidden`, writes `ffn_out` (= h2, aliasing the
+    /// freed Dense-MLP slot).
+    PostMoeNorm,
+
+    /// Sum the two parallel branches: `ffn_out = scratch_a + ffn_out`
+    /// (h1 + h2). Distinct from `FfnResidualAdd` (which adds residual).
+    MoeBranchAdd,
 }
 
 /// Activation flavour for the FFN gated-linear-unit shader.
@@ -386,12 +446,37 @@ pub fn build_gemma4_layer(
 
     plan.push(LayerStep::PostAttnNorm);
     plan.push(LayerStep::AttnResidualAdd);
-    plan.push(LayerStep::PreFfnNorm);
 
+    // FFN block. E2B: Dense-MLP only.
+    // 26B-A4B: Dense-MLP AND MoE in parallel, summed before
+    // `PostFfnNorm`/`FfnResidualAdd`/`LayerScalarMul`.
+    plan.push(LayerStep::PreFfnNorm);
     plan.push(LayerStep::GateProj);
     plan.push(LayerStep::UpProj);
     plan.push(LayerStep::Activation { kind: ActivationKind::GeluPytorchTanhGlu });
     plan.push(LayerStep::DownProj);
+
+    if g.enable_moe_block {
+        // Branch 1 close-out (h1): PostDenseMlpNorm reads ffn_out,
+        // writes scratch_a.
+        plan.push(LayerStep::PostDenseMlpNorm);
+        // Branch 2 (parallel on residual): PreMoeNorm reads res1
+        // (NOT ffn_out / scratch_a), writes scratch_b. Then router,
+        // expert FFN, post-MoE norm.
+        plan.push(LayerStep::PreMoeNorm);
+        plan.push(LayerStep::MoeRoute {
+            n_experts: g.n_experts,
+            top_k: g.top_k_experts,
+        });
+        plan.push(LayerStep::MoeExpertFfn {
+            n_experts: g.n_experts,
+            top_k: g.top_k_experts,
+            moe_intermediate: g.moe_intermediate_size,
+        });
+        plan.push(LayerStep::PostMoeNorm);
+        // Combine: ffn_out = scratch_a + ffn_out (h1 + h2).
+        plan.push(LayerStep::MoeBranchAdd);
+    }
 
     plan.push(LayerStep::PostFfnNorm);
     plan.push(LayerStep::FfnResidualAdd);
@@ -520,6 +605,11 @@ mod tests {
             layer_scalars: vec![0.5; 35],
             layers,
             hidden_size_per_layer_input: 256,
+            // Sprint 51C — E2B test fixture: no MoE block.
+            enable_moe_block: false,
+            n_experts: 0,
+            top_k_experts: 0,
+            moe_intermediate_size: 0,
         }
     }
 
@@ -780,6 +870,81 @@ mod tests {
         assert!(!plan.iter().any(|s| matches!(s, LayerStep::PleBlock)));
         // LayerScalarMul still fires.
         assert!(plan.iter().any(|s| matches!(s, LayerStep::LayerScalarMul)));
+    }
+
+    /// Sprint 51C — E2B's Gemma4Spec has `enable_moe_block: false`,
+    /// so no MoE-related step ever appears in the layer plan and
+    /// the existing Dense-MLP path runs end-to-end.
+    #[test]
+    fn gemma4_e2b_layer_plan_has_no_moe_steps() {
+        let cfg = gemma4_cfg();
+        let flags = LayerWeightFlags { has_ple: true, ..Default::default() };
+        for layer in 0..cfg.n_layers {
+            let plan = build_gemma4_layer(&cfg, layer, &flags, 1.0);
+            assert!(
+                !plan.iter().any(|s| matches!(
+                    s,
+                    LayerStep::PostDenseMlpNorm
+                        | LayerStep::PreMoeNorm
+                        | LayerStep::MoeRoute { .. }
+                        | LayerStep::MoeExpertFfn { .. }
+                        | LayerStep::PostMoeNorm
+                        | LayerStep::MoeBranchAdd
+                )),
+                "E2B layer {layer} unexpectedly emits an MoE step"
+            );
+        }
+    }
+
+    /// Sprint 51C — when `enable_moe_block: true`, the layer plan
+    /// emits all six new MoE steps in the documented order
+    /// (PostDenseMlpNorm → PreMoeNorm → MoeRoute → MoeExpertFfn →
+    /// PostMoeNorm → MoeBranchAdd) and surrounds them with the
+    /// existing PreFfnNorm-block before and PostFfnNorm-block after.
+    #[test]
+    fn gemma4_26b_moe_layer_plan_emits_six_steps() {
+        let mut spec = gemma4_e2b_spec();
+        spec.enable_moe_block = true;
+        spec.n_experts = 128;
+        spec.top_k_experts = 8;
+        spec.moe_intermediate_size = 704;
+        let cfg = ModelConfig {
+            architecture: "gemma4".into(),
+            n_layers: 30,
+            n_heads: 16,
+            n_kv_heads: 8,
+            hidden_dim: 2816,
+            ffn_dim: 2112,
+            vocab_size: 262144,
+            head_dim: 512,
+            rope_freq_base: 1_000_000.0,
+            rope_dim: 512,
+            rope_variant: RopeVariant::Neox,
+            context_length: 8192,
+            has_qk_norm: true,
+            rms_norm_eps: 1e-6,
+            gemma4: Some(spec),
+        };
+        let flags = LayerWeightFlags::default();
+        let plan = build_gemma4_layer(&cfg, 0, &flags, 1.0);
+
+        let names: Vec<&'static str> = plan.iter().map(|s| match s {
+            LayerStep::PostDenseMlpNorm => "PostDenseMlpNorm",
+            LayerStep::PreMoeNorm => "PreMoeNorm",
+            LayerStep::MoeRoute { .. } => "MoeRoute",
+            LayerStep::MoeExpertFfn { .. } => "MoeExpertFfn",
+            LayerStep::PostMoeNorm => "PostMoeNorm",
+            LayerStep::MoeBranchAdd => "MoeBranchAdd",
+            _ => "",
+        }).filter(|s| !s.is_empty()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "PostDenseMlpNorm", "PreMoeNorm", "MoeRoute",
+                "MoeExpertFfn", "PostMoeNorm", "MoeBranchAdd",
+            ],
+            "MoE step order mismatch"
+        );
     }
 
     #[test]

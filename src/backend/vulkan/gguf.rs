@@ -419,6 +419,18 @@ pub struct Gemma4Spec {
     /// → 1536 for projection) and the per-slot
     /// `per_layer_inputs` buffer stride.
     pub hidden_size_per_layer_input: u32,
+    /// Sprint 51C — `true` on Gemma-4-26B-A4B; the layer FFN runs
+    /// Dense-MLP AND MoE-expert-FFN in parallel and sums their
+    /// outputs. `false` for E2B.
+    pub enable_moe_block: bool,
+    /// Sprint 51C — total expert count (`128` for 26B-A4B, `0` for E2B).
+    pub n_experts: u32,
+    /// Sprint 51C — top-K experts selected per token (`8` for 26B-A4B).
+    pub top_k_experts: u32,
+    /// Sprint 51C — per-expert FFN intermediate size (`704` for
+    /// 26B-A4B, `0` for E2B). Independent of the Dense-MLP
+    /// `intermediate_size` (= 2112 for 26B-A4B).
+    pub moe_intermediate_size: u32,
 }
 
 /// Sprint 43B-2 — per-layer routing state for a Gemma-4 stack.

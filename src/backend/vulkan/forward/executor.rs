@@ -192,6 +192,29 @@ impl DecodeExec {
             LayerStep::FfnResidualAdd => self.step_ffn_residual_add(fwd, cfg, ctx),
             LayerStep::PleBlock => self.step_ple_block(fwd, cfg, ctx),
             LayerStep::LayerScalarMul => self.step_layer_scalar_mul(fwd, cfg, ctx),
+            // Sprint 51C — Gemma-4-26B-A4B MoE-block stubs. The
+            // layer-plan builder gates these on `enable_moe_block`,
+            // so E2B / Qwen3 / Llama never hit them. Loader rejects
+            // 26B-A4B with a clear error until Sprint 51D wires the
+            // tensor upload + dispatch.
+            LayerStep::PostDenseMlpNorm => {
+                todo!("Sprint 51D — PostDenseMlpNorm: ffn_out → scratch_a (h1)")
+            }
+            LayerStep::PreMoeNorm => {
+                todo!("Sprint 51D — PreMoeNorm: res1 → scratch_b (MoE input)")
+            }
+            LayerStep::MoeRoute { n_experts: _, top_k: _ } => {
+                todo!("Sprint 51D — MoeRoute: router GEMV + softmax + Top-K")
+            }
+            LayerStep::MoeExpertFfn { .. } => {
+                todo!("Sprint 51D — MoeExpertFfn: per-token K-expert dispatch")
+            }
+            LayerStep::PostMoeNorm => {
+                todo!("Sprint 51D — PostMoeNorm: ffn_hidden → ffn_out (h2)")
+            }
+            LayerStep::MoeBranchAdd => {
+                todo!("Sprint 51D — MoeBranchAdd: ffn_out += scratch_a (h1+h2)")
+            }
         }
     }
 
@@ -973,6 +996,28 @@ impl BatchExec {
             LayerStep::FfnResidualAdd => self.b_step_ffn_residual_add(fwd, cfg, ctx),
             LayerStep::PleBlock => self.b_step_ple_block(fwd, cfg, ctx),
             LayerStep::LayerScalarMul => self.b_step_layer_scalar_mul(fwd, cfg, ctx),
+            // Sprint 51C — same MoE stubs as DecodeExec (see comment
+            // on the DecodeExec match-arm). BatchExec is loaded
+            // through the same `enable_moe_block` gate; never hit on
+            // E2B / Qwen3 / Llama.
+            LayerStep::PostDenseMlpNorm => {
+                todo!("Sprint 51D — b_step_post_dense_mlp_norm")
+            }
+            LayerStep::PreMoeNorm => {
+                todo!("Sprint 51D — b_step_pre_moe_norm")
+            }
+            LayerStep::MoeRoute { n_experts: _, top_k: _ } => {
+                todo!("Sprint 51D — b_step_moe_route")
+            }
+            LayerStep::MoeExpertFfn { .. } => {
+                todo!("Sprint 51D — b_step_moe_expert_ffn")
+            }
+            LayerStep::PostMoeNorm => {
+                todo!("Sprint 51D — b_step_post_moe_norm")
+            }
+            LayerStep::MoeBranchAdd => {
+                todo!("Sprint 51D — b_step_moe_branch_add")
+            }
         }
     }
 

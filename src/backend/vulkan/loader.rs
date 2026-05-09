@@ -1593,6 +1593,20 @@ fn hf_to_model_config(hf: &HfConfig) -> Result<ModelConfig, LoaderError> {
             });
         }
 
+        // Sprint 51C — Gemma-4-26B-A4B MoE failsafe. The full router /
+        // expert tensor loading + dispatch arrives in Sprint 51D; 51C
+        // only adds the layer-plan structure. Refusing the load here
+        // beats a less-comprehensible crash deeper in the loader when
+        // the packed `experts.*` tensors hit unimplemented code paths.
+        if gm.enable_moe_block {
+            return Err(LoaderError::Buffer(
+                "Gemma-4 MoE block detected (e.g. Gemma-4-26B-A4B): \
+                 Sprint 51C added the layer plan + tensor naming; \
+                 expert tensor upload + MoE dispatch land in Sprint 51D"
+                    .into(),
+            ));
+        }
+
         let embed_scale = (hf.hidden_size as f32).sqrt();
         let spec = Gemma4Spec {
             sliding_window: gm.sliding_window,
@@ -1606,6 +1620,10 @@ fn hf_to_model_config(hf: &HfConfig) -> Result<ModelConfig, LoaderError> {
             // once the BF16 [1] tensors have been read off disk.
             layer_scalars: vec![1.0; hf.num_hidden_layers as usize],
             hidden_size_per_layer_input: gm.hidden_size_per_layer_input,
+            enable_moe_block: gm.enable_moe_block,
+            n_experts: gm.n_experts,
+            top_k_experts: gm.top_k_experts,
+            moe_intermediate_size: gm.moe_intermediate_size,
         };
         (max_head_dim, max_ffn, Some(spec))
     } else {

@@ -107,6 +107,18 @@ pub struct Gemma4TextMeta {
     /// for Gemma-4-26B-A4B. Sliding-attention layers always have
     /// their own v_proj regardless.
     pub attention_k_eq_v: bool,
+    /// Sprint 51C — true on Gemma-4-26B-A4B; layer FFN runs Dense-MLP
+    /// AND MoE-expert-FFN in parallel and sums their outputs. False
+    /// for E2B (Dense-MLP only).
+    pub enable_moe_block: bool,
+    /// Sprint 51C — total expert count (`128` for 26B-A4B, `0` for E2B).
+    pub n_experts: u32,
+    /// Sprint 51C — top-K experts selected per token (`8` for 26B-A4B).
+    pub top_k_experts: u32,
+    /// Sprint 51C — per-expert FFN intermediate size (`704` for
+    /// 26B-A4B, `0` for E2B). Independent of the Dense-MLP
+    /// `intermediate_size` (= 2112 for 26B-A4B).
+    pub moe_intermediate_size: u32,
 }
 
 /// Per-layer attention kind in a Gemma-4 stack.
@@ -323,6 +335,25 @@ fn parse_gemma4_text_meta(text: &serde_json::Value) -> Result<Gemma4TextMeta, St
     // E2B omits the field (default false).
     let attention_k_eq_v = bool_field("attention_k_eq_v", false);
 
+    // Sprint 51C — Gemma-4-26B-A4B MoE block. E2B has none of these
+    // keys → defaults are zero / false.
+    let enable_moe_block = bool_field("enable_moe_block", false);
+    let n_experts = text
+        .get("num_experts")
+        .and_then(|v| v.as_u64())
+        .map(|x| x as u32)
+        .unwrap_or(0);
+    let top_k_experts = text
+        .get("top_k_experts")
+        .and_then(|v| v.as_u64())
+        .map(|x| x as u32)
+        .unwrap_or(0);
+    let moe_intermediate_size = text
+        .get("moe_intermediate_size")
+        .and_then(|v| v.as_u64())
+        .map(|x| x as u32)
+        .unwrap_or(0);
+
     Ok(Gemma4TextMeta {
         layer_types,
         sliding_window,
@@ -339,6 +370,10 @@ fn parse_gemma4_text_meta(text: &serde_json::Value) -> Result<Gemma4TextMeta, St
         full_rope_theta,
         full_rope_partial_factor,
         attention_k_eq_v,
+        enable_moe_block,
+        n_experts,
+        top_k_experts,
+        moe_intermediate_size,
     })
 }
 

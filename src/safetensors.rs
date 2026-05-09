@@ -326,6 +326,19 @@ pub fn hf_to_vf_name(hf: &str) -> Option<String> {
         "per_layer_input_gate.weight" => "per_layer_input_gate.weight",
         "per_layer_projection.weight" => "per_layer_projection.weight",
         "post_per_layer_input_norm.weight" => "post_per_layer_input_norm.weight",
+        // Sprint 51C — Gemma-4-26B-A4B MoE-block weights (parallel
+        // Dense-MLP + MoE FFN per layer). Three additional norms
+        // around the MoE branch + the packed expert/router tensors.
+        // Sprint 51D will wire the actual loader uploads + dispatch;
+        // 51C registers the names so the loader sees them as known.
+        "post_feedforward_layernorm_1.weight" => "ffn_post_norm_1.weight",
+        "pre_feedforward_layernorm_2.weight" => "ffn_pre_norm_2.weight",
+        "post_feedforward_layernorm_2.weight" => "ffn_post_norm_2.weight",
+        "experts.gate_up_proj" => "moe_experts.gate_up_proj",
+        "experts.down_proj" => "moe_experts.down_proj",
+        "router.proj.weight" => "moe_router.proj.weight",
+        "router.scale" => "moe_router.scale",
+        "router.per_expert_scale" => "moe_router.per_expert_scale",
         _ => return None,
     };
     Some(format!("blk.{layer}.{vf_suffix}"))
