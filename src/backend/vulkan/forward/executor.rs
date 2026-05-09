@@ -982,6 +982,22 @@ impl BatchExec {
         //    Gemma-4: separate rms_norm in `execute_layer` tail).
     }
 
+    /// Sprint 47D — emit `compute_barrier` only on Gemma-4 subscriber
+    /// layers (`layer >= first_kv_shared`), where Q's writes need to
+    /// be flushed before the next stage reads `batch_q`. Owner layers
+    /// already get a trailing barrier on the LAST step of each
+    /// Q+K[+V] stage (V-proj / V-bias / K-norm-rope / K-rope) and the
+    /// unconditional 46H emit cost ~7 % prefill on 36-layer Q4_K_M
+    /// (Qwen3) — see Sprint 47C bisect. Models without `cfg.gemma4`
+    /// (Qwen3, Llama, …) skip the barrier entirely.
+    fn b_subscriber_q_barrier(&self, cfg: &ModelConfig, ctx: &ExecCtx) {
+        if let Some(g) = cfg.gemma4.as_ref() {
+            if ctx.layer >= g.first_kv_shared {
+                compute_barrier(ctx.dev, ctx.cmd);
+            }
+        }
+    }
+
     fn b_step_q_proj(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
         let seq_len = batch_seq_len(ctx);
         let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
@@ -995,17 +1011,11 @@ impl BatchExec {
             q_dim, cfg.hidden_dim, seq_len, "gemm_q",
             /* quantize_input = */ true,
         );
-        // Sprint 46H — barrier between Q-proj and the next stage. For
-        // OWNER layers the trailing `compute_barrier` in `b_step_v_proj`
-        // covers Q/K/V writes uniformly, so this is redundant. For
-        // SUBSCRIBER layers (Gemma-4 KV-share, layers >= num_kv_shared)
-        // the plan skips KProj/VProj/biases entirely and the next step
-        // is QNormRope, which reads batch_q — without this barrier
-        // QNormRope races with Q-proj's writes, surfacing as garbage Q
-        // values for q_idx>0 (the bug manifested as compressed final
-        // logits in 46F's bit-ID test). Latent until 46F lifted
-        // force_per_token_prefill for Gemma-4.
-        compute_barrier(ctx.dev, ctx.cmd);
+        // Sprint 46H + 47D — Gemma-4 subscribers skip KProj/VProj/biases
+        // entirely; without flushing Q here, QNormRope races with
+        // Q-proj's writes (garbage Q for q_idx>0). Owner layers already
+        // get a trailing barrier in V-proj covering Q+K+V uniformly.
+        self.b_subscriber_q_barrier(cfg, ctx);
     }
 
     fn b_step_k_proj(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
@@ -1098,12 +1108,10 @@ impl BatchExec {
             cfg.n_heads, seq_len,
             cfg.rms_norm_eps, "rms_norm_mul_rope_q_b",
         );
-        // Sprint 46H — see b_step_q_proj. Owner layers' trailing
-        // barrier in `b_step_k_norm_rope` covers Q+K, but subscribers
-        // skip the K side and the Attention step reads batch_q
-        // directly — without this barrier the Q write races with the
-        // attention read.
-        compute_barrier(ctx.dev, ctx.cmd);
+        // Sprint 46H + 47D — subscribers skip the K side; without this
+        // barrier Attention races with Q. Owner: K-norm-rope's trailing
+        // barrier covers both.
+        self.b_subscriber_q_barrier(cfg, ctx);
     }
 
     fn b_step_k_norm_rope(
@@ -1145,10 +1153,8 @@ impl BatchExec {
             head_dim, rotary_dim, freq_base, theta_scale,
             cfg.n_heads, seq_len, "rope_q_batch",
         );
-        // Sprint 46H — same as b_step_q_norm_rope. Subscribers skip
-        // the matching K-side rope; without this trailing barrier
-        // attention races with Q's writes.
-        compute_barrier(ctx.dev, ctx.cmd);
+        // Sprint 46H + 47D — see b_step_q_norm_rope.
+        self.b_subscriber_q_barrier(cfg, ctx);
     }
 
     fn b_step_k_rope(
