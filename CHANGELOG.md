@@ -1,5 +1,115 @@
 # Changelog
 
+## v0.3.16 — Mesa cleanup, FP8 hardwire, barrier gate (2026-05-09)
+
+Three small follow-ups to v0.3.15 plus an upstream Mesa observation
+filed as an issue. No new features; correctness preserved on all
+four production paths (Qwen3-8B Q4_K_M / FP8, Llama-3.1-8B Q4_K_M,
+Gemma-4-E2B-it).
+
+### Sprint 47A — Mesa-version doc + comment cleanup
+
+Mesa 26.1 is the system default on current Arch / CachyOS, so
+hard-coded `Mesa 26.1+` / `Mesa 26.0.x` references in code
+comments, banner strings, and docs are stale. Replaced with
+capability-level wording (`VK_EXT_shader_float8`,
+`shaderFloat8CooperativeMatrix`, `VK_KHR_cooperative_matrix`).
+Removed the manual Mesa-26.1-rc3 build recipe + `VK_ICD_FILENAMES`
+env-script section from `docs/INSTALLATION.md` (obsolete).
+README/INSTALL recommend Mesa 26.1+ as default. No functional
+change.
+
+### Sprint 47B — FP8 native WMMA hard-wired
+
+`VF_FP8_NATIVE_WMMA` env-var removed. The two FP8 GEMM dispatch
+sites in `runs.rs` now read `Forward::native_fp8_wmma` (set at
+construction from `VulkanDevice::native_fp8_wmma`). Capability-
+driven instead of user-driven; the env-var was always set
+automatically by `auto_detect::apply_post_device` when the driver
+advertised the FP8 cooperative-matrix extension, the env-var hop
+just added an indirection.
+
+User-visible change: setting `VF_FP8_NATIVE_WMMA=0` to disable the
+native path no longer works (verified — same throughput as auto).
+Use the `VF_FP8=0` legacy flag to opt out of FP8 entirely.
+
+### Sprint 47D — Subscriber barrier gate (regression fix)
+
+The Sprint 46H Q-side barriers in `BatchExec` (added to fix a
+Gemma-4 subscriber-layer race) were unconditional and cost 5–7 %
+prefill on Owner-only models. Verified by Sprint 47C bisect:
+Qwen3-8B Q4_K_M baseline was 719 t/s on v0.3.14 / Mesa 26.1-rc3;
+post-46H it dropped to 638 t/s.
+
+Fix: gate the barrier on the Gemma-4 subscriber predicate via a
+single helper `b_subscriber_q_barrier`. Owner-only models
+(`cfg.gemma4 = None`: Qwen3, Llama, …) skip the barrier
+entirely; only Gemma-4 layers `>= first_kv_shared` emit it
+(semantically identical to 46H on the affected path).
+
+| Metric (Qwen3-8B Q4_K_M, 15-prompt suite avg) | v0.3.15 | v0.3.16 | Δ        |
+|-----------------------------------------------|---------|---------|----------|
+| Prefill                                       | 638 t/s | **701 t/s** | **+9.9 %** |
+| Decode                                        | 104 t/s | 104 t/s | unchanged |
+| Power (avg W, full bench)                     | 259 W   | 258 W   | unchanged |
+| Coherence (15-prompt)                         | 15/15   | 15/15   | unchanged |
+
+Gemma-4 bit-ID against `VULKANFORGE_FORCE_PER_TOKEN=1` reference
+preserved (identical 8-token output `2 + 2 is **4**.`).
+
+### Sprint 48D — Mesa upstream issue
+
+`global_load_tr_b64` (op 0x58) and `global_load_tr_b128` (op 0x57)
+are defined in `aco_opcodes.py` for gfx12 but emitted by no
+codegen path in Mesa 26.1.0. These transposed block loads would
+feed FP8 cooperative-matrix tile data directly in WMMA operand
+layout, avoiding the post-load shuffle that the current
+`global_load_dwordx2/x4` path requires.
+
+Filed as [mesa/mesa!15431](https://gitlab.freedesktop.org/mesa/mesa/-/work_items/15431)
+with reproduction grep + RX 9070 XT benchmark numbers (FP8
+0.32 tok/s/W vs INT4 0.40 tok/s/W on the same model).
+
+This is an observation, not a patch — the fix needs a new
+NIR intrinsic + RADV lowering + ACO pattern match (200–500 LOC
+across 3–5 files in Mesa). Tracking is on the Mesa side now.
+
+### Files
+
+```
+Cargo.toml                              0.3.15 → 0.3.16
+CHANGELOG.md                            this entry
+README.md                               perf table + driver-section updates
+src/auto_detect.rs                      FP8 hardwire (47B), Mesa wording (47A)
+src/main.rs                             Phase B comment (47A/B)
+src/backend/vulkan/device.rs            cap-driven wording (47A/B)
+src/backend/vulkan/forward/state.rs     +native_fp8_wmma field (47B), comments
+src/backend/vulkan/forward/setup.rs     capture dev.native_fp8_wmma (47B)
+src/backend/vulkan/forward/runs.rs      env-var → field reads (47B)
+src/backend/vulkan/forward/executor.rs  subscriber barrier gate (47D)
+src/backend/vulkan/shaders.rs           cap-driven wording (47A/B)
+build.rs                                cap-driven wording (47A/B)
+INSTALL.md / docs/INSTALLATION.md
+docs/MODELS.md / docs/BENCHMARKS.md     Mesa wording (47A), FP8 hardwire (47B)
+tests/fp8_gemv_correctness.rs           cap-driven wording (47A)
+```
+
+### Sprint chain
+
+```
+ee8ca7c  refactor(forward): hard-wire native FP8 WMMA via VulkanDevice::native_fp8_wmma (Sprint 47B)
+5151997  chore(docs+comments): Mesa-version cleanup — capability-based wording (Sprint 47A)
+24134da  fix(forward): gate Sprint 46H Q-side barriers on Gemma-4 subscriber predicate (Sprint 47D)
+<release> v0.3.16
+```
+
+Sprint 47C (Mesa rc3 → final benchmark + bisect) and 48A–48D
+(Mesa source build + ACO LOAD_TR analysis + upstream issue) left
+no code commits — analysis sprints. Reports under `results/`
+(gitignored).
+
+---
+
 ## v0.3.15 — Gemma-4 Batch Prefill (2026-05-08)
 
 Lifts the Sprint 43F `force_per_token_prefill` workaround for Gemma-4.

@@ -101,27 +101,33 @@ RADV unless noted. Full tables with power data and methodology in
 | llama.cpp     | 8B Llama     | Q4_K_M | Vulkan   |          114 |   0.37  |
 | llama.cpp     | 8B Llama     | Q4_K_M | ROCm     |           94 |   0.30  |
 
-### v0.3.14 15-prompt mixed-workload benchmark
+### v0.3.16 15-prompt mixed-workload benchmark
 
 The v0.3.9 row above is `vulkanforge bench tg128` (1-token prompt,
 constant-low KV). The 15-prompt suite is a real-workload mix (smoke /
 code / prose / reasoning / context-stress / numerics / tokenizer) with
 generations up to 1024 tokens — KV grows during decode, so steady-state
-numbers are below `tg128`.
+numbers are below `tg128`. Mesa 26.1.0 RADV.
 
 | Model                  | Prefill avg | Decode avg | Avg W | tok/s/W | Quality |
 |------------------------|------------:|-----------:|------:|--------:|--------:|
-| Qwen3-8B Q4_K_M        |     719 t/s |   **105.2 t/s** |  241 W |  0.437  | 15/15 ✓ |
-| Llama-3.1-8B Q4_K_M    |     585 t/s |   **110.3 t/s** |  251 W | **0.440** | 15/15 ✓ |
-| Qwen3-8B FP8           |     388 t/s |    60.8 t/s   |  191 W |  0.319  | 15/15 ✓ |
-| **Gemma-4-E2B-it**     |    89 t/s ¹ |    34.0 t/s   | **68 W** | **0.500** | 14/15 ✓ |
+| Qwen3-8B Q4_K_M        |     **701 t/s** ² |   104.0 t/s |  258 W |  0.40   | 15/15 ✓ |
+| Llama-3.1-8B Q4_K_M    |     824 t/s |   **110.0 t/s** |  271 W | **0.41** | 15/15 ✓ |
+| Qwen3-8B FP8           |     559 t/s |    60.7 t/s |  193 W |  0.32   | 15/15 ✓ |
+| **Gemma-4-E2B-it**     |    96 t/s ¹ |    33.7 t/s | **64 W** | **0.53** | 15/15 ✓ |
 
 ¹ v0.3.15 lifted the v0.3.14 `force_per_token_prefill` workaround
-(33 → 89 t/s, **2.7×**). The batch path is now bit-identical to the
-per-token reference (`VULKANFORGE_FORCE_PER_TOKEN=1` keeps the v0.3.14
-path available as a bisect fallback). Decode-side is on par with the
-larger models on a tok/s/W basis (best in the test) thanks to the
-2 B parameter count keeping power draw at 68 W.
+(33 → 89 → 96 t/s on v0.3.14 / v0.3.15 / v0.3.16). The batch path is
+bit-identical to the per-token reference
+(`VULKANFORGE_FORCE_PER_TOKEN=1` keeps the v0.3.14 path available
+as a bisect fallback). Decode-side is on par with the larger models
+on a tok/s/W basis (best in the test) thanks to the 2 B parameter
+count keeping power draw at 64 W.
+
+² v0.3.16 closes the v0.3.15 Sprint-46H barrier regression on
+Owner-only models (Qwen3, Llama). The Q-side barriers are now
+gated on the Gemma-4 subscriber predicate; Qwen3-Q4_K_M prefill
+recovers from 638 to **701 t/s** (+9.9 %).
 
 ### Native FP8 prefill pp=512 (Mesa 26.1+, native FP8 WMMA path)
 
