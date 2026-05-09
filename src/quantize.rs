@@ -34,6 +34,7 @@
 //! if load time becomes a bottleneck.
 
 use half::f16;
+use rayon::prelude::*;
 
 pub const QK_K: usize = 256;
 pub const K_SCALE_SIZE: usize = 12;
@@ -251,13 +252,33 @@ fn unpack_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
 }
 
 /// Quantize a flat FP32 row to Q4_K_M blocks. Length must be a multiple
-/// of `QK_K` (256).
+/// of `QK_K` (256). Sprint 50C — block-level rayon parallelism over the
+/// (independent) super-blocks; each block is bit-identical to the serial
+/// path.
 pub fn quantize_f32_to_q4k(input: &[f32]) -> Vec<u8> {
     assert!(
         input.len() % QK_K == 0,
         "Q4_K requires input length to be a multiple of {QK_K} (got {})",
         input.len()
     );
+    let n_blocks = input.len() / QK_K;
+    let mut output = vec![0u8; n_blocks * Q4K_BLOCK_BYTES];
+    output
+        .par_chunks_mut(Q4K_BLOCK_BYTES)
+        .enumerate()
+        .for_each(|(b, yi)| {
+            let xi = &input[b * QK_K..(b + 1) * QK_K];
+            quantize_block_q4k(xi, yi);
+        });
+    output
+}
+
+/// Serial reference impl of `quantize_f32_to_q4k`. Public only via
+/// `#[cfg(test)]` — used by the bit-identity test that proves the
+/// rayon path is functionally equivalent.
+#[cfg(test)]
+pub(crate) fn quantize_f32_to_q4k_serial(input: &[f32]) -> Vec<u8> {
+    assert!(input.len() % QK_K == 0);
     let n_blocks = input.len() / QK_K;
     let mut output = vec![0u8; n_blocks * Q4K_BLOCK_BYTES];
     for b in 0..n_blocks {
@@ -370,6 +391,33 @@ mod tests {
         let dq = dequantize_q4k_to_f32(&q);
         let err = max_abs_err(&input, &dq);
         assert!(err < 0.05, "multi-block sin max_abs_err = {err}");
+    }
+
+    #[test]
+    fn parallel_matches_serial() {
+        // 100 super-blocks of varied content — exercise enough work that
+        // rayon actually splits across threads, not just the auto
+        // fall-back to a single thread.
+        let mut input: Vec<f32> = Vec::with_capacity(QK_K * 100);
+        let mut s: u32 = 0xCAFE_BABE;
+        for i in 0..QK_K * 100 {
+            // Mix a smooth sin component with deterministic noise so
+            // both make_qkx2 branches (smooth + outlier-y) get hit.
+            s = s.wrapping_mul(48271);
+            let noise = (s as f32 / u32::MAX as f32) * 2.0 - 1.0;
+            input.push((i as f32 * 0.013).sin() * 0.5 + noise * 0.05);
+        }
+        let serial = quantize_f32_to_q4k_serial(&input);
+        let parallel = quantize_f32_to_q4k(&input);
+        assert_eq!(
+            serial.len(),
+            parallel.len(),
+            "serial / parallel byte-count differ"
+        );
+        // Bit-identity: per-block is independent, no shared state — the
+        // two outputs MUST match byte-for-byte. Mismatch implies a
+        // race-condition bug.
+        assert_eq!(serial, parallel, "rayon output diverges from serial");
     }
 
     #[test]
