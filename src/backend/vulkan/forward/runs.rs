@@ -302,18 +302,17 @@ impl Forward {
         };
         let groups_x = (m + BM - 1) / BM;
         let groups_y = (n + BN - 1) / BN;
-        // Sprint 38 Part 2 + Sprint 39 — `VF_FP8_NATIVE_WMMA=1` selects
-        // the native FP8 cooperative-matrix pipeline. Sprint 38 Part 2
-        // shipped with this routing disabled because the naive
-        // FP32→FP8 cast on the B-tile destroyed too much dynamic range
-        // for block-wise weights; Sprint 39 adds an in-shader
-        // per-k_block dynamic activation absmax + rescale, so the
-        // native path now produces coherent output and the routing is
-        // re-enabled.
-        let native_fp8_wmma = std::env::var("VF_FP8_NATIVE_WMMA")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        let pipeline = if native_fp8_wmma {
+        // Sprint 38 Part 2 + Sprint 39 — native FP8 cooperative-matrix
+        // pipeline. Sprint 38 Part 2 shipped with this routing disabled
+        // because the naive FP32→FP8 cast on the B-tile destroyed too
+        // much dynamic range for block-wise weights; Sprint 39 adds an
+        // in-shader per-k_block dynamic activation absmax + rescale, so
+        // the native path now produces coherent output and the routing
+        // is re-enabled. Sprint 47B — capability-driven via
+        // `Forward::native_fp8_wmma` (set at construction from
+        // `VulkanDevice::native_fp8_wmma`); the legacy
+        // `VF_FP8_NATIVE_WMMA` env-var has been removed.
+        let pipeline = if self.native_fp8_wmma {
             self.fp8bwgemm_native_pipeline
         } else {
             self.fp8bwgemm.pipeline
@@ -1792,9 +1791,10 @@ impl Forward {
         //
         // Override via `VF_FP8_GEMM_BN={16,32,64}`. Legacy
         // `VF_FP8_GEMM_BN32=0` still respected as opt-out to BN=16.
-        // Sprint 38 Part 1 — `VF_FP8_NATIVE_WMMA=1` opt-in selects the
-        // FP8×FP8 cooperative-matrix variant of BN=32 (requires
-        // `shaderFloat8CooperativeMatrix` to be advertised).
+        // Sprint 38 Part 1 — FP8×FP8 cooperative-matrix variant of
+        // BN=32. Sprint 47B — capability-driven via
+        // `Forward::native_fp8_wmma`; legacy `VF_FP8_NATIVE_WMMA`
+        // env-var has been removed.
         let bn_override = std::env::var("VF_FP8_GEMM_BN")
             .ok()
             .and_then(|v| v.parse::<u32>().ok());
@@ -1802,12 +1802,9 @@ impl Forward {
             .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
             .unwrap_or(false);
         let bn_target = bn_override.unwrap_or(if bn32_disabled { 16 } else { 32 });
-        let native_fp8_wmma = std::env::var("VF_FP8_NATIVE_WMMA")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
         let use_bn64 = bn_target >= 64 && m >= 64 && n >= 64;
         let use_bn32 = !use_bn64 && bn_target >= 32 && m >= 64 && n >= 64;
-        let use_native = native_fp8_wmma && use_bn32;
+        let use_native = self.native_fp8_wmma && use_bn32;
         let multi_wg = m >= 64 && n >= 64;
         let shader = if use_native {
             ShaderId::MulCoopmatFp8NativeBn32

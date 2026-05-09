@@ -31,14 +31,16 @@ Check FP8 cooperative-matrix support (required for native WMMA):
 
 ```bash
 vulkaninfo 2>/dev/null | grep shaderFloat8CooperativeMatrix
-# → must show "true" before setting VF_FP8_NATIVE_WMMA=1
+# → "true" means VulkanForge will route FP8 GEMM through the
+#   native cooperative-matrix path automatically.
 ```
 
-`VF_FP8=auto` (v0.3.12+) probes the FP8 cooperative-matrix extension
-at device-init and only enables `VF_FP8_NATIVE_WMMA` when it's
-actually advertised. On a driver without the extension the BF16
-conversion path runs without crashing, and the auto-detect chain
-keeps `VF_FP8_NATIVE_WMMA` off automatically.
+VulkanForge probes the FP8 cooperative-matrix extension at
+device-init (Sprint 42C / v0.3.12) and routes FP8 GEMM through the
+native cooperative-matrix path iff the driver advertises it
+(Sprint 47B / v0.3.16 made this capability-driven; the legacy
+`VF_FP8_NATIVE_WMMA` env-var was removed). On a driver without the
+extension the BF16 conversion path runs without crashing.
 
 ## Kernel parameter
 
@@ -80,7 +82,6 @@ Boolean flags accept `1` / `0`, `true` / `false`, case-insensitive.
 | Variable                       | Default | Effect                                                                            |
 |--------------------------------|---------|-----------------------------------------------------------------------------------|
 | `VULKANFORGE_ENABLE_FP8`       | `0`     | Allow FP8 SafeTensors loading (auto-detects per-tensor / per-channel / block-wise) |
-| `VF_FP8_NATIVE_WMMA`           | `0`     | Use native FP8 WMMA (requires Mesa 26.1+; covers all three FP8 scaling strategies) |
 | `VF_CPU_LM_HEAD`               | `0`     | Offload `lm_head` to CPU as Q6_K (saves ~970 MB VRAM; AVX-512 GEMV; v0.3.10) |
 | `VF_FP8_GEMM_BN`               | `32`    | GEMM tile size for the FP8 BF16 path: `16` (naive) / `32` (default) / `64` (opt-in) |
 | `VF_FP8_GEMM_BN32`             | unset   | Legacy opt-out: `0` falls back to BN=16                                           |
@@ -144,17 +145,26 @@ Path / model variables:
 
 ## Recommended defaults
 
-For most users running on Mesa 26.1+:
+For most users running on Mesa 26.1+ with FP8 SafeTensors models:
 
 ```bash
-export VULKANFORGE_ENABLE_FP8=1
-export VF_FP8_NATIVE_WMMA=1
+export VF_FP8=auto    # picks up FP8 model + native cooperative-matrix
+                      # routing automatically; no other flags needed.
 ```
 
-Set them in your shell profile or `~/.config/environment.d/vulkanforge.conf`.
-On a driver that doesn't advertise `shaderFloat8CooperativeMatrix`
-leave `VF_FP8_NATIVE_WMMA` unset (or just use `VF_FP8=auto`, which
-decides for you).
+Or, if you want to be explicit:
+
+```bash
+export VULKANFORGE_ENABLE_FP8=1   # legacy v0.3.10 flag, still works.
+```
+
+Set them in your shell profile or
+`~/.config/environment.d/vulkanforge.conf`. The native FP8 WMMA path
+is selected automatically when the driver advertises
+`shaderFloat8CooperativeMatrix`; on a driver without it,
+VulkanForge falls back to the BF16 conversion path without
+crashing (no env-var to flip — capability-driven since
+Sprint 47B / v0.3.16).
 
 For 14B FP8 on Zen 4 / Sapphire Rapids (or 12 GB cards anywhere
 with AVX-512), additionally:

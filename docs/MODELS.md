@@ -25,9 +25,12 @@ VulkanForge auto-detects all three FP8 scaling strategies from the
 | Per-channel          | `larryvrh/Qwen2.5-14B-Instruct-FP8`            |  13.8 GiB  |     14 tok/s |   **450 tok/s** |    **17.8 tok/s** ✓  |              15/15  |
 | Block-wise [128,128] | `Qwen/Qwen3-8B-FP8`                             |   8.5 GiB  |     62 tok/s |  **1118 tok/s** |   (not benched yet)  |              15/15  |
 
-\*With `VF_FP8_NATIVE_WMMA=1` on Mesa 26.1+. On Mesa 26.0.x or
-without the flag, all three paths use the BF16 conversion fallback
-at ~770 / 325 / 757 tok/s respectively.
+\*With native FP8 WMMA on Mesa 26.1+. Routing is capability-driven
+since Sprint 47B / v0.3.16: VulkanForge picks the native path
+automatically when the driver advertises
+`shaderFloat8CooperativeMatrix`; on Mesa 26.0.x or any driver
+without the extension, all three paths use the BF16 conversion
+fallback at ~770 / 325 / 757 tok/s respectively.
 
 The CPU `lm_head` column shows decode tok/s when
 `VF_CPU_LM_HEAD=1` is set (AVX-512 Q6_K GEMV on Zen 4 7945HX,

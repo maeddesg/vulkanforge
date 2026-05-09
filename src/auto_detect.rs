@@ -1,10 +1,13 @@
-//! `VF_FP8=auto` runtime detection (v0.3.12).
+//! `VF_FP8=auto` runtime detection (v0.3.12, simplified in Sprint 47B).
 //!
-//! Replaces the three-flag opt-in surface
+//! Replaces a three-flag opt-in surface
 //! (`VULKANFORGE_ENABLE_FP8` / `VF_FP8_NATIVE_WMMA` /
 //! `VF_CPU_LM_HEAD`) with a single env var and an auto-detection
-//! chain. The old flags still work as explicit overrides; this
-//! module decides what they should be when the user picks `auto`.
+//! chain. `VF_FP8_NATIVE_WMMA` was removed in Sprint 47B — native
+//! FP8 cooperative-matrix routing is now read directly from
+//! `VulkanDevice::native_fp8_wmma` by `Forward::new()` instead of
+//! going through an env-var. `VULKANFORGE_ENABLE_FP8` and
+//! `VF_CPU_LM_HEAD` still work as explicit overrides.
 //!
 //! Detection is split into two phases because half the inputs come
 //! from the model directory (config.json, fast) and the other half
@@ -19,19 +22,19 @@
 //!   pushes `VK_EXT_shader_float8` into the device-create chain.
 //!
 //! Phase B — post-device, before `Forward::new()`:
-//! * `apply_post_device(...)` reads back `VulkanDevice::native_fp8_wmma`,
-//!   the AVX-512 capability of the host CPU, and the model's parameter
-//!   count. If `auto`, it sets `VF_FP8_NATIVE_WMMA=1` when the device
-//!   actually advertises `shaderFloat8CooperativeMatrix`, and
+//! * `apply_post_device(...)` reads `VulkanDevice::native_fp8_wmma`
+//!   (only used by `print_summary` for the banner — the routing in
+//!   `runs.rs` reads it via `Forward::native_fp8_wmma`), the host's
+//!   AVX-512 capability, and the model's parameter count. Sets
 //!   `VF_CPU_LM_HEAD=1` when the model is ≥ 12 B parameters and the
 //!   host has AVX-512F+BW+VL. Smaller models stay on the GPU lm_head
 //!   because CPU offload is ~32 % slower for 8 B (it's a VRAM-savings
 //!   feature, not a speed feature, below 12 B).
 //!
-//! Backward-compat: if the user explicitly sets `VF_FP8_NATIVE_WMMA=0`
-//! / `VF_CPU_LM_HEAD=0` / `VF_FP8_NATIVE_WMMA=1` / `VF_CPU_LM_HEAD=1`,
-//! that wins regardless of the auto decision. Same for the legacy
-//! `VULKANFORGE_ENABLE_FP8` flag — see `parse_fp8_mode()`.
+//! Backward-compat: if the user explicitly sets `VF_CPU_LM_HEAD=0`
+//! / `VF_CPU_LM_HEAD=1`, that wins regardless of the auto decision.
+//! Same for the legacy `VULKANFORGE_ENABLE_FP8` flag — see
+//! `parse_fp8_mode()`.
 
 use std::path::Path;
 
@@ -189,22 +192,18 @@ pub fn apply_pre_device(model_path: &Path) -> PhaseAResult {
     }
 }
 
-/// Phase B — runs *after* `VulkanDevice::new()`. Takes the device's
-/// real `native_fp8_wmma` capability (so we don't promise native
-/// WMMA on a driver that doesn't advertise the FP8 cooperative-matrix
-/// extension) and writes the legacy flags that `forward.rs` /
-/// `loader.rs` will read next.
-pub fn apply_post_device(phase_a: &PhaseAResult, native_fp8_wmma: bool) {
+/// Phase B — runs *after* `VulkanDevice::new()`. Sprint 47B: the
+/// FP8 native-WMMA decision is now read directly from
+/// `VulkanDevice::native_fp8_wmma` by `Forward::new` (capability-
+/// driven), so this phase only needs to manage `VF_CPU_LM_HEAD` —
+/// CPU lm_head offload depends on host AVX-512 + model size, which
+/// neither the GPU device nor `Forward` knows about.
+pub fn apply_post_device(phase_a: &PhaseAResult, _native_fp8_wmma: bool) {
     if phase_a.mode != Fp8Mode::Auto {
         return; // Explicit On/Off — user is in charge.
     }
     if !phase_a.is_fp8_model {
         return; // GGUF path. Nothing to do.
-    }
-
-    // VF_FP8_NATIVE_WMMA: respect explicit override, else auto-decide.
-    if std::env::var("VF_FP8_NATIVE_WMMA").is_err() && native_fp8_wmma {
-        unsafe { std::env::set_var("VF_FP8_NATIVE_WMMA", "1") };
     }
 
     // VF_CPU_LM_HEAD: respect explicit override, else auto-decide for ≥ 12 B + AVX-512.
@@ -224,6 +223,7 @@ pub fn print_summary(phase_a: &PhaseAResult, native_fp8_wmma: bool) {
         return;
     }
     let on = |k: &str| std::env::var(k).map(|v| v == "1").unwrap_or(false);
+    let fp8_active = phase_a.is_fp8_model && native_fp8_wmma;
     println!("VF_FP8=auto detected:");
     println!("  FP8 model:      {}", if phase_a.is_fp8_model { "yes" } else { "no (GGUF)" });
     println!(
@@ -236,7 +236,13 @@ pub fn print_summary(phase_a: &PhaseAResult, native_fp8_wmma: bool) {
     );
     println!("  AVX-512:        {}", if phase_a.avx512 { "yes" } else { "no" });
     println!("  Model size:     ~{:.1} B params", phase_a.model_params_billions);
-    println!("  → Native WMMA:  {}", if on("VF_FP8_NATIVE_WMMA") { "ON" } else { "OFF" });
+    // Sprint 47B — `→ Native WMMA` is now capability-driven (no env
+    // var). It mirrors `native_fp8_wmma` for FP8 models and is N/A
+    // for GGUF (the routing in `runs.rs` is FP8-only).
+    println!(
+        "  → Native WMMA:  {}",
+        if fp8_active { "ON" } else if phase_a.is_fp8_model { "OFF" } else { "n/a (GGUF)" },
+    );
     println!(
         "  → CPU lm_head:  {}",
         if on("VF_CPU_LM_HEAD") {

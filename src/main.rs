@@ -500,8 +500,9 @@ fn run_chat_safetensors(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>
 
     let dev = VulkanDevice::new()?;
 
-    // Phase B — set `VF_FP8_NATIVE_WMMA=1` / `VF_CPU_LM_HEAD=1` based
-    // on the device's actual capability + host CPU + model size.
+    // Phase B — set `VF_CPU_LM_HEAD=1` based on host CPU + model size.
+    // Native FP8 WMMA is capability-driven via `dev.native_fp8_wmma` →
+    // `Forward::native_fp8_wmma` since Sprint 47B (no env-var).
     vulkanforge::auto_detect::apply_post_device(&phase_a, dev.native_fp8_wmma);
     vulkanforge::auto_detect::print_summary(&phase_a, dev.native_fp8_wmma);
     let mut allocator = Allocator::new(&AllocatorCreateDesc {

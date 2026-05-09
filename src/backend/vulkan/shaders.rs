@@ -91,9 +91,9 @@ pub enum ShaderId {
     /// and `v_cvt_pk_fp8_f32` for the activation FP32 → FP8 conversion.
     /// Requires `shaderFloat8CooperativeMatrix` advertised by the
     /// driver. Mixed FP8/BF16 is unsupported on RADV (amdllpc
-    /// rejects). Routed by `VF_FP8_NATIVE_WMMA=1` for per-tensor /
-    /// per-channel FP8 models; block-wise FP8 stays on the Sprint 36
-    /// BF16 path.
+    /// rejects). Routed for per-tensor / per-channel FP8 models when
+    /// `Forward::native_fp8_wmma` is true (capability-driven since
+    /// Sprint 47B); block-wise FP8 stays on the Sprint 36 BF16 path.
     MulCoopmatFp8NativeBn32,
     RmsNorm,
     RopeNorm,

@@ -227,8 +227,10 @@ take ~70 ms, plenty of room for the CPU to land its 5–6 ms work.
 
 ## Native FP8 — Mesa 26.1+ vs Mesa 26.0.x
 
-`VF_FP8_NATIVE_WMMA=1` enables `V_WMMA_F32_16X16X16_FP8_FP8` on
-Mesa 26.1+. Mesa 26.0.x silently runs the BF16 conversion path.
+VulkanForge selects `V_WMMA_F32_16X16X16_FP8_FP8` automatically on
+Mesa 26.1+ (capability-driven via `shaderFloat8CooperativeMatrix`,
+no env-var since v0.3.16 / Sprint 47B). Mesa 26.0.x silently runs
+the BF16 conversion path.
 
 | Model                    | Scale type           | Mesa 26.0.x / no flag | Mesa 26.1+ native | Δ        |
 |--------------------------|----------------------|----------------------:|------------------:|---------:|

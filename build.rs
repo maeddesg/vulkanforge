@@ -1149,8 +1149,9 @@ const JOBS: &[ShaderJob] = &[
     // is `floate4m3_t` instead of `bfloat16_t`. ACO emits
     // v_wmma_f32_16x16x16_fp8_fp8 directly. Activations (FP32) are
     // converted to FP8 via v_cvt_pk_fp8_f32 during B-tile staging.
-    // Opt-in via VF_FP8_NATIVE_WMMA=1 (requires VK_EXT_shader_float8
-    // + shaderFloat8CooperativeMatrix advertised by the driver).
+    // Selected by Forward::native_fp8_wmma (capability-driven since
+    // Sprint 47B; requires VK_EXT_shader_float8 +
+    // shaderFloat8CooperativeMatrix advertised by the driver).
     ShaderJob {
         out_name: "mul_coopmat_fp8_native_bn32.spv",
         entry_source: "mul_coopmat_fp8_native_bn32.comp",
@@ -1162,8 +1163,8 @@ const JOBS: &[ShaderJob] = &[
     // partial coopmat<float>; after each block_k the partial is
     // multiplied by the per-(n_block, k_block) scale (4× v_mul_f32)
     // and added into the total accumulator (4× v_add_f32). Output is
-    // a plain copy. Opt-in via VF_FP8_NATIVE_WMMA=1 for block-wise
-    // FP8 models (Qwen3-FP8 / DeepSeek-V3-FP8).
+    // a plain copy. Selected by Forward::native_fp8_wmma for block-
+    // wise FP8 models (Qwen3-FP8 / DeepSeek-V3-FP8).
     ShaderJob {
         out_name: "mul_coopmat_fp8_native_bn32_blockwise.spv",
         entry_source: "mul_coopmat_fp8_native_bn32_blockwise.comp",

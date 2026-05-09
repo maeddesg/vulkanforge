@@ -658,6 +658,7 @@ impl Forward {
             fp8bwgemm_native_shader_module,
             fp8bwgemm_native_pipeline,
             lmhead,
+            native_fp8_wmma: dev.native_fp8_wmma,
         })
     }
     pub fn destroy(self, device: &ash::Device, allocator: &mut Allocator) {

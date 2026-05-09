@@ -25,8 +25,10 @@ pub struct VulkanDevice {
     pub queue_family_index: u32,
     /// True when the driver advertises `VK_EXT_shader_float8` *and*
     /// `shaderFloat8CooperativeMatrix` — i.e. native FP8 WMMA is
-    /// usable. v0.3.12 `VF_FP8=auto` reads this to decide whether
-    /// to set `VF_FP8_NATIVE_WMMA=1`.
+    /// usable. `Forward::new` copies this into
+    /// `Forward::native_fp8_wmma`, which the FP8 GEMM routing in
+    /// `runs.rs` reads (Sprint 47B; before that the routing went
+    /// through a `VF_FP8_NATIVE_WMMA` env var).
     pub native_fp8_wmma: bool,
     debug_loader: Option<debug_utils::Instance>,
     debug_messenger: vk::DebugUtilsMessengerEXT,
@@ -203,9 +205,11 @@ impl VulkanDevice {
         // unconditionally on `fp8_opt_in`, which crashed with
         // `VK_ERROR_EXTENSION_NOT_PRESENT` on drivers that didn't
         // advertise it. Probing makes `VF_FP8=auto` safe everywhere
-        // (no native WMMA, but no hard crash either) and lets
-        // `VF_FP8_NATIVE_WMMA` reflect the device's *actual*
-        // capability rather than the user's request.
+        // (no native WMMA, but no hard crash either) and feeds
+        // `native_fp8_wmma` so the FP8 GEMM routing reflects the
+        // device's *actual* capability (Sprint 47B made the routing
+        // capability-driven; the legacy `VF_FP8_NATIVE_WMMA` env-var
+        // was removed).
         let fp8_ext_available = unsafe {
             instance
                 .enumerate_device_extension_properties(physical_device)

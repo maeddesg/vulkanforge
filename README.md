@@ -25,8 +25,9 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
   directly, no FP16 round-trip on disk.
 - **All three FP8 scaling strategies auto-detected**:
   per-tensor, per-channel, block-wise `[128, 128]`.
-- **Native FP8 WMMA on Mesa 26.1+** (`VF_FP8_NATIVE_WMMA=1`)
-  — +45–58 % FP8 prefill across all three sub-types.
+- **Native FP8 WMMA on Mesa 26.1+** (auto-enabled when the driver
+  advertises `shaderFloat8CooperativeMatrix`) — +45–58 % FP8 prefill
+  across all three sub-types.
 - **CPU `lm_head` offload (v0.3.10)** — Q6_K weights on CPU RAM,
   hand-tuned AVX-512 GEMV (Zen 4). Frees ~970 MB VRAM and on
   **14B FP8 it's 32 % faster than the GPU baseline**
@@ -65,16 +66,19 @@ VF_FP8=auto vulkanforge chat --model ~/models/Qwen2.5-14B-Instruct-FP8/
 ```
 
 The legacy v0.3.10 flags (`VULKANFORGE_ENABLE_FP8=1`,
-`VF_FP8_NATIVE_WMMA=1`, `VF_CPU_LM_HEAD=1`) and `--tokenizer-from
-<gguf>` still work as explicit overrides — handy when you want CPU
-`lm_head` on an 8 B model for VRAM headroom, or want to force a
-specific tokenizer source for a regression check.
+`VF_CPU_LM_HEAD=1`) and `--tokenizer-from <gguf>` still work as
+explicit overrides — handy when you want CPU `lm_head` on an 8 B
+model for VRAM headroom, or want to force a specific tokenizer
+source for a regression check.
 
-Verify Mesa 26.1+ before setting `VF_FP8_NATIVE_WMMA=1`:
+Native FP8 WMMA was a flag in v0.3.10–v0.3.15
+(`VF_FP8_NATIVE_WMMA=1`); v0.3.16 (Sprint 47B) removes the flag and
+makes the routing capability-driven — VulkanForge picks the native
+FP8 path automatically iff the driver advertises
+`shaderFloat8CooperativeMatrix`. Check with:
 
 ```bash
 vulkaninfo 2>/dev/null | grep shaderFloat8CooperativeMatrix
-# → must show "true"
 ```
 
 Build from source:
@@ -119,7 +123,7 @@ path available as a bisect fallback). Decode-side is on par with the
 larger models on a tok/s/W basis (best in the test) thanks to the
 2 B parameter count keeping power draw at 68 W.
 
-### Native FP8 prefill pp=512 (Mesa 26.1+, `VF_FP8_NATIVE_WMMA=1`)
+### Native FP8 prefill pp=512 (Mesa 26.1+, native FP8 WMMA path)
 
 | Model            | Scale type           | VulkanForge | vLLM 0.20.1 ROCm* |
 |------------------|----------------------|------------:|------------------:|
@@ -166,7 +170,7 @@ flag is a default-on candidate for 14B FP8 on Zen 4.
 | Feature              | Flag                       | Requires                     | Effect                              |
 |----------------------|----------------------------|------------------------------|-------------------------------------|
 | FP8 model loading    | `VULKANFORGE_ENABLE_FP8=1` | Mesa 26.1+ (or 26.0.6 BF16 path) | Load HuggingFace FP8 SafeTensors    |
-| Native FP8 WMMA      | `VF_FP8_NATIVE_WMMA=1`     | `shaderFloat8CooperativeMatrix` (Mesa 26.1+) | +45–58 % FP8 prefill |
+| Native FP8 WMMA      | (auto)                     | `shaderFloat8CooperativeMatrix` (Mesa 26.1+) | +45–58 % FP8 prefill |
 | CPU `lm_head` offload| `VF_CPU_LM_HEAD=1`         | AVX-512F + BW + VL (Zen 4 / Ice Lake+) | −970 MB VRAM, 14B +32 % decode |
 
 All features are opt-in. Without flags, VulkanForge runs GGUF models

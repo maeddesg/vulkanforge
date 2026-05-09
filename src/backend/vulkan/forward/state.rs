@@ -47,8 +47,9 @@ pub(super) const MUL_COOPMAT_FP8_BN32_BLOCKWISE: &[u8] =
 // descriptor set + push-constant layout as the BF16 cousin, but the
 // shader uses `coopmat<floate4m3_t>` and applies the per-block scale
 // via a partial accumulator multiplied by the scalar block scale,
-// then summed into the total accumulator. Routed when
-// `VF_FP8_NATIVE_WMMA=1` for block-wise FP8 models.
+// then summed into the total accumulator. Routed for block-wise FP8
+// models when the driver advertises `shaderFloat8CooperativeMatrix`
+// (capability-driven since Sprint 47B).
 pub(super) const MUL_COOPMAT_FP8_NATIVE_BN32_BLOCKWISE: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_fp8_native_bn32_blockwise.spv"));
 
@@ -396,8 +397,9 @@ pub struct Forward {
 
     // Sprint 38 Part 2 — block-wise FP8 GEMM with native FP8 WMMA.
     // Shares dsl/pipeline_layout/pool with the BF16 cousin above; only
-    // the shader module + pipeline differ. Routed when
-    // `VF_FP8_NATIVE_WMMA=1` for block-wise FP8 models.
+    // the shader module + pipeline differ. Routed for block-wise FP8
+    // models when `Forward::native_fp8_wmma` is true (capability-
+    // driven since Sprint 47B).
     pub(super) fp8bwgemm_native_shader_module: vk::ShaderModule,
     pub(super) fp8bwgemm_native_pipeline: vk::Pipeline,
 
@@ -457,4 +459,13 @@ pub struct Forward {
     pub(super) elision_disabled: bool,
     pub(super) barrier_stats_checked: u64,
     pub(super) barrier_stats_issued: u64,
+
+    /// Sprint 47B — captured at construction from
+    /// `VulkanDevice::native_fp8_wmma`. Replaces the legacy
+    /// `VF_FP8_NATIVE_WMMA` env-var read in the FP8 routing in
+    /// `runs.rs`. Capability-driven: native FP8×FP8 cooperative-matrix
+    /// is selected iff the driver advertised
+    /// `shaderFloat8CooperativeMatrix` *and* the FP8 extension was
+    /// enabled at device-create time.
+    pub(super) native_fp8_wmma: bool,
 }
