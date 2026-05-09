@@ -37,7 +37,7 @@ use super::super::pipeline::{
 use super::super::pipeline_registry::PipelineRegistry;
 use super::super::shaders::ShaderId;
 
-use super::arch::{compute_barrier, gemma4_kv_read_layer, gemma4_kv_start};
+use super::arch::{compute_barrier, gemma4_kv_read_layer, gemma4_kv_start, n_kv_heads_for};
 use super::state::Forward;
 
 impl Forward {
@@ -758,7 +758,7 @@ impl Forward {
         );
         let pc = ScalarAttnPushConstants {
             n_heads: cfg.n_heads,
-            n_kv_heads: cfg.n_kv_heads,
+            n_kv_heads: n_kv_heads_for(&cfg, layer),
             head_dim: head_dim_layer,
             seq_len: position + 1,
             max_seq: self.kv_cache.config.max_seq_len,
@@ -944,7 +944,7 @@ impl Forward {
         );
         let pc = FlashAttnBatchPushConstants {
             n_heads: cfg.n_heads,
-            n_kv_heads: cfg.n_kv_heads,
+            n_kv_heads: n_kv_heads_for(&cfg, layer),
             head_dim: head_dim_layer,
             m,
             n_kv,
@@ -1063,7 +1063,7 @@ impl Forward {
         );
         let pc = FlashAttnBatchPushConstants {
             n_heads: cfg.n_heads,
-            n_kv_heads: cfg.n_kv_heads,
+            n_kv_heads: n_kv_heads_for(&cfg, layer),
             head_dim: head_dim_layer,
             m,
             n_kv,
@@ -1147,7 +1147,7 @@ impl Forward {
         );
         let split_pc = FlashAttnSplitPushConstants {
             n_heads: cfg.n_heads,
-            n_kv_heads: cfg.n_kv_heads,
+            n_kv_heads: n_kv_heads_for(&cfg, layer),
             head_dim: head_dim_layer,
             seq_len: position + 1,
             max_seq: self.kv_cache.config.max_seq_len,

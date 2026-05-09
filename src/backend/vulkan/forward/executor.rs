@@ -236,7 +236,7 @@ impl DecodeExec {
 
     fn step_k_proj(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
         let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
-        let kv_dim = cfg.n_kv_heads * head_dim;
+        let kv_dim = n_kv_heads_for(cfg, ctx.layer) * head_dim;
         let hidden_norm = fwd.cur().hidden_norm.handle;
         let k_buf = fwd.cur().k_buf.handle;
         let wk = layer_weight(ctx.model, ctx.layer, "attn_k.weight");
@@ -262,7 +262,7 @@ impl DecodeExec {
 
     fn step_v_proj(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
         let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
-        let kv_dim = cfg.n_kv_heads * head_dim;
+        let kv_dim = n_kv_heads_for(cfg, ctx.layer) * head_dim;
         let hidden_norm = fwd.cur().hidden_norm.handle;
         let v_buf = fwd.cur().v_buf.handle;
         let wv = layer_weight(ctx.model, ctx.layer, "attn_v.weight");
@@ -304,7 +304,7 @@ impl DecodeExec {
 
     fn step_k_bias(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
         let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
-        let kv_dim = cfg.n_kv_heads * head_dim;
+        let kv_dim = n_kv_heads_for(cfg, ctx.layer) * head_dim;
         let k_buf = fwd.cur().k_buf.handle;
         let b = layer_weight_opt(ctx.model, ctx.layer, "attn_k.bias")
             .expect("KBiasAdd emitted but attn_k.bias is missing");
@@ -315,7 +315,7 @@ impl DecodeExec {
 
     fn step_v_bias(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
         let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
-        let kv_dim = cfg.n_kv_heads * head_dim;
+        let kv_dim = n_kv_heads_for(cfg, ctx.layer) * head_dim;
         let v_buf = fwd.cur().v_buf.handle;
         let b = layer_weight_opt(ctx.model, ctx.layer, "attn_v.bias")
             .expect("VBiasAdd emitted but attn_v.bias is missing");
@@ -364,7 +364,7 @@ impl DecodeExec {
             ctx.dev, ctx.registry, ctx.cmd,
             k_buf, wkn, k_buf,
             head_dim, rotary_dim, freq_base, theta_scale,
-            cfg.n_kv_heads, 1,
+            n_kv_heads_for(cfg, ctx.layer), 1,
             cfg.rms_norm_eps, "rms_norm_mul_rope_k",
         );
         fwd.mark_written(&[k_buf]);
@@ -407,7 +407,7 @@ impl DecodeExec {
         fwd.run_rope_neox_with_pos_offset(
             ctx.dev, ctx.registry, ctx.cmd, k_buf, k_buf,
             head_dim, rotary_dim, freq_base, theta_scale,
-            cfg.n_kv_heads, position, 0, "rope_k",
+            n_kv_heads_for(cfg, ctx.layer), position, 0, "rope_k",
         );
         fwd.mark_written(&[k_buf]);
     }
@@ -420,7 +420,7 @@ impl DecodeExec {
         fwd.run_rms_norm(
             ctx.dev, ctx.registry, ctx.cmd,
             v_buf, vnorm_ones, v_buf,
-            head_dim, cfg.n_kv_heads,
+            head_dim, n_kv_heads_for(cfg, ctx.layer),
             cfg.rms_norm_eps, "rms_norm_v",
         );
         fwd.mark_written(&[v_buf]);
@@ -429,7 +429,7 @@ impl DecodeExec {
     fn step_kv_write(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
         let position = decode_position(ctx);
         let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
-        let kv_dim = cfg.n_kv_heads * head_dim;
+        let kv_dim = n_kv_heads_for(cfg, ctx.layer) * head_dim;
         let k_src = fwd.cur().k_buf.handle;
         let v_src = fwd.cur().v_buf.handle;
         let k_dst = fwd.kv_cache.k_buffer.handle;
@@ -1021,7 +1021,7 @@ impl BatchExec {
     fn b_step_k_proj(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
         let seq_len = batch_seq_len(ctx);
         let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
-        let kv_dim = cfg.n_kv_heads * head_dim;
+        let kv_dim = n_kv_heads_for(cfg, ctx.layer) * head_dim;
         self.b_run_proj(
             fwd, cfg, ctx,
             "attn_k.weight",
@@ -1035,7 +1035,7 @@ impl BatchExec {
     fn b_step_v_proj(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
         let seq_len = batch_seq_len(ctx);
         let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
-        let kv_dim = cfg.n_kv_heads * head_dim;
+        let kv_dim = n_kv_heads_for(cfg, ctx.layer) * head_dim;
         self.b_run_proj(
             fwd, cfg, ctx,
             "attn_v.weight",
@@ -1065,7 +1065,7 @@ impl BatchExec {
     fn b_step_k_bias(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
         let seq_len = batch_seq_len(ctx);
         let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
-        let kv_dim = cfg.n_kv_heads * head_dim;
+        let kv_dim = n_kv_heads_for(cfg, ctx.layer) * head_dim;
         let b = layer_weight_opt(ctx.model, ctx.layer, "attn_k.bias")
             .expect("KBiasAdd emitted but attn_k.bias missing");
         fwd.run_bias_add(
@@ -1078,7 +1078,7 @@ impl BatchExec {
     fn b_step_v_bias(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
         let seq_len = batch_seq_len(ctx);
         let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
-        let kv_dim = cfg.n_kv_heads * head_dim;
+        let kv_dim = n_kv_heads_for(cfg, ctx.layer) * head_dim;
         let b = layer_weight_opt(ctx.model, ctx.layer, "attn_v.bias")
             .expect("VBiasAdd emitted but attn_v.bias missing");
         fwd.run_bias_add(
@@ -1130,7 +1130,7 @@ impl BatchExec {
             ctx.dev, ctx.registry, ctx.cmd,
             fwd.batch_k.handle, wkn, fwd.batch_k.handle,
             head_dim, rotary_dim, freq_base, theta_scale,
-            cfg.n_kv_heads, seq_len,
+            n_kv_heads_for(cfg, ctx.layer), seq_len,
             cfg.rms_norm_eps, "rms_norm_mul_rope_k_b",
         );
         compute_barrier(ctx.dev, ctx.cmd);
@@ -1172,7 +1172,7 @@ impl BatchExec {
             ctx.dev, ctx.registry, ctx.cmd,
             fwd.batch_k.handle, fwd.batch_k.handle,
             head_dim, rotary_dim, freq_base, theta_scale,
-            cfg.n_kv_heads, seq_len, "rope_k_batch",
+            n_kv_heads_for(cfg, ctx.layer), seq_len, "rope_k_batch",
         );
         compute_barrier(ctx.dev, ctx.cmd);
     }
@@ -1187,7 +1187,7 @@ impl BatchExec {
         fwd.run_rms_norm(
             ctx.dev, ctx.registry, ctx.cmd,
             fwd.batch_v.handle, fwd.vnorm_ones.handle, fwd.batch_v.handle,
-            head_dim, cfg.n_kv_heads * seq_len,
+            head_dim, n_kv_heads_for(cfg, ctx.layer) * seq_len,
             cfg.rms_norm_eps, "rms_norm_v_b",
         );
         compute_barrier(ctx.dev, ctx.cmd);
@@ -1196,7 +1196,7 @@ impl BatchExec {
     fn b_step_kv_write(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
         let (seq_len, base_pos) = batch_seq_pos(ctx);
         let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
-        let kv_dim = cfg.n_kv_heads * head_dim;
+        let kv_dim = n_kv_heads_for(cfg, ctx.layer) * head_dim;
         let dst_off = fwd.kv_cache.pos_offset_bytes(ctx.layer, base_pos);
         let kv_elements = seq_len * kv_dim;
         if fwd.kv_cache.is_fp8() {
@@ -1935,3 +1935,8 @@ fn decode_position(ctx: &ExecCtx) -> u32 {
 /// Re-export of `arch::common::layer_dims` for the per-step helpers.
 /// Returns `(head_dim, ffn_dim, rope_theta, rotary_dim)` per layer.
 use super::arch::layer_dims as layer_dims_local;
+
+/// Sprint 51B-pre — per-layer KV-head count (8 / 2 split for the
+/// Gemma-4-26B-A4B sliding / full pattern). Falls back to the
+/// uniform `ModelConfig::n_kv_heads` for non-Gemma-4 architectures.
+use super::arch::n_kv_heads_for;

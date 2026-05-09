@@ -19,7 +19,7 @@ pub(super) use common::{
     GemmKind, compute_barrier, is_f32_layer_weight, is_fp8_layer_weight, layer_dims,
     layer_weight, layer_weight_opt, layer_weight_scale_block, layer_weight_scale_buf,
     layer_weight_scale_scalar, layer_weight_shader, layer_weight_shader_gemm,
-    transfer_to_compute_barrier,
+    n_kv_heads_for, transfer_to_compute_barrier,
 };
 pub(super) use gemma4::{
     apply_final_logit_softcap, gemma4_kv_read_layer, gemma4_kv_start,

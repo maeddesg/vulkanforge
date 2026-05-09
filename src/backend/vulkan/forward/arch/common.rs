@@ -244,6 +244,23 @@ pub(crate) fn layer_dims(cfg: &ModelConfig, layer: u32) -> (u32, u32, f32, u32) 
     }
 }
 
+/// Sprint 51B-pre — per-layer KV-head count. Mirrors `layer_dims`
+/// for `head_dim`: returns the Gemma-4 per-layer value when
+/// `cfg.gemma4` is set, falls back to the uniform `cfg.n_kv_heads`
+/// otherwise. Architectures without a per-layer KV-head override
+/// (Llama, Qwen3, Mistral, …) hit the fallback and stay bit-identical
+/// to pre-51B-pre behaviour. Used by every per-dispatch site that
+/// currently reads `cfg.n_kv_heads` directly (executor.rs, runs.rs,
+/// debug.rs); load-time / worst-case scratch sizing keeps the global
+/// `cfg.n_kv_heads` (= the maximum across layer types).
+pub(crate) fn n_kv_heads_for(cfg: &ModelConfig, layer: u32) -> u32 {
+    if let Some(g) = cfg.gemma4.as_ref() {
+        g.layers[layer as usize].n_kv_heads
+    } else {
+        cfg.n_kv_heads
+    }
+}
+
 pub(crate) fn layer_weight(model: &LoadedModel, layer: u32, suffix: &str) -> vk::Buffer {
     let key = format!("blk.{layer}.{suffix}");
     model

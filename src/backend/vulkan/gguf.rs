@@ -445,6 +445,11 @@ pub struct Gemma4LayerSpec {
     /// variant. `Some(0.25)` for full layers in E2B; `None` for
     /// sliding layers (= default RoPE).
     pub rope_partial_factor: Option<f32>,
+    /// Sprint 51B-pre — per-layer KV-head count. Equal to
+    /// `cfg.n_kv_heads` for E2B (all layers); diverges on
+    /// 26B-A4B (`8` for sliding layers, `2` for full layers via
+    /// `num_global_key_value_heads`).
+    pub n_kv_heads: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

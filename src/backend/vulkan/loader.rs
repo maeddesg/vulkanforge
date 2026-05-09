@@ -1573,6 +1573,15 @@ fn hf_to_model_config(hf: &HfConfig) -> Result<ModelConfig, LoaderError> {
                 kv_source,
                 rope_theta: theta,
                 rope_partial_factor: partial,
+                // Sprint 51B-pre — E2B has uniform kv_heads (=1
+                // num_key_value_heads). 26B-A4B will diverge here:
+                // 8 for sliding (`num_key_value_heads`) and 2 for
+                // full (`num_global_key_value_heads`). For E2B the
+                // value is the same on every layer so the Vec we feed
+                // into KvCacheConfig is no-op-equivalent to the global
+                // `cfg.n_kv_heads`, but routing through the per-layer
+                // helper keeps the code path uniform.
+                n_kv_heads: hf.n_kv_heads(),
             });
         }
 

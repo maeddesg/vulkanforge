@@ -28,6 +28,7 @@ use super::super::pipeline_registry::PipelineRegistry;
 use super::arch::{
     compute_barrier, layer_weight, layer_weight_opt, layer_weight_scale_block,
     layer_weight_scale_buf, layer_weight_scale_scalar, layer_weight_shader,
+    n_kv_heads_for,
 };
 use super::state::{DebugTarget, Forward};
 
@@ -70,11 +71,11 @@ impl Forward {
             ),
             DebugTarget::KProj | DebugTarget::KNormRope => (
                 self.cur().k_buf.handle,
-                (cfg.n_kv_heads * cfg.head_dim) as u64,
+                (n_kv_heads_for(&cfg, layer) * cfg.head_dim) as u64,
             ),
             DebugTarget::VProj => (
                 self.cur().v_buf.handle,
-                (cfg.n_kv_heads * cfg.head_dim) as u64,
+                (n_kv_heads_for(&cfg, layer) * cfg.head_dim) as u64,
             ),
             DebugTarget::AttnOut => (
                 self.cur().attn_out.handle,
@@ -177,19 +178,19 @@ impl Forward {
         }
         if let Some(s) = sb_k {
             self.run_gemv_fp8_dispatch(dev, cmd, wk, s, in_h, k_h,
-                cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim,
+                cfg.hidden_dim, n_kv_heads_for(&cfg, layer) * cfg.head_dim,
                 layer_weight_scale_block(model, layer, "attn_k.weight"), "gemv_k");
         } else {
             self.run_gemv(dev, registry, cmd, sk, wk, in_h, k_h,
-                cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, scale_k, "gemv_k");
+                cfg.hidden_dim, n_kv_heads_for(&cfg, layer) * cfg.head_dim, scale_k, "gemv_k");
         }
         if let Some(s) = sb_v {
             self.run_gemv_fp8_dispatch(dev, cmd, wv, s, in_h, v_h,
-                cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim,
+                cfg.hidden_dim, n_kv_heads_for(&cfg, layer) * cfg.head_dim,
                 layer_weight_scale_block(model, layer, "attn_v.weight"), "gemv_v");
         } else {
             self.run_gemv(dev, registry, cmd, sv, wv, in_h, v_h,
-                cfg.hidden_dim, cfg.n_kv_heads * cfg.head_dim, scale_v, "gemv_v");
+                cfg.hidden_dim, n_kv_heads_for(&cfg, layer) * cfg.head_dim, scale_v, "gemv_v");
         }
         if matches!(halt, DebugTarget::QProj | DebugTarget::KProj | DebugTarget::VProj) {
             return;
@@ -199,7 +200,7 @@ impl Forward {
         // Sprint 24B — Q/K/V bias-add (Qwen2 attention biases). Skipped
         // for architectures without biases (Llama, Qwen3, Mistral).
         let q_dim = cfg.n_heads * cfg.head_dim;
-        let kv_dim = cfg.n_kv_heads * cfg.head_dim;
+        let kv_dim = n_kv_heads_for(&cfg, layer) * cfg.head_dim;
         let q_bias = layer_weight_opt(model, layer, "attn_q.bias");
         let k_bias = layer_weight_opt(model, layer, "attn_k.bias");
         let v_bias = layer_weight_opt(model, layer, "attn_v.bias");
@@ -222,7 +223,7 @@ impl Forward {
                              cfg.head_dim, cfg.n_heads, cfg.rms_norm_eps, "rms_norm_q");
             self.run_rms_norm(dev, registry, cmd,
                              self.cur().k_buf.handle, wkn, self.cur().k_buf.handle,
-                             cfg.head_dim, cfg.n_kv_heads, cfg.rms_norm_eps, "rms_norm_k");
+                             cfg.head_dim, n_kv_heads_for(&cfg, layer), cfg.rms_norm_eps, "rms_norm_k");
             compute_barrier(dev, cmd);
         }
 
@@ -230,7 +231,7 @@ impl Forward {
         self.run_rope_neox(dev, registry, cmd, self.cur().q_buf.handle, self.cur().q_buf.handle,
                            cfg.head_dim, cfg.n_heads, position, "rope_q");
         self.run_rope_neox(dev, registry, cmd, self.cur().k_buf.handle, self.cur().k_buf.handle,
-                           cfg.head_dim, cfg.n_kv_heads, position, "rope_k");
+                           cfg.head_dim, n_kv_heads_for(&cfg, layer), position, "rope_k");
         if matches!(halt, DebugTarget::QNormRope | DebugTarget::KNormRope) {
             return;
         }
@@ -246,7 +247,7 @@ impl Forward {
         let k_dst = self.kv_cache.k_buffer.handle;
         let v_dst = self.kv_cache.v_buffer.handle;
         if self.kv_cache.is_fp8() {
-            let kv_elements = cfg.n_kv_heads * cfg.head_dim;
+            let kv_elements = n_kv_heads_for(&cfg, layer) * cfg.head_dim;
             self.run_kv_store_fp8(
                 dev, registry, cmd, k_src, k_dst, kv_elements, dst_off,
                 "kv_store_fp8_k_d",
@@ -256,7 +257,7 @@ impl Forward {
                 "kv_store_fp8_v_d",
             );
         } else if self.kv_cache.is_fp16() {
-            let kv_elements = cfg.n_kv_heads * cfg.head_dim;
+            let kv_elements = n_kv_heads_for(&cfg, layer) * cfg.head_dim;
             self.run_kv_copy_fp16(
                 dev, registry, cmd, k_src, k_dst, kv_elements, dst_off,
                 "kv_copy_fp16_k_d",

@@ -344,6 +344,14 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
             per_layer_head_dim: cfg.gemma4.as_ref().map(|g| {
                 g.layers.iter().map(|s| s.head_dim).collect()
             }),
+            // Sprint 51B-pre — heterogeneous KV-head count (Gemma-4-26B's
+            // 8 sliding / 2 full split). E2B has uniform kv_heads=1 but
+            // we route through the per-layer Vec for consistency with
+            // n_kv_heads_for(); architectures without `cfg.gemma4` use
+            // the uniform `cfg.n_kv_heads` (None).
+            per_layer_n_kv_heads: cfg.gemma4.as_ref().map(|g| {
+                g.layers.iter().map(|s| s.n_kv_heads).collect()
+            }),
         },
     )?;
     // Sprint 43C — KV cache one-shot zero-fill. Required for Gemma-4
@@ -718,6 +726,14 @@ fn run_chat_safetensors(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>
             // this stays None and the cache uses the uniform stride.
             per_layer_head_dim: cfg.gemma4.as_ref().map(|g| {
                 g.layers.iter().map(|s| s.head_dim).collect()
+            }),
+            // Sprint 51B-pre — heterogeneous KV-head count (Gemma-4-26B's
+            // 8 sliding / 2 full split). E2B has uniform kv_heads=1 but
+            // we route through the per-layer Vec for consistency with
+            // n_kv_heads_for(); architectures without `cfg.gemma4` use
+            // the uniform `cfg.n_kv_heads` (None).
+            per_layer_n_kv_heads: cfg.gemma4.as_ref().map(|g| {
+                g.layers.iter().map(|s| s.n_kv_heads).collect()
             }),
         },
     )?;
@@ -1321,6 +1337,14 @@ fn run_bench(
             per_layer_head_dim: cfg.gemma4.as_ref().map(|g| {
                 g.layers.iter().map(|s| s.head_dim).collect()
             }),
+            // Sprint 51B-pre — heterogeneous KV-head count (Gemma-4-26B's
+            // 8 sliding / 2 full split). E2B has uniform kv_heads=1 but
+            // we route through the per-layer Vec for consistency with
+            // n_kv_heads_for(); architectures without `cfg.gemma4` use
+            // the uniform `cfg.n_kv_heads` (None).
+            per_layer_n_kv_heads: cfg.gemma4.as_ref().map(|g| {
+                g.layers.iter().map(|s| s.n_kv_heads).collect()
+            }),
         },
     )?;
     let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;
@@ -1501,6 +1525,14 @@ fn run_bench_safetensors(
             max_seq_len: bench_max_seq.max(max_pp_local + 64),
             per_layer_head_dim: cfg.gemma4.as_ref().map(|g| {
                 g.layers.iter().map(|s| s.head_dim).collect()
+            }),
+            // Sprint 51B-pre — heterogeneous KV-head count (Gemma-4-26B's
+            // 8 sliding / 2 full split). E2B has uniform kv_heads=1 but
+            // we route through the per-layer Vec for consistency with
+            // n_kv_heads_for(); architectures without `cfg.gemma4` use
+            // the uniform `cfg.n_kv_heads` (None).
+            per_layer_n_kv_heads: cfg.gemma4.as_ref().map(|g| {
+                g.layers.iter().map(|s| s.n_kv_heads).collect()
             }),
         },
     )?;

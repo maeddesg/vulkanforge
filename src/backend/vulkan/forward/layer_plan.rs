@@ -484,6 +484,8 @@ mod tests {
                 kv_source,
                 rope_theta,
                 rope_partial_factor,
+                // Sprint 51B-pre — E2B test fixture: uniform kv_heads=1.
+                n_kv_heads: 1,
             });
         }
         Gemma4Spec {
