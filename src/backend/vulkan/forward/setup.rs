@@ -349,6 +349,11 @@ impl Forward {
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let prefill_pool = unsafe { device.create_command_pool(&prefill_pool_info, None)? };
         let prefill_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None)? };
+        // Sprint 51D-C — dedicated mid-frame fence for Gemma-4 MoE router
+        // GPU→CPU readback. Lifetime is fully contained inside one
+        // `mid_frame_submit_and_wait` call, so a single fence reused
+        // across MoE layers is safe.
+        let mid_frame_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None)? };
         let prefill_cbs = if layers_per_submit > 0 && layers_per_submit < config.n_layers {
             // ceil(n_layers / layers_per_submit) chunks for the layer
             // loop; the last chunk also carries the final-norm + lm_head
@@ -630,6 +635,7 @@ impl Forward {
             prefill_cbs,
             prefill_fence,
             layers_per_submit,
+            mid_frame_fence,
             logits_buf,
             logits_staging,
             hidden_staging,
@@ -700,6 +706,8 @@ impl Forward {
             // Sprint 19B-A — multi-submit prefill pool + fence.
             device.destroy_fence(self.prefill_fence, None);
             device.destroy_command_pool(self.prefill_pool, None);
+            // Sprint 51D-C — dedicated mid-frame submit fence.
+            device.destroy_fence(self.mid_frame_fence, None);
         }
         // Sprint 15D — destroy both intermediate slots in turn.
         let [slot0, slot1] = self.slots;

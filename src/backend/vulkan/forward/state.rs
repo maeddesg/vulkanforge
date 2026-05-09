@@ -244,6 +244,16 @@ pub struct Forward {
     pub(super) prefill_cbs: Vec<vk::CommandBuffer>,
     pub(super) prefill_fence: vk::Fence,
     pub(super) layers_per_submit: u32,
+    /// Sprint 51D-C — dedicated fence for the mid-frame submit pattern
+    /// used by Gemma-4 MoE routing (router output is consumed on the CPU
+    /// to pick Top-K expert indices, which requires a GPU→CPU sync in
+    /// the middle of `forward_token`'s otherwise-monolithic command
+    /// buffer). Kept separate from `cmd_ctx.fence` (the closure-end
+    /// `one_shot` wait) and `prefill_fence` so each fence has a single,
+    /// non-overlapping lifetime — never two waiters on the same fence.
+    /// Allocated unconditionally; the per-token cost is zero on
+    /// non-MoE archs because nothing dispatches a mid-frame submit.
+    pub(super) mid_frame_fence: vk::Fence,
     pub(super) logits_buf: GpuBuffer,
     /// Sprint 27 — host-readable staging copy of `logits_buf`.
     /// `logits_buf` is now `GpuOnly` (fast GPU-local writes from

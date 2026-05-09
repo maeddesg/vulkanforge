@@ -42,6 +42,8 @@
 //!   `dispatch_layer`, `dispatch_final`, async-decode pipeline).
 //! - [`prefill`]  — batched-prompt path (`prefill_batch`,
 //!   `dispatch_layer_batch`).
+//! - [`mid_frame`] — mid-frame submit-and-wait primitive used by
+//!   Gemma-4 MoE routing for GPU→CPU Top-K readback (Sprint 51D-C).
 //! - [`debug`]    — single-layer drivers + env-gated dump helpers.
 //! - [`arch`]     — architecture-specific helpers (Gemma-4 KV-share /
 //!   p-RoPE / sliding-window, layer_weight family, GEMM picker,
@@ -64,6 +66,7 @@ mod decode;
 mod executor;
 mod harness;
 mod layer_plan;
+mod mid_frame;
 mod prefill;
 mod runs;
 mod setup;

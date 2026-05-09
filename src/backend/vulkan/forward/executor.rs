@@ -921,10 +921,20 @@ impl DecodeExec {
     // === Sprint 51D-B Block 2 / 3 — stubs, real impl follows after Block 1 STOP-Gate ===
 
     fn step_moe_route(
-        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx,
+        &self, fwd: &mut Forward, _cfg: &ModelConfig, ctx: &ExecCtx,
         _n_experts: u32, _top_k: u32,
     ) {
-        unimplemented!("Sprint 51D-B Block 2 — MoeRoute (router GEMV + softmax + Top-K)");
+        // Sprint 51D-C — exercise the mid-frame submit pattern. The
+        // router GEMV + softmax + Top-K (Sprint 51D-D) will record its
+        // dispatches BEFORE this call and read the host-visible Top-K
+        // staging buffer AFTER. Calling it here without preceding work
+        // is a no-op-ish smoke that proves the
+        // end → submit → wait → reset → begin sequence returns
+        // cleanly; it does NOT make the 26B output correct (the
+        // unimplemented! below still trips on the very next step).
+        fwd.mid_frame_submit_and_wait(ctx.dev, ctx.cmd)
+            .expect("mid_frame_submit_and_wait failed");
+        unimplemented!("Sprint 51D-D — MoeRoute (router GEMV + softmax + Top-K)");
     }
 
     fn step_moe_expert_ffn(
@@ -1963,10 +1973,19 @@ impl BatchExec {
     // === Block 2 / 3 stubs ===
 
     fn b_step_moe_route(
-        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx,
+        &self, fwd: &mut Forward, _cfg: &ModelConfig, ctx: &ExecCtx,
         _n_experts: u32, _top_k: u32,
     ) {
-        unimplemented!("Sprint 51D-B Block 2 — b_step_moe_route");
+        // Sprint 51D-C — same probe as the decode path. Note: prefill
+        // already does manual multi-CB pacing (Sprint 19B-A
+        // `prefill_cbs`), so a real Sprint 51D-D batch implementation
+        // will need to thread mid-frame submit through the chunk
+        // boundary logic. For 51D-C we just exercise the helper to
+        // catch any cross-path Vulkan-validation issues that decode
+        // alone wouldn't surface.
+        fwd.mid_frame_submit_and_wait(ctx.dev, ctx.cmd)
+            .expect("mid_frame_submit_and_wait failed (batch)");
+        unimplemented!("Sprint 51D-D — b_step_moe_route");
     }
 
     fn b_step_moe_expert_ffn(
