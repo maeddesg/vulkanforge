@@ -79,8 +79,19 @@ pub enum LayerStep {
     KProj,
 
     /// V linear projection. Skipped alongside `KProj` for Gemma-4
-    /// subscribers.
+    /// subscribers, and replaced by `VFromKRaw` on Gemma-4-26B-A4B
+    /// full-attention layers (where `attention_k_eq_v: true`).
     VProj,
+
+    /// Sprint 51B — Gemma-4-26B-A4B full-attention layers under
+    /// `attention_k_eq_v: true` derive V from K's raw projection
+    /// instead of running their own `v_proj`. Executor copies
+    /// `k_buf` (raw, pre-norm, pre-RoPE) into `v_buf` so the
+    /// downstream `VNorm` (parameterless RMSNorm) can run on V
+    /// independently of K's own `KNormRope` chain.
+    /// Emitted instead of `VProj` when the layer has
+    /// `Gemma4LayerSpec.has_v_proj == false`.
+    VFromKRaw,
 
     /// Q bias add (Qwen2 / DeepSeek-V2 attention biases). Builder
     /// only emits if `LayerWeightFlags::has_q_bias` is set.
@@ -336,11 +347,19 @@ pub fn build_gemma4_layer(
     plan.push(LayerStep::QProj);
     if owns_kv {
         plan.push(LayerStep::KProj);
-        plan.push(LayerStep::VProj);
+        // Sprint 51B — Gemma-4-26B-A4B full-attention layers under
+        // `attention_k_eq_v: true` skip the v_proj weight; V is
+        // derived from K's raw projection. Emit `VFromKRaw` BEFORE
+        // any norm/RoPE on K so v_buf gets the unrotated values.
+        if s.has_v_proj {
+            plan.push(LayerStep::VProj);
+        } else {
+            plan.push(LayerStep::VFromKRaw);
+        }
     }
     if flags.has_q_bias { plan.push(LayerStep::QBiasAdd); }
     if owns_kv && flags.has_k_bias { plan.push(LayerStep::KBiasAdd); }
-    if owns_kv && flags.has_v_bias { plan.push(LayerStep::VBiasAdd); }
+    if owns_kv && s.has_v_proj && flags.has_v_bias { plan.push(LayerStep::VBiasAdd); }
 
     // Gemma-4 has Q/K-norm in the reference HF model? — check
     // cfg.has_qk_norm. Currently Gemma-4-E2B has has_qk_norm=true
@@ -486,6 +505,9 @@ mod tests {
                 rope_partial_factor,
                 // Sprint 51B-pre — E2B test fixture: uniform kv_heads=1.
                 n_kv_heads: 1,
+                // Sprint 51B — E2B test fixture: every layer has its
+                // own v_proj (`attention_k_eq_v=false`).
+                has_v_proj: true,
             });
         }
         Gemma4Spec {

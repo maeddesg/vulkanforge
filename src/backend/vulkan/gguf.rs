@@ -450,6 +450,12 @@ pub struct Gemma4LayerSpec {
     /// 26B-A4B (`8` for sliding layers, `2` for full layers via
     /// `num_global_key_value_heads`).
     pub n_kv_heads: u32,
+    /// Sprint 51B — when `false`, the layer skips its V-side dispatch
+    /// (no `v_proj` weight, no VBiasAdd). V is taken from K's raw
+    /// projection (pre-norm, pre-RoPE) and run through a parameterless
+    /// `v_norm`. Used by 26B-A4B's full-attention layers under
+    /// `attention_k_eq_v: true`. Defaults to `true` for E2B.
+    pub has_v_proj: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

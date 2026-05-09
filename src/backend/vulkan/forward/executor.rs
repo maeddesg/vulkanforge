@@ -159,6 +159,7 @@ impl DecodeExec {
             LayerStep::QProj => self.step_q_proj(fwd, cfg, ctx),
             LayerStep::KProj => self.step_k_proj(fwd, cfg, ctx),
             LayerStep::VProj => self.step_v_proj(fwd, cfg, ctx),
+            LayerStep::VFromKRaw => self.step_v_from_k_raw(fwd, cfg, ctx),
             LayerStep::QBiasAdd => self.step_q_bias(fwd, cfg, ctx),
             LayerStep::KBiasAdd => self.step_k_bias(fwd, cfg, ctx),
             LayerStep::VBiasAdd => self.step_v_bias(fwd, cfg, ctx),
@@ -258,6 +259,30 @@ impl DecodeExec {
             );
         }
         fwd.mark_written(&[k_buf]);
+    }
+
+    /// Sprint 51B — Gemma-4-26B-A4B `attention_k_eq_v` path. The
+    /// layer has no `v_proj` weight; V is taken from K's raw
+    /// projection (output of `step_k_proj`, which lives in
+    /// `fwd.cur().k_buf` at this point — pre-norm, pre-RoPE).
+    /// Copy that buffer into `v_buf` so the downstream `step_v_norm`
+    /// (parameterless RMSNorm) operates on it independently of K's
+    /// own `step_k_norm_rope` chain.
+    fn step_v_from_k_raw(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
+        let kv_dim = n_kv_heads_for(cfg, ctx.layer) * head_dim;
+        let bytes = (kv_dim as u64) * 4; // FP32 scratch
+        let k_buf = fwd.cur().k_buf.handle;
+        let v_buf = fwd.cur().v_buf.handle;
+        let copy = vk::BufferCopy::default().src_offset(0).dst_offset(0).size(bytes);
+        fwd.profile("v_from_k_raw", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
+            dev.device.cmd_copy_buffer(cmd, k_buf, v_buf, std::slice::from_ref(&copy));
+        });
+        // V depends on K's raw output → ensure step_k_proj's writes
+        // are visible to this transfer; downstream VNorm's compute
+        // read sees v_buf via the transfer→compute barrier emitted by
+        // mark_written + maybe_compute_barrier.
+        fwd.mark_written(&[v_buf]);
     }
 
     fn step_v_proj(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
@@ -915,6 +940,7 @@ impl BatchExec {
             LayerStep::QProj => self.b_step_q_proj(fwd, cfg, ctx),
             LayerStep::KProj => self.b_step_k_proj(fwd, cfg, ctx),
             LayerStep::VProj => self.b_step_v_proj(fwd, cfg, ctx),
+            LayerStep::VFromKRaw => self.b_step_v_from_k_raw(fwd, cfg, ctx),
             LayerStep::QBiasAdd => self.b_step_q_bias(fwd, cfg, ctx),
             LayerStep::KBiasAdd => self.b_step_k_bias(fwd, cfg, ctx),
             LayerStep::VBiasAdd => self.b_step_v_bias(fwd, cfg, ctx),
@@ -1046,6 +1072,25 @@ impl BatchExec {
         );
         // After Q+K+V finished, emit a single barrier (matches the
         // legacy `compute_barrier` after the GEMM block).
+        compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    /// Sprint 51B — batch counterpart of `step_v_from_k_raw`. Copies
+    /// `batch_k` (raw output of `b_step_k_proj`) into `batch_v` so
+    /// `b_step_v_norm` can run independently of K's normalization.
+    /// Emits a `compute_barrier` to mirror the trailing barrier on
+    /// `b_step_v_proj` (the GEMM block's universal Q+K+V→read sync).
+    fn b_step_v_from_k_raw(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
+        let seq_len = batch_seq_len(ctx);
+        let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
+        let kv_dim = n_kv_heads_for(cfg, ctx.layer) * head_dim;
+        let bytes = (seq_len as u64) * (kv_dim as u64) * 4; // FP32 batch row
+        let src = fwd.batch_k.handle;
+        let dst = fwd.batch_v.handle;
+        let copy = vk::BufferCopy::default().src_offset(0).dst_offset(0).size(bytes);
+        fwd.profile("v_from_k_raw_b", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
+            dev.device.cmd_copy_buffer(cmd, src, dst, std::slice::from_ref(&copy));
+        });
         compute_barrier(ctx.dev, ctx.cmd);
     }
 

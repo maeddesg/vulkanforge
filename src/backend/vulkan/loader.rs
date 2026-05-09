@@ -1582,6 +1582,14 @@ fn hf_to_model_config(hf: &HfConfig) -> Result<ModelConfig, LoaderError> {
                 // `cfg.n_kv_heads`, but routing through the per-layer
                 // helper keeps the code path uniform.
                 n_kv_heads: hf.n_kv_heads(),
+                // Sprint 51B — full-attention layers under
+                // `attention_k_eq_v: true` (26B-A4B) skip the v_proj
+                // weight and derive V from K_raw. Sliding layers
+                // always have their own v_proj. E2B has
+                // `attention_k_eq_v=false` → every layer keeps its
+                // v_proj.
+                has_v_proj: !(gm.attention_k_eq_v
+                    && matches!(kind, Gemma4LayerKind::Full)),
             });
         }
 

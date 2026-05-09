@@ -101,6 +101,12 @@ pub struct Gemma4TextMeta {
     /// Proportional-rotation factor for full-attention RoPE (0.25
     /// for E2B → only the first 25 % of the head dim is rotated).
     pub full_rope_partial_factor: Option<f32>,
+    /// Sprint 51B — when true, full-attention layers omit the v_proj
+    /// weight; V is taken from K's raw projection (pre-norm, pre-RoPE)
+    /// and run through a parameterless v_norm. False for E2B; true
+    /// for Gemma-4-26B-A4B. Sliding-attention layers always have
+    /// their own v_proj regardless.
+    pub attention_k_eq_v: bool,
 }
 
 /// Per-layer attention kind in a Gemma-4 stack.
@@ -313,6 +319,9 @@ fn parse_gemma4_text_meta(text: &serde_json::Value) -> Result<Gemma4TextMeta, St
         .get("partial_rotary_factor")
         .and_then(|v| v.as_f64())
         .map(|x| x as f32);
+    // Sprint 51B — Gemma-4-26B-A4B sets `attention_k_eq_v: true`;
+    // E2B omits the field (default false).
+    let attention_k_eq_v = bool_field("attention_k_eq_v", false);
 
     Ok(Gemma4TextMeta {
         layer_types,
@@ -329,6 +338,7 @@ fn parse_gemma4_text_meta(text: &serde_json::Value) -> Result<Gemma4TextMeta, St
         sliding_rope_theta,
         full_rope_theta,
         full_rope_partial_factor,
+        attention_k_eq_v,
     })
 }
 
