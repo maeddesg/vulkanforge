@@ -1149,7 +1149,8 @@ const JOBS: &[ShaderJob] = &[
     // is `floate4m3_t` instead of `bfloat16_t`. ACO emits
     // v_wmma_f32_16x16x16_fp8_fp8 directly. Activations (FP32) are
     // converted to FP8 via v_cvt_pk_fp8_f32 during B-tile staging.
-    // Opt-in via VF_FP8_NATIVE_WMMA=1 (Mesa 26.1+ required).
+    // Opt-in via VF_FP8_NATIVE_WMMA=1 (requires VK_EXT_shader_float8
+    // + shaderFloat8CooperativeMatrix advertised by the driver).
     ShaderJob {
         out_name: "mul_coopmat_fp8_native_bn32.spv",
         entry_source: "mul_coopmat_fp8_native_bn32.comp",

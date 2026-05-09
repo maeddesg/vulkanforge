@@ -51,7 +51,7 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
 ## Quick start
 
 ```bash
-# GGUF — no flag needed, default-everywhere path (Mesa 26.0.6+)
+# GGUF — no flag needed, default-everywhere path (Mesa 26.1+ recommended)
 vulkanforge chat --model ~/models/Qwen3-8B-Q4_K_M.gguf
 
 # FP8 SafeTensors — one flag, no --tokenizer-from needed (v0.3.13)
@@ -165,12 +165,13 @@ flag is a default-on candidate for 14B FP8 on Zen 4.
 
 | Feature              | Flag                       | Requires                     | Effect                              |
 |----------------------|----------------------------|------------------------------|-------------------------------------|
-| FP8 model loading    | `VULKANFORGE_ENABLE_FP8=1` | Mesa 26.0.6+                 | Load HuggingFace FP8 SafeTensors    |
-| Native FP8 WMMA      | `VF_FP8_NATIVE_WMMA=1`     | Mesa 26.1+                   | +45–58 % FP8 prefill                |
+| FP8 model loading    | `VULKANFORGE_ENABLE_FP8=1` | Mesa 26.1+ (or 26.0.6 BF16 path) | Load HuggingFace FP8 SafeTensors    |
+| Native FP8 WMMA      | `VF_FP8_NATIVE_WMMA=1`     | `shaderFloat8CooperativeMatrix` (Mesa 26.1+) | +45–58 % FP8 prefill |
 | CPU `lm_head` offload| `VF_CPU_LM_HEAD=1`         | AVX-512F + BW + VL (Zen 4 / Ice Lake+) | −970 MB VRAM, 14B +32 % decode |
 
 All features are opt-in. Without flags, VulkanForge runs GGUF models
-on any Mesa 26.0.6+ with no special requirements.
+on Mesa 26.1+ with no special configuration. `VF_FP8=auto` picks
+the right FP8 path based on what the driver actually advertises.
 
 ## Quality (15-prompt benchmark)
 
@@ -204,8 +205,8 @@ activations inside the FP8 E4M3 ±448 envelope.
 
 | Mesa version | Capabilities                                                                  |
 |--------------|-------------------------------------------------------------------------------|
-| **26.0.6+**  | Full GGUF + FP8 SafeTensors via the BF16 conversion WMMA path                 |
-| **26.1+**    | Adds `shaderFloat8CooperativeMatrix` → `VF_FP8_NATIVE_WMMA=1` is safe to set  |
+| **26.1+**    | Default. Native FP8 WMMA via `shaderFloat8CooperativeMatrix`                  |
+| **26.0.6**   | Legacy. GGUF + FP8 SafeTensors via the BF16 conversion path (no native FP8 WMMA) |
 
 For 14B+ models, set `amdgpu.lockup_timeout=10000,10000` on the
 kernel command line — the default 2 s compute timeout is too short

@@ -1793,7 +1793,8 @@ impl Forward {
         // Override via `VF_FP8_GEMM_BN={16,32,64}`. Legacy
         // `VF_FP8_GEMM_BN32=0` still respected as opt-out to BN=16.
         // Sprint 38 Part 1 — `VF_FP8_NATIVE_WMMA=1` opt-in selects the
-        // FP8×FP8 cooperative-matrix variant of BN=32 (Mesa 26.1+).
+        // FP8×FP8 cooperative-matrix variant of BN=32 (requires
+        // `shaderFloat8CooperativeMatrix` to be advertised).
         let bn_override = std::env::var("VF_FP8_GEMM_BN")
             .ok()
             .and_then(|v| v.parse::<u32>().ok());

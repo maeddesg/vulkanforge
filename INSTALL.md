@@ -5,9 +5,10 @@
 - **GPU:** AMD RX 9070 XT (RDNA4 / `gfx1201`) — other GPUs untested.
   Other RDNA generations may work but the spec-constants are tuned
   for `gfx1201` Wave64.
-- **Driver:** RADV (Mesa 26.0.6+) advertising `VK_KHR_cooperative_matrix`.
-  Mesa 26.1-rc3 works (Sprint 13B) but isn't faster — recommended
-  driver is **Mesa 26.0.6**.
+- **Driver:** RADV (Mesa **26.1+** recommended; system default on
+  current Arch / CachyOS) advertising `VK_KHR_cooperative_matrix`.
+  Mesa 26.0.6 still works via the BF16 conversion path but does not
+  support native FP8 WMMA.
 - **OS:** Linux. Tested on Arch Linux / CachyOS; other distros should
   work as long as they ship the same Mesa.
 - **Rust:** stable toolchain, MSRV **1.85** (edition 2024).
@@ -101,7 +102,8 @@ VULKANFORGE_KV_FP8=1 vulkanforge chat --model ~/models/Qwen3-8B-Q4_K_M.gguf
 Quality: 15 / 15 prompts coherent on the regression suite —
 indistinguishable from FP16 in spot checks. Setting
 `VULKANFORGE_KV_FP8=1` implies `VULKANFORGE_ENABLE_FP8=1` so the
-device feature is auto-wired. Requires RDNA4 + Mesa 26.0.6+.
+device feature is auto-wired. Requires RDNA4 + a Mesa version
+advertising `VK_KHR_cooperative_matrix` (26.1+ recommended).
 
 ## Environment variables
 

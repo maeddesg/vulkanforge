@@ -25,8 +25,8 @@ pub struct VulkanDevice {
     pub queue_family_index: u32,
     /// True when the driver advertises `VK_EXT_shader_float8` *and*
     /// `shaderFloat8CooperativeMatrix` — i.e. native FP8 WMMA is
-    /// usable (Mesa 26.1+ on RADV gfx1201). v0.3.12 `VF_FP8=auto`
-    /// reads this to decide whether to set `VF_FP8_NATIVE_WMMA=1`.
+    /// usable. v0.3.12 `VF_FP8=auto` reads this to decide whether
+    /// to set `VF_FP8_NATIVE_WMMA=1`.
     pub native_fp8_wmma: bool,
     debug_loader: Option<debug_utils::Instance>,
     debug_messenger: vk::DebugUtilsMessengerEXT,
@@ -201,10 +201,11 @@ impl VulkanDevice {
         // Sprint 42C / v0.3.12 — probe `VK_EXT_shader_float8` availability
         // before requesting it. Pre-v0.3.12 device.rs pushed the extension
         // unconditionally on `fp8_opt_in`, which crashed with
-        // `VK_ERROR_EXTENSION_NOT_PRESENT` on Mesa 26.0.x. Probing makes
-        // `VF_FP8=auto` safe on older drivers (no native WMMA, but no
-        // hard crash either) and lets `VF_FP8_NATIVE_WMMA` reflect the
-        // device's *actual* capability rather than the user's request.
+        // `VK_ERROR_EXTENSION_NOT_PRESENT` on drivers that didn't
+        // advertise it. Probing makes `VF_FP8=auto` safe everywhere
+        // (no native WMMA, but no hard crash either) and lets
+        // `VF_FP8_NATIVE_WMMA` reflect the device's *actual*
+        // capability rather than the user's request.
         let fp8_ext_available = unsafe {
             instance
                 .enumerate_device_extension_properties(physical_device)
@@ -222,8 +223,8 @@ impl VulkanDevice {
         } else if fp8_opt_in && !fp8_ext_available {
             eprintln!(
                 "VulkanForge: VK_EXT_shader_float8 not advertised by driver — \
-                 falling back to BF16 conversion path (Mesa 26.0.x). Update to \
-                 Mesa 26.1+ for native FP8 cooperative-matrix WMMA."
+                 falling back to BF16 conversion path. Update to a driver \
+                 that exposes shaderFloat8CooperativeMatrix for native FP8 WMMA."
             );
         }
 
@@ -234,10 +235,10 @@ impl VulkanDevice {
         // pipelines without the extension being enabled, but
         // validation layers fire VUID-…-pCode-08742 on every
         // shader-module create. Enable the extension when the runtime
-        // advertises it (Mesa 26.1+) and silence the warnings. We
-        // probe the available device extensions explicitly so a
-        // Mesa 26.0.x runtime keeps working untouched (it just sees
-        // the warnings as before).
+        // advertises it and silence the warnings. We probe the
+        // available device extensions explicitly so runtimes without
+        // it keep working untouched (they just see the warnings as
+        // before).
         let bfloat16_available = unsafe {
             instance
                 .enumerate_device_extension_properties(physical_device)

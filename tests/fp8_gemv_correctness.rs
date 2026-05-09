@@ -13,8 +13,8 @@
 //! regression.
 //!
 //! Skipped at runtime when FP8 isn't actually advertised by the
-//! device (per `VULKANFORGE_ENABLE_FP8=1` opt-in or RDNA4 + Mesa
-//! 26.0.6+).
+//! device (per `VULKANFORGE_ENABLE_FP8=1` opt-in plus a driver that
+//! exposes `VK_KHR_cooperative_matrix`).
 
 use ash::vk;
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};

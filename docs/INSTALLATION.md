@@ -17,10 +17,11 @@ VRAM:
 
 | Mesa version | Capabilities                                                                 |
 |--------------|------------------------------------------------------------------------------|
-| **26.0.6+**  | Full GGUF + FP8 SafeTensors support via the BF16-conversion WMMA path        |
-| **26.1+**    | Adds `shaderFloat8CooperativeMatrix` → `VF_FP8_NATIVE_WMMA=1` is safe to set |
+| **26.1+**    | Default. Native FP8 cooperative-matrix WMMA via `shaderFloat8CooperativeMatrix` |
+| **26.0.6**   | Legacy. GGUF + FP8 SafeTensors via the BF16-conversion WMMA path (no native FP8 WMMA) |
 
-Check your Mesa version:
+Mesa 26.1 is the system default on current Arch / CachyOS. Check
+your installed version:
 
 ```bash
 vulkaninfo 2>/dev/null | grep driverInfo
@@ -33,29 +34,11 @@ vulkaninfo 2>/dev/null | grep shaderFloat8CooperativeMatrix
 # → must show "true" before setting VF_FP8_NATIVE_WMMA=1
 ```
 
-VulkanForge does **not** auto-detect the Mesa version. Setting
-`VF_FP8_NATIVE_WMMA=1` on a Mesa 26.0.x driver fails at pipeline build
-because the FP8 cooperative-matrix capability isn't exposed. Leave the
-flag unset on older Mesa and the BF16 path runs everywhere.
-
-### Mesa setup recipe (Arch / btrfs example)
-
-VulkanForge has been tested with the AUR `mesa-git` builds and with
-locally-compiled `mesa-26.1.0-rc3`. A typical local build:
-
-```bash
-git clone --depth 1 https://gitlab.freedesktop.org/mesa/mesa.git ~/tmp/mesa-26.1
-cd ~/tmp/mesa-26.1
-meson setup build -Dvulkan-drivers=amd -Dgallium-drivers=radeonsi \
-                  -Dprefix=$HOME/tmp/mesa-26.1
-meson install -C build
-cat > ~/tmp/mesa26.1.env.sh <<EOF
-export VK_ICD_FILENAMES=$HOME/tmp/mesa-26.1/share/vulkan/icd.d/radeon_icd.x86_64.json
-export LD_LIBRARY_PATH=$HOME/tmp/mesa-26.1/lib:\$LD_LIBRARY_PATH
-EOF
-# Activate per-shell:
-source ~/tmp/mesa26.1.env.sh
-```
+`VF_FP8=auto` (v0.3.12+) probes the FP8 cooperative-matrix extension
+at device-init and only enables `VF_FP8_NATIVE_WMMA` when it's
+actually advertised. On a driver without the extension the BF16
+conversion path runs without crashing, and the auto-detect chain
+keeps `VF_FP8_NATIVE_WMMA` off automatically.
 
 ## Kernel parameter
 
@@ -158,8 +141,6 @@ Path / model variables:
 | Variable               | Effect                                                              |
 |------------------------|---------------------------------------------------------------------|
 | `VF_MODEL_PATH`        | Default model path (used when `--model` is omitted)                 |
-| `VK_ICD_FILENAMES`     | Mesa ICD JSON (set this to switch between system Mesa and `~/tmp/`) |
-| `LD_LIBRARY_PATH`      | Mesa lib dir (paired with `VK_ICD_FILENAMES`)                       |
 
 ## Recommended defaults
 
@@ -171,7 +152,9 @@ export VF_FP8_NATIVE_WMMA=1
 ```
 
 Set them in your shell profile or `~/.config/environment.d/vulkanforge.conf`.
-On Mesa 26.0.x leave `VF_FP8_NATIVE_WMMA` unset.
+On a driver that doesn't advertise `shaderFloat8CooperativeMatrix`
+leave `VF_FP8_NATIVE_WMMA` unset (or just use `VF_FP8=auto`, which
+decides for you).
 
 For 14B FP8 on Zen 4 / Sapphire Rapids (or 12 GB cards anywhere
 with AVX-512), additionally:

@@ -89,10 +89,11 @@ pub enum ShaderId {
     /// of `MulCoopmatFp8Bn32`. ELEM_TYPE = floate4m3_t instead of
     /// bfloat16_t; ACO emits `v_wmma_f32_16x16x16_fp8_fp8` directly
     /// and `v_cvt_pk_fp8_f32` for the activation FP32 → FP8 conversion.
-    /// Requires Mesa 26.1+ (FP8 cooperative matrix). Mixed FP8/BF16
-    /// is unsupported on RADV (amdllpc rejects). Routed by
-    /// `VF_FP8_NATIVE_WMMA=1` for per-tensor / per-channel FP8
-    /// models; block-wise FP8 stays on the Sprint 36 BF16 path.
+    /// Requires `shaderFloat8CooperativeMatrix` advertised by the
+    /// driver. Mixed FP8/BF16 is unsupported on RADV (amdllpc
+    /// rejects). Routed by `VF_FP8_NATIVE_WMMA=1` for per-tensor /
+    /// per-channel FP8 models; block-wise FP8 stays on the Sprint 36
+    /// BF16 path.
     MulCoopmatFp8NativeBn32,
     RmsNorm,
     RopeNorm,

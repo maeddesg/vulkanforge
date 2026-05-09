@@ -191,8 +191,9 @@ pub fn apply_pre_device(model_path: &Path) -> PhaseAResult {
 
 /// Phase B — runs *after* `VulkanDevice::new()`. Takes the device's
 /// real `native_fp8_wmma` capability (so we don't promise native
-/// WMMA on Mesa 26.0.x) and writes the legacy flags that
-/// `forward.rs` / `loader.rs` will read next.
+/// WMMA on a driver that doesn't advertise the FP8 cooperative-matrix
+/// extension) and writes the legacy flags that `forward.rs` /
+/// `loader.rs` will read next.
 pub fn apply_post_device(phase_a: &PhaseAResult, native_fp8_wmma: bool) {
     if phase_a.mode != Fp8Mode::Auto {
         return; // Explicit On/Off — user is in charge.
@@ -225,7 +226,14 @@ pub fn print_summary(phase_a: &PhaseAResult, native_fp8_wmma: bool) {
     let on = |k: &str| std::env::var(k).map(|v| v == "1").unwrap_or(false);
     println!("VF_FP8=auto detected:");
     println!("  FP8 model:      {}", if phase_a.is_fp8_model { "yes" } else { "no (GGUF)" });
-    println!("  Native WMMA:    {}", if native_fp8_wmma { "yes (Mesa 26.1+)" } else { "no (BF16 fallback)" });
+    println!(
+        "  Native WMMA:    {}",
+        if native_fp8_wmma {
+            "yes (VK_EXT_shader_float8)"
+        } else {
+            "no (BF16 conversion path)"
+        }
+    );
     println!("  AVX-512:        {}", if phase_a.avx512 { "yes" } else { "no" });
     println!("  Model size:     ~{:.1} B params", phase_a.model_params_billions);
     println!("  → Native WMMA:  {}", if on("VF_FP8_NATIVE_WMMA") { "ON" } else { "OFF" });
