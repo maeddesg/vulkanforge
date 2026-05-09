@@ -201,14 +201,15 @@ impl PipelineRegistry {
                     ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes, None)
                 }
                 // silu, swiglu, multi_add_rms, copy, rope_norm,
-                // rope_neox: no spec consts.
+                // rope_neox, fma_add: no spec consts.
                 ShaderId::Silu
                 | ShaderId::SwiGLU
                 | ShaderId::GeluPytorchTanhGlu
                 | ShaderId::MultiAddRms
                 | ShaderId::Copy
                 | ShaderId::RopeNorm
-                | ShaderId::RopeNeox => {
+                | ShaderId::RopeNeox
+                | ShaderId::FmaAdd => {
                     ComputeKernel::from_spv(device, &words, cache)
                 }
                 ShaderId::ScalarAttn => {

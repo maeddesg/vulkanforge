@@ -104,7 +104,19 @@ impl Forward {
             let res1 = mk_storage(hidden_bytes, MemoryLocation::GpuOnly, &format!("res1{suf}"))?;
             let gate_buf = mk_storage(ffn_bytes, MemoryLocation::GpuOnly, &format!("gate_buf{suf}"))?;
             let up_buf = mk_storage(ffn_bytes, MemoryLocation::GpuOnly, &format!("up_buf{suf}"))?;
-            let ffn_hidden = mk_storage(ffn_bytes, MemoryLocation::GpuOnly, &format!("ffn_hidden{suf}"))?;
+            // Sprint 51D-D — Gemma-4-26B-A4B has `intermediate_size=2112 <
+            // hidden_size=2816`, so the standard `ffn_bytes` allocation
+            // is too small for: (a) the MoE per-token accumulator that
+            // collects K weighted expert outputs (each of size
+            // `[hidden]`), and (b) the legacy 51D-B PostMoeNorm path
+            // which reads `cols=hidden_dim` floats from `ffn_hidden`
+            // (latent OOB on 26B, harmless on every other arch where
+            // `ffn_dim ≥ hidden_dim`). `max(ffn_bytes, hidden_bytes)`
+            // is unconditional: on Qwen3 / Llama / E2B `ffn_dim` is
+            // already several × `hidden_dim`, so the `.max(…)` is a
+            // no-op there.
+            let ffn_hidden_bytes = ffn_bytes.max(hidden_bytes);
+            let ffn_hidden = mk_storage(ffn_hidden_bytes, MemoryLocation::GpuOnly, &format!("ffn_hidden{suf}"))?;
             let ffn_out = mk_storage(hidden_bytes, MemoryLocation::GpuOnly, &format!("ffn_out{suf}"))?;
             // Phase 3E drift-fix: rope_pos_buf must hold one slot per
             // prefill token (otherwise the per-token host writes during
@@ -282,8 +294,26 @@ impl Forward {
         let batch_o          = mk_storage(pp_hidden, MemoryLocation::GpuOnly,  "batch_o")?;
         let batch_gate       = mk_storage(pp_ffn,    MemoryLocation::GpuOnly,  "batch_gate")?;
         let batch_up         = mk_storage(pp_ffn,    MemoryLocation::GpuOnly,  "batch_up")?;
-        let batch_ffn_hidden = mk_storage(pp_ffn,    MemoryLocation::GpuOnly,  "batch_ffn_hidden")?;
+        // Sprint 51D-D — same `max(ffn, hidden)` rationale as the
+        // per-slot `ffn_hidden` above, applied per-token across the
+        // full prefill batch.
+        let batch_ffn_hidden_bytes = pp_ffn.max(pp_hidden);
+        let batch_ffn_hidden = mk_storage(batch_ffn_hidden_bytes, MemoryLocation::GpuOnly,  "batch_ffn_hidden")?;
         let batch_ffn_out    = mk_storage(pp_hidden, MemoryLocation::GpuOnly,  "batch_ffn_out")?;
+
+        // Sprint 51D-D — host-readable staging for MoE router input.
+        // Sized for the worst case: full prefill batch × hidden × 4 B.
+        // Cheap (~1.4 MB on 26B at pp=128); always allocated so the
+        // buffer-management code stays uniform across MoE / non-MoE
+        // models.
+        let moe_route_staging_bytes = pp_hidden.max(
+            (config.hidden_dim as u64) * 4,
+        );
+        let moe_route_staging = mk_storage(
+            moe_route_staging_bytes,
+            MemoryLocation::GpuToCpu,
+            "moe_route_staging",
+        )?;
 
         // Descriptor pool sized for one prefill_batch submit at
         // max_prefill_tokens, plus the per-token forward fallback.
@@ -636,6 +666,9 @@ impl Forward {
             prefill_fence,
             layers_per_submit,
             mid_frame_fence,
+            moe_route_staging,
+            moe_routing: None,
+            moe_routing_batch: None,
             logits_buf,
             logits_staging,
             hidden_staging,
@@ -752,6 +785,8 @@ impl Forward {
         self.batch_up.destroy(device, allocator);
         self.batch_ffn_hidden.destroy(device, allocator);
         self.batch_ffn_out.destroy(device, allocator);
+        // Sprint 51D-D — MoE router staging.
+        self.moe_route_staging.destroy(device, allocator);
         self.kv_cache.destroy(device, allocator);
         if let Some(p) = self.profiler {
             p.destroy(device);

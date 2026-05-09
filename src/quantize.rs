@@ -273,6 +273,73 @@ pub fn quantize_f32_to_q4k(input: &[f32]) -> Vec<u8> {
     output
 }
 
+/// Sprint 51D-D — Q4_K quantizer that pads each "row" to the next
+/// multiple of 256 with zeros before quantization. Required for 3D
+/// expert weights whose innermost dim isn't 256-aligned (Gemma-4-26B-A4B
+/// `experts.down_proj` has K=704 = `moe_intermediate_size`; Q4_K's
+/// 256-element block layout would otherwise drop the last 192
+/// elements per row when the GEMV shader runs with `ncols/QUANT_K`
+/// integer-truncated to 2 instead of 2.75).
+///
+/// Inputs:
+/// - `input` length = `n_rows × k_orig`. For 3D expert tensors, `n_rows`
+///   collapses the leading two dims (e.g., `[128 × 2816, 704]` for
+///   26B's down_proj).
+/// - `k_orig`: original innermost dim length.
+/// - `k_padded`: target innermost dim length, must be a multiple of 256
+///   and ≥ `k_orig`. Padded positions are zero-filled before
+///   quantization so the dequantized result is exactly 0 there
+///   (verified by `all_zeros_round_trip`); the padded zeros contribute
+///   nothing to the GEMV sum, so the math is unchanged.
+///
+/// Output bytes layout matches the standard Q4_K row format:
+/// `n_rows × (k_padded / 256) × 144` bytes. The shader dispatch pushes
+/// `ncols = k_padded` (not `k_orig`); the input vector binding may
+/// have garbage past `k_orig` but is multiplied by zero.
+pub fn quantize_f32_to_q4k_padded_rows(
+    input: &[f32],
+    n_rows: usize,
+    k_orig: usize,
+    k_padded: usize,
+) -> Vec<u8> {
+    assert!(
+        k_padded % QK_K == 0,
+        "k_padded {k_padded} must be a multiple of {QK_K}"
+    );
+    assert!(
+        k_padded >= k_orig,
+        "k_padded {k_padded} must be ≥ k_orig {k_orig}"
+    );
+    assert_eq!(
+        input.len(),
+        n_rows * k_orig,
+        "input len mismatch: got {}, expected {} × {} = {}",
+        input.len(),
+        n_rows,
+        k_orig,
+        n_rows * k_orig,
+    );
+    let n_blocks_per_row = k_padded / QK_K;
+    let total_blocks = n_rows * n_blocks_per_row;
+    let mut output = vec![0u8; total_blocks * Q4K_BLOCK_BYTES];
+    output
+        .par_chunks_mut(n_blocks_per_row * Q4K_BLOCK_BYTES)
+        .enumerate()
+        .for_each(|(r, row_bytes)| {
+            // Build a padded row in a thread-local buffer (cheap;
+            // k_padded is at most a few thousand floats).
+            let mut padded = vec![0.0_f32; k_padded];
+            padded[..k_orig].copy_from_slice(&input[r * k_orig..(r + 1) * k_orig]);
+            // padded[k_orig..] already zero-initialized.
+            for b in 0..n_blocks_per_row {
+                let xi = &padded[b * QK_K..(b + 1) * QK_K];
+                let yi = &mut row_bytes[b * Q4K_BLOCK_BYTES..(b + 1) * Q4K_BLOCK_BYTES];
+                quantize_block_q4k(xi, yi);
+            }
+        });
+    output
+}
+
 /// Serial reference impl of `quantize_f32_to_q4k`. Public only via
 /// `#[cfg(test)]` — used by the bit-identity test that proves the
 /// rayon path is functionally equivalent.

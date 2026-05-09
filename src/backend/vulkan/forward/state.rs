@@ -254,6 +254,28 @@ pub struct Forward {
     /// Allocated unconditionally; the per-token cost is zero on
     /// non-MoE archs because nothing dispatches a mid-frame submit.
     pub(super) mid_frame_fence: vk::Fence,
+    /// Sprint 51D-D — host-readable staging for MoE router input
+    /// (post-Pre-MoE-Norm hidden state). The router runs entirely on
+    /// the CPU, so each MoE-bearing layer:
+    ///   1. `cmd_copy_buffer(scratch_b → moe_route_staging[..])`
+    ///   2. compute→transfer + transfer→host barriers
+    ///   3. `mid_frame_submit_and_wait` (Sprint 51D-C)
+    ///   4. CPU reads staging slice, picks Top-K experts.
+    /// Sized for `max_prefill_tokens × hidden_size × 4` so the same
+    /// buffer covers decode (1 token) and prefill (full batch). 26B
+    /// at default pp=128: 128 × 2816 × 4 = 1.4 MB.
+    pub(super) moe_route_staging: GpuBuffer,
+    /// Sprint 51D-D — last decode-token routing state. `Some` after
+    /// `step_moe_route` runs; consumed by `step_moe_expert_ffn` and
+    /// then cleared. Each entry: `(expert_idx, weight)` where weight
+    /// is post-renormalize-and-per-expert-scale (i.e., the scalar
+    /// applied to the expert's FFN output before accumulation).
+    pub(super) moe_routing: Option<Vec<(u32, f32)>>,
+    /// Sprint 51D-D — prefill per-token routing. Outer index =
+    /// token offset within the prefill batch; inner = same shape as
+    /// `moe_routing` above. Populated by `b_step_moe_route` once per
+    /// MoE-bearing layer; consumed by `b_step_moe_expert_ffn`.
+    pub(super) moe_routing_batch: Option<Vec<Vec<(u32, f32)>>>,
     pub(super) logits_buf: GpuBuffer,
     /// Sprint 27 — host-readable staging copy of `logits_buf`.
     /// `logits_buf` is now `GpuOnly` (fast GPU-local writes from

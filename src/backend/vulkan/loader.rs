@@ -20,7 +20,7 @@ use super::commands::CommandContext;
 use super::device::VulkanDevice;
 use super::gguf::{GgmlType, GgufFile, ModelConfig};
 use crate::hf_config::{HfConfig, Llama3RopeScaling};
-use crate::quantize::{quantize_f32_to_q4k, QK_K};
+use crate::quantize::{quantize_f32_to_q4k, quantize_f32_to_q4k_padded_rows, QK_K};
 use crate::safetensors::{hf_to_vf_name, SafeTensorsFile, TensorDtype, TensorInfo};
 
 /// Staging-buffer size used for batched uploads. Sprint 20-M1
@@ -122,6 +122,20 @@ pub struct LoadedModel {
     /// vector ([num_layers × hps] FP32) is uploaded to a per-slot
     /// CpuToGpu buffer and consumed by `dispatch_layer`'s PLE block.
     pub ple_data: Option<PleData>,
+    /// Sprint 51D-D — Host-cached MoE router weights for Gemma-4-26B-A4B.
+    /// Router runs entirely on the CPU after a `mid_frame_submit_and_wait`
+    /// (Sprint 51D-C) hands the post-Pre-MoE-Norm hidden state back to
+    /// the host. The router is small (per layer: `[n_experts × hidden]
+    /// + [hidden] + [n_experts]` = 363392 floats on 26B; total ~43 MB
+    /// FP32 across all 30 layers) and has no GEMM cost the GPU could
+    /// usefully share, so a CPU implementation is simpler than a
+    /// shader and avoids GPU→CPU readback of the proj output. The GPU
+    /// upload of these tensors (which still happens via the standard
+    /// path because `should_quantize_st` skips them but doesn't gate
+    /// uploads) is unused in this sprint — a follow-up can also skip
+    /// upload to free ~21 MB of VRAM. `Some` only when the model is
+    /// Gemma-4 with `enable_moe_block=true`.
+    pub moe_router_data: Option<MoeRouterData>,
 }
 
 /// Sprint 43D-3 + 43D-4 — Per-Layer Embeddings runtime state for Gemma-4.
@@ -248,6 +262,41 @@ impl PleData {
         }
         out
     }
+}
+
+/// Sprint 51D-D — Host-cached MoE router state for Gemma-4-26B-A4B.
+///
+/// One `MoeRouterLayerData` per layer; the router runs entirely on the
+/// CPU between two halves of the per-token GPU command buffer. See the
+/// docstring on `LoadedModel::moe_router_data` for the rationale.
+///
+/// All weights are stored as plain FP32 host vectors (expanded from
+/// the on-disk BF16 representation at load). The router is invoked
+/// once per token per MoE-bearing layer; for 26B that's `seq_len ×
+/// 30` calls per forward, which totals ~10 ms of CPU time on AVX-512
+/// — negligible vs. the ~80 ms / token GPU work.
+pub struct MoeRouterData {
+    pub n_experts: u32,
+    pub top_k: u32,
+    pub hidden_size: u32,
+    pub rms_norm_eps: f32,
+    /// Index = layer (0..n_layers). Layers without an MoE block have
+    /// an empty entry — never accessed because the layer-plan builder
+    /// gates `MoeRoute` / `MoeExpertFfn` steps on `enable_moe_block`.
+    /// 26B emits MoE on every layer, so all entries are populated.
+    pub layers: Vec<MoeRouterLayerData>,
+}
+
+pub struct MoeRouterLayerData {
+    /// Row-major `[n_experts, hidden_size]` FP32. PyTorch Linear
+    /// convention: `proj[e][h] = proj[e * hidden_size + h]`.
+    pub proj: Vec<f32>,
+    /// Per-channel scale `[hidden_size]` applied after parameterless
+    /// RMSNorm of the input, before the GEMV against `proj`.
+    pub scale: Vec<f32>,
+    /// Per-expert scale `[n_experts]` applied to each renormalized
+    /// Top-K weight before they leave the routing function.
+    pub per_expert_scale: Vec<f32>,
 }
 
 impl LoadedModel {
@@ -397,6 +446,10 @@ impl LoadedModel {
             // map directly into a `CpuLmHead` without requantize).
             cpu_lm_head: None,
             ple_data: None,
+            // GGUF path: no Gemma-4 MoE models in GGUF land yet. Whenever
+            // a GGUF MoE export shows up, `MoeRouterData` can be built
+            // from the GGUF tensor table the same way `ple_data` is.
+            moe_router_data: None,
         })
     }
 
@@ -695,7 +748,36 @@ impl LoadedModel {
                             let bf = u16::from_le_bytes([raw[2 * i], raw[2 * i + 1]]);
                             f32_vec[i] = bf16_to_f32(bf);
                         }
-                        let q4k = quantize_f32_to_q4k(&f32_vec);
+                        // Sprint 51D-D — 3D expert tensors with
+                        // innermost dim not aligned to QK_K need
+                        // per-row padding so each row is a whole
+                        // number of Q4_K blocks. This is exactly
+                        // Gemma-4-26B-A4B's `experts.down_proj`
+                        // (shape `[128, 2816, 704]` — K=704 → padded
+                        // to 768). Otherwise the GEMV shader
+                        // integer-truncates `ncols/QUANT_K` and
+                        // silently drops the last 192 elements per
+                        // row, producing garbage tokens.
+                        let needs_padding = info.shape.len() == 3
+                            && hf_name.contains("experts.")
+                            && (info.shape[2] as usize) % QK_K != 0;
+                        let q4k = if needs_padding {
+                            let n_rows = (info.shape[0] as usize)
+                                       * (info.shape[1] as usize);
+                            let k_orig = info.shape[2] as usize;
+                            let k_padded = k_orig.div_ceil(QK_K) * QK_K;
+                            eprintln!(
+                                "Sprint 51D-D: padded-Q4_K for {hf_name} \
+                                 (rows={n_rows} K={k_orig}→{k_padded}, \
+                                 +{:.1}% bytes vs unpadded)",
+                                100.0 * ((k_padded as f64 / k_orig as f64) - 1.0),
+                            );
+                            quantize_f32_to_q4k_padded_rows(
+                                &f32_vec, n_rows, k_orig, k_padded,
+                            )
+                        } else {
+                            quantize_f32_to_q4k(&f32_vec)
+                        };
                         // FP32-equivalent original size for compression ratio
                         // (BF16-on-disk would understate the saving since
                         // the runtime would have expanded to FP32 anyway).
@@ -1273,6 +1355,72 @@ impl LoadedModel {
             None
         };
 
+        // Sprint 51D-D — Build the host-cached MoE router state for
+        // Gemma-4-26B-A4B. The 51D-C `mid_frame_submit_and_wait`
+        // primitive lets the per-layer router run on the CPU between
+        // two halves of the per-token GPU CB; this populates the
+        // tables it consumes. Mirrors the PleData pattern: read the
+        // SafeTensors mmap directly, expand BF16 → FP32, validate
+        // sizes, store as plain host vectors.
+        let moe_router_data = match hf.gemma4.as_ref() {
+            Some(gm) if gm.enable_moe_block => {
+                let n_layers = config.n_layers as usize;
+                let n_experts = gm.n_experts;
+                let top_k = gm.top_k_experts;
+                let hidden = config.hidden_dim;
+                let mut layers: Vec<MoeRouterLayerData> = Vec::with_capacity(n_layers);
+                let mut total_bytes: usize = 0;
+                for layer in 0..n_layers {
+                    let proj_path = format!(
+                        "model.language_model.layers.{layer}.router.proj.weight"
+                    );
+                    let scale_path = format!(
+                        "model.language_model.layers.{layer}.router.scale"
+                    );
+                    let pes_path = format!(
+                        "model.language_model.layers.{layer}.router.per_expert_scale"
+                    );
+                    let proj_info = st.tensor(&proj_path).ok_or_else(|| {
+                        LoaderError::Buffer(format!("MoE router missing: {proj_path}"))
+                    })?;
+                    let scale_info = st.tensor(&scale_path).ok_or_else(|| {
+                        LoaderError::Buffer(format!("MoE router missing: {scale_path}"))
+                    })?;
+                    let pes_info = st.tensor(&pes_path).ok_or_else(|| {
+                        LoaderError::Buffer(format!("MoE router missing: {pes_path}"))
+                    })?;
+                    // proj: [n_experts, hidden] = [128, 2816], BF16.
+                    let proj_expected = (n_experts as usize) * (hidden as usize);
+                    let proj: Vec<f32> = read_router_tensor_f32(
+                        &st, proj_info, &proj_path, proj_expected,
+                    )?;
+                    // scale: [hidden] = [2816], BF16.
+                    let scale: Vec<f32> = read_router_tensor_f32(
+                        &st, scale_info, &scale_path, hidden as usize,
+                    )?;
+                    // per_expert_scale: [n_experts] = [128], BF16.
+                    let per_expert_scale: Vec<f32> = read_router_tensor_f32(
+                        &st, pes_info, &pes_path, n_experts as usize,
+                    )?;
+                    total_bytes += (proj.len() + scale.len() + per_expert_scale.len()) * 4;
+                    layers.push(MoeRouterLayerData { proj, scale, per_expert_scale });
+                }
+                eprintln!(
+                    "Sprint 51D-D MoE router: {n_layers} layers × ({n_experts} × \
+                     {hidden} + {hidden} + {n_experts}) FP32 host = {:.1} MB",
+                    total_bytes as f64 / 1e6,
+                );
+                Some(MoeRouterData {
+                    n_experts,
+                    top_k,
+                    hidden_size: hidden,
+                    rms_norm_eps: config.rms_norm_eps,
+                    layers,
+                })
+            }
+            _ => None,
+        };
+
         Ok((
             Self {
                 config,
@@ -1281,10 +1429,53 @@ impl LoadedModel {
                 upload_duration,
                 cpu_lm_head,
                 ple_data,
+                moe_router_data,
             },
             host_embed,
             hf,
         ))
+    }
+}
+
+/// Sprint 51D-D — Read a single MoE router tensor (BF16 or F32 source)
+/// from the SafeTensors mmap and expand to `Vec<f32>` of `expected_n`
+/// elements. Mirrors the BF16/F32 dispatch the PleData loader uses.
+fn read_router_tensor_f32(
+    st: &SafeTensorsFile,
+    info: &TensorInfo,
+    path: &str,
+    expected_n: usize,
+) -> Result<Vec<f32>, LoaderError> {
+    match info.dtype {
+        TensorDtype::BF16 => {
+            let raw = st.tensor_bytes(info);
+            if raw.len() != expected_n * 2 {
+                return Err(LoaderError::Buffer(format!(
+                    "{path}: BF16 size {} != expected {} (= {} elems × 2 B)",
+                    raw.len(), expected_n * 2, expected_n,
+                )));
+            }
+            Ok(raw
+                .chunks_exact(2)
+                .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect())
+        }
+        TensorDtype::F32 => {
+            let raw = st.tensor_bytes(info);
+            if raw.len() != expected_n * 4 {
+                return Err(LoaderError::Buffer(format!(
+                    "{path}: F32 size {} != expected {} (= {} elems × 4 B)",
+                    raw.len(), expected_n * 4, expected_n,
+                )));
+            }
+            Ok(raw
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect())
+        }
+        other => Err(LoaderError::Buffer(format!(
+            "{path}: dtype {other:?} not supported (BF16 or F32 only)"
+        ))),
     }
 }
 
@@ -1405,6 +1596,21 @@ fn should_quantize_st(hf_name: &str, info: &TensorInfo) -> bool {
     // is rank-agnostic, only numel matters).
     if info.shape.len() == 3 && hf_name.contains("experts.") {
         return true;
+    }
+    // Sprint 51D-D — 2D tensors whose innermost dim isn't a multiple
+    // of QK_K can't be expressed in Q4_K's row layout: the GEMV shader
+    // computes `num_blocks_per_row = ncols / QK_K` with integer
+    // division, silently dropping the last `ncols % QK_K` columns of
+    // every row. The 3D-experts case above has its own padded-row
+    // path; this guard handles the 2D case (e.g., Gemma-4-26B-A4B's
+    // Dense MLP `ffn_down.weight` of shape `[2816, 2112]` — K=2112,
+    // 2112 % 256 = 64). Falling back to FP32 costs ~0.7 GB extra on
+    // 26B's 30 layers and avoids a much larger plumbing change to
+    // thread per-tensor padded-K through every GEMV dispatch site.
+    if info.shape.len() == 2
+        && (info.shape[1] as usize) % QK_K != 0
+    {
+        return false;
     }
     if info.shape.len() != 2 {
         return false;

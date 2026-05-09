@@ -1,0 +1,30 @@
+#version 450
+
+// Sprint 51D-D — Fused multiply-add accumulator: out[i] += scale * in[i].
+//
+// Used by the Gemma-4 MoE expert-FFN block: each of the K (= 8 on
+// 26B-A4B) selected experts produces a `[hidden_size]` output via two
+// GEMVs + GLU activation; this shader scales by the renormalized
+// router weight and accumulates into a shared `ffn_hidden` buffer.
+//
+// 2 SSBOs (in, out) — the descriptor-set layout is derived by SPIR-V
+// reflection, so unused bindings are pruned. Keep this minimal so the
+// Rust-side `run_fma_add` doesn't have to write to a phantom binding.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0, std430) readonly buffer InBuf  { float data_a[]; };
+layout (binding = 1, std430) buffer        OutBuf { float data_d[]; };
+
+layout (push_constant) uniform Params {
+    uint  ne;       // element count
+    float scale;    // per-expert weight (post-renorm × per_expert_scale)
+} p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.ne) return;
+    data_d[i] = data_d[i] + p.scale * data_a[i];
+}
+// (Binding 1 is the output buffer; descriptor reflection now sees only
+// bindings 0 and 1, which is what `run_fma_add` writes.)

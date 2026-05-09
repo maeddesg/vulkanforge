@@ -1303,6 +1303,219 @@ impl Forward {
         });
     }
 
+    /// Sprint 51D-D — Q4_K GEMV with a byte-offset on the weight
+    /// buffer binding. Used by the MoE expert-FFN block to dispatch
+    /// against a slice of the packed `experts.gate_up_proj` /
+    /// `experts.down_proj` Q4_K-quantized 3D tensors. Each expert
+    /// occupies `n_blocks_per_expert × 144` bytes contiguously; the
+    /// offset is always `expert_idx × that_size` so it is a multiple
+    /// of 144 (and therefore of 16, satisfying RDNA4's 16-byte
+    /// `minStorageBufferOffsetAlignment`). The shader's per-block
+    /// dequant scales (`d`, `dmin`) are read directly from the bound
+    /// slice — the offset is purely a binding-side adjustment.
+    ///
+    /// Picks the subgroup variant when
+    /// `mul_mat_vec_subgroup_enabled` (Sprint 14B default-on for
+    /// K-quant decode); falls back to the LDS-tree variant otherwise.
+    /// `weight_scale` is fixed at 1.0 because Q4_K carries its scale
+    /// per block — the FP8 per-tensor `weight_scale` push-constant
+    /// is unused by the Q4_K shader.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_gemv_q4k_at_offset(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        weights: vk::Buffer,
+        weight_offset: u64,
+        input: vk::Buffer,
+        output: vk::Buffer,
+        k: u32,
+        m: u32,
+        label: &str,
+    ) {
+        let shader = if self.mul_mat_vec_subgroup_enabled {
+            ShaderId::MulMatVecQ4KSubgroup
+        } else {
+            ShaderId::MulMatVecQ4K
+        };
+        let kernel = registry.get(shader);
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[
+                (0, weights, weight_offset, 0),
+                (1, input, 0, 0),
+                (2, output, 0, 0),
+                (3, self.fuse0.handle, 0, 0),
+                (4, self.fuse1.handle, 0, 0),
+            ],
+        );
+        let pc = MatVecPushConstants {
+            ncols: k, stride_a: k, stride_b: k, stride_d: m,
+            batch_stride_a: k * m, batch_stride_b: k, batch_stride_d: m,
+            fusion_flags: 0, base_work_group_y: 0,
+            ne02: 1, ne12: 1, broadcast2: 1,
+            broadcast3: (1.0_f32).to_bits(),
+        };
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            let n_rows = crate::backend::vulkan::pipeline_registry::MMV_NUM_ROWS;
+            let groups = (m + n_rows - 1) / n_rows;
+            dev.device.cmd_dispatch(cmd, groups, 1, 1);
+        });
+    }
+
+    /// Sprint 51D-D — Q4_K GEMV with byte offsets on weight, input,
+    /// AND output bindings. Used by `b_step_moe_expert_ffn` to
+    /// dispatch a single per-token expert call against slices of the
+    /// per-batch `batch_o` (input) and `batch_ffn_hidden` (output)
+    /// slabs without an extra copy step. Offset/range conventions
+    /// match `alloc_or_get_set`: range=0 → WHOLE_SIZE, but here we
+    /// pass explicit ranges so the descriptor-set cache key
+    /// distinguishes per-token slices.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_gemv_q4k_at_offset_inout(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        weights: vk::Buffer, weight_offset: u64,
+        input: vk::Buffer, input_offset: u64, input_range: u64,
+        output: vk::Buffer, output_offset: u64, output_range: u64,
+        k: u32,
+        m: u32,
+        label: &str,
+    ) {
+        let shader = if self.mul_mat_vec_subgroup_enabled {
+            ShaderId::MulMatVecQ4KSubgroup
+        } else {
+            ShaderId::MulMatVecQ4K
+        };
+        let kernel = registry.get(shader);
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[
+                (0, weights, weight_offset, 0),
+                (1, input, input_offset, input_range),
+                (2, output, output_offset, output_range),
+                (3, self.fuse0.handle, 0, 0),
+                (4, self.fuse1.handle, 0, 0),
+            ],
+        );
+        let pc = MatVecPushConstants {
+            ncols: k, stride_a: k, stride_b: k, stride_d: m,
+            batch_stride_a: k * m, batch_stride_b: k, batch_stride_d: m,
+            fusion_flags: 0, base_work_group_y: 0,
+            ne02: 1, ne12: 1, broadcast2: 1,
+            broadcast3: (1.0_f32).to_bits(),
+        };
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            let n_rows = crate::backend::vulkan::pipeline_registry::MMV_NUM_ROWS;
+            let groups = (m + n_rows - 1) / n_rows;
+            dev.device.cmd_dispatch(cmd, groups, 1, 1);
+        });
+    }
+
+    /// Sprint 51D-D — `out[off..off+n*4] += scale * in[..n*4]`.
+    /// Offset variant of `run_fma_add` for the batch path.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_fma_add_at_offset(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        in_buf: vk::Buffer, in_offset: u64,
+        out_buf: vk::Buffer, out_offset: u64,
+        n: u32,
+        scale: f32,
+        label: &str,
+    ) {
+        let kernel = registry.get(ShaderId::FmaAdd);
+        let n_bytes = (n as u64) * 4;
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[
+                (0, in_buf,  in_offset,  n_bytes),
+                (1, out_buf, out_offset, n_bytes),
+            ],
+        );
+        let pc: [u32; 2] = [n, scale.to_bits()];
+        let dispatch_x = (n + 255) / 256;
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
+        });
+    }
+
+    /// Sprint 51D-D — fused multiply-add accumulator.
+    /// `out[i] = out[i] + scale * in[i]` over `n` elements. Used by the
+    /// Gemma-4 MoE expert-FFN block to scale each selected expert's
+    /// FFN output by its post-renormalize router weight and accumulate
+    /// into a shared `ffn_hidden` buffer. The shader uses a custom 8-byte
+    /// push block (`ne` + `scale`) and 3 SSBOs; binding 1 is bound to
+    /// `fuse0` because the shader's reflection requires three buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_fma_add(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        in_buf: vk::Buffer,
+        out_buf: vk::Buffer,
+        n: u32,
+        scale: f32,
+        label: &str,
+    ) {
+        let kernel = registry.get(ShaderId::FmaAdd);
+        // FmaAdd shader has 2 bindings (0 = in, 1 = out). The descriptor
+        // set layout is reflected from SPIR-V, so unused bindings are
+        // pruned — match the live shape exactly.
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[(0, in_buf, 0, 0), (1, out_buf, 0, 0)],
+        );
+        // Custom 8-byte push block matching `Params { uint ne; float scale; }`.
+        let pc: [u32; 2] = [n, scale.to_bits()];
+        let dispatch_x = (n + 255) / 256;
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
+        });
+    }
+
     /// Sprint 43D-4 — broadcast-Mul where `b` is a single-scalar buffer.
     /// Computes `d[i] = a[i] * b[0]`. Implemented by routing through the
     /// existing `Mul` shader with `ne1*=1, nb1*=0` so the broadcast

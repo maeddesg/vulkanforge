@@ -49,6 +49,161 @@ use super::arch::{
 };
 use super::layer_plan::{ActivationKind, LayerPlan, LayerStep};
 use super::state::Forward;
+use super::super::loader::MoeRouterLayerData;
+
+/// Sprint 51D-D — one-shot log-on-first-call for the layer-0 router
+/// decision (debug aid). Prevents flooding decode-token logs with
+/// per-token prints; only the first decode token reports.
+static MOE_LAYER0_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Sprint 51D-D — COMPUTE_SHADER → TRANSFER barrier.
+///
+/// Equivalent of `transfer_to_compute_barrier` flipped: makes prior
+/// shader writes visible to a `cmd_copy_buffer` reading those same
+/// buffers. Used by the MoE route step to drain `scratch_b` (written
+/// by `step_pre_moe_norm`'s rms_norm dispatch) before the host
+/// readback copy.
+fn compute_to_transfer_barrier(dev: &super::super::device::VulkanDevice, cmd: vk::CommandBuffer) {
+    let mb = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+    unsafe {
+        dev.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            std::slice::from_ref(&mb),
+            &[], &[],
+        );
+    }
+}
+
+/// Sprint 51D-D — TRANSFER → HOST barrier.
+///
+/// Makes a just-issued `cmd_copy_buffer` write into a host-visible
+/// buffer observable to host reads after the next queue-submit drains.
+/// Required for the MoE router because the CPU reads
+/// `moe_route_staging` directly through its mmap pointer; without
+/// this barrier the HOST_READ access on the staging would race with
+/// the TRANSFER_WRITE.
+fn transfer_to_host_barrier(dev: &super::super::device::VulkanDevice, cmd: vk::CommandBuffer) {
+    let mb = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::HOST_READ);
+    unsafe {
+        dev.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            std::slice::from_ref(&mb),
+            &[], &[],
+        );
+    }
+}
+
+/// Sprint 51D-D — pure-CPU MoE router.
+///
+/// Implements the Gemma-4-26B-A4B routing formula
+/// (transformers `Gemma4SparseMoeBlock.forward`):
+///
+/// 1. Parameterless RMS-norm of `hidden`.
+/// 2. Multiply by `scale[hidden]` and `hidden_size**(-0.5)`
+///    (the brief-mandated "scale × inv_sqrt" pre-MatMul correction).
+/// 3. MatMul against `proj` shape `[n_experts, hidden]` row-major
+///    (PyTorch convention `proj[e][h] = proj[e * hidden + h]`).
+/// 4. Softmax → probs over experts.
+/// 5. Top-K with sort-by-prob.
+/// 6. Renormalize Top-K weights to sum=1.
+/// 7. Multiply each by `per_expert_scale[idx]`.
+///
+/// All math runs in `f64` accumulators to avoid catastrophic
+/// cancellation on the softmax denominator (n_experts=128).
+pub(super) fn cpu_moe_route(
+    hidden: &[f32],
+    layer_data: &MoeRouterLayerData,
+    hidden_size: usize,
+    n_experts: usize,
+    top_k: usize,
+    eps: f32,
+) -> Vec<(u32, f32)> {
+    debug_assert_eq!(hidden.len(), hidden_size);
+    debug_assert_eq!(layer_data.proj.len(), n_experts * hidden_size);
+    debug_assert_eq!(layer_data.scale.len(), hidden_size);
+    debug_assert_eq!(layer_data.per_expert_scale.len(), n_experts);
+
+    // (1) Parameterless RMS norm.
+    let mut sq_sum = 0.0_f64;
+    for &v in hidden {
+        sq_sum += (v as f64) * (v as f64);
+    }
+    let mean_sq = sq_sum / (hidden_size as f64);
+    let rms_inv = 1.0 / (mean_sq + eps as f64).sqrt();
+
+    // (2) Per-channel scale × hidden^(-0.5). Combine into one scalar
+    //     per channel to avoid two passes.
+    let inv_sqrt = (hidden_size as f64).powf(-0.5);
+    let mut scaled = vec![0.0_f64; hidden_size];
+    for i in 0..hidden_size {
+        scaled[i] = (hidden[i] as f64) * rms_inv
+                  * (layer_data.scale[i] as f64) * inv_sqrt;
+    }
+
+    // (3) MatMul: proj[e, :] · scaled  → scores[e].
+    let mut scores = vec![0.0_f64; n_experts];
+    for e in 0..n_experts {
+        let row = &layer_data.proj[e * hidden_size..(e + 1) * hidden_size];
+        let mut acc = 0.0_f64;
+        for j in 0..hidden_size {
+            acc += (row[j] as f64) * scaled[j];
+        }
+        scores[e] = acc;
+    }
+
+    // (4) Softmax (numerically stable: subtract max).
+    let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let mut sum = 0.0_f64;
+    let mut probs = vec![0.0_f64; n_experts];
+    for e in 0..n_experts {
+        let p = (scores[e] - max).exp();
+        probs[e] = p;
+        sum += p;
+    }
+    for p in probs.iter_mut() {
+        *p /= sum;
+    }
+
+    // (5) Top-K (partial-sort by descending prob).
+    let mut idx: Vec<usize> = (0..n_experts).collect();
+    idx.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+    idx.truncate(top_k);
+
+    // (6) Renormalize selected probs to sum=1.
+    let top_sum: f64 = idx.iter().map(|&i| probs[i]).sum();
+    let renorm = if top_sum > 0.0 { 1.0 / top_sum } else { 0.0 };
+
+    // (7) Apply per-expert scale.
+    idx.into_iter()
+        .map(|i| {
+            let w = probs[i] * renorm * (layer_data.per_expert_scale[i] as f64);
+            (i as u32, w as f32)
+        })
+        .collect()
+}
+
+/// Sprint 51D-D — sanity log for the layer-0 first-token router decision.
+fn log_router_decision(layer: u32, routing: &[(u32, f32)]) {
+    let pre_renorm_sum: f32 = routing.iter().map(|&(_, w)| w).sum();
+    let mut s = format!("Sprint 51D-D MoE Layer {layer} Top-{} = [", routing.len());
+    for (i, &(e, w)) in routing.iter().enumerate() {
+        if i > 0 { s.push_str(", "); }
+        s.push_str(&format!("({e}, {w:.4})"));
+    }
+    s.push_str(&format!("], post-renorm×pes sum = {pre_renorm_sum:.4}"));
+    eprintln!("{s}");
+}
 
 /// Per-call execution context shared between executors.
 pub(super) struct ExecCtx<'a> {
@@ -918,30 +1073,193 @@ impl DecodeExec {
         fwd.mark_written(&[ffn_out]);
     }
 
-    // === Sprint 51D-B Block 2 / 3 — stubs, real impl follows after Block 1 STOP-Gate ===
+    // === Sprint 51D-D — MoE routing + per-token expert FFN ===
 
+    /// Copy the post-Pre-MoE-Norm hidden state (scratch_b) to the
+    /// host-readable staging buffer, mid-frame-submit so the GPU work
+    /// drains, then run the router on the CPU and stash the Top-K
+    /// `(expert_idx, weight)` tuples on `Forward` for the next step
+    /// (`step_moe_expert_ffn`) to consume.
     fn step_moe_route(
         &self, fwd: &mut Forward, _cfg: &ModelConfig, ctx: &ExecCtx,
-        _n_experts: u32, _top_k: u32,
+        n_experts: u32, top_k: u32,
     ) {
-        // Sprint 51D-C — exercise the mid-frame submit pattern. The
-        // router GEMV + softmax + Top-K (Sprint 51D-D) will record its
-        // dispatches BEFORE this call and read the host-visible Top-K
-        // staging buffer AFTER. Calling it here without preceding work
-        // is a no-op-ish smoke that proves the
-        // end → submit → wait → reset → begin sequence returns
-        // cleanly; it does NOT make the 26B output correct (the
-        // unimplemented! below still trips on the very next step).
+        let router_data = ctx.model.moe_router_data
+            .as_ref()
+            .expect("MoeRoute step emitted but model has no MoeRouterData");
+        debug_assert_eq!(router_data.n_experts, n_experts);
+        debug_assert_eq!(router_data.top_k, top_k);
+        let hidden = router_data.hidden_size;
+        let bytes = (hidden as u64) * 4;
+
+        // (1) Compute → Transfer barrier on `scratch_b` (written by
+        //     step_pre_moe_norm just before us).
+        let scratch_b = fwd.cur().scratch_b.handle;
+        compute_to_transfer_barrier(ctx.dev, ctx.cmd);
+
+        // (2) Copy scratch_b → moe_route_staging.
+        let staging = fwd.moe_route_staging.handle;
+        unsafe {
+            let region = vk::BufferCopy { src_offset: 0, dst_offset: 0, size: bytes };
+            ctx.dev.device.cmd_copy_buffer(
+                ctx.cmd, scratch_b, staging, std::slice::from_ref(&region),
+            );
+        }
+
+        // (3) Transfer → Host barrier so the staging mmap is visible
+        //     to host reads after `mid_frame_submit_and_wait`.
+        transfer_to_host_barrier(ctx.dev, ctx.cmd);
+
+        // (4) Submit + wait + reset+begin (Sprint 51D-C primitive).
         fwd.mid_frame_submit_and_wait(ctx.dev, ctx.cmd)
-            .expect("mid_frame_submit_and_wait failed");
-        unimplemented!("Sprint 51D-D — MoeRoute (router GEMV + softmax + Top-K)");
+            .expect("mid_frame_submit_and_wait failed (decode MoE route)");
+
+        // (5) Read host-visible staging slice.
+        let raw = fwd.moe_route_staging.read_bytes()
+            .expect("moe_route_staging not host-visible");
+        let hidden_state: Vec<f32> = raw[..(bytes as usize)]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // (6) CPU route. `model.moe_router_data` is keyed by layer.
+        let layer_data = &router_data.layers[ctx.layer as usize];
+        let routing = cpu_moe_route(
+            &hidden_state, layer_data,
+            hidden as usize,
+            n_experts as usize,
+            top_k as usize,
+            router_data.rms_norm_eps,
+        );
+
+        // (7) Sanity log on layer 0, first token (helps spot router
+        //     bugs without polluting decode-token logs).
+        if ctx.layer == 0 && !MOE_LAYER0_LOGGED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            log_router_decision(0, &routing);
+        }
+
+        fwd.moe_routing = Some(routing);
     }
 
+    /// Per-token K-expert FFN. Reads the Top-K `(idx, weight)` tuples
+    /// stashed by `step_moe_route`, dispatches `gate_up + GLU + down`
+    /// once per expert against offset slices of the packed weight
+    /// tensors, and accumulates each expert's `[hidden]` output into
+    /// `ffn_hidden` weighted by the renormalized router weight.
     fn step_moe_expert_ffn(
-        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx,
-        _n_experts: u32, _top_k: u32, _moe_intermediate: u32,
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx,
+        _n_experts: u32, _top_k: u32, moe_intermediate: u32,
     ) {
-        unimplemented!("Sprint 51D-B Block 3 — MoeExpertFfn (per-token K-expert dispatch)");
+        let routing = fwd.moe_routing.take()
+            .expect("MoeExpertFfn before MoeRoute populated routing");
+        let scratch_b   = fwd.cur().scratch_b.handle;
+        let gate_buf    = fwd.cur().gate_buf.handle;
+        let up_buf      = fwd.cur().up_buf.handle;
+        // Sprint 51D-D — per-expert down-GEMV output goes to o_buf
+        // (hidden-sized, free during the FFN block) because gate_buf
+        // is `ffn_bytes`-sized which is < hidden_bytes on 26B
+        // (intermediate_size=2112 < hidden_size=2816).
+        let o_buf       = fwd.cur().o_buf.handle;
+        let ffn_hidden  = fwd.cur().ffn_hidden.handle;
+        let h           = cfg.hidden_dim;
+        let mi          = moe_intermediate;
+        // Sprint 51D-D — padded-K alignment for `down_proj`. When
+        // `moe_intermediate_size` (= K of the down GEMV) is not a
+        // multiple of 256, the loader pads each row to the next 256
+        // boundary in the Q4_K representation. The GEMV shader must
+        // then push `ncols=mi_padded` (not `mi`) so it iterates over
+        // the full 3 blocks per row instead of integer-truncating to
+        // 2. `gate_up_proj` always has K=hidden, which is 256-aligned
+        // for the shipped Gemma-4 configs, so no padding there.
+        let mi_padded: u32 = ((mi + 255) / 256) * 256;
+        let gate_up_bytes_per_expert: u64 =
+            (((2 * mi) as u64) * (h as u64) / 256) * 144;
+        let down_bytes_per_expert: u64 =
+            ((h as u64) * (mi_padded as u64) / 256) * 144;
+        let gate_up_w = layer_weight(ctx.model, ctx.layer, "moe_experts.gate_up_proj");
+        let down_w    = layer_weight(ctx.model, ctx.layer, "moe_experts.down_proj");
+
+        // Zero the accumulator before the per-expert loop. Replaces a
+        // dedicated "zero buffer" shader; the COMPUTE→TRANSFER barrier
+        // around it is implicit because we just begin'd a fresh CB
+        // (Sprint 51D-C primitive resets command-buffer state and the
+        // barrier-elision tracker before this step runs).
+        unsafe {
+            ctx.dev.device.cmd_fill_buffer(
+                ctx.cmd, ffn_hidden, 0, (h as u64) * 4, 0,
+            );
+        }
+        transfer_to_compute_barrier(ctx.dev, ctx.cmd);
+
+        for &(expert_idx, weight) in &routing {
+            // (a) gate_up GEMV: scratch_b × experts.gate_up_proj[e] → gate_buf [2*mi].
+            let gate_up_off = (expert_idx as u64) * gate_up_bytes_per_expert;
+            fwd.run_gemv_q4k_at_offset(
+                ctx.dev, ctx.registry, ctx.cmd,
+                gate_up_w, gate_up_off,
+                scratch_b, gate_buf,
+                h, 2 * mi,
+                "moe_gate_up",
+            );
+            fwd.mark_written(&[gate_buf]);
+            fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[gate_buf]);
+
+            // (b) GeluPytorchTanhGlu: gate_buf[0..mi] (gate) × gelu(gate_buf[mi..2mi]) (up) → up_buf [mi].
+            //     The shader expects 3 SSBOs (gate, up, output); we
+            //     bind gate_buf at two different offsets to feed both
+            //     halves of the packed gate_up output.
+            let kernel = ctx.registry.get(ShaderId::GeluPytorchTanhGlu);
+            let mi_bytes = (mi as u64) * 4;
+            let set = fwd.alloc_or_get_set(
+                ctx.dev, kernel.descriptor_set_layout,
+                &[
+                    (0, gate_buf, 0, mi_bytes),
+                    (1, gate_buf, mi_bytes, mi_bytes),
+                    (2, up_buf, 0, mi_bytes),
+                ],
+            );
+            let pc = SwigluPushConstants { n: mi };
+            let dispatch_x = (mi + 255) / 256;
+            let layout = kernel.pipeline_layout;
+            let pipeline = kernel.pipeline;
+            fwd.profile("moe_glu", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
+                dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                dev.device.cmd_bind_descriptor_sets(
+                    cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+                );
+                dev.device.cmd_push_constants(
+                    cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+                );
+                dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
+            });
+            fwd.mark_written(&[up_buf]);
+            fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[up_buf]);
+
+            // (c) down GEMV: up_buf × experts.down_proj[e] → o_buf [hidden].
+            //     Uses padded K (`mi_padded`); the input vector binding
+            //     extends past `mi` valid floats but the corresponding
+            //     padded weight columns are quantized zeros so the
+            //     extra contributions are exactly 0.
+            let down_off = (expert_idx as u64) * down_bytes_per_expert;
+            fwd.run_gemv_q4k_at_offset(
+                ctx.dev, ctx.registry, ctx.cmd,
+                down_w, down_off,
+                up_buf, o_buf,
+                mi_padded, h,
+                "moe_down",
+            );
+            fwd.mark_written(&[o_buf]);
+            fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[o_buf]);
+
+            // (d) ffn_hidden += weight * o_buf  (per-expert weighted accumulation).
+            fwd.run_fma_add(
+                ctx.dev, ctx.registry, ctx.cmd,
+                o_buf, ffn_hidden, h, weight,
+                "moe_fma_add",
+            );
+            fwd.mark_written(&[ffn_hidden]);
+            fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[ffn_hidden]);
+        }
     }
 }
 
@@ -1970,29 +2288,181 @@ impl BatchExec {
         compute_barrier(ctx.dev, ctx.cmd);
     }
 
-    // === Block 2 / 3 stubs ===
+    // === Sprint 51D-D — Batch (prefill) MoE routing + expert FFN ===
 
     fn b_step_moe_route(
         &self, fwd: &mut Forward, _cfg: &ModelConfig, ctx: &ExecCtx,
-        _n_experts: u32, _top_k: u32,
+        n_experts: u32, top_k: u32,
     ) {
-        // Sprint 51D-C — same probe as the decode path. Note: prefill
-        // already does manual multi-CB pacing (Sprint 19B-A
-        // `prefill_cbs`), so a real Sprint 51D-D batch implementation
-        // will need to thread mid-frame submit through the chunk
-        // boundary logic. For 51D-C we just exercise the helper to
-        // catch any cross-path Vulkan-validation issues that decode
-        // alone wouldn't surface.
+        let router_data = ctx.model.moe_router_data
+            .as_ref()
+            .expect("MoeRoute step (batch) emitted but model has no MoeRouterData");
+        let hidden = router_data.hidden_size;
+        let seq_len = batch_seq_len(ctx);
+        let total_bytes = (seq_len as u64) * (hidden as u64) * 4;
+
+        // Pre-MoE-Norm output is in batch_o (b_step_pre_moe_norm above).
+        let batch_in = fwd.batch_o.handle;
+        compute_to_transfer_barrier(ctx.dev, ctx.cmd);
+        let staging = fwd.moe_route_staging.handle;
+        unsafe {
+            let region = vk::BufferCopy { src_offset: 0, dst_offset: 0, size: total_bytes };
+            ctx.dev.device.cmd_copy_buffer(
+                ctx.cmd, batch_in, staging, std::slice::from_ref(&region),
+            );
+        }
+        transfer_to_host_barrier(ctx.dev, ctx.cmd);
         fwd.mid_frame_submit_and_wait(ctx.dev, ctx.cmd)
-            .expect("mid_frame_submit_and_wait failed (batch)");
-        unimplemented!("Sprint 51D-D — b_step_moe_route");
+            .expect("mid_frame_submit_and_wait failed (batch MoE route)");
+
+        // CPU-side per-token routing.
+        let raw = fwd.moe_route_staging.read_bytes()
+            .expect("moe_route_staging not host-visible");
+        let mut all_routing: Vec<Vec<(u32, f32)>> = Vec::with_capacity(seq_len as usize);
+        let layer_data = &router_data.layers[ctx.layer as usize];
+        let h_usize = hidden as usize;
+        for t in 0..(seq_len as usize) {
+            let off = t * h_usize * 4;
+            let token_hidden: Vec<f32> = raw[off..off + h_usize * 4]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let routing = cpu_moe_route(
+                &token_hidden, layer_data,
+                h_usize, n_experts as usize, top_k as usize,
+                router_data.rms_norm_eps,
+            );
+            // Same one-shot log as decode path, gated on token 0 layer 0.
+            if ctx.layer == 0 && t == 0
+                && !MOE_LAYER0_LOGGED.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                log_router_decision(0, &routing);
+            }
+            all_routing.push(routing);
+        }
+        fwd.moe_routing_batch = Some(all_routing);
     }
 
     fn b_step_moe_expert_ffn(
-        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx,
-        _n_experts: u32, _top_k: u32, _moe_intermediate: u32,
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx,
+        _n_experts: u32, _top_k: u32, moe_intermediate: u32,
     ) {
-        unimplemented!("Sprint 51D-B Block 3 — b_step_moe_expert_ffn");
+        let routing_batch = fwd.moe_routing_batch.take()
+            .expect("MoeExpertFfn (batch) before MoeRoute populated routing");
+        let seq_len = batch_seq_len(ctx);
+        let h = cfg.hidden_dim;
+        let mi = moe_intermediate;
+        let h_bytes = (h as u64) * 4;
+        let mi_bytes = (mi as u64) * 4;
+        // Sprint 51D-D — padded-K alignment (see decode-side comment).
+        let mi_padded: u32 = ((mi + 255) / 256) * 256;
+        let gate_up_bytes_per_expert: u64 =
+            (((2 * mi) as u64) * (h as u64) / 256) * 144;
+        let down_bytes_per_expert: u64 =
+            ((h as u64) * (mi_padded as u64) / 256) * 144;
+        let gate_up_w = layer_weight(ctx.model, ctx.layer, "moe_experts.gate_up_proj");
+        let down_w    = layer_weight(ctx.model, ctx.layer, "moe_experts.down_proj");
+        let batch_in = fwd.batch_o.handle;
+        let batch_out = fwd.batch_ffn_hidden.handle;
+
+        // Zero the full batch_ffn_hidden output slab once.
+        unsafe {
+            ctx.dev.device.cmd_fill_buffer(
+                ctx.cmd, batch_out, 0, (seq_len as u64) * h_bytes, 0,
+            );
+        }
+        transfer_to_compute_barrier(ctx.dev, ctx.cmd);
+
+        // Per-token K-expert loop. Reuses the decode-slot per-token
+        // gate_buf / up_buf for the gate_up + GLU intermediates (sized
+        // ≥ 2*moe_int on 26B) and o_buf for the per-expert down output
+        // (hidden-sized, free during the FFN block).
+        let gate_buf = fwd.cur().gate_buf.handle;
+        let up_buf   = fwd.cur().up_buf.handle;
+        let o_buf    = fwd.cur().o_buf.handle;
+        for t in 0..(seq_len as usize) {
+            let in_off  = (t as u64) * h_bytes;
+            let out_off = (t as u64) * h_bytes;
+            let routing = &routing_batch[t];
+            for &(expert_idx, weight) in routing {
+                let gate_up_off = (expert_idx as u64) * gate_up_bytes_per_expert;
+                let down_off    = (expert_idx as u64) * down_bytes_per_expert;
+
+                // (a) gate_up GEMV: batch_in[t] × experts.gate_up_proj[e] → gate_buf [2*mi].
+                fwd.run_gemv_q4k_at_offset_inout(
+                    ctx.dev, ctx.registry, ctx.cmd,
+                    gate_up_w, gate_up_off,
+                    batch_in, in_off, (h as u64) * 4,
+                    gate_buf, 0, (2 * mi as u64) * 4,
+                    h, 2 * mi,
+                    "moe_gate_up_b",
+                );
+                fwd.mark_written(&[gate_buf]);
+                fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[gate_buf]);
+
+                // (b) GLU(gate, up) → up_buf [mi].
+                let kernel = ctx.registry.get(ShaderId::GeluPytorchTanhGlu);
+                let set = fwd.alloc_or_get_set(
+                    ctx.dev, kernel.descriptor_set_layout,
+                    &[
+                        (0, gate_buf, 0, mi_bytes),
+                        (1, gate_buf, mi_bytes, mi_bytes),
+                        (2, up_buf, 0, mi_bytes),
+                    ],
+                );
+                let pc = SwigluPushConstants { n: mi };
+                let dispatch_x = (mi + 255) / 256;
+                let layout = kernel.pipeline_layout;
+                let pipeline = kernel.pipeline;
+                fwd.profile("moe_glu_b", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
+                    dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                    dev.device.cmd_bind_descriptor_sets(
+                        cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+                    );
+                    dev.device.cmd_push_constants(
+                        cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+                    );
+                    dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
+                });
+                fwd.mark_written(&[up_buf]);
+                fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[up_buf]);
+
+                // (c) down GEMV: up_buf × experts.down_proj[e] → o_buf [hidden].
+                //     `mi_padded` matches decode path. up_buf range is
+                //     `mi_bytes` (not the padded length) — the binding
+                //     stops there and the shader will read past the
+                //     range bound at most into the next valid buffer
+                //     region; with WHOLE_SIZE-binding semantics the
+                //     extra reads are in-bounds for the buffer (8448
+                //     bytes ≥ mi_padded × 4 = 3072 bytes) and the
+                //     padded weight columns are zero.
+                fwd.run_gemv_q4k_at_offset_inout(
+                    ctx.dev, ctx.registry, ctx.cmd,
+                    down_w, down_off,
+                    up_buf, 0, (mi_padded as u64) * 4,
+                    o_buf, 0, h_bytes,
+                    mi_padded, h,
+                    "moe_down_b",
+                );
+                fwd.mark_written(&[o_buf]);
+                fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[o_buf]);
+
+                // (d) batch_ffn_hidden[t] += weight * o_buf  (FmaAdd offset binding).
+                fwd.run_fma_add_at_offset(
+                    ctx.dev, ctx.registry, ctx.cmd,
+                    o_buf, 0,
+                    batch_out, out_off,
+                    h, weight,
+                    "moe_fma_add_b",
+                );
+                fwd.mark_written(&[batch_out]);
+                fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[batch_out]);
+            }
+        }
+        // Final compute_barrier so the next step (PostMoeNorm) sees a
+        // clean dirty-tracker; mirrors the trailing barrier the other
+        // batch steps emit.
+        compute_barrier(ctx.dev, ctx.cmd);
     }
 
     // ── shared GEMM-routing helper ───────────────────────────────────

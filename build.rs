@@ -264,6 +264,15 @@ const JOBS: &[ShaderJob] = &[
             ("FLOAT_TYPE", "float"),
         ],
     },
+    // Sprint 51D-D — Fused multiply-add: out[i] += scale * in[i].
+    // Custom 3-SSBO + 8-byte push block (ne + scale). Used by the
+    // Gemma-4 MoE expert-FFN block to accumulate weighted expert
+    // outputs.
+    ShaderJob {
+        out_name: "fma_add_f32.spv",
+        entry_source: "fma_add.comp",
+        defines: &[],
+    },
     // Element-wise multiply (gate * up in SwiGLU). generic_binary_head.
     ShaderJob {
         out_name: "mul_f32.spv",

@@ -99,6 +99,12 @@ pub enum ShaderId {
     RopeNorm,
     RopeNeox,
     Add,
+    /// Sprint 51D-D — Fused multiply-add accumulator
+    /// (`out[i] += scale * in[i]`). Used by the Gemma-4 MoE expert-FFN
+    /// block to accumulate each of the K selected experts' weighted
+    /// outputs into a shared `ffn_hidden` buffer. 3 SSBOs (in / fuse-
+    /// dummy / out), 8-byte push-constant block (`ne` + `scale`).
+    FmaAdd,
     Mul,
     Silu,
     /// v0.2 Sprint 9a — fused SwiGLU: out[i] = silu(gate[i]) * up[i].
@@ -386,6 +392,7 @@ impl ShaderId {
             ShaderId::RopeNorm => "rope_norm_f32",
             ShaderId::RopeNeox => "rope_neox_f32",
             ShaderId::Add => "add_f32",
+            ShaderId::FmaAdd => "fma_add_f32",
             ShaderId::Mul => "mul_f32",
             ShaderId::Silu => "silu_f32",
             ShaderId::SwiGLU => "swiglu_f32",
@@ -500,6 +507,7 @@ impl ShaderId {
             ShaderId::RopeNorm => ROPE_NORM_F32,
             ShaderId::RopeNeox => ROPE_NEOX_F32,
             ShaderId::Add => ADD_F32,
+            ShaderId::FmaAdd => FMA_ADD_F32,
             ShaderId::Mul => MUL_F32,
             ShaderId::Silu => SILU_F32,
             ShaderId::SwiGLU => SWIGLU_F32,
@@ -621,6 +629,7 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::RopeNorm,
     ShaderId::RopeNeox,
     ShaderId::Add,
+    ShaderId::FmaAdd,
     ShaderId::Mul,
     ShaderId::Silu,
     ShaderId::SwiGLU,
@@ -772,6 +781,7 @@ pub const RMS_NORM_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rms_no
 pub const ROPE_NORM_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope_norm_f32.spv"));
 pub const ROPE_NEOX_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope_neox_f32.spv"));
 pub const ADD_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/add_f32.spv"));
+pub const FMA_ADD_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fma_add_f32.spv"));
 pub const MUL_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_f32.spv"));
 pub const SILU_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silu_f32.spv"));
 pub const SWIGLU_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/swiglu_f32.spv"));
