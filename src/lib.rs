@@ -29,5 +29,6 @@
 pub mod auto_detect;
 pub mod backend;
 pub mod cpu;
+pub mod quantize;
 pub mod safetensors;
 pub mod hf_config;
