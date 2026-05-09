@@ -26,11 +26,16 @@ use crate::safetensors::{hf_to_vf_name, SafeTensorsFile, TensorDtype, TensorInfo
 /// Staging-buffer size used for batched uploads. Sprint 20-M1
 /// bumped this from 1 GiB → 2.5 GiB so the 8B Llama lm_head
 /// (128256 × 4096 × 4 B = 2.1 GiB after BF16→FP32 expansion) fits
-/// in a single staging slot. Still under RADV's 4-GiB
-/// `maxMemoryAllocationSize` (Phase-2A report §3.1). For GGUF
-/// loads the headroom is only paid as virtual memory until pages
-/// actually touch — `gpu-allocator` doesn't pin the whole slot.
-const STAGING_BYTES: u64 = 2_560 * 1024 * 1024;
+/// in a single staging slot. Sprint 51D-A bumped to 3.5 GiB so
+/// Gemma-4-26B-A4B's `token_embd.weight` (262144 × 2816 × 4 B =
+/// 2.95 GiB) fits — tied-weight model where `skip_embed_gpu` can't
+/// drop the upload because lm_head's fallback path reads the same
+/// GPU tensor (proper Embed-Lookup-Host-Pfad is a follow-up
+/// sub-sprint). Still under RADV's 4-GiB `maxMemoryAllocationSize`
+/// (Phase-2A report §3.1). For GGUF loads the headroom is only paid
+/// as virtual memory until pages actually touch — `gpu-allocator`
+/// doesn't pin the whole slot.
+const STAGING_BYTES: u64 = 3_584 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum LoaderError {
@@ -1356,10 +1361,6 @@ fn should_quantize_st(hf_name: &str, info: &TensorInfo) -> bool {
     if info.n_elements() % QK_K != 0 {
         return false;
     }
-    // Q4_K is a GEMM/GEMV input format; only 2D weight tensors apply.
-    if info.shape.len() != 2 {
-        return false;
-    }
     // Embeddings: lookup tables, never enter a GEMM.
     if hf_name.contains("embed_tokens") {
         return false;
@@ -1378,6 +1379,28 @@ fn should_quantize_st(hf_name: &str, info: &TensorInfo) -> bool {
     // Per-layer scalars (Gemma-4 `layer_scalar` [1]) — already filtered
     // by `n_elements % 256 != 0`, but defensive.
     if hf_name.ends_with("layer_scalar") {
+        return false;
+    }
+    // Sprint 51D-A — Gemma-4-26B MoE router weights stay FP32. The
+    // 2D `router.proj.weight` is 2816×128 = 360448 (% 256 == 0)
+    // which would otherwise be picked up by the 2D rule below; the
+    // 1D `router.scale` and `router.per_expert_scale` already get
+    // skipped by `shape.len() != 2`, but the blacklist keeps the
+    // intent explicit.
+    if hf_name.contains("router") {
+        return false;
+    }
+    // Q4_K is a GEMM/GEMV input format. 2D weight tensors are the
+    // common case (Q/K/V/O proj, MLP gate/up/down, embeddings).
+    // Sprint 51D-A — Gemma-4-26B's `experts.gate_up_proj` /
+    // `experts.down_proj` are packed 3D tensors `[n_experts, …, …]`
+    // whose total numel is a multiple of 256 (verified in 51A);
+    // route them through the same Q4_K quantizer (the block layout
+    // is rank-agnostic, only numel matters).
+    if info.shape.len() == 3 && hf_name.contains("experts.") {
+        return true;
+    }
+    if info.shape.len() != 2 {
         return false;
     }
     true
@@ -1593,19 +1616,23 @@ fn hf_to_model_config(hf: &HfConfig) -> Result<ModelConfig, LoaderError> {
             });
         }
 
-        // Sprint 51C — Gemma-4-26B-A4B MoE failsafe. The full router /
-        // expert tensor loading + dispatch arrives in Sprint 51D; 51C
-        // only adds the layer-plan structure. Refusing the load here
-        // beats a less-comprehensible crash deeper in the loader when
-        // the packed `experts.*` tensors hit unimplemented code paths.
-        if gm.enable_moe_block {
-            return Err(LoaderError::Buffer(
-                "Gemma-4 MoE block detected (e.g. Gemma-4-26B-A4B): \
-                 Sprint 51C added the layer plan + tensor naming; \
-                 expert tensor upload + MoE dispatch land in Sprint 51D"
-                    .into(),
-            ));
-        }
+        // Sprint 51D-A — Failsafe von 51C entfernt. Loader kann jetzt
+        // MoE-Tensoren laden:
+        //   - 3D experts.gate_up_proj / experts.down_proj durch den
+        //     Q4_K-Quantizer (`should_quantize_st` erkennt sie als
+        //     packed-3D mit numel % 256 == 0)
+        //   - router.proj.weight bleibt FP32 (router-blacklist in
+        //     should_quantize_st)
+        //   - router.scale / router.per_expert_scale sind 1D und
+        //     fallen automatisch durch (shape.len() != 2 + router-
+        //     blacklist defensive)
+        //   - 3 zusätzliche Norms (`ffn_post_norm_1` /
+        //     `ffn_pre_norm_2` / `ffn_post_norm_2`) durch
+        //     "norm"-blacklist ebenfalls FP32.
+        // Forward-Pfad ist NOCH im todo!()-Stub (Sprint 51D-B/C),
+        // ein 26B-Inference-Aufruf crasht weiterhin — aber jetzt mit
+        // einer klaren `not yet implemented`-Meldung statt einem
+        // Loader-Error.
 
         let embed_scale = (hf.hidden_size as f32).sqrt();
         let spec = Gemma4Spec {

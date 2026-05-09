@@ -158,11 +158,24 @@ impl Forward {
             // writing into the token-0 slot. 4-byte placeholder for
             // every other architecture.
             let ple_bytes: u64 = match config.gemma4.as_ref() {
-                Some(g) => (max_prefill_tokens.max(1) as u64)
-                    * (config.n_layers as u64)
-                    * (g.hidden_size_per_layer_input as u64)
-                    * 4,
-                None => 4,
+                Some(g) if g.hidden_size_per_layer_input > 0 => {
+                    (max_prefill_tokens.max(1) as u64)
+                        * (config.n_layers as u64)
+                        * (g.hidden_size_per_layer_input as u64)
+                        * 4
+                }
+                // Sprint 51D-A — Gemma-4-26B-A4B has no PLE
+                // (`hidden_size_per_layer_input == 0`). The legacy code
+                // computed `0 * n_layers * 0 * 4 = 0` and tried to
+                // allocate a zero-byte GpuBuffer, which `gpu-allocator`
+                // rejects with `Invalid AllocationCreateDesc` (Vulkan
+                // VUID-VkBufferCreateInfo-size-00912 also forbids
+                // `size == 0`). Mirror the non-Gemma-4 branch and use a
+                // 4-byte placeholder; the buffer is never read on the
+                // 26B path because the layer plan has no `PleBlock`
+                // step and the descriptor binding is always-on but
+                // disabled by `ple_pc.has_ple = 0`.
+                _ => 4,
             };
             let per_layer_inputs = mk_storage(
                 ple_bytes,
