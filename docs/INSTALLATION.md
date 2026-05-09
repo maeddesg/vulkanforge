@@ -83,6 +83,7 @@ Boolean flags accept `1` / `0`, `true` / `false`, case-insensitive.
 |--------------------------------|---------|-----------------------------------------------------------------------------------|
 | `VULKANFORGE_ENABLE_FP8`       | `0`     | Allow FP8 SafeTensors loading (auto-detects per-tensor / per-channel / block-wise) |
 | `VF_CPU_LM_HEAD`               | `0`     | Offload `lm_head` to CPU as Q6_K (saves ~970 MB VRAM; AVX-512 GEMV; v0.3.10) |
+| `VF_QUANTIZE_ON_LOAD`          | `0`     | Quantize FP32/BF16 SafeTensors weights to Q4_K_M at model load (v0.3.17). 2D weights only; norms/embeddings/lm_head stay native. Gemma-4: −71 % VRAM, +54 % decode |
 | `VF_FP8_GEMM_BN`               | `32`    | GEMM tile size for the FP8 BF16 path: `16` (naive) / `32` (default) / `64` (opt-in) |
 | `VF_FP8_GEMM_BN32`             | unset   | Legacy opt-out: `0` falls back to BN=16                                           |
 | `VULKANFORGE_KV_FP8`           | `0`     | FP8 E4M3 KV cache (half the KV memory; +tiny perplexity)                          |

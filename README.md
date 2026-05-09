@@ -109,12 +109,13 @@ code / prose / reasoning / context-stress / numerics / tokenizer) with
 generations up to 1024 tokens — KV grows during decode, so steady-state
 numbers are below `tg128`. Mesa 26.1.0 RADV.
 
-| Model                  | Prefill avg | Decode avg | Avg W | tok/s/W | Quality |
-|------------------------|------------:|-----------:|------:|--------:|--------:|
-| Qwen3-8B Q4_K_M        |     **701 t/s** ² |   104.0 t/s |  258 W |  0.40   | 15/15 ✓ |
-| Llama-3.1-8B Q4_K_M    |     824 t/s |   **110.0 t/s** |  271 W | **0.41** | 15/15 ✓ |
-| Qwen3-8B FP8           |     559 t/s |    60.7 t/s |  193 W |  0.32   | 15/15 ✓ |
-| **Gemma-4-E2B-it**     |    96 t/s ¹ |    33.7 t/s | **64 W** | **0.53** | 15/15 ✓ |
+| Model                              | Prefill avg | Decode avg | Avg W | tok/s/W | Quality |
+|------------------------------------|------------:|-----------:|------:|--------:|--------:|
+| Qwen3-8B Q4_K_M                    |     **701 t/s** ² |   104.0 t/s |  258 W |  0.40   | 15/15 ✓ |
+| Llama-3.1-8B Q4_K_M                |     824 t/s |   **110.0 t/s** |  271 W |  0.41   | 15/15 ✓ |
+| Qwen3-8B FP8                       |     559 t/s |    60.7 t/s |  193 W |  0.32   | 15/15 ✓ |
+| Gemma-4-E2B-it (FP32 SafeTensors)  |     96 t/s ¹ |    33.7 t/s |  64 W  |  0.53   | 15/15 ✓ |
+| **Gemma-4-E2B-it (Q4_K on-load³)** |    **106 t/s** | **52.0 t/s** | **37 W** | **1.39** | 15/15 ✓ |
 
 ¹ v0.3.15 lifted the v0.3.14 `force_per_token_prefill` workaround
 (33 → 89 → 96 t/s on v0.3.14 / v0.3.15 / v0.3.16). The batch path is
@@ -128,6 +129,15 @@ count keeping power draw at 64 W.
 Owner-only models (Qwen3, Llama). The Q-side barriers are now
 gated on the Gemma-4 subscriber predicate; Qwen3-Q4_K_M prefill
 recovers from 638 to **701 t/s** (+9.9 %).
+
+³ v0.3.17 adds on-the-fly Q4_K quantization at model load
+(`VF_QUANTIZE_ON_LOAD=1`). Gemma-4 SafeTensors weights are
+quantized FP32 → Q4_K_M on the CPU (rayon-parallelized,
+`Loaded in 13.2 s`) and routed through the existing Q4_K shader
+pipeline. Decode +54 %, power −41 %, **tok/s/W 1.39 — best in the
+suite**. VRAM 8.51 → 2.49 GiB (7.1× compression on the quantized
+tensors; norms / embeddings stay FP32). Coherence identical to
+the FP32 baseline.
 
 ### Native FP8 prefill pp=512 (Mesa 26.1+, native FP8 WMMA path)
 
@@ -178,6 +188,7 @@ flag is a default-on candidate for 14B FP8 on Zen 4.
 | FP8 model loading    | `VULKANFORGE_ENABLE_FP8=1` | Mesa 26.1+ (or 26.0.6 BF16 path) | Load HuggingFace FP8 SafeTensors    |
 | Native FP8 WMMA      | (auto)                     | `shaderFloat8CooperativeMatrix` (Mesa 26.1+) | +45–58 % FP8 prefill |
 | CPU `lm_head` offload| `VF_CPU_LM_HEAD=1`         | AVX-512F + BW + VL (Zen 4 / Ice Lake+) | −970 MB VRAM, 14B +32 % decode |
+| On-the-fly Q4_K      | `VF_QUANTIZE_ON_LOAD=1`    | SafeTensors model with FP32 / BF16 weights | Quantize 2D weights to Q4_K_M at load; ~7× VRAM compression on quantized tensors, routes through the Q4_K shader pipeline. Gemma-4-E2B: decode +54 %, power −41 %, tok/s/W 1.39 |
 
 All features are opt-in. Without flags, VulkanForge runs GGUF models
 on Mesa 26.1+ with no special configuration. `VF_FP8=auto` picks

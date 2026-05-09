@@ -1,5 +1,115 @@
 # Changelog
 
+## v0.3.17 — On-the-fly Q4_K Quantization (2026-05-09)
+
+`VF_QUANTIZE_ON_LOAD=1` quantizes a SafeTensors model's FP32/BF16
+weight tensors to Q4_K_M at load time, routing them through the
+existing Q4_K shader pipeline (CoopMat GEMM, INT8-WMMA prefill,
+Q4_K GEMV decode). Default OFF; opt-in for now until non-Gemma
+SafeTensors paths get a coherence sweep of their own.
+
+### Gemma-4-E2B-it impact (15-prompt suite, RX 9070 XT, Mesa 26.1.0)
+
+| Metric                       | FP32 baseline | Q4_K on-load | Δ           |
+|------------------------------|---------------|--------------|-------------|
+| Prefill (15-prompt avg)      |  95.8 t/s     | **106.2 t/s** | +10.9 %    |
+| Decode (15-prompt avg)       |  33.7 t/s     | **52.0 t/s**  | **+54.3 %** |
+| Avg power (full bench)       |  63.9 W       | **37.4 W**    | **−41.5 %** |
+| tok/s/W decode               |   0.527       | **1.392**     | **+164 %**  |
+| Model size in VRAM           |   8.51 GiB    | **2.49 GiB**  | −71 %       |
+| Coherence (greedy, temp=0)   |  15/15        | **15/15**     | identical   |
+
+`tok/s/W = 1.39` is the highest decode efficiency in VF's model
+suite. Prefill speedup is modest (Gemma-4's batch prefill was
+already CoopMat-bound on FP32); decode gain is the bandwidth
+saving from the 7.1× weight compression. Power saving comes from
+both (less VRAM traffic, smaller compute footprint per token).
+
+### Quantizer
+
+`src/quantize.rs` (Sprint 50A, +30 LOC for parallelisation in 50C).
+Pure-Rust port of llama.cpp's `quantize_row_q4_K_ref`
+(`ggml-quants.c:1395`):
+
+- 256-element super-blocks → 144 B (`d` + `dmin` FP16 + 12 B 6-bit
+  packed scales/mins + 128 B 4-bit qs).
+- `make_qkx2_quants` per-sub-block scale/min selector with
+  `nstep=20` MSE-minimised rescalings.
+- `nearest_int` via FP-magic banker's rounding, bit-identical to
+  the reference.
+- Block-level rayon parallelism in `quantize_f32_to_q4k`
+  (`par_chunks_mut(Q4K_BLOCK_BYTES)`); each block is
+  state-independent so the parallel output is byte-identical to
+  the serial reference (verified by the
+  `parallel_matches_serial` test).
+- Load-time on Gemma-4-E2B-it: **13.2 s** for 315 weight tensors
+  (= 7.01 GiB FP32-equivalent → 0.99 GiB Q4_K). Pure scalar Rust
+  in `quantize_block_q4k`; SIMD is a future optimisation if needed.
+
+### Loader integration
+
+`src/backend/vulkan/loader.rs::load_safetensors` —
+`should_quantize_st` predicate gates per-tensor:
+
+- **Quantized:** 2D weight tensors with `n_elements % 256 == 0`.
+  Covers `q_proj` / `k_proj` / `v_proj` / `o_proj`,
+  `gate_proj` / `up_proj` / `down_proj`, and the Gemma-4 PLE
+  projections (`per_layer_input_gate.weight`,
+  `per_layer_projection.weight`).
+- **Skipped:** any tensor matching `embed_tokens` / `norm` /
+  `lm_head` / `layer_scalar`, plus tensors whose `n_elements` isn't
+  a multiple of 256.
+
+Buffer sizing for the upload-loop derives from the encoded byte
+length (no special Q4_K wiring needed). Banner print after upload
+reports `n_quantized`, `n_skipped` (split by category), original
+FP32-equivalent bytes, and Q4_K bytes.
+
+### Files
+
+```
+Cargo.toml                              0.3.16 → 0.3.17
+CHANGELOG.md                            this entry
+README.md                               perf table + features section + env-var row
+docs/INSTALLATION.md                    env-var row
+src/lib.rs                              +pub mod quantize             (Sprint 50A)
+src/quantize.rs                         +428 LOC new module           (Sprint 50A + 50C)
+examples/quant_smoke.rs                 +29 LOC real-weight smoke     (Sprint 50A)
+src/backend/vulkan/loader.rs            +152 / −13 LOC quantizer hook (Sprint 50B)
+```
+
+### Sprint chain
+
+```
+b2fc8ba  feat(quantize): pure-Rust Q4_K_M quantizer + dequantizer (Sprint 50A)
+11ef78a  feat(loader): on-the-fly Q4_K quantization for SafeTensors weights (Sprint 50B)
+2f77ab6  perf(quantize): rayon block-parallel Q4_K quantizer (Sprint 50C)
+<release> v0.3.17
+```
+
+Sprint 50D (15-prompt coherence + 4-variant bench) left no code
+commits — analysis-only sprint. Reports under `results/`
+(gitignored). Variant C (unsloth GGUF Q4_K_M) excluded because
+the GGUF carries Gemma-4 PLE tensors in `ggml_type=30`, which VF
+doesn't decode yet — separate from the on-the-fly path.
+
+### Known limits
+
+- Gemma-4 GGUF (unsloth `gemma-4-E2B-it-Q4_K_M.gguf`) still fails
+  with `unknown ggml tensor type 30`. The on-the-fly path
+  (this release) is the working alternative for Gemma-4 Q4_K.
+- Llama-FP8 / Qwen3-FP8 with `VF_QUANTIZE_ON_LOAD=1` not exercised.
+  The `should_quantize_st` predicate leaves F8E4M3 tensors
+  untouched, but FP32 norms/embeddings inside an FP8 model would
+  become quantization candidates and weren't validated in this
+  cycle.
+- Load time of 13.2 s on the 2 B Gemma-4 is acceptable; a
+  hypothetical 26 B-class FP32 SafeTensors would scale to roughly
+  2 min on this CPU. SIMD or tensor-level parallelism in the
+  loader is a future option if model-load UX warrants it.
+
+---
+
 ## v0.3.16 — Mesa cleanup, FP8 hardwire, barrier gate (2026-05-09)
 
 Three small follow-ups to v0.3.15 plus an upstream Mesa observation
