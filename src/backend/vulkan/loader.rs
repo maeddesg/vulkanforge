@@ -643,15 +643,21 @@ impl LoadedModel {
             // tied buffer's `is_lm_head` heuristic in Sprint 22B was
             // limited to literal `lm_head.weight`; for Gemma-4 the
             // tied tensor lives at `model.language_model.embed_tokens.
-            // weight`. VF_GEMMA_EMBED_F16=1 routes Gemma-4 embed via
-            // BF16→F16 (= MulMatVecF16 path) instead of BF16→F32
-            // (= MulMatVecF32). Diagnose-only: lets us isolate
-            // whether MulMatVecF32 has a bug specific to vocab=262144
-            // by routing through the well-exercised F16 harness path.
-            let is_lm_head = hf_name == "lm_head.weight"
-                || (hf.gemma4.is_some()
-                    && hf_name == "model.language_model.embed_tokens.weight"
-                    && std::env::var("VF_GEMMA_EMBED_F16").is_ok());
+            // weight`. `VF_GEMMA_EMBED_F16=1` routed it BF16→F16
+            // behind an env opt-in.
+            // Sprint 51D-B Block 0 — make BF16→F16 narrow the default
+            // for ANY tied embedding, not just opt-in Gemma-4. Saves
+            // 1.5 GiB on Gemma-4-26B (2.95 GiB FP32 → 1.47 GiB FP16),
+            // 750 MB on Gemma-4-E2B, and ~1.0 GiB on tied Llama-style
+            // models. The downstream `dispatch_final` lm_head fallback
+            // already has a `(GgmlType::F16, _) => MulMatVecF16` arm
+            // (decode.rs:950) so the same buffer doubles as the lm_head
+            // GEMV input. Coherence verified on E2B with the env-on
+            // path in 43E-2; default-on should match.
+            let is_tied_embed = hf.tie_word_embeddings
+                && (hf_name == "model.embed_tokens.weight"
+                    || hf_name == "model.language_model.embed_tokens.weight");
+            let is_lm_head = hf_name == "lm_head.weight" || is_tied_embed;
             // Sprint 50B — quantize 2D weights to Q4_K_M when
             // `VF_QUANTIZE_ON_LOAD=1` and the tensor passes
             // `should_quantize_st`. Norms / embeddings / lm_head /
