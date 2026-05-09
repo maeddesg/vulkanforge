@@ -20,6 +20,7 @@ use super::commands::CommandContext;
 use super::device::VulkanDevice;
 use super::gguf::{GgmlType, GgufFile, ModelConfig};
 use crate::hf_config::{HfConfig, Llama3RopeScaling};
+use crate::quantize::{quantize_f32_to_q4k, QK_K};
 use crate::safetensors::{hf_to_vf_name, SafeTensorsFile, TensorDtype, TensorInfo};
 
 /// Staging-buffer size used for batched uploads. Sprint 20-M1
@@ -592,6 +593,13 @@ impl LoadedModel {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         let skip_lm_head_gpu = cpu_lm_head_enabled && has_lm_head;
+        // Sprint 50B — opt-in on-the-fly Q4_K quantization. Gated by
+        // `VF_QUANTIZE_ON_LOAD=1`; default OFF until Sprint 50D
+        // validates coherence on each architecture.
+        let quantize_on_load = std::env::var("VF_QUANTIZE_ON_LOAD")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let mut q_stats = QuantStats::default();
         let mut plans: Vec<Plan> = Vec::with_capacity(st.tensors.len());
         for (hf_name, info) in &st.tensors {
             // Skip scale metadata — already harvested above.
@@ -639,27 +647,64 @@ impl LoadedModel {
                 || (hf.gemma4.is_some()
                     && hf_name == "model.language_model.embed_tokens.weight"
                     && std::env::var("VF_GEMMA_EMBED_F16").is_ok());
+            // Sprint 50B — quantize 2D weights to Q4_K_M when
+            // `VF_QUANTIZE_ON_LOAD=1` and the tensor passes
+            // `should_quantize_st`. Norms / embeddings / lm_head /
+            // 1D scalars / non-multiple-of-256 tensors stay at their
+            // native dtype.
+            let do_quant = quantize_on_load
+                && !is_lm_head
+                && should_quantize_st(hf_name, info);
             let (target_dtype, bytes) = match info.dtype {
                 TensorDtype::F8E4M3 => (GgmlType::F8E4M3, Source::Borrowed(raw)),
                 TensorDtype::F16 => (GgmlType::F16, Source::Borrowed(raw)),
-                TensorDtype::F32 => (GgmlType::F32, Source::Borrowed(raw)),
+                TensorDtype::F32 => {
+                    if do_quant {
+                        let f32_vec: Vec<f32> = raw
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+                        let q4k = quantize_f32_to_q4k(&f32_vec);
+                        q_stats.record(raw.len() as u64, q4k.len() as u64);
+                        (GgmlType::Q4K, Source::Owned(q4k))
+                    } else {
+                        q_stats.record_skipped(hf_name, info.dtype);
+                        (GgmlType::F32, Source::Borrowed(raw))
+                    }
+                }
                 TensorDtype::BF16 if is_lm_head => {
                     let fp16 = bf16_to_f16_vec(raw, info, hf_name)?;
                     (GgmlType::F16, Source::Owned(fp16))
                 }
                 TensorDtype::BF16 => {
-                    let fp32 = bf16_to_f32_vec(raw, info, hf_name)?;
-                    // Sprint 43E investigation note — earlier hypothesis
-                    // was that Gemma-4 RMSNorm uses `(1 + weight)` and
-                    // requires a load-time +1.0 fix. Verification against
-                    // HF transformers `Gemma3nRMSNorm` (Gemma-4 inherits
-                    // from this) showed the semantics are *Llama-style*
-                    // again (`x * weight / sqrt(...)`, init=`torch.ones`).
-                    // The +1 patch was WRONG and got reverted. The NaN
-                    // root cause is *not* in RMSNorm semantics; further
-                    // bisect needed (lm_head GEMV with vocab=262144
-                    // remains the prime suspect).
-                    (GgmlType::F32, Source::Owned(fp32))
+                    if do_quant {
+                        let n = info.n_elements();
+                        let mut f32_vec = vec![0f32; n];
+                        for i in 0..n {
+                            let bf = u16::from_le_bytes([raw[2 * i], raw[2 * i + 1]]);
+                            f32_vec[i] = bf16_to_f32(bf);
+                        }
+                        let q4k = quantize_f32_to_q4k(&f32_vec);
+                        // FP32-equivalent original size for compression ratio
+                        // (BF16-on-disk would understate the saving since
+                        // the runtime would have expanded to FP32 anyway).
+                        q_stats.record((n * 4) as u64, q4k.len() as u64);
+                        (GgmlType::Q4K, Source::Owned(q4k))
+                    } else {
+                        // Sprint 43E investigation note — earlier hypothesis
+                        // was that Gemma-4 RMSNorm uses `(1 + weight)` and
+                        // requires a load-time +1.0 fix. Verification against
+                        // HF transformers `Gemma3nRMSNorm` (Gemma-4 inherits
+                        // from this) showed the semantics are *Llama-style*
+                        // again (`x * weight / sqrt(...)`, init=`torch.ones`).
+                        // The +1 patch was WRONG and got reverted. The NaN
+                        // root cause is *not* in RMSNorm semantics; further
+                        // bisect needed (lm_head GEMV with vocab=262144
+                        // remains the prime suspect).
+                        let fp32 = bf16_to_f32_vec(raw, info, hf_name)?;
+                        q_stats.record_skipped(hf_name, info.dtype);
+                        (GgmlType::F32, Source::Owned(fp32))
+                    }
                 }
                 TensorDtype::F8E5M2 => {
                     return Err(LoaderError::Buffer(format!(
@@ -912,6 +957,11 @@ impl LoadedModel {
         let upload_duration = started.elapsed();
         staging.destroy(&dev.device, allocator);
         cmd_ctx.destroy(&dev.device);
+
+        // Sprint 50B — surface the quantization summary.
+        if quantize_on_load {
+            q_stats.print();
+        }
 
         // Llama-3 RoPE scaling is parsed but not yet plumbed into
         // ModelConfig (Sprint 20-M1 scope). Surface it in stderr so
@@ -1242,6 +1292,95 @@ fn hf_name_to_vf(hf_name: &str) -> String {
 #[inline]
 fn bf16_to_f32(bf: u16) -> f32 {
     f32::from_bits((bf as u32) << 16)
+}
+
+/// Sprint 50B — accumulator for `VF_QUANTIZE_ON_LOAD=1` reporting.
+/// Tracks how many tensors got quantized vs. left at native dtype,
+/// and the byte counts (FP32-equivalent for the source side so the
+/// compression ratio reflects the in-VRAM saving).
+#[derive(Default)]
+struct QuantStats {
+    n_quantized: u32,
+    n_skipped_norm: u32,
+    n_skipped_embed: u32,
+    n_skipped_other: u32,
+    bytes_orig_fp32_eq: u64,
+    bytes_q4k: u64,
+}
+
+impl QuantStats {
+    fn record(&mut self, orig_bytes: u64, q4k_bytes: u64) {
+        self.n_quantized += 1;
+        self.bytes_orig_fp32_eq += orig_bytes;
+        self.bytes_q4k += q4k_bytes;
+    }
+    fn record_skipped(&mut self, hf_name: &str, _dtype: TensorDtype) {
+        if hf_name.contains("norm") {
+            self.n_skipped_norm += 1;
+        } else if hf_name.contains("embed") {
+            self.n_skipped_embed += 1;
+        } else {
+            self.n_skipped_other += 1;
+        }
+    }
+    fn print(&self) {
+        let n_skipped = self.n_skipped_norm + self.n_skipped_embed + self.n_skipped_other;
+        let orig_gib = self.bytes_orig_fp32_eq as f64 / (1024.0 * 1024.0 * 1024.0);
+        let q4k_gib = self.bytes_q4k as f64 / (1024.0 * 1024.0 * 1024.0);
+        let ratio = if self.bytes_q4k > 0 {
+            self.bytes_orig_fp32_eq as f64 / self.bytes_q4k as f64
+        } else {
+            0.0
+        };
+        println!(
+            "VulkanForge: On-the-fly Q4_K quantization ENABLED (VF_QUANTIZE_ON_LOAD=1)"
+        );
+        println!(
+            "  Quantized {} tensors ({:.2} GiB FP32-eq → {:.2} GiB Q4_K, {:.2}× compression)",
+            self.n_quantized, orig_gib, q4k_gib, ratio,
+        );
+        println!(
+            "  Skipped   {} tensors (norms: {}, embeddings: {}, other: {})",
+            n_skipped, self.n_skipped_norm, self.n_skipped_embed, self.n_skipped_other,
+        );
+    }
+}
+
+/// Sprint 50B — should the SafeTensors tensor `hf_name` be quantized
+/// to Q4_K_M at load? Heuristic mirrors the brief: 2D weights with
+/// `n_elements % 256 == 0` only, blacklisting the norms / embeddings /
+/// lm_head paths that consume FP32 in shaders today.
+fn should_quantize_st(hf_name: &str, info: &TensorInfo) -> bool {
+    // Q4_K block requires `numel % 256 == 0`. No padding implemented;
+    // tensors that don't fit cleanly stay at their native dtype.
+    if info.n_elements() % QK_K != 0 {
+        return false;
+    }
+    // Q4_K is a GEMM/GEMV input format; only 2D weight tensors apply.
+    if info.shape.len() != 2 {
+        return false;
+    }
+    // Embeddings: lookup tables, never enter a GEMM.
+    if hf_name.contains("embed_tokens") {
+        return false;
+    }
+    // Any norm weight (RMSNorm, LayerNorm, q/k norms, post-attention)
+    // is precision-sensitive and typically tiny. Defensive even though
+    // most are 1D and already filtered by the `shape.len() != 2` test.
+    if hf_name.contains("norm") {
+        return false;
+    }
+    // lm_head has its own paths (CPU-Offload via VF_CPU_LM_HEAD,
+    // FP16-narrow at upload time, tied-weight skipping). Don't compete.
+    if hf_name.ends_with("lm_head.weight") {
+        return false;
+    }
+    // Per-layer scalars (Gemma-4 `layer_scalar` [1]) — already filtered
+    // by `n_elements % 256 != 0`, but defensive.
+    if hf_name.ends_with("layer_scalar") {
+        return false;
+    }
+    true
 }
 
 /// Sprint 24A — Convert a `weight_scale` BF16 byte slice (either a
