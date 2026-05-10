@@ -1075,11 +1075,20 @@ impl DecodeExec {
 
     // === Sprint 51D-D — MoE routing + per-token expert FFN ===
 
-    /// Copy the post-Pre-MoE-Norm hidden state (scratch_b) to the
+    /// Copy the RAW post-attention residual (`res1`) to the
     /// host-readable staging buffer, mid-frame-submit so the GPU work
     /// drains, then run the router on the CPU and stash the Top-K
     /// `(expert_idx, weight)` tuples on `Forward` for the next step
     /// (`step_moe_expert_ffn`) to consume.
+    ///
+    /// Sprint 51D-F: the source is `res1`, NOT
+    /// `scratch_b`/`pre_ff_norm_2(res1)`. HF
+    /// `Gemma4TextDecoderLayer.forward` calls `self.router(residual)` on
+    /// the raw post-attention residual; the router does its own
+    /// parameterless RMS-norm + per-channel `scale` × `inv_sqrt(hidden)`
+    /// internally. Routing on the pre_ff_norm_2-multiplied residual
+    /// distorts the per-channel direction (γ_2 ≠ uniform) and picks the
+    /// wrong Top-K experts.
     fn step_moe_route(
         &self, fwd: &mut Forward, _cfg: &ModelConfig, ctx: &ExecCtx,
         n_experts: u32, top_k: u32,
@@ -1092,17 +1101,19 @@ impl DecodeExec {
         let hidden = router_data.hidden_size;
         let bytes = (hidden as u64) * 4;
 
-        // (1) Compute → Transfer barrier on `scratch_b` (written by
-        //     step_pre_moe_norm just before us).
-        let scratch_b = fwd.cur().scratch_b.handle;
+        // (1) Compute → Transfer barrier on `res1` (written by
+        //     step_attn_residual_add earlier in this layer; intervening
+        //     steps — PreFfnNorm, GateProj, …, DownProj, PostDenseMlpNorm —
+        //     read but do not overwrite res1).
+        let res1 = fwd.cur().res1.handle;
         compute_to_transfer_barrier(ctx.dev, ctx.cmd);
 
-        // (2) Copy scratch_b → moe_route_staging.
+        // (2) Copy res1 → moe_route_staging.
         let staging = fwd.moe_route_staging.handle;
         unsafe {
             let region = vk::BufferCopy { src_offset: 0, dst_offset: 0, size: bytes };
             ctx.dev.device.cmd_copy_buffer(
-                ctx.cmd, scratch_b, staging, std::slice::from_ref(&region),
+                ctx.cmd, res1, staging, std::slice::from_ref(&region),
             );
         }
 
@@ -2301,8 +2312,13 @@ impl BatchExec {
         let seq_len = batch_seq_len(ctx);
         let total_bytes = (seq_len as u64) * (hidden as u64) * 4;
 
-        // Pre-MoE-Norm output is in batch_o (b_step_pre_moe_norm above).
-        let batch_in = fwd.batch_o.handle;
+        // Sprint 51D-F: route on the RAW post-attention residual,
+        // matching HF `Gemma4TextDecoderLayer.forward`. The router does
+        // its own parameterless RMS-norm + `scale × inv_sqrt(hidden)`
+        // internally; feeding it `pre_ff_norm_2(residual)` distorts
+        // direction by per-channel γ_2 and selects wrong Top-K experts.
+        // PreMoeNorm now runs AFTER MoeRoute (see layer_plan.rs).
+        let batch_in = fwd.batch_residual.handle;
         compute_to_transfer_barrier(ctx.dev, ctx.cmd);
         let staging = fwd.moe_route_staging.handle;
         unsafe {

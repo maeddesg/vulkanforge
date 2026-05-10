@@ -217,8 +217,12 @@ pub enum LayerStep {
     /// MoE Router: `router.proj` GEMV [`hidden_size`→`n_experts`],
     /// followed by softmax + Top-K. CPU-side selection of the K
     /// active experts and their normalised weights.
-    /// Reads `scratch_b` (post `PreMoeNorm`); fills the router-
-    /// scratch with `[token_idx → (top_k_indices[K], top_k_weights[K])]`.
+    /// Reads `res1` / `batch_residual` (the RAW post-attention
+    /// residual). The router internally does its own parameterless
+    /// RMS-norm + per-channel `scale × inv_sqrt(hidden_size)`; passing
+    /// the pre_ff_norm_2-multiplied residual would distort direction.
+    /// Fills the router-scratch with `[token_idx → (top_k_indices[K],
+    /// top_k_weights[K])]`. Sprint 51D-F: ordered BEFORE PreMoeNorm.
     MoeRoute { n_experts: u32, top_k: u32 },
 
     /// MoE Expert FFN: dispatch the K active experts per token and
@@ -460,14 +464,23 @@ pub fn build_gemma4_layer(
         // Branch 1 close-out (h1): PostDenseMlpNorm reads ffn_out,
         // writes scratch_a.
         plan.push(LayerStep::PostDenseMlpNorm);
-        // Branch 2 (parallel on residual): PreMoeNorm reads res1
-        // (NOT ffn_out / scratch_a), writes scratch_b. Then router,
-        // expert FFN, post-MoE norm.
-        plan.push(LayerStep::PreMoeNorm);
+        // Branch 2 (parallel on residual). Sprint 51D-F — order matters:
+        // HF `Gemma4TextDecoderLayer.forward` calls `self.router(residual)`
+        // on the RAW post-attention residual (before pre_ff_norm_2),
+        // because `Gemma4TextRouter` does its own parameterless
+        // RMS-norm internally. Only the experts get
+        // `pre_ff_norm_2(residual)` as input. Routing on the
+        // pre_ff_norm_2-multiplied residual distorts the direction
+        // (per-channel γ_2 ≠ uniform → wrong Top-K).
+        //
+        //   MoeRoute    reads res1 / batch_residual (raw)
+        //   PreMoeNorm  res1 → scratch_b / batch_o (= pre_ff_norm_2(res1))
+        //   MoeExpertFfn reads scratch_b / batch_o
         plan.push(LayerStep::MoeRoute {
             n_experts: g.n_experts,
             top_k: g.top_k_experts,
         });
+        plan.push(LayerStep::PreMoeNorm);
         plan.push(LayerStep::MoeExpertFfn {
             n_experts: g.n_experts,
             top_k: g.top_k_experts,
@@ -898,9 +911,11 @@ mod tests {
 
     /// Sprint 51C — when `enable_moe_block: true`, the layer plan
     /// emits all six new MoE steps in the documented order
-    /// (PostDenseMlpNorm → PreMoeNorm → MoeRoute → MoeExpertFfn →
+    /// (PostDenseMlpNorm → MoeRoute → PreMoeNorm → MoeExpertFfn →
     /// PostMoeNorm → MoeBranchAdd) and surrounds them with the
     /// existing PreFfnNorm-block before and PostFfnNorm-block after.
+    /// Sprint 51D-F: MoeRoute moved BEFORE PreMoeNorm so the router
+    /// reads the raw post-attention residual, matching HF.
     #[test]
     fn gemma4_26b_moe_layer_plan_emits_six_steps() {
         let mut spec = gemma4_e2b_spec();
@@ -940,7 +955,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "PostDenseMlpNorm", "PreMoeNorm", "MoeRoute",
+                "PostDenseMlpNorm", "MoeRoute", "PreMoeNorm",
                 "MoeExpertFfn", "PostMoeNorm", "MoeBranchAdd",
             ],
             "MoE step order mismatch"
