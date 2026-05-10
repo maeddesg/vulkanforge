@@ -102,8 +102,24 @@ impl Forward {
             let attn_out = mk_storage(q_bytes, MemoryLocation::GpuOnly, &format!("attn_out{suf}"))?;
             let o_buf = mk_storage(hidden_bytes, MemoryLocation::GpuOnly, &format!("o_buf{suf}"))?;
             let res1 = mk_storage(hidden_bytes, MemoryLocation::GpuOnly, &format!("res1{suf}"))?;
-            let gate_buf = mk_storage(ffn_bytes, MemoryLocation::GpuOnly, &format!("gate_buf{suf}"))?;
-            let up_buf = mk_storage(ffn_bytes, MemoryLocation::GpuOnly, &format!("up_buf{suf}"))?;
+            // Sprint 51D-R — `gate_buf` is reused as the post-attn-norm
+            // scratch (`step_post_attn_norm` writes `cfg.hidden_dim`
+            // floats into it before `step_gate_proj` overwrites with
+            // `ffn_dim` floats). On every architecture except
+            // Gemma-4-26B-A4B, `ffn_dim ≥ hidden_dim`, so `ffn_bytes`
+            // already covers the worst case. 26B has `ffn_dim=2112 <
+            // hidden_dim=2816`, dropping the last 704 PostAttnNorm
+            // writes silently to OOB on the GPU and zeroing the tail
+            // of `gate_buf`. The zeroed tail then propagates into
+            // `step_attn_residual_add` (`res1 = input + gate_buf`)
+            // and from there through every downstream RMSNorm. Mirror
+            // the `ffn_hidden_bytes` `max(...)` pattern below. `up_buf`
+            // gets the same treatment defensively (no current
+            // hidden-sized write but cheap insurance against a future
+            // analogous reuse).
+            let gate_up_bytes = ffn_bytes.max(hidden_bytes);
+            let gate_buf = mk_storage(gate_up_bytes, MemoryLocation::GpuOnly, &format!("gate_buf{suf}"))?;
+            let up_buf = mk_storage(gate_up_bytes, MemoryLocation::GpuOnly, &format!("up_buf{suf}"))?;
             // Sprint 51D-D — Gemma-4-26B-A4B has `intermediate_size=2112 <
             // hidden_size=2816`, so the standard `ffn_bytes` allocation
             // is too small for: (a) the MoE per-token accumulator that
