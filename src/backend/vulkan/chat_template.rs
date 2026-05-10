@@ -44,6 +44,14 @@ pub enum ChatTemplate {
     /// `<start_of_turn>` / `<end_of_turn>` of Gemma-1/2/3):
     /// `<|turn>system\n{system}<turn|>\n<|turn>user\n{user}<turn|>\n<|turn>model\n`.
     Gemma4,
+    /// Sprint 51D-K — Gemma-4 variant that appends
+    /// `<|channel>thought\n<channel|>` after the assistant header when
+    /// `add_generation_prompt=true && enable_thinking=false` (the
+    /// upstream-jinja default for Gemma-4-26B-A4B). Without these 4
+    /// tokens the model sees a malformed prompt and collapses on
+    /// `<|channel>` (id 100). E2B's chat_template.jinja does NOT emit
+    /// the block; 26B's does.
+    Gemma4WithThoughtChannel,
     /// Plain text — system + user concatenated, no role markers.
     Raw,
 }
@@ -111,6 +119,19 @@ impl ChatTemplate {
                     .map(|s| s.to_string())
             })
             .unwrap_or_default();
+        // Sprint 51D-K — Gemma-4 ships its chat template as a separate
+        // `chat_template.jinja` file rather than embedding it in
+        // `tokenizer_config.json`. The `<|channel>thought<channel|>`
+        // suffix lives only in there (added by the 26B variant when
+        // `add_generation_prompt=true && enable_thinking=false`), so
+        // we read both and concatenate before sniffing.
+        let jinja_path = model_dir.join("chat_template.jinja");
+        let jinja_str = std::fs::read_to_string(&jinja_path).unwrap_or_default();
+        let template_str = if !jinja_str.is_empty() {
+            format!("{template_str}\n{jinja_str}")
+        } else {
+            template_str
+        };
 
         if template_str.contains("<｜User｜>") || template_str.contains("<｜Assistant｜>") {
             return ChatTemplate::DeepSeekR1;
@@ -132,6 +153,18 @@ impl ChatTemplate {
         // (Gemma-4 ships it as a separate `chat_template.jinja` file)
         // — fall through to the flavour check below in that case.
         if template_str.contains("<|turn>") && template_str.contains("<turn|>") {
+            // Sprint 51D-K — sub-detect the Gemma-4-26B-A4B variant
+            // that appends `<|channel>thought\n<channel|>` after the
+            // assistant header. Match the LITERAL jinja string
+            // `'<|channel>thought\n<channel|>'` (single concatenated
+            // form, no `+ thinking_text +`). E2B's chat_template only
+            // contains the concatenated form
+            // `'<|channel>thought\n' + thinking_text + '\n<channel|>'`
+            // for explicit-thinking-history paths, never the
+            // single-string form — so the substring discriminates.
+            if template_str.contains("<|channel>thought\\n<channel|>") {
+                return ChatTemplate::Gemma4WithThoughtChannel;
+            }
             return ChatTemplate::Gemma4;
         }
         match tokenizer.flavour() {
@@ -156,7 +189,9 @@ impl ChatTemplate {
             ChatTemplate::Llama3 => render_llama3_first(tokenizer, system, user),
             ChatTemplate::DeepSeekR1 => render_deepseek_first(tokenizer, system, user),
             ChatTemplate::Mistral => render_mistral_first(tokenizer, system, user),
-            ChatTemplate::Gemma4 => render_gemma4_first(tokenizer, system, user),
+            ChatTemplate::Gemma4 => render_gemma4_first(tokenizer, system, user, false),
+            ChatTemplate::Gemma4WithThoughtChannel
+                => render_gemma4_first(tokenizer, system, user, true),
             ChatTemplate::Raw => render_raw_first(tokenizer, system, user),
         }
     }
@@ -170,7 +205,9 @@ impl ChatTemplate {
             ChatTemplate::Llama3 => render_llama3_continuation(tokenizer, user),
             ChatTemplate::DeepSeekR1 => render_deepseek_continuation(tokenizer, user),
             ChatTemplate::Mistral => render_mistral_continuation(tokenizer, user),
-            ChatTemplate::Gemma4 => render_gemma4_continuation(tokenizer, user),
+            ChatTemplate::Gemma4 => render_gemma4_continuation(tokenizer, user, false),
+            ChatTemplate::Gemma4WithThoughtChannel
+                => render_gemma4_continuation(tokenizer, user, true),
             ChatTemplate::Raw => render_raw_continuation(tokenizer, user),
         }
     }
@@ -196,7 +233,23 @@ fn gemma4_special(tokenizer: &Tokenizer, name: &str) -> u32 {
         .unwrap_or_else(|| panic!("Gemma-4 chat template missing special token {name:?}"))
 }
 
-fn render_gemma4_first(tokenizer: &Tokenizer, system: &str, user: &str) -> Vec<u32> {
+/// Sprint 51D-K — append the `<|channel>thought\n<channel|>` block
+/// that 26B's chat_template.jinja emits when
+/// `add_generation_prompt=true && enable_thinking=false`. Without
+/// this 4-token suffix the model sees a malformed prompt and
+/// collapses on `<|channel>` (id 100).
+fn append_gemma4_thought_channel(tokenizer: &Tokenizer, tokens: &mut Vec<u32>) {
+    tokens.push(gemma4_special(tokenizer, "<|channel>"));
+    tokens.extend(tokenizer.encode("thought\n"));
+    tokens.push(gemma4_special(tokenizer, "<channel|>"));
+}
+
+fn render_gemma4_first(
+    tokenizer: &Tokenizer,
+    system: &str,
+    user: &str,
+    with_thought_channel: bool,
+) -> Vec<u32> {
     let bos = tokenizer.bos_id.unwrap_or_else(|| gemma4_special(tokenizer, "<bos>"));
     let sot = gemma4_special(tokenizer, "<|turn>");
     let eot = gemma4_special(tokenizer, "<turn|>");
@@ -217,10 +270,17 @@ fn render_gemma4_first(tokenizer: &Tokenizer, system: &str, user: &str) -> Vec<u
     tokens.extend(tokenizer.encode("\n"));
     tokens.push(sot);
     tokens.extend(tokenizer.encode("model\n"));
+    if with_thought_channel {
+        append_gemma4_thought_channel(tokenizer, &mut tokens);
+    }
     tokens
 }
 
-fn render_gemma4_continuation(tokenizer: &Tokenizer, user: &str) -> Vec<u32> {
+fn render_gemma4_continuation(
+    tokenizer: &Tokenizer,
+    user: &str,
+    with_thought_channel: bool,
+) -> Vec<u32> {
     let sot = gemma4_special(tokenizer, "<|turn>");
     let eot = gemma4_special(tokenizer, "<turn|>");
 
@@ -238,6 +298,9 @@ fn render_gemma4_continuation(tokenizer: &Tokenizer, user: &str) -> Vec<u32> {
     tokens.extend(tokenizer.encode("\n"));
     tokens.push(sot);
     tokens.extend(tokenizer.encode("model\n"));
+    if with_thought_channel {
+        append_gemma4_thought_channel(tokenizer, &mut tokens);
+    }
     tokens
 }
 
