@@ -1808,15 +1808,18 @@ fn hf_to_model_config(hf: &HfConfig) -> Result<ModelConfig, LoaderError> {
                 kv_source,
                 rope_theta: theta,
                 rope_partial_factor: partial,
-                // Sprint 51B-pre — E2B has uniform kv_heads (=1
-                // num_key_value_heads). 26B-A4B will diverge here:
-                // 8 for sliding (`num_key_value_heads`) and 2 for
-                // full (`num_global_key_value_heads`). For E2B the
-                // value is the same on every layer so the Vec we feed
-                // into KvCacheConfig is no-op-equivalent to the global
-                // `cfg.n_kv_heads`, but routing through the per-layer
-                // helper keeps the code path uniform.
-                n_kv_heads: hf.n_kv_heads(),
+                // Sprint 51D-N — per-layer kv-head split.
+                // Gemma-4-26B-A4B: `num_key_value_heads=8` for sliding
+                // layers, `num_global_key_value_heads=2` for full
+                // layers. E2B has `num_global_key_value_heads=null`
+                // and `num_key_value_heads=1` for every layer; the
+                // `unwrap_or(hf.n_kv_heads())` keeps E2B bit-id.
+                n_kv_heads: match kind {
+                    Gemma4LayerKind::Sliding => hf.n_kv_heads(),
+                    Gemma4LayerKind::Full => gm
+                        .num_global_key_value_heads
+                        .unwrap_or_else(|| hf.n_kv_heads()),
+                },
                 // Sprint 51B — full-attention layers under
                 // `attention_k_eq_v: true` (26B-A4B) skip the v_proj
                 // weight and derive V from K_raw. Sliding layers

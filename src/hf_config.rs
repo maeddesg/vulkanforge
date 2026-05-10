@@ -119,6 +119,13 @@ pub struct Gemma4TextMeta {
     /// 26B-A4B, `0` for E2B). Independent of the Dense-MLP
     /// `intermediate_size` (= 2112 for 26B-A4B).
     pub moe_intermediate_size: u32,
+    /// Sprint 51D-N — per-layer-type kv-head split. Gemma-4-26B-A4B
+    /// uses two distinct counts: `num_key_value_heads=8` for sliding
+    /// layers, `num_global_key_value_heads=2` for full layers. E2B
+    /// has `num_global_key_value_heads=null` and uniform
+    /// `num_key_value_heads=1`. `None` means "no split — every layer
+    /// uses the top-level `n_kv_heads()`".
+    pub num_global_key_value_heads: Option<u32>,
 }
 
 /// Per-layer attention kind in a Gemma-4 stack.
@@ -353,6 +360,15 @@ fn parse_gemma4_text_meta(text: &serde_json::Value) -> Result<Gemma4TextMeta, St
         .and_then(|v| v.as_u64())
         .map(|x| x as u32)
         .unwrap_or(0);
+    // Sprint 51D-N — Gemma-4-26B-A4B has split kv-head counts:
+    // `num_key_value_heads=8` for sliding layers,
+    // `num_global_key_value_heads=2` for full layers. E2B leaves the
+    // global field at JSON `null` (Option::None after parse), and
+    // every layer uses the uniform `num_key_value_heads=1`.
+    let num_global_key_value_heads = text
+        .get("num_global_key_value_heads")
+        .and_then(|v| v.as_u64())
+        .map(|x| x as u32);
 
     Ok(Gemma4TextMeta {
         layer_types,
@@ -374,6 +390,7 @@ fn parse_gemma4_text_meta(text: &serde_json::Value) -> Result<Gemma4TextMeta, St
         n_experts,
         top_k_experts,
         moe_intermediate_size,
+        num_global_key_value_heads,
     })
 }
 
