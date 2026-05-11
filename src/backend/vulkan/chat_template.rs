@@ -211,6 +211,48 @@ impl ChatTemplate {
             ChatTemplate::Raw => render_raw_continuation(tokenizer, user),
         }
     }
+
+    /// v0.4 Sprint 5 — render the entire `messages[]` history from
+    /// scratch in one shot. Used by the stateless OpenAI-compatible
+    /// API server, which resets the KV cache per request rather than
+    /// carrying state across requests like the interactive CLI does.
+    ///
+    /// `messages` MUST end with a `User` entry — the caller of this
+    /// function is responsible for that check; this function appends
+    /// the assistant generation-prompt header after the final user
+    /// turn so the model knows it's its turn to speak.
+    pub fn render_full_history(
+        self,
+        tokenizer: &Tokenizer,
+        messages: &[RenderMessage<'_>],
+    ) -> Vec<u32> {
+        match self {
+            ChatTemplate::ChatML => render_chatml_full(tokenizer, messages),
+            ChatTemplate::Llama3 => render_llama3_full(tokenizer, messages),
+            ChatTemplate::DeepSeekR1 => render_deepseek_full(tokenizer, messages),
+            ChatTemplate::Mistral => render_mistral_full(tokenizer, messages),
+            ChatTemplate::Gemma4 => render_gemma4_full(tokenizer, messages, false),
+            ChatTemplate::Gemma4WithThoughtChannel
+                => render_gemma4_full(tokenizer, messages, true),
+            ChatTemplate::Raw => render_raw_full(tokenizer, messages),
+        }
+    }
+}
+
+/// One message in the conversation history. Borrows the content so
+/// the caller can hold off on string-allocations until the rendered
+/// token vector is built.
+#[derive(Debug, Clone, Copy)]
+pub struct RenderMessage<'a> {
+    pub role: HistoryRole,
+    pub content: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryRole {
+    System,
+    User,
+    Assistant,
 }
 
 // ---------- Gemma-4 (Sprint 43B-2) ----------
@@ -538,4 +580,253 @@ fn render_raw_first(tokenizer: &Tokenizer, system: &str, user: &str) -> Vec<u32>
 
 fn render_raw_continuation(tokenizer: &Tokenizer, user: &str) -> Vec<u32> {
     tokenizer.encode(user)
+}
+
+// =========================================================================
+// v0.4 Sprint 5 — full-history renderers (stateless server path)
+// =========================================================================
+//
+// Each `render_*_full` walks the entire `messages[]` array and emits
+// the same on-the-wire form HuggingFace's `apply_chat_template` would
+// produce, ending with the assistant generation-prompt header. The
+// resulting `Vec<u32>` is what the GPU prefills against position 0
+// after a `kv_cache.reset()`.
+//
+// All renderers assume the last message has `role: User` (validated
+// by the caller — `server::handlers::chat::validate_and_normalise`).
+// Empty system content is treated as "no system message".
+
+/// Pick the first system message (if any) from the head of the list.
+/// All other messages (user/assistant alternation) follow.
+fn split_system<'a>(messages: &'a [RenderMessage<'a>]) -> (Option<&'a str>, &'a [RenderMessage<'a>]) {
+    if let Some(first) = messages.first() {
+        if first.role == HistoryRole::System {
+            return (Some(first.content), &messages[1..]);
+        }
+    }
+    (None, messages)
+}
+
+// ---------- ChatML (Qwen3 / generic) full ----------
+
+fn render_chatml_full(tokenizer: &Tokenizer, messages: &[RenderMessage<'_>]) -> Vec<u32> {
+    let im_start = tokenizer.im_start_id.expect("ChatML render needs <|im_start|>");
+    let im_end = tokenizer.im_end_id.expect("ChatML render needs <|im_end|>");
+
+    let mut tokens = Vec::new();
+    let (system, rest) = split_system(messages);
+    if let Some(sys) = system {
+        tokens.push(im_start);
+        tokens.extend(tokenizer.encode("system\n"));
+        tokens.extend(tokenizer.encode(sys));
+        tokens.push(im_end);
+        tokens.extend(tokenizer.encode("\n"));
+    }
+    for msg in rest {
+        let role_str = match msg.role {
+            HistoryRole::User => "user\n",
+            HistoryRole::Assistant => "assistant\n",
+            HistoryRole::System => continue, // duplicate system → ignored
+        };
+        tokens.push(im_start);
+        tokens.extend(tokenizer.encode(role_str));
+        tokens.extend(tokenizer.encode(msg.content));
+        tokens.push(im_end);
+        tokens.extend(tokenizer.encode("\n"));
+    }
+    // Generation prompt: assistant header without content.
+    tokens.push(im_start);
+    tokens.extend(tokenizer.encode("assistant\n"));
+    tokens
+}
+
+// ---------- Llama-3 full ----------
+
+fn render_llama3_full(tokenizer: &Tokenizer, messages: &[RenderMessage<'_>]) -> Vec<u32> {
+    let bot = llama3_special(tokenizer, "<|begin_of_text|>");
+    let start_h = llama3_special(tokenizer, "<|start_header_id|>");
+    let end_h = llama3_special(tokenizer, "<|end_header_id|>");
+    let eot = llama3_special(tokenizer, "<|eot_id|>");
+
+    let mut tokens = Vec::new();
+    tokens.push(bot);
+    let (system, rest) = split_system(messages);
+    if let Some(sys) = system {
+        tokens.push(start_h);
+        tokens.extend(tokenizer.encode("system"));
+        tokens.push(end_h);
+        tokens.extend(tokenizer.encode("\n\n"));
+        tokens.extend(tokenizer.encode(sys));
+        tokens.push(eot);
+    }
+    for msg in rest {
+        let role_str = match msg.role {
+            HistoryRole::User => "user",
+            HistoryRole::Assistant => "assistant",
+            HistoryRole::System => continue,
+        };
+        tokens.push(start_h);
+        tokens.extend(tokenizer.encode(role_str));
+        tokens.push(end_h);
+        tokens.extend(tokenizer.encode("\n\n"));
+        tokens.extend(tokenizer.encode(msg.content));
+        tokens.push(eot);
+    }
+    // Generation prompt.
+    tokens.push(start_h);
+    tokens.extend(tokenizer.encode("assistant"));
+    tokens.push(end_h);
+    tokens.extend(tokenizer.encode("\n\n"));
+    tokens
+}
+
+// ---------- Gemma-4 full ----------
+
+fn render_gemma4_full(
+    tokenizer: &Tokenizer,
+    messages: &[RenderMessage<'_>],
+    with_thought_channel: bool,
+) -> Vec<u32> {
+    let bos = tokenizer.bos_id.unwrap_or_else(|| gemma4_special(tokenizer, "<bos>"));
+    let sot = gemma4_special(tokenizer, "<|turn>");
+    let eot = gemma4_special(tokenizer, "<turn|>");
+
+    let mut tokens = Vec::new();
+    tokens.push(bos);
+    let (system, rest) = split_system(messages);
+    if let Some(sys) = system {
+        tokens.push(sot);
+        tokens.extend(tokenizer.encode("system\n"));
+        tokens.extend(tokenizer.encode(sys));
+        tokens.push(eot);
+        tokens.extend(tokenizer.encode("\n"));
+    }
+    for msg in rest {
+        let role_str = match msg.role {
+            HistoryRole::User => "user\n",
+            HistoryRole::Assistant => "model\n",
+            HistoryRole::System => continue,
+        };
+        tokens.push(sot);
+        tokens.extend(tokenizer.encode(role_str));
+        tokens.extend(tokenizer.encode(msg.content));
+        tokens.push(eot);
+        tokens.extend(tokenizer.encode("\n"));
+    }
+    // Generation prompt.
+    tokens.push(sot);
+    tokens.extend(tokenizer.encode("model\n"));
+    if with_thought_channel {
+        append_gemma4_thought_channel(tokenizer, &mut tokens);
+    }
+    tokens
+}
+
+// ---------- DeepSeek-R1 full ----------
+
+fn render_deepseek_full(tokenizer: &Tokenizer, messages: &[RenderMessage<'_>]) -> Vec<u32> {
+    let bos = tokenizer.bos_id.unwrap_or_else(|| {
+        tokenizer.special_id("<｜begin▁of▁sentence｜>").unwrap_or(0)
+    });
+    let user_tok = tokenizer
+        .special_id("<｜User｜>")
+        .expect("DeepSeek-R1 chat template missing <｜User｜>");
+    let asst_tok = tokenizer
+        .special_id("<｜Assistant｜>")
+        .expect("DeepSeek-R1 chat template missing <｜Assistant｜>");
+    let eos = tokenizer.special_id("<｜end▁of▁sentence｜>");
+
+    let mut tokens = Vec::new();
+    tokens.push(bos);
+    let (system, rest) = split_system(messages);
+    if let Some(sys) = system {
+        tokens.extend(tokenizer.encode(sys));
+    }
+    for msg in rest {
+        match msg.role {
+            HistoryRole::User => {
+                tokens.push(user_tok);
+                tokens.extend(tokenizer.encode(msg.content));
+            }
+            HistoryRole::Assistant => {
+                tokens.push(asst_tok);
+                tokens.extend(tokenizer.encode(msg.content));
+                // The model normally emits EOS after a finished
+                // assistant turn; in a stateless replay we have to
+                // insert it ourselves so the next user-turn boundary
+                // matches the training distribution.
+                if let Some(id) = eos {
+                    tokens.push(id);
+                }
+            }
+            HistoryRole::System => continue,
+        }
+    }
+    // Generation prompt with R1's mandatory `<think>` priming.
+    tokens.push(asst_tok);
+    tokens.extend(tokenizer.encode("<think>\n"));
+    tokens
+}
+
+// ---------- Mistral Instruct full ----------
+
+fn render_mistral_full(tokenizer: &Tokenizer, messages: &[RenderMessage<'_>]) -> Vec<u32> {
+    let bos = tokenizer.bos_id.unwrap_or(1);
+    let inst_open = mistral_special(tokenizer, "[INST]");
+    let inst_close = mistral_special(tokenizer, "[/INST]");
+    let eos = tokenizer.eos_id;
+
+    let mut tokens = Vec::new();
+    tokens.push(bos);
+
+    // Mistral's HF template ignores system role unless wrapped inside
+    // the FIRST user message. Pre-extract the system text; we'll
+    // splice it into the first user turn.
+    let (system, rest) = split_system(messages);
+    let system_owned = system.unwrap_or("");
+
+    let mut first_user_done = false;
+    let mut i = 0;
+    while i < rest.len() {
+        let msg = rest[i];
+        match msg.role {
+            HistoryRole::User => {
+                if !first_user_done && !system_owned.is_empty() {
+                    let body = format!(" {}\n\n{}", system_owned, msg.content);
+                    tokens.push(inst_open);
+                    tokens.extend(tokenizer.encode_no_prefix(&body));
+                    tokens.push(inst_close);
+                } else {
+                    tokens.push(inst_open);
+                    tokens.extend(tokenizer.encode_no_prefix(&format!(" {}", msg.content)));
+                    tokens.push(inst_close);
+                }
+                first_user_done = true;
+            }
+            HistoryRole::Assistant => {
+                tokens.extend(tokenizer.encode(msg.content));
+                tokens.push(eos);
+            }
+            HistoryRole::System => {}
+        }
+        i += 1;
+    }
+    tokens
+}
+
+// ---------- Raw / no-template full ----------
+
+fn render_raw_full(tokenizer: &Tokenizer, messages: &[RenderMessage<'_>]) -> Vec<u32> {
+    let mut tokens = Vec::new();
+    if let Some(bos) = tokenizer.bos_id {
+        tokens.push(bos);
+    }
+    for msg in messages {
+        if matches!(msg.role, HistoryRole::System) && msg.content.is_empty() {
+            continue;
+        }
+        tokens.extend(tokenizer.encode(msg.content));
+        tokens.extend(tokenizer.encode("\n"));
+    }
+    tokens
 }

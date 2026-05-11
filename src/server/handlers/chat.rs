@@ -3,29 +3,27 @@
 //! Architecture §2.1 (endpoint), §6 (chat-template integration),
 //! §7 (sampling mapping), §8 (error mapping).
 //!
-//! Sprint 3 scope:
+//! Sprint 5 scope (latest):
 //! - **Non-streaming** (`stream: false`): blocking task → JSON body.
-//! - **Streaming** (`stream: true`): mpsc-bridged SSE response
-//!   with header + delta chunks + final + optional usage-only +
-//!   `[DONE]` marker. Client TCP-disconnect → `tx.blocking_send`
-//!   returns `Err` → `CancelToken` flips → decode loop exits on
-//!   the next iteration (Sprint 3 §4.4).
-//! - **Single-turn requests only** — `messages = [system?, user]`.
-//!   Multi-turn (assistant messages in history) is rejected with
-//!   400 `unsupported_multi_turn` because the full-history renderer
-//!   lives in Sprint 6 (architecture §6.1).
+//! - **Streaming** (`stream: true`): mpsc-bridged SSE response.
+//! - **Multi-turn history** — `messages` can contain assistant
+//!   replies from prior turns; the entire history is re-rendered
+//!   from scratch on each request (stateless per Decision §3,
+//!   no prefix-cache).
 //!
-//! Validation order (§8.4) — model field is NOT validated
+//! Validation order (§8.4) — `model` field is NOT validated
 //! (Decision §2 / Merge-Sprint #1):
-//! 1. n ≤ 1
-//! 2. messages non-empty
-//! 3. each role ≠ tool, each content ≠ image_url
-//! 4. exactly one user message, last message must be that user
-//!    (system before it is optional)
-//! 5. Acquire permit → else 429
-//! 6. spawn_blocking → reset session → render → send_streaming
-//! 7. Either: map TurnResult → ChatCompletionResponse JSON,
-//!    or: stream Header/Delta/Final/Usage events through SSE adapter
+//! 1. `n ≤ 1`
+//! 2. `messages` non-empty
+//! 3. each role ≠ `tool`, each content ≠ `image_url`
+//! 4. at most one `system` message, and only as `messages[0]`
+//! 5. ≥1 `user` message, last entry must be `user`
+//! 6. Acquire permit → else 429
+//! 7. `spawn_blocking` → reset KV → `template.render_full_history`
+//!    → `generate_from_tokens`
+//! 8. Either: serialise the result into `ChatCompletionResponse`
+//!    (non-streaming) OR pipe each visible token into the SSE
+//!    adapter (streaming).
 //!
 //! Context-overflow propagation: `ChatSession::send_streaming`
 //! returns `ChatError::ContextOverflow` which we map to a 400 with
@@ -38,8 +36,10 @@ use axum::response::{IntoResponse, Json, Response};
 use tokio::sync::mpsc;
 use tokio::sync::OwnedSemaphorePermit;
 
-use crate::backend::vulkan::chat::ChatError;
-use crate::backend::vulkan::decode::{GenerateConfig, Sampling};
+use crate::backend::vulkan::chat_template::{HistoryRole, RenderMessage};
+use crate::backend::vulkan::decode::{
+    generate_from_tokens, EmbeddingSource, GenerateConfig, Sampling, ThinkFilter,
+};
 use crate::server::cancel::CancelToken;
 use crate::server::error::ApiError;
 use crate::server::sampling::SamplingParams;
@@ -101,8 +101,11 @@ pub async fn completions(
 /// user) plus the resolved sampling params.
 #[derive(Debug)]
 struct NormalisedRequest {
-    system: String,
-    user: String,
+    /// Full conversation history (possibly system + alternating
+    /// user/assistant), validated to end with a user turn. Sprint 5
+    /// renders this verbatim per-request — the GPU sees a fresh
+    /// prefill at position 0 each time.
+    history: Vec<(HistoryRole, String)>,
     sampling: SamplingParams,
     /// `true` when the request asked for `stream: true`. Decides
     /// between SSE adapter (Sprint 3) and a single JSON body.
@@ -137,10 +140,12 @@ fn validate_and_normalise(req: &ChatCompletionRequest) -> Result<NormalisedReque
         ));
     }
 
-    // §8.1 unsupported_role / unsupported_content_type — and check
-    // shape (single-turn only in Sprint 2).
-    let mut system: Option<String> = None;
-    let mut user: Option<String> = None;
+    // §8.1 — collect history, reject unsupported roles/content,
+    // enforce single optional leading system + non-empty user list +
+    // user is the last message.
+    let mut history: Vec<(HistoryRole, String)> = Vec::with_capacity(req.messages.len());
+    let mut saw_user = false;
+    let mut saw_system = false;
     for (i, msg) in req.messages.iter().enumerate() {
         match msg.role {
             Role::Tool => {
@@ -150,52 +155,52 @@ fn validate_and_normalise(req: &ChatCompletionRequest) -> Result<NormalisedReque
                     format!("messages[{i}].role"),
                 ));
             }
-            Role::Assistant => {
-                // v0.4 Sprint 6 will render multi-turn history.
-                return Err(ApiError::invalid_with_param(
-                    "multi-turn history (assistant messages) is planned for v0.4 Sprint 6; \
-                     send only [system?, user] in Sprint 2",
-                    "unsupported_multi_turn",
-                    format!("messages[{i}].role"),
-                ));
-            }
             Role::System => {
-                if system.is_some() {
+                if saw_system {
                     return Err(ApiError::invalid_with_param(
                         "more than one system message",
                         "duplicate_system_message",
                         format!("messages[{i}].role"),
                     ));
                 }
-                if user.is_some() {
+                if i != 0 {
                     return Err(ApiError::invalid_with_param(
-                        "system message must precede user message",
+                        "system message must be the first entry",
                         "invalid_message_order",
                         format!("messages[{i}].role"),
                     ));
                 }
-                system = Some(content_to_string(&msg.content, i)?);
+                saw_system = true;
+                history.push((HistoryRole::System, content_to_string(&msg.content, i)?));
             }
             Role::User => {
-                if user.is_some() {
-                    return Err(ApiError::invalid_with_param(
-                        "multiple user messages not supported in v0.4 Sprint 2 \
-                         (multi-turn history is Sprint 6)",
-                        "unsupported_multi_turn",
-                        format!("messages[{i}].role"),
-                    ));
-                }
-                user = Some(content_to_string(&msg.content, i)?);
+                saw_user = true;
+                history.push((HistoryRole::User, content_to_string(&msg.content, i)?));
+            }
+            Role::Assistant => {
+                history.push((HistoryRole::Assistant, content_to_string(&msg.content, i)?));
             }
         }
     }
-    let Some(user) = user else {
+    if !saw_user {
         return Err(ApiError::invalid_with_param(
             "no user message present",
             "no_user_message",
             "messages",
         ));
-    };
+    }
+    // Last non-system entry must be a user turn — otherwise the
+    // model doesn't know what to answer.
+    match history.last() {
+        Some((HistoryRole::User, _)) => {}
+        _ => {
+            return Err(ApiError::invalid_with_param(
+                "last message must be role: \"user\"",
+                "last_message_not_user",
+                "messages",
+            ));
+        }
+    }
 
     let sampling = SamplingParams::from_request(req);
     let include_usage = req
@@ -222,8 +227,7 @@ fn validate_and_normalise(req: &ChatCompletionRequest) -> Result<NormalisedReque
     }
 
     Ok(NormalisedRequest {
-        system: system.unwrap_or_default(),
-        user,
+        history,
         sampling,
         stream: req.stream,
         include_usage,
@@ -257,18 +261,39 @@ fn content_to_string(content: &MessageContent, msg_idx: usize) -> Result<String,
 // Processing (runs inside spawn_blocking)
 // =========================================================================
 
-fn process_request(
-    session: &mut crate::server::state::ServerSession,
-    model_id: &str,
-    req: NormalisedRequest,
-) -> Result<ChatCompletionResponse, ApiError> {
+/// Common Sprint 5 prep: render the multi-turn prefill against the
+/// session's chat template, reset the KV cache, validate the prompt
+/// fits the context window, and build the `GenerateConfig`.
+fn prepare_generate(
+    session: &mut ServerSession,
+    req: &NormalisedRequest,
+    cancel_token: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<(Vec<u32>, GenerateConfig, u32), ApiError> {
     // Stateless per Decision §3: every call wipes the KV cache.
-    session.chat.reset();
-    session.chat.system_prompt = req.system;
+    session.chat.forward.kv_cache.reset();
 
     let max_tokens = req.sampling.max_tokens.unwrap_or(200).max(1);
 
-    // VF's existing Sampling struct. Greedy if temperature == 0.
+    // Render the full history as a single prefill token sequence.
+    let messages: Vec<RenderMessage<'_>> = req
+        .history
+        .iter()
+        .map(|(role, content)| RenderMessage { role: *role, content: content.as_str() })
+        .collect();
+    let prefill_tokens = session.template.render_full_history(&session.tokenizer, &messages);
+
+    // §7.5 — pre-flight context check. The decode loop itself also
+    // gates on `max_seq_len`, but raising the structured error here
+    // gives clients the OpenAI-spec'd 400 instead of a 500.
+    let max_seq = session.chat.forward.kv_cache.config.max_seq_len;
+    if (prefill_tokens.len() as u32).saturating_add(max_tokens) > max_seq {
+        return Err(ApiError::ContextLengthExceeded {
+            prompt_tokens: prefill_tokens.len() as u32,
+            max_tokens,
+            context_window: max_seq,
+        });
+    }
+
     let vf_sampling = Sampling {
         temperature: req.sampling.temperature,
         top_k: req.sampling.top_k.unwrap_or(0),
@@ -284,14 +309,35 @@ fn process_request(
         // explicitly sets `chat_template_kwargs.enable_thinking: false`.
         think_filter: req.enable_thinking,
         sampling: vf_sampling,
-        cancel_token: None,
+        cancel_token,
     };
 
-    // Re-bind to a separate local to keep the borrow checker happy
-    // (ChatSession::send_streaming takes &mut self plus several
-    // &-borrows of session fields, but they're all distinct fields).
-    let user_msg = req.user;
-    let crate::server::state::ServerSession {
+    Ok((prefill_tokens, cfg_g, max_tokens))
+}
+
+fn process_request(
+    session: &mut ServerSession,
+    model_id: &str,
+    req: NormalisedRequest,
+) -> Result<ChatCompletionResponse, ApiError> {
+    let (prefill_tokens, cfg_g, _max_tokens) = prepare_generate(session, &req, None)?;
+
+    // Set up an incremental ThinkFilter so the visible/raw split
+    // matches what the streaming path produces. For non-streaming
+    // we discard the incremental chunks and read the aggregated
+    // `visible_text` from the result.
+    let mut filter = if cfg_g.think_filter {
+        Some(ThinkFilter::new())
+    } else {
+        None
+    };
+    let mut on_token = move |_id: u32, raw: &str| {
+        if let Some(f) = filter.as_mut() {
+            let _visible = f.push(raw);
+        }
+    };
+
+    let ServerSession {
         dev,
         registry,
         cmd_ctx,
@@ -303,20 +349,30 @@ fn process_request(
         ..
     } = session;
 
-    // No-op visible callback for non-streaming; the entire output is
-    // returned via TurnResult.visible_text at the end.
-    let on_visible = |_text: &str| {};
+    let result = generate_from_tokens(
+        &mut chat.forward,
+        dev, registry, cmd_ctx, model,
+        EmbeddingSource::Gguf(gguf),
+        cfg, tokenizer,
+        &prefill_tokens, 0, &cfg_g, false, &mut on_token,
+    )
+    .map_err(|e| {
+        // The decode-loop's pre-flight check produces a string error
+        // for the context-overflow case; everything else is a real
+        // 500. Both rare in practice given the pre-check above.
+        let s = e.to_string();
+        if s.contains("max_seq_len") {
+            ApiError::ContextLengthExceeded {
+                prompt_tokens: prefill_tokens.len() as u32,
+                max_tokens: cfg_g.max_tokens,
+                context_window: chat.forward.kv_cache.config.max_seq_len,
+            }
+        } else {
+            ApiError::internal(format!("generation: {s}"), "gpu_error")
+        }
+    })?;
 
-    let turn = chat
-        .send_streaming(
-            dev, registry, cmd_ctx, model, gguf, cfg, tokenizer, &user_msg, &cfg_g, on_visible,
-        )
-        .map_err(map_chat_error)?;
-
-    // §2.1 finish_reason mapping:
-    //   stopped_on_eos       → "stop"
-    //   else (max_tokens hit) → "length"
-    let finish_reason = if turn.stopped_on_eos {
+    let finish_reason = if result.stopped_on_eos {
         FinishReason::Stop
     } else {
         FinishReason::Length
@@ -325,27 +381,15 @@ fn process_request(
     let id = new_chatcmpl_id();
     let choice = Choice {
         index: 0,
-        message: AssistantMessage::new(turn.visible_text),
+        message: AssistantMessage::new(result.visible_text),
         logprobs: None,
         finish_reason,
     };
-    let usage = Usage::new(turn.prompt_tokens, turn.generated_tokens);
+    let usage = Usage::new(
+        result.prompt_tokens as u32,
+        result.generated_tokens as u32,
+    );
     Ok(ChatCompletionResponse::new(id, model_id.to_string(), choice, usage))
-}
-
-fn map_chat_error(e: ChatError) -> ApiError {
-    match e {
-        ChatError::ContextOverflow {
-            current_pos,
-            needed,
-            max_seq_len,
-        } => ApiError::ContextLengthExceeded {
-            prompt_tokens: current_pos.saturating_add(needed).saturating_sub(max_seq_len),
-            max_tokens: needed,
-            context_window: max_seq_len,
-        },
-        ChatError::Generation(err) => ApiError::internal(format!("generation: {err}"), "gpu_error"),
-    }
 }
 
 fn new_chatcmpl_id() -> String {
@@ -431,39 +475,26 @@ fn start_streaming(
 
 /// Run the chat generation, pushing `StreamEvent`s into `tx`. Designed
 /// to be called *inside* `spawn_blocking`: it uses blocking-mpsc
-/// sends and the synchronous chat-session API.
+/// sends and `generate_from_tokens` directly (no ChatSession — that
+/// helper is tuned for the CLI's KV-cache-carrying REPL, which is
+/// the opposite of what stateless multi-turn needs).
 fn run_streaming_generation(
     session: &mut ServerSession,
-    model_id: &str,
+    _model_id: &str,
     req: NormalisedRequest,
     tx: mpsc::Sender<StreamEvent>,
     cancel: CancelToken,
     include_usage: bool,
 ) {
-    let _ = model_id; // model id lives on the chunk meta; not needed
-                       // inside per-chunk construction here.
-
-    // Stateless per Decision §3.
-    session.chat.reset();
-    session.chat.system_prompt = req.system;
-
-    let max_tokens = req.sampling.max_tokens.unwrap_or(200).max(1);
-    let vf_sampling = Sampling {
-        temperature: req.sampling.temperature,
-        top_k: req.sampling.top_k.unwrap_or(0),
-        top_p: req.sampling.top_p,
-        repetition_penalty: req.sampling.repetition_penalty,
-        seed: req.sampling.seed.unwrap_or_else(seed_from_clock),
-    };
-    let cfg_g = GenerateConfig {
-        max_tokens,
-        print_stream: false,
-        // §4.5 — ThinkFilter ON by default; OFF when the request
-        // explicitly sets `chat_template_kwargs.enable_thinking: false`.
-        think_filter: req.enable_thinking,
-        sampling: vf_sampling,
-        cancel_token: Some(cancel.as_arc()),
-    };
+    let (prefill_tokens, cfg_g, _max_tokens) =
+        match prepare_generate(session, &req, Some(cancel.as_arc())) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = tx.blocking_send(StreamEvent::Error(e));
+                return;
+            }
+        };
+    let prefill_len = prefill_tokens.len() as u32;
 
     // Emit the header chunk first. If the client is already gone
     // (rare but possible), bail out before doing any GPU work.
@@ -472,7 +503,44 @@ fn run_streaming_generation(
         return;
     }
 
-    let user_msg = req.user;
+    // Per-token ThinkFilter, mirroring the chat.rs pattern. The
+    // `visible` chunks (post-filter) are what we stream as
+    // `StreamEvent::Delta`; the raw chunks stay buffered inside the
+    // filter so a partial `</think>` tag near the boundary is held
+    // back until it can be resolved.
+    let mut filter = if cfg_g.think_filter {
+        Some(ThinkFilter::new())
+    } else {
+        None
+    };
+
+    let tx_for_cb = tx.clone();
+    let cancel_for_cb = cancel.clone();
+    let mut on_token = move |_id: u32, raw: &str| {
+        if cancel_for_cb.is_cancelled() {
+            return;
+        }
+        if tx_for_cb.is_closed() {
+            cancel_for_cb.cancel();
+            return;
+        }
+        let visible_owned: String = match filter.as_mut() {
+            Some(f) => f.push(raw),
+            None => raw.to_string(),
+        };
+        if visible_owned.is_empty() {
+            return;
+        }
+        if tx_for_cb
+            .blocking_send(StreamEvent::Delta(visible_owned))
+            .is_err()
+        {
+            // Client disconnected mid-stream — flip the flag so the
+            // decode loop exits within the next token.
+            cancel_for_cb.cancel();
+        }
+    };
+
     let ServerSession {
         dev,
         registry,
@@ -485,48 +553,22 @@ fn run_streaming_generation(
         ..
     } = session;
 
-    // The on_visible callback runs once per visible token chunk
-    // (post-ThinkFilter). It both sends the delta to the SSE channel
-    // and watches for client-disconnect. Two independent signals
-    // catch disconnects:
-    //   1. `tx.is_closed()` — fast non-blocking check; fires the
-    //      instant the SSE adapter is dropped.
-    //   2. `tx.blocking_send(...)` Err — fires on send to a closed
-    //      receiver (also flips the same cancel flag).
-    let tx_for_cb = tx.clone();
-    let cancel_for_cb = cancel.clone();
-    let on_visible = move |text: &str| {
-        if cancel_for_cb.is_cancelled() {
-            return;
-        }
-        if tx_for_cb.is_closed() {
-            cancel_for_cb.cancel();
-            return;
-        }
-        if text.is_empty() {
-            return;
-        }
-        if tx_for_cb
-            .blocking_send(StreamEvent::Delta(text.to_string()))
-            .is_err()
-        {
-            // Client disconnected — flip the cancel flag so the
-            // decode loop exits on its next iteration.
-            cancel_for_cb.cancel();
-        }
-    };
-
-    let result =
-        chat.send_streaming(dev, registry, cmd_ctx, model, gguf, cfg, tokenizer, &user_msg, &cfg_g, on_visible);
+    let result = generate_from_tokens(
+        &mut chat.forward,
+        dev, registry, cmd_ctx, model,
+        EmbeddingSource::Gguf(gguf),
+        cfg, tokenizer,
+        &prefill_tokens, 0, &cfg_g, false, &mut on_token,
+    );
 
     match result {
-        Ok(turn) => {
-            let finish = if turn.stopped_on_eos {
+        Ok(g) => {
+            let finish = if g.stopped_on_eos {
                 FinishReason::Stop
             } else {
                 FinishReason::Length
             };
-            let usage = Usage::new(turn.prompt_tokens, turn.generated_tokens);
+            let usage = Usage::new(g.prompt_tokens as u32, g.generated_tokens as u32);
             // Best-effort: if the client already disconnected the
             // send returns Err; we drop the event and exit.
             let _ = tx.blocking_send(StreamEvent::Final {
@@ -536,7 +578,17 @@ fn run_streaming_generation(
             });
         }
         Err(e) => {
-            let _ = tx.blocking_send(StreamEvent::Error(map_chat_error(e)));
+            let s = e.to_string();
+            let api_err = if s.contains("max_seq_len") {
+                ApiError::ContextLengthExceeded {
+                    prompt_tokens: prefill_len,
+                    max_tokens: cfg_g.max_tokens,
+                    context_window: chat.forward.kv_cache.config.max_seq_len,
+                }
+            } else {
+                ApiError::internal(format!("generation: {s}"), "gpu_error")
+            };
+            let _ = tx.blocking_send(StreamEvent::Error(api_err));
         }
     }
     // Dropping tx here lets the SSE adapter's stream complete; it
@@ -563,8 +615,9 @@ mod tests {
             "messages": [{"role": "user", "content": "Hi"}],
         }));
         let n = validate_and_normalise(&req).unwrap();
-        assert_eq!(n.user, "Hi");
-        assert!(n.system.is_empty());
+        assert_eq!(n.history.len(), 1);
+        assert_eq!(n.history[0].0, HistoryRole::User);
+        assert_eq!(n.history[0].1, "Hi");
     }
 
     #[test]
@@ -577,8 +630,10 @@ mod tests {
             ],
         }));
         let n = validate_and_normalise(&req).unwrap();
-        assert_eq!(n.system, "Be brief.");
-        assert_eq!(n.user, "Hi");
+        assert_eq!(n.history.len(), 2);
+        assert_eq!(n.history[0].0, HistoryRole::System);
+        assert_eq!(n.history[0].1, "Be brief.");
+        assert_eq!(n.history[1].0, HistoryRole::User);
     }
 
     #[test]
@@ -591,7 +646,8 @@ mod tests {
             ],
         }));
         let n = validate_and_normalise(&req).unwrap();
-        assert_eq!(n.system, "Be concise.");
+        assert_eq!(n.history[0].0, HistoryRole::System);
+        assert_eq!(n.history[0].1, "Be concise.");
     }
 
     #[test]
@@ -602,17 +658,78 @@ mod tests {
     }
 
     #[test]
-    fn assistant_message_rejected_with_multi_turn_code() {
+    fn multi_turn_history_accepted() {
+        let req = req_from(json!({
+            "model": "x",
+            "messages": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "I am Tom."},
+                {"role": "assistant", "content": "Hi Tom!"},
+                {"role": "user", "content": "Who am I?"},
+            ],
+        }));
+        let n = validate_and_normalise(&req).unwrap();
+        assert_eq!(n.history.len(), 4);
+        let roles: Vec<HistoryRole> = n.history.iter().map(|(r, _)| *r).collect();
+        assert_eq!(
+            roles,
+            vec![
+                HistoryRole::System,
+                HistoryRole::User,
+                HistoryRole::Assistant,
+                HistoryRole::User,
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_turn_without_system_accepted() {
+        let req = req_from(json!({
+            "model": "x",
+            "messages": [
+                {"role": "user", "content": "Q1"},
+                {"role": "assistant", "content": "A1"},
+                {"role": "user", "content": "Q2"},
+                {"role": "assistant", "content": "A2"},
+                {"role": "user", "content": "Q3"},
+            ],
+        }));
+        let n = validate_and_normalise(&req).unwrap();
+        assert_eq!(n.history.len(), 5);
+        assert!(n.history.iter().all(|(r, _)| !matches!(r, HistoryRole::System)));
+    }
+
+    #[test]
+    fn last_message_must_be_user() {
         let req = req_from(json!({
             "model": "x",
             "messages": [
                 {"role": "user", "content": "Hi"},
                 {"role": "assistant", "content": "Hello!"},
-                {"role": "user", "content": "How are you?"},
             ],
         }));
         let e = validate_and_normalise(&req).unwrap_err();
-        assert_eq!(e.code(), "unsupported_multi_turn");
+        assert_eq!(e.code(), "last_message_not_user");
+    }
+
+    #[test]
+    fn only_assistant_rejected_as_no_user() {
+        let req = req_from(json!({
+            "model": "x",
+            "messages": [{"role": "assistant", "content": "stale"}],
+        }));
+        let e = validate_and_normalise(&req).unwrap_err();
+        assert_eq!(e.code(), "no_user_message");
+    }
+
+    #[test]
+    fn only_system_rejected_as_no_user() {
+        let req = req_from(json!({
+            "model": "x",
+            "messages": [{"role": "system", "content": "Be brief."}],
+        }));
+        let e = validate_and_normalise(&req).unwrap_err();
+        assert_eq!(e.code(), "no_user_message");
     }
 
     #[test]
@@ -751,7 +868,7 @@ mod tests {
             }],
         }));
         let n = validate_and_normalise(&req).unwrap();
-        assert_eq!(n.user, "Hello world");
+        assert_eq!(n.history.last().unwrap().1, "Hello world");
     }
 
     #[test]
