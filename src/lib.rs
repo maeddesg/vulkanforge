@@ -32,3 +32,4 @@ pub mod cpu;
 pub mod quantize;
 pub mod safetensors;
 pub mod hf_config;
+pub mod server;
