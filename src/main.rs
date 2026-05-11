@@ -175,6 +175,40 @@ enum Commands {
         #[arg(short, long)]
         model: Option<PathBuf>,
     },
+    /// v0.4 — OpenAI-compatible HTTP server. Exposes
+    /// `POST /v1/chat/completions`, `GET /v1/models`, `GET /health`
+    /// (plus alias paths without the `/v1/` prefix).
+    Serve {
+        /// Path to GGUF model file. SafeTensors directory models
+        /// are deferred to Sprint 4 (use `vulkanforge chat` for now).
+        #[arg(short, long)]
+        model: Option<PathBuf>,
+        /// Listen address. Default `127.0.0.1` (loopback only).
+        /// Set to `0.0.0.0` for remote/Docker access — only over a
+        /// network you trust (v0.4 has no auth).
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// TCP port. Default `8080` (matches llama.cpp server).
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Enable CORS with `Access-Control-Allow-Origin: *`.
+        /// Required for browser-based UIs (Open WebUI, SillyTavern)
+        /// running on a different port. Default off (same-origin).
+        #[arg(long)]
+        cors: bool,
+        /// Forward-compat tokenizer-from-GGUF path (Sprint 4
+        /// SafeTensors path will use it).
+        #[arg(long)]
+        tokenizer_from: Option<PathBuf>,
+        /// KV-cache capacity in tokens. Default 2048; pin at startup.
+        #[arg(long)]
+        ctx_size: Option<u32>,
+        /// Override the model-id reported by `/v1/models` and the
+        /// `model` field in chat completion responses. Default is
+        /// the lowercased basename of `--model` without extension.
+        #[arg(long)]
+        served_model_name: Option<String>,
+    },
 }
 
 fn main() {
@@ -246,6 +280,17 @@ fn main() {
         }
         Commands::Info { model } => {
             run_info(&model.unwrap_or_else(default_model_path))
+        }
+        Commands::Serve { model, host, port, cors, tokenizer_from, ctx_size, served_model_name } => {
+            vulkanforge::server::serve::run(vulkanforge::server::serve::ServeArgs {
+                model: model.unwrap_or_else(default_model_path),
+                host,
+                port,
+                cors,
+                tokenizer_from,
+                ctx_size,
+                served_model_name,
+            })
         }
     };
     if let Err(e) = result {

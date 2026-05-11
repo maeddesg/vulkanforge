@@ -1,13 +1,16 @@
 //! VulkanForge v0.4 OpenAI-compatible API server.
 //!
-//! Sprint 1 (Foundation) lands the wire-format types, the error
+//! Sprint 1 (Foundation) landed the wire-format types, the error
 //! representation, and the OpenAI-to-VF sampling-parameter mapping.
-//! Sprints 2-3 add the router, handlers, streaming adapter, and CLI
-//! wiring per `docs/v0.4/api_server_architecture.md`.
-//!
-//! Nothing in this module touches the GPU. Everything is pure
-//! request/response data and the math to map one to the other.
+//! Sprint 2 adds the router, handlers, application state, and the
+//! `vulkanforge serve` CLI subcommand for non-streaming requests.
+//! Sprint 3 will lift the streaming-rejection in `chat::completions`
+//! by wiring up an SSE adapter.
 
 pub mod error;
+pub mod handlers;
+pub mod routes;
 pub mod sampling;
+pub mod serve;
+pub mod state;
 pub mod types;
