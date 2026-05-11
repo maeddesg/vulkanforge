@@ -71,6 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let cfg_g = GenerateConfig {
         max_tokens, print_stream: false, think_filter: false, sampling: Default::default(),
+        cancel_token: None,
     };
     let turn = session.send(
         &dev, &registry, &cmd_ctx, &model, &gguf, &cfg, &tokenizer,

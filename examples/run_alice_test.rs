@@ -169,6 +169,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         max_tokens: 0,
         print_stream: false,
         think_filter: false, sampling: Default::default(),
+        cancel_token: None,
     };
 
     for (i, t) in ALICE_TURNS.iter().enumerate() {

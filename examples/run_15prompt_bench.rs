@@ -212,6 +212,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             max_tokens: max_tok,
             print_stream: false,
             think_filter: false, sampling: Default::default(),
+            cancel_token: None,
         };
         // KV reset between every prompt — apples-to-apples with ROCmForge.
         session.reset();

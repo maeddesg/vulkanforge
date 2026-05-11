@@ -101,7 +101,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let r = generate(
             &mut forward, &dev, &registry, &cmd_ctx, &model, &gguf, &cfg, &tokenizer,
             prompt,
-            &GenerateConfig { max_tokens, print_stream: false, think_filter: false, sampling: Default::default() },
+            &GenerateConfig { max_tokens, print_stream: false, think_filter: false, sampling: Default::default(), cancel_token: None },
         )?;
         println!("\n{}", r.generated_text);
         println!(

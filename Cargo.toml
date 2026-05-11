@@ -25,6 +25,10 @@ axum = { version = "0.8", default-features = false, features = ["json", "http1",
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 uuid = { version = "1", features = ["v4"] }
+# Sprint 3 — SSE streaming. `futures-util` gives us Stream/StreamExt,
+# `tokio-stream` wraps mpsc::Receiver as a Stream for the SSE adapter.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tokio-stream = "0.1"
 
 [build-dependencies]
 shaderc = "0.8"

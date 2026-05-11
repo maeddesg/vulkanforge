@@ -7,10 +7,12 @@
 //! Sprint 3 will lift the streaming-rejection in `chat::completions`
 //! by wiring up an SSE adapter.
 
+pub mod cancel;
 pub mod error;
 pub mod handlers;
 pub mod routes;
 pub mod sampling;
 pub mod serve;
 pub mod state;
+pub mod stream;
 pub mod types;

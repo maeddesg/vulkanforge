@@ -43,6 +43,14 @@ pub struct GenerateConfig {
     /// the bench / regression tests pin temperature=0 so their
     /// outputs remain deterministic and comparable to v0.1.1.
     pub sampling: Sampling,
+    /// v0.4 Sprint 3 — optional cooperative cancellation. When set,
+    /// the decode loop checks the flag once per token and exits
+    /// gracefully (treated as a soft EOS) when the bit is `true`.
+    /// `None` (the default) keeps the legacy unconditional run-to-
+    /// `max_tokens`-or-EOS behaviour — every CLI/bench call site is
+    /// unaffected. The server's streaming handler sets this so a
+    /// client TCP-disconnect cancels GPU work within ~1 token.
+    pub cancel_token: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Default for GenerateConfig {
@@ -52,6 +60,7 @@ impl Default for GenerateConfig {
             print_stream: false,
             think_filter: false,
             sampling: Sampling::greedy(),
+            cancel_token: None,
         }
     }
 }
@@ -574,6 +583,17 @@ pub fn generate_from_tokens(
                 if generated.len() >= config.max_tokens as usize || pos >= max_seq {
                     break;
                 }
+                // v0.4 Sprint 3 — cooperative cancel. Treated as
+                // soft-EOS so the caller still gets a finish_reason
+                // and the token sequence written so far is intact.
+                if config
+                    .cancel_token
+                    .as_ref()
+                    .is_some_and(|t| t.load(std::sync::atomic::Ordering::Acquire))
+                {
+                    stopped_on_eos = true;
+                    break;
+                }
                 let prev_slot = 1 - cur_slot;
 
                 // Stage 1: pre-record the current slot's CB. References
@@ -611,6 +631,18 @@ pub fn generate_from_tokens(
     } else {
         // ---- Serial path (pre-15E behaviour) ----
         loop {
+            // v0.4 Sprint 3 — cooperative cancel (same shape as the
+            // async path above). Set before the next sampling so a
+            // disconnect on token N never gets the wasted compute
+            // for token N+1.
+            if config
+                .cancel_token
+                .as_ref()
+                .is_some_and(|t| t.load(std::sync::atomic::Ordering::Acquire))
+            {
+                stopped_on_eos = true;
+                break;
+            }
             let next_id = sample_next_token(
                 &mut last_logits, &generated, &config.sampling, &mut rng_state,
             );

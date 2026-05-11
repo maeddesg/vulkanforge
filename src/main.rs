@@ -813,6 +813,7 @@ fn run_chat_safetensors(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>
             repetition_penalty: args.repetition_penalty,
             seed: args.seed,
         },
+        cancel_token: None,
     };
     // Sprint 20-Wire — FP8 GEMM is wired through `dispatch_layer_batch`
     // and (Sprint 46B-E) Gemma-4 F32 batch prefill is too. Per-token
@@ -1016,6 +1017,7 @@ fn send_turn(
         print_stream: false,
         think_filter,
         sampling: sampling.clone(),
+        cancel_token: None,
     };
     session.send_streaming(
         dev, registry, cmd_ctx, model, gguf, cfg, tokenizer,
@@ -1405,6 +1407,7 @@ fn run_bench(
         print_stream: false,
         think_filter: false,
         sampling: Sampling { temperature: 0.0, top_k: 0, top_p: 1.0, repetition_penalty: 1.0, seed: 0 },
+        cancel_token: None,
     };
     let prefill_tok = vec![tokenizer.bos_id.unwrap_or(1)];
     let mut decode_samples = Vec::new();
@@ -1447,6 +1450,7 @@ fn run_bench(
             print_stream: false,
             think_filter: false,
             sampling: Sampling { temperature: 0.0, top_k: 0, top_p: 1.0, repetition_penalty: 1.0, seed: 0 },
+            cancel_token: None,
         };
         let mut samples_ms = Vec::new();
         for _ in 0..runs {
@@ -1596,6 +1600,7 @@ fn run_bench_safetensors(
         print_stream: false,
         think_filter: false,
         sampling: Sampling { temperature: 0.0, top_k: 0, top_p: 1.0, repetition_penalty: 1.0, seed: 0 },
+        cancel_token: None,
     };
     let prefill_tok = vec![tokenizer.bos_id.unwrap_or(1)];
     let mut decode_samples = Vec::new();
@@ -1626,6 +1631,7 @@ fn run_bench_safetensors(
         print_stream: false,
         think_filter: false,
         sampling: Sampling { temperature: 0.0, top_k: 0, top_p: 1.0, repetition_penalty: 1.0, seed: 0 },
+        cancel_token: None,
     };
     for &pp in &pp_sizes {
         let toks: Vec<u32> = (0..pp).map(|_| tokenizer.bos_id.unwrap_or(1)).collect();
