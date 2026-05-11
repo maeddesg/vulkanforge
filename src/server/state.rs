@@ -57,16 +57,31 @@ pub struct AppState {
     /// long-lived Vulkan / pipeline objects. Locked only inside
     /// [`tokio::task::spawn_blocking`] tasks (the Mutex is sync).
     pub session: Mutex<ServerSession>,
+
+    /// Default ThinkFilter state when a request doesn't set
+    /// `chat_template_kwargs.enable_thinking` explicitly. `true`
+    /// (= filter ON) preserves Sprint-3+ CLI behaviour. Set to
+    /// `false` via `vulkanforge serve --no-think-filter` for
+    /// clients like Open WebUI that can't pass the kwargs (those
+    /// clients otherwise see empty content for Qwen3-style models
+    /// when the `<think>` block consumes the whole reply).
+    pub default_think_filter: bool,
 }
 
 impl AppState {
-    pub fn new(model_id: String, model_path: PathBuf, session: ServerSession) -> Self {
+    pub fn new(
+        model_id: String,
+        model_path: PathBuf,
+        session: ServerSession,
+        default_think_filter: bool,
+    ) -> Self {
         Self {
             model_id,
             model_path,
             started_at: unix_now_secs(),
             permit: Arc::new(Semaphore::new(1)),
             session: Mutex::new(session),
+            default_think_filter,
         }
     }
 }

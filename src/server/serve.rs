@@ -41,6 +41,14 @@ pub struct ServeArgs {
     /// Override the lowercased-basename default with a custom id
     /// reported by `/v1/models` and the chat completion `model` field.
     pub served_model_name: Option<String>,
+    /// When `true`, the server-wide ThinkFilter default flips from
+    /// ON to OFF. Useful for Qwen3-style models behind clients that
+    /// can't pass `chat_template_kwargs.enable_thinking: false`
+    /// (e.g. Open WebUI): with the filter off by default, the
+    /// `<think>...</think>` block reaches the client verbatim
+    /// instead of being stripped to an empty content string.
+    /// Per-request override via `chat_template_kwargs` still wins.
+    pub no_think_filter: bool,
 }
 
 pub fn run(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -68,7 +76,12 @@ pub fn run(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| derive_model_id(&args.model));
 
     let session = load_gguf_session(&args)?;
-    let state = Arc::new(AppState::new(model_id, args.model.clone(), session));
+    let state = Arc::new(AppState::new(
+        model_id,
+        args.model.clone(),
+        session,
+        !args.no_think_filter,
+    ));
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

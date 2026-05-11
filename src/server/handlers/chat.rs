@@ -57,7 +57,17 @@ pub async fn completions(
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
     // 1-4. Validate. Cheap, no GPU touch yet.
-    let normalised = validate_and_normalise(&req)?;
+    let mut normalised = validate_and_normalise(&req)?;
+
+    // Apply the server-wide ThinkFilter default when the client
+    // didn't pass `chat_template_kwargs` at all. This is the
+    // `vulkanforge serve --no-think-filter` switch — needed for
+    // Open WebUI + Qwen3 where the client can't set the kwargs
+    // and the model otherwise consumes the entire response inside
+    // a `<think>` block that the default-on filter strips to "".
+    if req.chat_template_kwargs.is_none() {
+        normalised.enable_thinking = state.default_think_filter;
+    }
 
     // 5. Concurrency gate. §5.3 — try_acquire_owned, 429 on miss.
     // Owned variant lets us move the permit into the blocking

@@ -208,6 +208,16 @@ enum Commands {
         /// the lowercased basename of `--model` without extension.
         #[arg(long)]
         served_model_name: Option<String>,
+        /// Flip the server-wide ThinkFilter default from ON to OFF.
+        /// Useful for Qwen3-style thinking models when the client
+        /// (e.g. Open WebUI) can't pass
+        /// `chat_template_kwargs.enable_thinking: false`. With the
+        /// filter off, `<think>...</think>` blocks reach the
+        /// client verbatim instead of being stripped to an empty
+        /// content string. Per-request `chat_template_kwargs`
+        /// still wins over this CLI default.
+        #[arg(long)]
+        no_think_filter: bool,
     },
 }
 
@@ -281,17 +291,25 @@ fn main() {
         Commands::Info { model } => {
             run_info(&model.unwrap_or_else(default_model_path))
         }
-        Commands::Serve { model, host, port, cors, tokenizer_from, ctx_size, served_model_name } => {
-            vulkanforge::server::serve::run(vulkanforge::server::serve::ServeArgs {
-                model: model.unwrap_or_else(default_model_path),
-                host,
-                port,
-                cors,
-                tokenizer_from,
-                ctx_size,
-                served_model_name,
-            })
-        }
+        Commands::Serve {
+            model,
+            host,
+            port,
+            cors,
+            tokenizer_from,
+            ctx_size,
+            served_model_name,
+            no_think_filter,
+        } => vulkanforge::server::serve::run(vulkanforge::server::serve::ServeArgs {
+            model: model.unwrap_or_else(default_model_path),
+            host,
+            port,
+            cors,
+            tokenizer_from,
+            ctx_size,
+            served_model_name,
+            no_think_filter,
+        }),
     };
     if let Err(e) = result {
         eprintln!("❌ {e}");
