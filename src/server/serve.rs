@@ -45,13 +45,21 @@ pub struct ServeArgs {
 
 pub fn run(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     // SafeTensors directories are valid models but need a different
-    // load path (see `main.rs::run_chat_safetensors`). Sprint 4 will
-    // factor that out into a shared helper; for Sprint 2 we surface
-    // a clear error instead of running a half-broken load.
+    // load path (see `main.rs::run_chat_safetensors`): host-resident
+    // embeddings via `EmbeddingSource::Host`, `apply_pre_device` for
+    // FP8/quantize-on-load detection, and `Tokenizer::from_hf_dir`
+    // for the JSON tokenizer. Reusing the CLI's `ChatSession` would
+    // need a refactor (the helper hard-codes `EmbeddingSource::Gguf`).
+    // Scope-deferred to v0.4.1 — the FP8 SafeTensors smoke target
+    // ships through `vulkanforge chat` today, so the gap doesn't
+    // block the v0.4.0 server release.
     if args.model.is_dir() {
-        return Err("SafeTensors directory models aren't supported by `vulkanforge serve` \
-                    in Sprint 2 — use `vulkanforge chat` for those, or wait for Sprint 4."
-            .into());
+        return Err(
+            "SafeTensors directory models aren't supported by `vulkanforge serve` in v0.4.0. \
+             Use `vulkanforge chat --model <dir>` for FP8/HF SafeTensors models; \
+             SafeTensors serve support is planned for v0.4.1 (host-embed pipeline refactor)."
+                .into(),
+        );
     }
 
     let model_id = args

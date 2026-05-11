@@ -14,6 +14,8 @@
 //!   don't drop a long-prefilling connection.
 
 use std::convert::Infallible;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -21,6 +23,7 @@ use futures_util::stream::{Stream, StreamExt};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::server::cancel::CancelToken;
 use crate::server::error::ApiError;
 use crate::server::types::response::{FinishReason, Usage};
 use crate::server::types::streaming::ChatCompletionChunk;
@@ -66,23 +69,73 @@ pub struct ChunkMeta {
 ///    `Delta` → delta, `Final` → final + optional usage-only).
 /// 2. Appends a synthetic `data: [DONE]` marker when the channel
 ///    closes.
+/// 3. Triggers [`CancelToken::cancel`] when the stream is dropped,
+///    which guarantees the GPU thread sees the signal even if the
+///    `mpsc::Sender::blocking_send` error pathway is slow to fire
+///    (Sprint 4 cancel-latency fix — see [`CancelOnDrop`]).
 ///
-/// Keep-alive is set to 15 s of idle (per architecture §4.3).
+/// Keep-alive is set to 1 s of idle so axum forces a write into the
+/// TCP socket every second; on a closed socket that write errors,
+/// which causes hyper to drop the response body and (transitively)
+/// the inner stream — triggering the drop guard above.
 pub fn sse_response(
     rx: mpsc::Receiver<StreamEvent>,
     meta: ChunkMeta,
+    cancel: CancelToken,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = ReceiverStream::new(rx)
+    let inner = ReceiverStream::new(rx)
         .flat_map(move |ev| futures_util::stream::iter(events_for(&meta, ev)))
         .chain(futures_util::stream::iter(std::iter::once(Ok::<_, Infallible>(
             Event::default().data("[DONE]"),
         ))));
 
-    Sse::new(stream).keep_alive(
+    // Drop-guard the entire chain. axum's `Sse` retains the wrapped
+    // stream until either it polls to completion (server finished
+    // generation) OR hyper drops the response body (client closed
+    // the TCP socket). In the second case the `Drop` impl on
+    // `CancelOnDrop` flips the cancel token, the GPU thread's
+    // decode loop sees the flag on its next iteration, and aborts
+    // cleanly — bounding wasted compute at ~1 token plus the
+    // 1 s keep-alive interval needed to surface the closed-socket
+    // write error.
+    let guarded = CancelOnDrop { stream: inner, cancel };
+
+    Sse::new(guarded).keep_alive(
         KeepAlive::new()
-            .interval(Duration::from_secs(15))
+            .interval(Duration::from_secs(1))
             .text("keep-alive"),
     )
+}
+
+/// Stream adapter that flips a [`CancelToken`] when dropped.
+///
+/// Used to translate "client TCP-close → axum drops the response
+/// body" into "GPU thread sees cancel flag" without relying on
+/// the mpsc-Sender error-pathway alone (which Sprint 3 found to
+/// not propagate fast enough on its own).
+struct CancelOnDrop<S> {
+    stream: S,
+    cancel: CancelToken,
+}
+
+impl<S: Stream + Unpin> Stream for CancelOnDrop<S> {
+    type Item = S::Item;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.stream).poll_next(cx)
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.stream.size_hint()
+    }
+}
+
+impl<S> Drop for CancelOnDrop<S> {
+    fn drop(&mut self) {
+        // Idempotent: cancel() is a single atomic store, safe to
+        // call even on the normal completion path (the GPU has
+        // already exited the decode loop by then, so the flag has
+        // no effect).
+        self.cancel.cancel();
+    }
 }
 
 /// Translate one [`StreamEvent`] into one or more SSE events.

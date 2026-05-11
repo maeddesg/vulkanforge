@@ -110,6 +110,10 @@ struct NormalisedRequest {
     /// Populated from `stream_options.include_usage`. Only honoured
     /// when `stream` is true.
     include_usage: bool,
+    /// `chat_template_kwargs.enable_thinking`. Default `true`
+    /// preserves CLI/Sprint-3 behaviour. `false` disables the
+    /// ThinkFilter so `<think>...</think>` blocks reach the client.
+    enable_thinking: bool,
 }
 
 fn validate_and_normalise(req: &ChatCompletionRequest) -> Result<NormalisedRequest, ApiError> {
@@ -199,6 +203,23 @@ fn validate_and_normalise(req: &ChatCompletionRequest) -> Result<NormalisedReque
         .as_ref()
         .map(|o| o.include_usage)
         .unwrap_or(false);
+    let enable_thinking = req
+        .chat_template_kwargs
+        .as_ref()
+        .map(|o| o.enable_thinking)
+        .unwrap_or(true);
+
+    // §7.1 — presence_penalty is accepted-but-ignored. Surface it
+    // here so operators can spot clients that depend on it; the
+    // handler runs once per request so the log volume is bounded
+    // by client cadence.
+    if let Some(pp) = req.presence_penalty {
+        if pp != 0.0 {
+            eprintln!(
+                "[vulkanforge serve] presence_penalty={pp} ignored (not supported in v0.4)"
+            );
+        }
+    }
 
     Ok(NormalisedRequest {
         system: system.unwrap_or_default(),
@@ -206,6 +227,7 @@ fn validate_and_normalise(req: &ChatCompletionRequest) -> Result<NormalisedReque
         sampling,
         stream: req.stream,
         include_usage,
+        enable_thinking,
     })
 }
 
@@ -258,12 +280,9 @@ fn process_request(
     let cfg_g = GenerateConfig {
         max_tokens,
         print_stream: false,
-        // Apply ThinkFilter by default for templates that produce
-        // <think> blocks. The existing CLI defaults to filter-on
-        // unless `--no-think-filter`; we follow suit. A future
-        // request-level override (`enable_thinking` extension) can
-        // wire through this flag.
-        think_filter: true,
+        // §4.5 — ThinkFilter ON by default; OFF when the request
+        // explicitly sets `chat_template_kwargs.enable_thinking: false`.
+        think_filter: req.enable_thinking,
         sampling: vf_sampling,
         cancel_token: None,
     };
@@ -374,6 +393,7 @@ fn start_streaming(
 
     let state_for_task = state.clone();
     let cancel_for_task = cancel.clone();
+    let cancel_for_sse = cancel.clone();
     let model_id_for_task = model_id.clone();
     tokio::task::spawn_blocking(move || {
         // Permit held for the whole generation; dropped on return.
@@ -402,7 +422,11 @@ fn start_streaming(
         id: chatcmpl_id,
         model: model_id,
     };
-    sse_response(rx, meta).into_response()
+    // The SSE adapter takes ownership of a CancelToken clone; its
+    // Drop impl flips the flag if the client disconnects mid-stream,
+    // catching cases where mpsc-Sender's error pathway alone is
+    // slow to fire (Sprint 4 cancel-latency fix).
+    sse_response(rx, meta, cancel_for_sse).into_response()
 }
 
 /// Run the chat generation, pushing `StreamEvent`s into `tx`. Designed
@@ -434,7 +458,9 @@ fn run_streaming_generation(
     let cfg_g = GenerateConfig {
         max_tokens,
         print_stream: false,
-        think_filter: true,
+        // §4.5 — ThinkFilter ON by default; OFF when the request
+        // explicitly sets `chat_template_kwargs.enable_thinking: false`.
+        think_filter: req.enable_thinking,
         sampling: vf_sampling,
         cancel_token: Some(cancel.as_arc()),
     };
@@ -461,10 +487,22 @@ fn run_streaming_generation(
 
     // The on_visible callback runs once per visible token chunk
     // (post-ThinkFilter). It both sends the delta to the SSE channel
-    // and watches for client-disconnect.
+    // and watches for client-disconnect. Two independent signals
+    // catch disconnects:
+    //   1. `tx.is_closed()` — fast non-blocking check; fires the
+    //      instant the SSE adapter is dropped.
+    //   2. `tx.blocking_send(...)` Err — fires on send to a closed
+    //      receiver (also flips the same cancel flag).
     let tx_for_cb = tx.clone();
     let cancel_for_cb = cancel.clone();
     let on_visible = move |text: &str| {
+        if cancel_for_cb.is_cancelled() {
+            return;
+        }
+        if tx_for_cb.is_closed() {
+            cancel_for_cb.cancel();
+            return;
+        }
         if text.is_empty() {
             return;
         }
@@ -639,6 +677,38 @@ mod tests {
         let n = validate_and_normalise(&req).unwrap();
         assert!(!n.stream);
         assert!(!n.include_usage);
+    }
+
+    #[test]
+    fn enable_thinking_defaults_to_true() {
+        let req = req_from(json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "Hi"}],
+        }));
+        let n = validate_and_normalise(&req).unwrap();
+        assert!(n.enable_thinking, "ThinkFilter should default ON");
+    }
+
+    #[test]
+    fn enable_thinking_false_propagates() {
+        let req = req_from(json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "chat_template_kwargs": {"enable_thinking": false},
+        }));
+        let n = validate_and_normalise(&req).unwrap();
+        assert!(!n.enable_thinking);
+    }
+
+    #[test]
+    fn empty_chat_template_kwargs_keeps_default_thinking_on() {
+        let req = req_from(json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "chat_template_kwargs": {},
+        }));
+        let n = validate_and_normalise(&req).unwrap();
+        assert!(n.enable_thinking);
     }
 
     #[test]

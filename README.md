@@ -246,11 +246,78 @@ for long prefill submits. Setup details and troubleshooting in
 ```
 vulkanforge chat   --model <PATH> [--tokenizer-from <GGUF>] ...
 vulkanforge bench  --model <PATH> [--tokenizer-from <GGUF>] [--runs N]
+vulkanforge serve  --model <PATH> [--host 127.0.0.1] [--port 8080] [--cors]
 ```
 
 `vulkanforge chat --help` lists every flag (sampling, max-tokens,
 think-filter, max-context). The chat REPL accepts `/help`, `/quit`,
 and a single-shot mode via `VF_PROMPT="..."`.
+
+## API Server (v0.4)
+
+OpenAI-compatible HTTP server. Drop-in backend for Open WebUI,
+SillyTavern, Continue.dev, the OpenAI Python SDK, LangChain, and
+any other client that speaks Chat Completions.
+
+```
+vulkanforge serve --model ~/models/Qwen3-8B-Q4_K_M.gguf --port 8080
+```
+
+### Endpoints
+
+| Path                         | Method | Description                          |
+|------------------------------|--------|--------------------------------------|
+| `/v1/chat/completions`       | POST   | Chat (streaming via SSE + sync JSON) |
+| `/v1/models`                 | GET    | List loaded model                    |
+| `/health`                    | GET    | Liveness + KV-cache status           |
+
+The non-prefixed aliases `/chat/completions` and `/models` are also
+routed for clients that omit the `/v1/` prefix.
+
+### Examples
+
+```bash
+# Non-streaming
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-8b-q4_k_m",
+    "messages": [{"role": "user", "content": "What is a mutex?"}],
+    "max_tokens": 100
+  }'
+
+# Streaming (SSE)
+curl -N http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-8b-q4_k_m",
+    "messages": [{"role": "user", "content": "Hi"}],
+    "stream": true,
+    "stream_options": {"include_usage": true},
+    "max_tokens": 50
+  }'
+```
+
+### Options
+
+| Flag                   | Default       | Notes                                              |
+|------------------------|---------------|----------------------------------------------------|
+| `--host`               | `127.0.0.1`   | Use `0.0.0.0` for remote/Docker (no auth in v0.4)  |
+| `--port`               | `8080`        | TCP listen port                                    |
+| `--cors`               | off           | Enable CORS (browser UIs on different ports)       |
+| `--ctx-size`           | `2048`        | KV-cache capacity in tokens                        |
+| `--served-model-name`  | basename      | Override the `model` id reported by `/v1/models`   |
+| `--tokenizer-from`     | —             | Reserved for SafeTensors-serve (v0.4.1)            |
+
+### Scope
+
+- **In:** Streaming + non-streaming chat, `frequency_penalty` →
+  repetition-penalty mapping, `stream_options.include_usage`,
+  `developer` role alias for `system`, `chat_template_kwargs.enable_thinking`
+  toggle for `<think>` filtering.
+- **Out (v0.4):** Multi-turn history (system + user only), tool
+  calling, vision content, embeddings, `/v1/completions`, auth,
+  SafeTensors directory models (use `vulkanforge chat` for those).
 
 ## Limitations
 

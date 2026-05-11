@@ -30,6 +30,13 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
 
+    /// VF/llama.cpp extension. Currently honours one key:
+    /// `enable_thinking: false` disables the ThinkFilter, surfacing
+    /// `<think>...</think>` blocks verbatim. Default: filter ON for
+    /// templates that emit `<think>` (Qwen3, DeepSeek-R1, Gemma-4-26B).
+    #[serde(default)]
+    pub chat_template_kwargs: Option<ChatTemplateKwargs>,
+
     // ---- OpenAI sampling fields (all optional, default per §7.1) ----
     #[serde(default)]
     pub max_tokens: Option<u32>,
@@ -92,6 +99,22 @@ pub struct ChatCompletionRequest {
 pub struct StreamOptions {
     #[serde(default)]
     pub include_usage: bool,
+}
+
+/// llama.cpp-compatible knob for templates that emit thinking blocks.
+/// `enable_thinking: false` lets the model generate the `<think>`
+/// block but disables the server-side ThinkFilter, so the raw text
+/// (including the tags) reaches the client. Useful for debugging
+/// the chain-of-thought of thinking-mode models.
+#[derive(Debug, Deserialize, Default)]
+pub struct ChatTemplateKwargs {
+    /// Default `true` — keep ThinkFilter ON (existing CLI default).
+    #[serde(default = "default_true")]
+    pub enable_thinking: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// `stop` can be a single string or an array of strings (up to 4
