@@ -25,7 +25,7 @@ use super::super::gguf::ModelConfig;
 use super::super::loader::LoadedModel;
 use super::super::pipeline_registry::PipelineRegistry;
 
-use super::arch::{compute_barrier, layer_weight};
+use super::arch::{compute_barrier, layer_weight, transfer_to_compute_barrier};
 use super::state::Forward;
 
 impl Forward {
@@ -376,6 +376,24 @@ impl Forward {
         base_pos: u32,
         next_attn_norm_weight: Option<vk::Buffer>,
     ) {
+        // Sprint 51D-AN — Gemma-4 Full-attention layers route through
+        // the proven DEC per-token path; Sliding layers keep the fast
+        // batched dispatch. Workaround for the multiple parallel bugs
+        // in BAT Full-layer dispatch (51D-AK flash_attn_batch attention
+        // + 51D-AM FFN/PostAttnNorm). Cost: 5 of 30 layers serialise
+        // per prefill (~18 mid-frame submits per Full layer).
+        let is_full = self.config.gemma4.as_ref()
+            .map(|g| matches!(
+                g.layers[layer as usize].kind,
+                super::super::gguf::Gemma4LayerKind::Full,
+            ))
+            .unwrap_or(false);
+        if is_full {
+            self.dispatch_full_layer_per_token(
+                dev, registry, cmd, model, layer, seq_len, base_pos,
+            );
+            return;
+        }
         let plan = super::layer_plan::build_layer_plan(
             &self.config, model, layer, self.rope_theta_scale,
         );
@@ -387,5 +405,117 @@ impl Forward {
         };
         let exec = super::executor::BatchExec;
         exec.execute_layer(self, &plan, &ctx);
+    }
+
+    /// Sprint 51D-AN — per-token DEC dispatch for one Full layer of a
+    /// BAT prefill batch. For each token in the batch:
+    ///   1. mid-frame submit-and-wait drains prior GPU work and lets
+    ///      us host-write rope_pos_buf[0] with this token's position;
+    ///   2. cmd_copy_buffer brings `batch_residual[q_idx-row]` into
+    ///      `cur().scratch_a` (the DEC layer's input slot);
+    ///   3. `dispatch_layer` runs the proven DEC pipeline for this
+    ///      single (layer, position) pair, writing `cur().scratch_b`;
+    ///   4. cmd_copy_buffer writes back into the same row of
+    ///      `batch_residual` so the next BAT layer sees the post-Full
+    ///      hidden state in its expected layout.
+    ///
+    /// The mid-frame submit between iterations is the only mechanism
+    /// that lets us update `rope_pos_buf[0]` host-side so each per-token
+    /// DEC dispatch sees the right RoPE position (DEC RoPE binds
+    /// `rope_pos_buf` at offset 0; the BAT-side pre-stage at prefill
+    /// start writes positions 0..seq_len-1 contiguously, but DEC only
+    /// reads the first slot).
+    fn dispatch_full_layer_per_token(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        model: &LoadedModel,
+        layer: u32,
+        seq_len: u32,
+        base_pos: u32,
+    ) {
+        let hidden_dim = self.config.hidden_dim;
+        let hidden_bytes = (hidden_dim as u64) * 4;
+
+        for q_idx in 0..seq_len {
+            let position = base_pos + q_idx;
+            let src_off = (q_idx as u64) * hidden_bytes;
+
+            // 1. Drain prior commands so we can host-write rope_pos_buf.
+            self.mid_frame_submit_and_wait(dev, cmd)
+                .expect("51D-AN mid_frame_submit_and_wait failed");
+
+            // 2. Host-write the per-token RoPE position. DEC's
+            //    `run_rms_norm_mul_rope` binds rope_pos_buf at offset 0
+            //    with size = m*4 = 4 (single token), so writing the first
+            //    4 bytes is sufficient.
+            self.cur_mut().rope_pos_buf
+                .write_bytes(bytemuck::bytes_of(&position))
+                .expect("51D-AN rope_pos_buf write failed");
+
+            // 3. Copy batch_residual[q_idx row] → cur().scratch_a (DEC input).
+            let scratch_a = self.cur().scratch_a.handle;
+            let scratch_b = self.cur().scratch_b.handle;
+            let batch_residual = self.batch_residual.handle;
+            let copy_in = vk::BufferCopy::default()
+                .src_offset(src_off).dst_offset(0).size(hidden_bytes);
+            unsafe {
+                dev.device.cmd_copy_buffer(
+                    cmd, batch_residual, scratch_a,
+                    std::slice::from_ref(&copy_in),
+                );
+            }
+            transfer_to_compute_barrier(dev, cmd);
+
+            // 4. Run the DEC layer (Q/K/V proj + norm/rope + attention +
+            //    O-proj + FFN/MoE + residual + layer-scalar) for one
+            //    token at `position`.
+            self.dispatch_layer(
+                dev, registry, cmd, model, layer, position, scratch_a, scratch_b,
+            );
+
+            // 5. Copy scratch_b → batch_residual[q_idx row].
+            //    Need a COMPUTE→TRANSFER barrier first: dispatch_layer's
+            //    final step writes scratch_b (shader_write); the upcoming
+            //    cmd_copy_buffer reads it (transfer_read).
+            let mb = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            unsafe {
+                dev.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&mb), &[], &[],
+                );
+            }
+            let copy_out = vk::BufferCopy::default()
+                .src_offset(0).dst_offset(src_off).size(hidden_bytes);
+            unsafe {
+                dev.device.cmd_copy_buffer(
+                    cmd, scratch_b, batch_residual,
+                    std::slice::from_ref(&copy_out),
+                );
+            }
+            // Sync TRANSFER write to batch_residual for any subsequent
+            // compute reads (within this CB; the next iteration starts
+            // fresh after mid-frame submit).
+            transfer_to_compute_barrier(dev, cmd);
+        }
+
+        // Restore the BAT-shape pre-stage of rope_pos_buf so the next
+        // (Sliding) BAT layer sees the full [base_pos, base_pos+1, …]
+        // sequence in slot positions 0..seq_len-1. Without this restore,
+        // rope_pos_buf[0] retains the last per-token DEC position
+        // (= base_pos + seq_len - 1) and the next Sliding layer's
+        // batch RoPE reads a corrupted token-0 position.
+        self.mid_frame_submit_and_wait(dev, cmd)
+            .expect("51D-AN final mid_frame_submit failed");
+        let positions: Vec<u32> = (0..seq_len).map(|t| base_pos + t).collect();
+        self.cur_mut().rope_pos_buf
+            .write_bytes(bytemuck::cast_slice(&positions))
+            .expect("51D-AN rope_pos_buf restore failed");
     }
 }
