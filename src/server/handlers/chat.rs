@@ -69,15 +69,29 @@ pub async fn completions(
         normalised.enable_thinking = state.default_think_filter;
     }
 
-    // 5. Concurrency gate. §5.3 — try_acquire_owned, 429 on miss.
-    // Owned variant lets us move the permit into the blocking
-    // thread; the borrowed variant (try_acquire) would tie the
-    // permit's lifetime to the borrow of `state.permit`.
-    let permit = state
-        .permit
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| ApiError::ServerBusy)?;
+    // 5. Concurrency gate. §5.3 + v0.4.0 quick-fix: wait up to 5 s
+    // for the permit before surrendering with 429. Open WebUI fires
+    // the next chat-completion immediately after the previous
+    // response's last SSE chunk, but the prior spawn_blocking task
+    // may still be in its drop chain (final-chunk send, channel
+    // close) for a few hundred milliseconds. Without the wait,
+    // back-to-back UI turns would 429-flap. Owned-variant lets the
+    // permit move into the blocking thread.
+    let permit = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state.permit.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(p)) => p,
+        Ok(Err(_)) => {
+            return Err(ApiError::internal(
+                "request-permit semaphore closed",
+                "internal_error",
+            ))
+        }
+        Err(_) => return Err(ApiError::ServerBusy),
+    };
 
     if normalised.stream {
         // 6a. Streaming path — return SSE immediately; the GPU work

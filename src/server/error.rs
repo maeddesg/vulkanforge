@@ -191,8 +191,21 @@ pub struct ErrorDetail {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status();
+        let is_busy = matches!(self, ApiError::ServerBusy);
         let body = self.to_response_body();
-        (status, Json(body)).into_response()
+        let mut resp = (status, Json(body)).into_response();
+        // Open WebUI honours `Retry-After` and re-tries the request
+        // after the given delay instead of surfacing an error to the
+        // user. 1 s is enough to bridge the brief permit-release
+        // window between a streamed response's `[DONE]` chunk and the
+        // spawn_blocking task's drop chain.
+        if is_busy {
+            resp.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+        }
+        resp
     }
 }
 
@@ -280,6 +293,40 @@ mod tests {
         let e = ApiError::ServerBusy;
         let resp = e.into_response();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn server_busy_attaches_retry_after_header() {
+        // Open WebUI compat: 429 must carry Retry-After so the
+        // client backs off instead of surfacing a user-visible error.
+        let resp = ApiError::ServerBusy.into_response();
+        let v = resp
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .expect("Retry-After header should be set on 429");
+        assert_eq!(v.to_str().unwrap(), "1");
+    }
+
+    #[test]
+    fn non_busy_errors_have_no_retry_after_header() {
+        // Other 4xx/5xx must NOT carry Retry-After — only the
+        // concurrent-limit case is transient and retry-friendly.
+        for e in [
+            ApiError::invalid("x", "invalid_body"),
+            ApiError::ContextLengthExceeded {
+                prompt_tokens: 1,
+                max_tokens: 1,
+                context_window: 1,
+            },
+            ApiError::internal("x", "internal_error"),
+            ApiError::ModelLoading,
+        ] {
+            let resp = e.into_response();
+            assert!(
+                resp.headers().get(axum::http::header::RETRY_AFTER).is_none(),
+                "Retry-After must not appear on non-ServerBusy errors"
+            );
+        }
     }
 
     #[test]
