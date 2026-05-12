@@ -285,6 +285,37 @@ fn content_to_string(content: &MessageContent, msg_idx: usize) -> Result<String,
 // Processing (runs inside spawn_blocking)
 // =========================================================================
 
+/// Clamp `max_tokens` to the remaining context budget. Mirrors
+/// llama.cpp: silently reduce the budget when prompt + max_tokens
+/// would overflow, and only reject (400) when the prompt alone
+/// leaves no room for even one generated token. Open WebUI hard-codes
+/// `max_tokens: 4096` and grows the chat history unboundedly — a
+/// 4418-token history + 4096 max + 8192 ctx must produce 3774 tokens,
+/// not a user-visible error.
+fn clamp_max_tokens(
+    prompt_tokens: u32,
+    max_tokens: u32,
+    context_window: u32,
+) -> Result<u32, ApiError> {
+    let available = context_window.saturating_sub(prompt_tokens);
+    if available == 0 {
+        return Err(ApiError::ContextLengthExceeded {
+            prompt_tokens,
+            max_tokens,
+            context_window,
+        });
+    }
+    if max_tokens > available {
+        eprintln!(
+            "[vulkanforge serve] max_tokens clamped: {} -> {} (prompt={}, ctx={})",
+            max_tokens, available, prompt_tokens, context_window,
+        );
+        Ok(available)
+    } else {
+        Ok(max_tokens)
+    }
+}
+
 /// Common Sprint 5 prep: render the multi-turn prefill against the
 /// session's chat template, reset the KV cache, validate the prompt
 /// fits the context window, and build the `GenerateConfig`.
@@ -306,17 +337,16 @@ fn prepare_generate(
         .collect();
     let prefill_tokens = session.template.render_full_history(&session.tokenizer, &messages);
 
-    // §7.5 — pre-flight context check. The decode loop itself also
-    // gates on `max_seq_len`, but raising the structured error here
-    // gives clients the OpenAI-spec'd 400 instead of a 500.
+    // §7.5 — pre-flight context check. Mirrors llama.cpp: clamp
+    // `max_tokens` to the remaining context budget instead of
+    // rejecting the request, so a long Open WebUI history + a
+    // hard-coded `max_tokens: 4096` still produces an answer
+    // instead of a user-visible 400. The decode loop also gates
+    // on `max_seq_len`; this pre-flight just keeps the 400 path
+    // limited to the truly-unrecoverable case (prompt alone
+    // fills the context).
     let max_seq = session.chat.forward.kv_cache.config.max_seq_len;
-    if (prefill_tokens.len() as u32).saturating_add(max_tokens) > max_seq {
-        return Err(ApiError::ContextLengthExceeded {
-            prompt_tokens: prefill_tokens.len() as u32,
-            max_tokens,
-            context_window: max_seq,
-        });
-    }
+    let max_tokens = clamp_max_tokens(prefill_tokens.len() as u32, max_tokens, max_seq)?;
 
     let vf_sampling = Sampling {
         temperature: req.sampling.temperature,
@@ -902,5 +932,64 @@ mod tests {
         let hex = &id[9..];
         assert_eq!(hex.len(), 32);
         assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // ---- clamp_max_tokens ------------------------------------------------
+
+    #[test]
+    fn clamp_passes_through_when_request_fits() {
+        // prompt=100, max=4096, ctx=8192 → unchanged
+        let got = clamp_max_tokens(100, 4096, 8192).unwrap();
+        assert_eq!(got, 4096);
+    }
+
+    #[test]
+    fn clamp_reduces_when_prompt_plus_max_would_overflow() {
+        // Open WebUI case: long history + hard-coded max_tokens=4096
+        // prompt=4418, max=4096, ctx=8192 → 8192-4418 = 3774
+        let got = clamp_max_tokens(4418, 4096, 8192).unwrap();
+        assert_eq!(got, 3774);
+    }
+
+    #[test]
+    fn clamp_exact_fit_is_ok() {
+        // prompt=8000, max=192, ctx=8192 → unchanged (boundary)
+        let got = clamp_max_tokens(8000, 192, 8192).unwrap();
+        assert_eq!(got, 192);
+    }
+
+    #[test]
+    fn clamp_to_one_when_prompt_is_one_short_of_ctx() {
+        // prompt=8191, max=100, ctx=8192 → exactly 1 token room left
+        let got = clamp_max_tokens(8191, 100, 8192).unwrap();
+        assert_eq!(got, 1);
+    }
+
+    #[test]
+    fn clamp_errors_when_prompt_fills_context_exactly() {
+        // prompt=8192, max=1, ctx=8192 → zero room → 400
+        let e = clamp_max_tokens(8192, 1, 8192).unwrap_err();
+        assert_eq!(e.code(), "context_length_exceeded");
+    }
+
+    #[test]
+    fn clamp_errors_when_prompt_exceeds_context() {
+        // prompt=8200, max=100, ctx=8192 → saturating_sub → 0 → 400
+        let e = clamp_max_tokens(8200, 100, 8192).unwrap_err();
+        assert_eq!(e.code(), "context_length_exceeded");
+        // Sanity-check the wire-body carries the unclamped request
+        // values so the client sees the actual sizes that conflicted.
+        match e {
+            ApiError::ContextLengthExceeded {
+                prompt_tokens,
+                max_tokens,
+                context_window,
+            } => {
+                assert_eq!(prompt_tokens, 8200);
+                assert_eq!(max_tokens, 100);
+                assert_eq!(context_window, 8192);
+            }
+            _ => panic!("expected ContextLengthExceeded variant"),
+        }
     }
 }
