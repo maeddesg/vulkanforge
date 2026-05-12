@@ -142,7 +142,9 @@ enum Commands {
         /// Default 2048. Larger values increase VRAM proportionally
         /// (FP16 KV: 144 B/layer/token; FP8 KV: 72 B/layer/token).
         /// Pinned at startup; pin once vs the model's `ctx_max`.
-        #[arg(long)]
+        /// `--ctx-size` is accepted as a synonym for parity with
+        /// `vulkanforge serve --ctx-size`.
+        #[arg(long, visible_alias = "ctx-size")]
         max_context: Option<u32>,
     },
     /// Run a small bench: 5-prompt decode + 4-point pp sweep. For the
@@ -890,15 +892,34 @@ fn run_chat_safetensors(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>
                 );
             }
         }
-        let need = prefill.len() as u32 + cfg_g.max_tokens;
-        if *current_pos + need > max_seq {
+        let prefill_end = (*current_pos).saturating_add(prefill.len() as u32);
+        // Hard overflow only when the prompt alone fills the KV cache
+        // (parity with `vulkanforge serve`'s clamp_max_tokens, e12622a,
+        // and GGUF ChatSession::send_streaming). Otherwise clamp
+        // `max_tokens` to the remaining budget for this turn so a
+        // `--max-tokens 2048` request against `--ctx-size 2048` still
+        // generates a useful answer.
+        if prefill_end >= max_seq {
             eprintln!(
-                "\n  [context overflow: {} + {} > {}]",
-                *current_pos, need, max_seq,
+                "\n  [context overflow: prompt {} >= ctx {}]",
+                prefill_end, max_seq,
             );
             eprintln!("  Use /reset to start a new conversation.");
             return Ok(false);
         }
+        let available = max_seq - prefill_end;
+        let mut clamped_config: GenerateConfig;
+        let cfg_g: &GenerateConfig = if cfg_g.max_tokens > available {
+            eprintln!(
+                "  [max_tokens clamped: {} -> {} (prompt={}, ctx={})]",
+                cfg_g.max_tokens, available, prefill_end, max_seq,
+            );
+            clamped_config = cfg_g.clone();
+            clamped_config.max_tokens = available;
+            &clamped_config
+        } else {
+            &cfg_g
+        };
         // Optional `<think>...</think>` filter — reuses the same
         // streaming filter the GGUF ChatSession applies.
         let mut filter = if think_filter {

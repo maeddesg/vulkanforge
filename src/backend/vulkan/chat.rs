@@ -149,14 +149,33 @@ impl ChatSession {
         mut on_visible: impl FnMut(&str),
     ) -> Result<TurnResult, ChatError> {
         let prefill = self.build_prefill_tokens(tokenizer, user_message);
-        let need = prefill.len() as u32 + config.max_tokens;
-        if self.current_pos + need > self.max_seq_len() {
+        let max_seq = self.max_seq_len();
+        let prefill_end = self.current_pos.saturating_add(prefill.len() as u32);
+        // Hard overflow only when the prompt alone fills the cache —
+        // mirrors `vulkanforge serve`'s clamp_max_tokens (e12622a) and
+        // llama.cpp behaviour. Otherwise clamp `max_tokens` to fit and
+        // generate as much as the budget allows so the user gets *an*
+        // answer instead of "context overflow".
+        if prefill_end >= max_seq {
             return Err(ChatError::ContextOverflow {
                 current_pos: self.current_pos,
-                needed: need,
-                max_seq_len: self.max_seq_len(),
+                needed: prefill.len() as u32 + config.max_tokens,
+                max_seq_len: max_seq,
             });
         }
+        let available = max_seq - prefill_end;
+        let mut clamped_config: GenerateConfig;
+        let config: &GenerateConfig = if config.max_tokens > available {
+            eprintln!(
+                "  [max_tokens clamped: {} -> {} (prompt={}, ctx={})]",
+                config.max_tokens, available, prefill_end, max_seq,
+            );
+            clamped_config = config.clone();
+            clamped_config.max_tokens = available;
+            &clamped_config
+        } else {
+            config
+        };
 
         // Wire streaming through ThinkFilter when requested.
         let mut filter = if config.think_filter {
