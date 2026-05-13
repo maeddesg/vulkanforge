@@ -201,6 +201,13 @@ impl MetadataValue {
             _ => None,
         }
     }
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            MetadataValue::Bool(v) => Some(*v),
+            MetadataValue::U8(v) => Some(*v != 0),
+            _ => None,
+        }
+    }
     pub fn as_i32(&self) -> Option<i32> {
         match self {
             MetadataValue::I32(v) => Some(*v),
@@ -382,6 +389,51 @@ impl GgufFile {
             .as_f32()
             .ok_or_else(|| GgufError::UnexpectedType(key.into(), "f32"))
     }
+
+    /// Sprint 52B — read a per-layer u32 array out of GGUF metadata.
+    /// Used by `Gemma4Spec::from_gguf` for `feed_forward_length` (the
+    /// per-layer FFN intermediate size, already-doubled in the GGUF
+    /// for shared layers). Scalar metadata is rejected here — use
+    /// `metadata_u32` or `metadata_u32_scalar_or_array_max` for those.
+    pub fn metadata_u32_array(&self, key: &str) -> Result<Vec<u32>, GgufError> {
+        let arr = self
+            .metadata
+            .get(key)
+            .ok_or_else(|| GgufError::MissingMetadata(key.into()))?
+            .as_array()
+            .ok_or_else(|| GgufError::UnexpectedType(key.into(), "u32[]"))?;
+        let mut out = Vec::with_capacity(arr.len());
+        for el in arr {
+            let v = el
+                .as_u32()
+                .ok_or_else(|| GgufError::UnexpectedType(key.into(), "u32[]"))?;
+            out.push(v);
+        }
+        Ok(out)
+    }
+
+    /// Sprint 52B — read a per-layer bool array out of GGUF metadata.
+    /// Used by `Gemma4Spec::from_gguf` for
+    /// `gemma4.attention.sliding_window_pattern` (bool[n_layers],
+    /// `true` = Sliding, `false` = Full — verified against the E2B
+    /// GGUF dump, where the `False` positions are 4, 9, 14, 19, 24, 29, 34
+    /// — the standard Gemma SSSSF pattern at indices ≡ 4 (mod 5)).
+    pub fn metadata_bool_array(&self, key: &str) -> Result<Vec<bool>, GgufError> {
+        let arr = self
+            .metadata
+            .get(key)
+            .ok_or_else(|| GgufError::MissingMetadata(key.into()))?
+            .as_array()
+            .ok_or_else(|| GgufError::UnexpectedType(key.into(), "bool[]"))?;
+        let mut out = Vec::with_capacity(arr.len());
+        for el in arr {
+            let v = el
+                .as_bool()
+                .ok_or_else(|| GgufError::UnexpectedType(key.into(), "bool[]"))?;
+            out.push(v);
+        }
+        Ok(out)
+    }
 }
 
 /// Layout convention for RoPE. `Neox` rotates `[i, i + n_dims/2]`
@@ -535,6 +587,265 @@ pub enum Gemma4KvSource {
     SubscribesFull,
 }
 
+/// Sprint 52B — pure function that maps the per-layer
+/// `sliding_window_pattern` (`true` = Sliding, `false` = Full) and the
+/// `first_kv_shared` boundary into the per-layer `Gemma4KvSource`
+/// routing decision. Layers in `[0, first_kv_shared)` own their KV;
+/// the **last** sliding and the **last** full layer in that range
+/// become the publishers for every subscriber after the boundary.
+///
+/// Extracted from `Gemma4Spec::from_gguf` so the publisher algorithm
+/// can be unit-tested with synthetic patterns (the SafeTensors path
+/// in `loader.rs:1918-1925` has the same shape but isn't testable
+/// without an HfConfig).
+fn build_kv_sources(
+    pattern: &[bool],
+    first_kv_shared: u32,
+    n_layers: usize,
+) -> Vec<Gemma4KvSource> {
+    let mut last_sliding: Option<u32> = None;
+    let mut last_full: Option<u32> = None;
+    for i in 0..first_kv_shared as usize {
+        // Out-of-range pattern → assume Sliding (the dense kind, which
+        // is the safe default for Gemma where Full is sparse).
+        let is_sliding = pattern.get(i).copied().unwrap_or(true);
+        if is_sliding {
+            last_sliding = Some(i as u32);
+        } else {
+            last_full = Some(i as u32);
+        }
+    }
+    (0..n_layers as u32)
+        .map(|i| {
+            let is_sliding = pattern.get(i as usize).copied().unwrap_or(true);
+            if i >= first_kv_shared {
+                if is_sliding {
+                    Gemma4KvSource::SubscribesSliding
+                } else {
+                    Gemma4KvSource::SubscribesFull
+                }
+            } else if Some(i) == last_sliding {
+                Gemma4KvSource::OwnAndPublishesSliding
+            } else if Some(i) == last_full {
+                Gemma4KvSource::OwnAndPublishesFull
+            } else {
+                Gemma4KvSource::Own
+            }
+        })
+        .collect()
+}
+
+impl Gemma4Spec {
+    /// Sprint 52B — construct a `Gemma4Spec` from GGUF metadata. Mirrors
+    /// the SafeTensors builder (`loader.rs::hf_to_model_config` Gemma-4
+    /// branch) 1:1 with the metadata pulled from `gemma4.*` keys.
+    ///
+    /// Key cross-walk (verified against `gemma-4-E2B-it-Q4_K_M.gguf`
+    /// header dump):
+    /// ```
+    /// SafeTensors HfConfig field         GGUF metadata key                      E2B
+    /// ─────────────────────────────────────────────────────────────────────────────
+    /// num_hidden_layers                  gemma4.block_count                     35
+    /// hidden_size                        gemma4.embedding_length                1536
+    /// num_kv_shared_layers               gemma4.attention.shared_kv_layers      20
+    /// sliding_window                     gemma4.attention.sliding_window        512
+    /// final_logit_softcapping            gemma4.final_logit_softcapping         30.0
+    /// hidden_size_per_layer_input        gemma4.embedding_length_per_layer_input 256
+    /// head_dim_full / _sliding           gemma4.attention.key_length / _swa     512 / 256
+    /// full_rope_theta / sliding_         gemma4.rope.freq_base / _swa           1e6 / 1e4
+    /// layer_types[i]                     gemma4.attention.sliding_window_pattern bool[35]
+    ///                                       (true = Sliding, false = Full)
+    /// intermediate_size[i]               gemma4.feed_forward_length             u32[35]
+    ///                                       (already-doubled in GGUF for shared layers)
+    /// hidden_activation                  HARDCODED "gelu_pytorch_tanh"          —
+    /// tie_word_embeddings                INFERRED: !gguf.tensor("output.weight") true
+    /// full_rope_partial_factor           HARDCODED Some(0.25)                   0.25
+    ///                                       (llama.cpp doesn't store this key
+    ///                                       — Gemma-3/4 always partial=0.25 on
+    ///                                       Full layers per HF transformers)
+    /// ```
+    ///
+    /// 26B-A4B-only fields (`expert_count`, etc.) are read with
+    /// `metadata.get` so they default cleanly to 0 / None on E2B.
+    pub fn from_gguf(gguf: &GgufFile) -> Result<Self, GgufError> {
+        // Block-count and core dims (already validated by ModelConfig
+        // caller but we double-read for self-containment).
+        let n_layers = gguf.metadata_u32("gemma4.block_count")? as usize;
+        let hidden_size = gguf.metadata_u32("gemma4.embedding_length")?;
+        let embed_scale = (hidden_size as f32).sqrt();
+
+        // KV-share boundary. E2B: 35 - 20 = 15. Layers `[0, 15)` are
+        // publishers (own their KV); `[15, 35)` subscribe.
+        let n_shared = gguf
+            .metadata
+            .get("gemma4.attention.shared_kv_layers")
+            .and_then(|v| v.as_u32())
+            .unwrap_or(0) as usize;
+        let first_kv_shared = (n_layers.saturating_sub(n_shared)) as u32;
+
+        // Per-layer kind (true = Sliding, false = Full — verified
+        // against the E2B GGUF where False sits at indices 4, 9, 14,
+        // 19, 24, 29, 34 = the canonical Gemma SSSSF pattern).
+        let pattern: Vec<bool> = gguf
+            .metadata_bool_array("gemma4.attention.sliding_window_pattern")
+            .unwrap_or_else(|_| vec![true; n_layers]);
+        // Per-layer FFN intermediate size (already includes the
+        // shared-layer doubling — no `use_double_wide_mlp` flag to apply).
+        let ffl: Vec<u32> = gguf
+            .metadata_u32_array("gemma4.feed_forward_length")
+            .unwrap_or_else(|_| vec![0; n_layers]);
+
+        // Head / RoPE dims, Full and Sliding variants.
+        let head_dim_full = gguf
+            .metadata
+            .get("gemma4.attention.key_length")
+            .and_then(|v| v.as_u32())
+            .unwrap_or(256);
+        let head_dim_sliding = gguf
+            .metadata
+            .get("gemma4.attention.key_length_swa")
+            .and_then(|v| v.as_u32())
+            .unwrap_or(256);
+        let rope_full = gguf
+            .metadata
+            .get("gemma4.rope.freq_base")
+            .and_then(|v| v.as_f32())
+            .unwrap_or(1_000_000.0);
+        let rope_sliding = gguf
+            .metadata
+            .get("gemma4.rope.freq_base_swa")
+            .and_then(|v| v.as_f32())
+            .unwrap_or(10_000.0);
+
+        // 26B-A4B per-layer KV-head divergence. E2B: head_count_kv = 1
+        // for every layer. 26B: 8 sliding / 2 full via a separate
+        // `gemma4.attention.head_count_kv_full` (?) — llama.cpp's
+        // gemma4 arch key wasn't observed in the E2B header, so for
+        // now read `head_count_kv` as the global default. 52E will
+        // verify whether 26B GGUFs ship a per-layer-or-Full override.
+        let n_kv_global = gguf
+            .metadata
+            .get("gemma4.attention.head_count_kv")
+            .and_then(|v| v.as_u32())
+            .unwrap_or(1);
+
+        // Per-layer kv-source via the publisher algorithm (extracted
+        // to a pure fn for unit-testability).
+        let kv_sources = build_kv_sources(&pattern, first_kv_shared, n_layers);
+
+        let mut layers: Vec<Gemma4LayerSpec> = Vec::with_capacity(n_layers);
+        for i in 0..n_layers as u32 {
+            let is_sliding = *pattern.get(i as usize).unwrap_or(&true);
+            let kind = if is_sliding {
+                Gemma4LayerKind::Sliding
+            } else {
+                Gemma4LayerKind::Full
+            };
+            let head_dim = match kind {
+                Gemma4LayerKind::Sliding => head_dim_sliding,
+                Gemma4LayerKind::Full => head_dim_full,
+            };
+            let intermediate = ffl.get(i as usize).copied().unwrap_or(0);
+            let is_shared = i >= first_kv_shared;
+            let kv_source = kv_sources[i as usize];
+            let (rope_theta, rope_partial_factor) = match kind {
+                Gemma4LayerKind::Sliding => (rope_sliding, None),
+                // HF Gemma-4 always uses partial_rotary_factor=0.25 on
+                // Full layers (rotary_dim = 0.25 * key_length = 128 on
+                // E2B Full). llama.cpp doesn't emit a metadata key for
+                // this — hardcoded matches the SafeTensors path
+                // (Sprint 51D-AJ).
+                Gemma4LayerKind::Full => (rope_full, Some(0.25)),
+            };
+            // 26B Full layers get `n_kv_heads = 2` via
+            // `num_global_key_value_heads`, sliding gets 8. The GGUF
+            // key for that isn't yet observed; for E2B (head_count_kv=1
+            // for every layer) the global default is correct. Sprint
+            // 52E will revisit if 26B diverges.
+            let n_kv_heads = n_kv_global;
+            // E2B: every layer has its own v_proj (attention_k_eq_v
+            // is false). 26B-A4B Full layers under attention_k_eq_v
+            // skip v_proj; that flag isn't in the E2B GGUF and we
+            // default to false. Sprint 52E will surface if 26B GGUFs
+            // need the per-layer override.
+            let attention_k_eq_v = gguf
+                .metadata
+                .get("gemma4.attention.k_eq_v")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let has_v_proj = !(attention_k_eq_v && matches!(kind, Gemma4LayerKind::Full));
+            layers.push(Gemma4LayerSpec {
+                kind,
+                head_dim,
+                intermediate_size: intermediate,
+                has_kv_proj: !is_shared,
+                kv_source,
+                rope_theta,
+                rope_partial_factor,
+                n_kv_heads,
+                has_v_proj,
+            });
+        }
+
+        // Global Gemma4Spec fields.
+        let sliding_window = gguf
+            .metadata
+            .get("gemma4.attention.sliding_window")
+            .and_then(|v| v.as_u32())
+            .unwrap_or(512);
+        let final_logit_softcapping = gguf
+            .metadata
+            .get("gemma4.final_logit_softcapping")
+            .and_then(|v| v.as_f32());
+        let hidden_size_per_layer_input = gguf
+            .metadata
+            .get("gemma4.embedding_length_per_layer_input")
+            .and_then(|v| v.as_u32())
+            .unwrap_or(0);
+        // Tied embeddings = no separate `output.weight` tensor.
+        let tie_word_embeddings = gguf.tensor("output.weight").is_none();
+        // MoE (26B-A4B). E2B has none of these keys; defaults of
+        // (0, 0, 0, false) keep the dispatcher on the Dense path.
+        let n_experts = gguf
+            .metadata
+            .get("gemma4.expert_count")
+            .and_then(|v| v.as_u32())
+            .unwrap_or(0);
+        let top_k_experts = gguf
+            .metadata
+            .get("gemma4.expert_used_count")
+            .and_then(|v| v.as_u32())
+            .unwrap_or(0);
+        let moe_intermediate_size = gguf
+            .metadata
+            .get("gemma4.expert_feed_forward_length")
+            .and_then(|v| v.as_u32())
+            .unwrap_or(0);
+        let enable_moe_block = n_experts > 0;
+
+        Ok(Gemma4Spec {
+            sliding_window,
+            final_logit_softcapping,
+            embed_scale,
+            hidden_activation: "gelu_pytorch_tanh".to_string(),
+            tie_word_embeddings,
+            first_kv_shared,
+            layers,
+            // Filled by the loader in a second pass once the BF16
+            // `blk.{i}.layer_scalar` tensors are read off disk — same
+            // pattern as the SafeTensors path (loader.rs:2017-2019).
+            // No consumer in `forward/` today reads this Vec; the
+            // GPU tensor is queried via `layer_weight(..., "layer_scalar")`.
+            layer_scalars: vec![1.0; n_layers],
+            hidden_size_per_layer_input,
+            enable_moe_block,
+            n_experts,
+            top_k_experts,
+            moe_intermediate_size,
+        })
+    }
+}
+
 impl ModelConfig {
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self, GgufError> {
         let architecture = gguf.metadata_str("general.architecture")?.to_string();
@@ -594,6 +905,14 @@ impl ModelConfig {
             _ => RopeVariant::Norm,
         };
 
+        // Sprint 52B — build Gemma-4 per-layer spec from GGUF metadata
+        // when `arch == "gemma4"`. Non-Gemma archs keep `gemma4: None`.
+        let gemma4 = if arch == "gemma4" {
+            Some(Gemma4Spec::from_gguf(gguf)?)
+        } else {
+            None
+        };
+
         Ok(Self {
             architecture,
             n_layers,
@@ -609,7 +928,7 @@ impl ModelConfig {
             context_length,
             has_qk_norm,
             rms_norm_eps,
-            gemma4: None,
+            gemma4,
         })
     }
 }
@@ -802,5 +1121,110 @@ mod tests {
             resolve("missing"),
             Err(GgufError::MissingMetadata(_))
         ));
+    }
+
+    /// Sprint 52B — verify the publisher-algorithm against the
+    /// canonical E2B pattern: 35 layers, `first_kv_shared = 15`,
+    /// SSSSF cycle with Full at indices 4, 9, 14, 19, 24, 29, 34.
+    /// Brief sanity items:
+    ///   * Layer 13 (last sliding in `[0, 15)`) → `OwnAndPublishesSliding`
+    ///   * Layer 14 (last full in `[0, 15)`)    → `OwnAndPublishesFull`
+    ///   * Layers 0..13 except 4 / 9            → `Own` (sliding non-publisher)
+    ///   * Layers 4, 9                          → `Own` (full non-publisher)
+    ///   * Sliding layers ≥15                   → `SubscribesSliding`
+    ///   * Full layers 19, 24, 29, 34           → `SubscribesFull`
+    #[test]
+    fn build_kv_sources_e2b_pattern() {
+        // Replicate the E2B GGUF's sliding_window_pattern exactly.
+        let pattern: Vec<bool> = (0..35)
+            .map(|i| (i % 5) != 4) // True (Sliding) except at indices ≡ 4 (mod 5)
+            .collect();
+        // Sanity-check the test fixture matches what python gguf reported.
+        let full_indices: Vec<usize> = pattern
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| !**b)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(full_indices, vec![4, 9, 14, 19, 24, 29, 34]);
+
+        let srcs = build_kv_sources(&pattern, 15, 35);
+
+        // Publishers in the pre-shared range:
+        assert_eq!(srcs[13], Gemma4KvSource::OwnAndPublishesSliding,
+            "layer 13 is the last sliding pre-shared");
+        assert_eq!(srcs[14], Gemma4KvSource::OwnAndPublishesFull,
+            "layer 14 is the last full pre-shared");
+        // Non-publisher pre-shared: full at 4 / 9, sliding at 0..3, 5..8, 10..12
+        for i in [0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 4, 9] {
+            assert_eq!(srcs[i], Gemma4KvSource::Own,
+                "layer {i} should be Own (non-publisher in pre-shared)");
+        }
+        // Subscribers in `[15, 35)`:
+        for i in 15..35 {
+            let expected = if (i % 5) == 4 {
+                Gemma4KvSource::SubscribesFull
+            } else {
+                Gemma4KvSource::SubscribesSliding
+            };
+            assert_eq!(srcs[i], expected, "layer {i} subscriber kind");
+        }
+    }
+
+    #[test]
+    fn build_kv_sources_handles_no_full_pre_shared() {
+        // Edge: all-sliding pre-shared range — no full publisher should
+        // be assigned in `[0, first_kv_shared)`, even though shared
+        // full layers exist later (subscribers would have no source —
+        // but VF should still return SubscribesFull for them and a
+        // higher-level fail-loud check catches that mismatch).
+        let pattern: Vec<bool> = vec![true; 10]; // all sliding
+        let mut p = pattern.clone();
+        p[7] = false; // a single full layer outside the pre-shared range
+        let srcs = build_kv_sources(&p, 5, 10);
+        // Pre-shared (0..5) all sliding; layer 4 is the last → publisher
+        assert_eq!(srcs[4], Gemma4KvSource::OwnAndPublishesSliding);
+        // Layer 7 is shared (≥5) and full → SubscribesFull
+        assert_eq!(srcs[7], Gemma4KvSource::SubscribesFull);
+        // Other shared sliding layers
+        for i in [5, 6, 8, 9] {
+            assert_eq!(srcs[i], Gemma4KvSource::SubscribesSliding);
+        }
+    }
+
+    /// Sprint 52B — `metadata_bool_array` should round-trip a `[bool]`
+    /// metadata array. Uses the in-memory shape because there's no
+    /// public test constructor for `GgufFile`; the resolve closure
+    /// mirrors the helper's logic exactly.
+    #[test]
+    fn metadata_bool_array_round_trip() {
+        let arr = MetadataValue::Array(vec![
+            MetadataValue::Bool(true),
+            MetadataValue::Bool(false),
+            MetadataValue::Bool(true),
+            MetadataValue::Bool(true),
+            MetadataValue::Bool(false),
+        ]);
+        let parts = arr.as_array().unwrap();
+        let mut out = Vec::with_capacity(parts.len());
+        for el in parts {
+            out.push(el.as_bool().expect("bool element"));
+        }
+        assert_eq!(out, vec![true, false, true, true, false]);
+
+        // U8(0/1) should also work as bool — defensive.
+        let mixed = MetadataValue::Array(vec![
+            MetadataValue::U8(1),
+            MetadataValue::U8(0),
+        ]);
+        let parts = mixed.as_array().unwrap();
+        let out: Vec<bool> = parts
+            .iter()
+            .filter_map(|el| el.as_bool())
+            .collect();
+        assert_eq!(out, vec![true, false]);
+
+        // Non-bool element returns None — defensive.
+        assert!(MetadataValue::U32(5).as_bool().is_none());
     }
 }

@@ -307,22 +307,6 @@ impl LoadedModel {
     ) -> Result<Self, LoaderError> {
         let config = ModelConfig::from_gguf(gguf)?;
 
-        // Sprint 52A guard — accept Gemma-4 GGUFs through the
-        // `inference_support` arch_ok gate (so the tensor-name remap
-        // below is exercised), but refuse to proceed to `Forward::new`
-        // because `Gemma4Spec::from_gguf` is not yet implemented
-        // (Sprint 52B). Without the spec, `forward/` would silently
-        // fall back to the Llama plan and produce gibberish — a
-        // clean error here is the brief's intended "STOP after 52A".
-        if config.architecture == "gemma4" && config.gemma4.is_none() {
-            return Err(LoaderError::Buffer(
-                "Sprint 52A WIP: arch='gemma4' GGUF detected, tensor-name remap is wired \
-                 but `Gemma4Spec::from_gguf` is Sprint 52B scope. \
-                 `vulkanforge info` works; chat needs 52B + 52C + 52D before E2E."
-                    .into(),
-            ));
-        }
-
         // Sort tensor names for deterministic upload order — helpful
         // when debugging which tensor a panic came from.
         let mut tensor_names: Vec<&str> =
