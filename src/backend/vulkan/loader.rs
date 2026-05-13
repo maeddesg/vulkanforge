@@ -512,6 +512,100 @@ fn build_gemma4_ple_from_gguf(
     }))
 }
 
+/// Sprint 52I-1 — build `MoeRouterData` from a Gemma-4 26B-A4B GGUF.
+/// Mirrors the SafeTensors path (`loader.rs::load_safetensors` MoE
+/// router section, `loader.rs:1855-1900`). Reads three F32 tensors
+/// per layer directly from the GGUF mmap into CPU host vectors — the
+/// router executes on the host between two halves of the per-token
+/// GPU command buffer (Sprint 51D-C `mid_frame_submit_and_wait`).
+///
+/// GGUF source names (PRE-remap):
+///   blk.{i}.ffn_gate_inp.weight   F32 [n_experts, hidden]  → proj
+///   blk.{i}.ffn_gate_inp.scale    F32 [hidden]             → scale
+///   blk.{i}.ffn_down_exps.scale   F32 [n_experts]          → per_expert_scale
+///
+/// These DO also flow through `gemma4_gguf_remap` to land in the GPU
+/// `tensors` HashMap under `moe_router.*` keys, but the runtime
+/// (`forward/executor.rs::step_moe_route`) reads exclusively from the
+/// host vectors — the GPU copies are unused dead VRAM, matching the
+/// SafeTensors path's behaviour.
+///
+/// Returns `Ok(None)` for non-MoE models (E2B / E4B) and for any
+/// non-Gemma arch.
+fn build_moe_router_data_from_gguf(
+    gguf: &GgufFile, config: &ModelConfig,
+) -> Result<Option<MoeRouterData>, LoaderError> {
+    let gm = match config.gemma4.as_ref() {
+        Some(g) if g.enable_moe_block => g,
+        _ => return Ok(None),
+    };
+    let n_layers = config.n_layers as usize;
+    let n_experts = gm.n_experts as usize;
+    let hidden = config.hidden_dim as usize;
+
+    let to_vec = |info: &crate::backend::vulkan::gguf::TensorInfo| -> Vec<f32> {
+        gguf.tensor_bytes(info)
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    };
+
+    let mut layers: Vec<MoeRouterLayerData> = Vec::with_capacity(n_layers);
+    let mut total_bytes: usize = 0;
+    for layer in 0..n_layers {
+        let proj_name = format!("blk.{layer}.ffn_gate_inp.weight");
+        let scale_name = format!("blk.{layer}.ffn_gate_inp.scale");
+        let pes_name = format!("blk.{layer}.ffn_down_exps.scale");
+        let proj_info = gguf.tensor(&proj_name).ok_or_else(|| {
+            LoaderError::Buffer(format!("MoE router missing: {proj_name}"))
+        })?;
+        let scale_info = gguf.tensor(&scale_name).ok_or_else(|| {
+            LoaderError::Buffer(format!("MoE router missing: {scale_name}"))
+        })?;
+        let pes_info = gguf.tensor(&pes_name).ok_or_else(|| {
+            LoaderError::Buffer(format!("MoE router missing: {pes_name}"))
+        })?;
+        // All three are F32 per Phase-0 inventory (`F32: 392` includes
+        // these). Validate shape AND dtype before reading.
+        for (name, info, n_expected) in [
+            (&proj_name[..], proj_info, n_experts * hidden),
+            (&scale_name[..], scale_info, hidden),
+            (&pes_name[..], pes_info, n_experts),
+        ] {
+            if info.ggml_type != GgmlType::F32 {
+                return Err(LoaderError::Buffer(format!(
+                    "{name}: ggml type {:?}, expected F32",
+                    info.ggml_type,
+                )));
+            }
+            if info.n_elements() as usize != n_expected {
+                return Err(LoaderError::Buffer(format!(
+                    "{name}: {} elements != expected {n_expected}",
+                    info.n_elements(),
+                )));
+            }
+        }
+        let proj = to_vec(proj_info);
+        let scale = to_vec(scale_info);
+        let per_expert_scale = to_vec(pes_info);
+        total_bytes += (proj.len() + scale.len() + per_expert_scale.len()) * 4;
+        layers.push(MoeRouterLayerData { proj, scale, per_expert_scale });
+    }
+    eprintln!(
+        "Sprint 52I MoE router GGUF: {n_layers} layers × ({n_experts} experts \
+         × {hidden} hidden + {hidden} scale + {n_experts} per_expert_scale) = \
+         {:.1} MB FP32 host",
+        total_bytes as f64 / 1e6,
+    );
+    Ok(Some(MoeRouterData {
+        n_experts: gm.n_experts,
+        top_k: gm.top_k_experts,
+        hidden_size: config.hidden_dim,
+        rms_norm_eps: config.rms_norm_eps,
+        layers,
+    }))
+}
+
 impl LoadedModel {
     /// Sprint 52F — `gamma_from`: optional SafeTensors directory paired
     /// with the GGUF. When `Some`, the loader replaces the Sprint 52D
@@ -926,6 +1020,11 @@ impl LoadedModel {
         // `config.gemma4.is_none()`).
         let ple_data = build_gemma4_ple_from_gguf(gguf, &config)?;
 
+        // Sprint 52I-1 — CPU-side MoE router state from the three F32
+        // tensors per layer that VF's runtime reads directly without
+        // GPU dispatch. None for non-MoE models (E2B / E4B).
+        let moe_router_data = build_moe_router_data_from_gguf(gguf, &config)?;
+
         Ok(Self {
             config,
             tensors,
@@ -937,10 +1036,7 @@ impl LoadedModel {
             // map directly into a `CpuLmHead` without requantize).
             cpu_lm_head: None,
             ple_data,
-            // GGUF path: no Gemma-4 MoE models in GGUF land yet. Whenever
-            // a GGUF MoE export shows up, `MoeRouterData` can be built
-            // from the GGUF tensor table the same way `ple_data` is.
-            moe_router_data: None,
+            moe_router_data,
         })
     }
 
@@ -2073,6 +2169,20 @@ pub(crate) fn gemma4_gguf_remap(name: &str) -> Option<String> {
         "ffn_down_exps.weight"    => "moe_experts.down_proj",
         "ffn_gate_inp.weight"     => "moe_router.proj.weight",
         "ffn_gate_inp.scale"      => "moe_router.scale",
+        // Sprint 52I-1 + smoke discovery — the 26B MoE block has two
+        // parallel sub-paths (Dense MLP || MoE experts) each with its
+        // own `pre_*` / `post_*` norm pair. llama.cpp prefixes them
+        // with `pre_ffw_*` / `post_ffw_*` (matching the Dense-path
+        // `post_ffw_norm` it already emits); VF's runtime queries
+        // them as `ffn_post_norm_1` / `ffn_pre_norm_2` /
+        // `ffn_post_norm_2` (per `safetensors.rs::hf_to_vf_name`
+        // entries Sprint 51C added). VF's `post_ffw_norm.weight`
+        // (the Dense-path post-FFN norm) is already remapped above
+        // to `ffn_post_norm.weight` — that's index 0 of the
+        // MoE-pair convention.
+        "post_ffw_norm_1.weight"  => "ffn_post_norm_1.weight",
+        "pre_ffw_norm_2.weight"   => "ffn_pre_norm_2.weight",
+        "post_ffw_norm_2.weight"  => "ffn_post_norm_2.weight",
         // `ffn_down_exps.scale` is `[n_experts=128]` F32 per-expert
         // scaling. Shape matches `moe_router.per_expert_scale` in
         // SafeTensors. Treat as the same role; if the MoeRouterData
@@ -2648,6 +2758,33 @@ mod tests {
         assert_eq!(
             gemma4_gguf_remap("blk.5.ffn_down_exps.scale").as_deref(),
             Some("blk.5.moe_router.per_expert_scale"),
+        );
+    }
+
+    /// Sprint 52I — 26B MoE has 2 parallel FFN branches each with its
+    /// own pre/post norm pair. The Dense-path `post_ffw_norm.weight`
+    /// already maps to `ffn_post_norm.weight` (Sprint 52A); the MoE
+    /// branch adds `_1` / `_2` suffix variants and a `pre_ffw_norm_2`.
+    #[test]
+    fn gemma4_remap_renames_26b_moe_norm_suffixes() {
+        assert_eq!(
+            gemma4_gguf_remap("blk.0.post_ffw_norm_1.weight").as_deref(),
+            Some("blk.0.ffn_post_norm_1.weight"),
+        );
+        assert_eq!(
+            gemma4_gguf_remap("blk.15.pre_ffw_norm_2.weight").as_deref(),
+            Some("blk.15.ffn_pre_norm_2.weight"),
+        );
+        assert_eq!(
+            gemma4_gguf_remap("blk.29.post_ffw_norm_2.weight").as_deref(),
+            Some("blk.29.ffn_post_norm_2.weight"),
+        );
+        // The base `post_ffw_norm.weight` (no `_1`/`_2`) must still
+        // map to `ffn_post_norm.weight` (Sprint 52A rename); the new
+        // entries don't shadow it.
+        assert_eq!(
+            gemma4_gguf_remap("blk.0.post_ffw_norm.weight").as_deref(),
+            Some("blk.0.ffn_post_norm.weight"),
         );
     }
 
