@@ -108,10 +108,14 @@ enum Commands {
         /// Defaults to $VF_MODEL_PATH or ~/models/Qwen3-8B-Q4_K_M.gguf.
         #[arg(short, long)]
         model: Option<PathBuf>,
-        /// Sprint 20-M3 — SafeTensors models don't carry an embedded
-        /// tokenizer, so VF reuses the BPE from a matching GGUF.
-        /// Required when `--model` points at a directory; ignored
-        /// otherwise.
+        /// Sprint 20-M3 / Sprint 52R — alternative tokenizer source.
+        /// Accepts either a `.gguf` file (the original behaviour:
+        /// SafeTensors models reuse a GGUF's BPE) **or** a HuggingFace
+        /// model directory (the inverse: a GGUF model reuses
+        /// `<dir>/tokenizer.json` + `<dir>/chat_template.jinja`,
+        /// useful when comparing GGUF and SafeTensors paths against
+        /// the same prompt-tokenisation).
+        /// Required when `--model` points at a directory.
         #[arg(long)]
         tokenizer_from: Option<PathBuf>,
         /// System prompt (default: "You are a helpful assistant.").
@@ -401,7 +405,44 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
     let gguf = GgufFile::open(&model_path)?;
     let cfg = ModelConfig::from_gguf(&gguf)?;
     let model = LoadedModel::load(&dev, &mut allocator, &gguf, args.gamma_from.as_deref())?;
-    let tokenizer = Tokenizer::from_gguf(&gguf)?;
+    // Sprint 52R R-1 — `--tokenizer-from` is now bidirectional:
+    //   `Some(dir)`  → load tokenizer.json + chat_template.jinja from
+    //                   a HuggingFace model directory (lets a GGUF run
+    //                   reproduce a SafeTensors run's exact
+    //                   prompt-tokenisation for hidden-state bisects).
+    //   `Some(file)` → existing path: load the BPE from another GGUF
+    //                   (Sprint 20-M3 / 21C; rare these days but kept
+    //                   for back-compat).
+    //   `None`       → load the tokenizer embedded in the model GGUF
+    //                   itself (the default chat path).
+    let (tokenizer, template) = match args.tokenizer_from.as_ref() {
+        Some(path) if path.is_dir() => {
+            let tok = Tokenizer::from_hf_dir(path)?;
+            let tpl = vulkanforge::backend::vulkan::chat_template::ChatTemplate::detect_hf(
+                path, &tok,
+            );
+            eprintln!(
+                "Sprint 52R: --tokenizer-from <hf-dir> = {} (tokenizer.json + chat_template.jinja)",
+                path.display(),
+            );
+            (tok, tpl)
+        }
+        Some(gguf_path) => {
+            let tok_gguf = GgufFile::open(gguf_path)?;
+            let tok = Tokenizer::from_gguf(&tok_gguf)?;
+            let tpl = vulkanforge::backend::vulkan::chat_template::ChatTemplate::detect(
+                &tok_gguf, &tok,
+            );
+            (tok, tpl)
+        }
+        None => {
+            let tok = Tokenizer::from_gguf(&gguf)?;
+            let tpl = vulkanforge::backend::vulkan::chat_template::ChatTemplate::detect(
+                &gguf, &tok,
+            );
+            (tok, tpl)
+        }
+    };
     if max_context > cfg.context_length {
         eprintln!(
             "VulkanForge: --max-context {} exceeds model's reported context_length {} — \
@@ -453,13 +494,9 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.seed_was_explicit,
     );
 
-    // Sprint 17A — pick the chat template by inspecting the embedded
-    // Jinja `tokenizer.chat_template` (with tokenizer-flavour fallback)
-    // instead of always using ChatML. Required for Llama-3.1, Mistral,
-    // DeepSeek-R1 and friends to render the right turn boundaries.
-    let template = vulkanforge::backend::vulkan::chat_template::ChatTemplate::detect(
-        &gguf, &tokenizer,
-    );
+    // Sprint 17A — chat template was picked by the tokenizer-source
+    // branch above (`detect` for GGUF sources / `detect_hf` for HF-dir
+    // sources). It's now bound; just hand it to the session.
     let mut session = ChatSession::new_with_template(forward, system_prompt.clone(), template);
     let mut last_turn: Option<TurnResult> = None;
 
