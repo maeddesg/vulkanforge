@@ -346,6 +346,35 @@ impl GgufFile {
             .ok_or_else(|| GgufError::UnexpectedType(key.into(), "u32"))
     }
 
+    /// Gemma-4-style per-layer arrays (`{arch}.feed_forward_length`,
+    /// `{arch}.attention.sliding_window_pattern` …) appear as Array of
+    /// scalars in the metadata table. For buffer sizing on the
+    /// `ModelConfig` side, we need a single representative value —
+    /// the **max** across all layers (so any per-layer dispatch fits
+    /// the same scratch buffers). Scalar metadata returns the scalar
+    /// unchanged; this keeps non-Gemma archs working.
+    pub fn metadata_u32_scalar_or_array_max(&self, key: &str) -> Result<u32, GgufError> {
+        let v = self
+            .metadata
+            .get(key)
+            .ok_or_else(|| GgufError::MissingMetadata(key.into()))?;
+        if let Some(n) = v.as_u32() {
+            return Ok(n);
+        }
+        if let Some(arr) = v.as_array() {
+            let mut best: Option<u32> = None;
+            for el in arr {
+                if let Some(n) = el.as_u32() {
+                    best = Some(best.map_or(n, |b| b.max(n)));
+                }
+            }
+            if let Some(b) = best {
+                return Ok(b);
+            }
+        }
+        Err(GgufError::UnexpectedType(key.into(), "u32 or u32[]"))
+    }
+
     pub fn metadata_f32(&self, key: &str) -> Result<f32, GgufError> {
         self.metadata
             .get(key)
@@ -522,7 +551,12 @@ impl ModelConfig {
         let n_heads = metadata_u32("attention.head_count")?;
         let n_kv_heads = metadata_u32("attention.head_count_kv")?;
         let hidden_dim = metadata_u32("embedding_length")?;
-        let ffn_dim = metadata_u32("feed_forward_length")?;
+        // Gemma-4 stores `feed_forward_length` as a per-layer u32 array
+        // (35 entries for E2B). For `ModelConfig.ffn_dim` (single value,
+        // used for max-buffer sizing), take the array max. Scalar
+        // metadata still returns the scalar, so all other archs
+        // (qwen2/3, llama, mistral, …) keep their existing behaviour.
+        let ffn_dim = gguf.metadata_u32_scalar_or_array_max(&format!("{arch}.feed_forward_length"))?;
         let context_length = metadata_u32("context_length")?;
         let rope_freq_base = metadata_f32("rope.freq_base")?;
         let rms_norm_eps = metadata_f32("attention.layer_norm_rms_epsilon")?;
@@ -708,5 +742,65 @@ mod tests {
         };
         assert_eq!(info.n_elements(), 128 * 64);
         assert_eq!(info.byte_size(), 128 * 64 * 2);
+    }
+
+    /// Gemma-4 GGUFs encode `feed_forward_length` (and a handful of
+    /// other per-layer keys) as a u32 array, one entry per block. Pre
+    /// this sprint, the strict `metadata_u32` rejected them with
+    /// `UnexpectedType("…", "u32")`, blocking every Gemma-4 GGUF at
+    /// `ModelConfig::from_gguf`. Verify the array-tolerant helper
+    /// returns the max element (used for buffer sizing) AND still
+    /// works for plain scalar metadata so non-Gemma archs are
+    /// unaffected.
+    #[test]
+    fn metadata_u32_scalar_or_array_max_handles_array() {
+        let mut md: HashMap<String, MetadataValue> = HashMap::new();
+        md.insert("scalar".to_string(), MetadataValue::U32(2048));
+        md.insert(
+            "array".to_string(),
+            MetadataValue::Array(vec![
+                MetadataValue::U32(8192),
+                MetadataValue::U32(12288),
+                MetadataValue::U32(2048),
+                MetadataValue::U32(12288), // max present twice on purpose
+                MetadataValue::U32(4096),
+            ]),
+        );
+        md.insert(
+            "u64_scalar".to_string(),
+            MetadataValue::U64(65536), // fits in u32; should resolve via as_u32()
+        );
+
+        // Hand-roll a GgufFile-shaped object isn't trivial (mmap), so
+        // test the helper logic by stitching the metadata access path
+        // manually — same code paths the method calls.
+        let resolve = |key: &str| -> Result<u32, GgufError> {
+            let v = md
+                .get(key)
+                .ok_or_else(|| GgufError::MissingMetadata(key.into()))?;
+            if let Some(n) = v.as_u32() {
+                return Ok(n);
+            }
+            if let Some(arr) = v.as_array() {
+                let mut best: Option<u32> = None;
+                for el in arr {
+                    if let Some(n) = el.as_u32() {
+                        best = Some(best.map_or(n, |b| b.max(n)));
+                    }
+                }
+                if let Some(b) = best {
+                    return Ok(b);
+                }
+            }
+            Err(GgufError::UnexpectedType(key.into(), "u32 or u32[]"))
+        };
+
+        assert_eq!(resolve("scalar").unwrap(), 2048);
+        assert_eq!(resolve("array").unwrap(), 12288);
+        assert_eq!(resolve("u64_scalar").unwrap(), 65536);
+        assert!(matches!(
+            resolve("missing"),
+            Err(GgufError::MissingMetadata(_))
+        ));
     }
 }

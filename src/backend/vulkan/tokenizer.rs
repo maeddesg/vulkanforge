@@ -145,6 +145,20 @@ pub struct Tokenizer {
     pub endoftext_id: Option<u32>,
 }
 
+/// Pick the BPE pre-tokenizer flavour given the GGUF
+/// `tokenizer.ggml.model` and `tokenizer.ggml.pre` values. Pulled out
+/// of `from_gguf_bpe` for unit-testing — see `tokenizer::tests`.
+fn pick_bpe_flavour(model: &str, pre: &str) -> Result<TokenizerFlavour, TokenizerError> {
+    match (model, pre) {
+        (_, "qwen2") => Ok(TokenizerFlavour::Qwen2),
+        (_, "llama-bpe") => Ok(TokenizerFlavour::Llama3),
+        // Gemma-4 GGUFs (model="gemma4") skip the `pre` key — detect
+        // by model name.
+        ("gemma4", _) => Ok(TokenizerFlavour::Gemma2),
+        (_, other) => Err(TokenizerError::BadModel(format!("pre={other}"))),
+    }
+}
+
 impl Tokenizer {
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self, TokenizerError> {
         let model = gguf
@@ -153,23 +167,27 @@ impl Tokenizer {
             .and_then(|v| v.as_str())
             .ok_or(TokenizerError::MissingMetadata("tokenizer.ggml.model"))?;
         match model {
-            "gpt2" => Self::from_gguf_bpe(gguf),
+            "gpt2" => Self::from_gguf_bpe(gguf, "gpt2"),
             "llama" => Self::from_gguf_spm(gguf),
+            // Gemma-4 GGUFs (llama.cpp ≥ b56xx) use `model = "gemma4"`
+            // and ship BPE merges in SPM-style (▁-prefixed). They omit
+            // `tokenizer.ggml.pre` because the upstream pre-tokenizer is
+            // a `Split` on " " with `MergedWithPrevious` semantics, not
+            // a regex split. `from_gguf_bpe` routes that to the existing
+            // `TokenizerFlavour::Gemma2` path which already has the
+            // matching encode logic (`gemma_encode`).
+            "gemma4" => Self::from_gguf_bpe(gguf, "gemma4"),
             other => Err(TokenizerError::BadModel(other.to_string())),
         }
     }
 
-    fn from_gguf_bpe(gguf: &GgufFile) -> Result<Self, TokenizerError> {
+    fn from_gguf_bpe(gguf: &GgufFile, model: &str) -> Result<Self, TokenizerError> {
         let pre = gguf
             .metadata
             .get("tokenizer.ggml.pre")
             .and_then(|v| v.as_str())
             .unwrap_or("default");
-        let flavour = match pre {
-            "qwen2" => TokenizerFlavour::Qwen2,
-            "llama-bpe" => TokenizerFlavour::Llama3,
-            other => return Err(TokenizerError::BadModel(format!("pre={other}"))),
-        };
+        let flavour = pick_bpe_flavour(model, pre)?;
         let pre_regex = match flavour {
             TokenizerFlavour::Qwen2 => QWEN2_PRE_REGEX,
             TokenizerFlavour::Llama3 => LLAMA3_PRE_REGEX,
@@ -261,10 +279,24 @@ impl Tokenizer {
                     }
                 }
             }
-            // Sprint 43B-2 — Gemma-4 isn't reachable through the
-            // GGUF path (no llama.cpp Gemma-4 support yet); arm
-            // listed for exhaustiveness only.
-            TokenizerFlavour::Gemma2 => {}
+            // Gemma-4 GGUF: eos_token_id from metadata is `<turn|>`
+            // (per-turn boundary, id=106 in E2B/26B). Add `<eos>`
+            // (id=1, model-level end) as an extra stop so decode
+            // terminates on either marker. Mirrors the HF path
+            // (Sprint 43B-2) which does the same with the SafeTensors
+            // tokenizer.
+            TokenizerFlavour::Gemma2 => {
+                if let Some(&id) = token_to_id.get("<eos>") {
+                    if id != eos_id && !extra_eos_ids.contains(&id) {
+                        extra_eos_ids.push(id);
+                    }
+                }
+                if let Some(&id) = token_to_id.get("<turn|>") {
+                    if id != eos_id && !extra_eos_ids.contains(&id) {
+                        extra_eos_ids.push(id);
+                    }
+                }
+            }
         }
 
         let (byte_to_char, char_to_byte) = build_byte_unicode_tables();
@@ -1017,6 +1049,41 @@ fn build_byte_unicode_tables() -> ([char; 256], HashMap<char, u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Gemma-4 GGUFs declare `tokenizer.ggml.model = "gemma4"` and
+    /// omit `tokenizer.ggml.pre`. Pre this sprint the BPE factory
+    /// rejected them at `match (model, pre) { … }` with
+    /// `BadModel("pre=default")`. Verify the routing now lands on
+    /// `TokenizerFlavour::Gemma2` regardless of `pre`, while
+    /// non-Gemma archs still go through the existing branches.
+    #[test]
+    fn pick_bpe_flavour_routes_gemma4_to_gemma2() {
+        // Gemma-4 GGUF (pre = "default" because metadata omits the key)
+        assert_eq!(
+            pick_bpe_flavour("gemma4", "default").unwrap(),
+            TokenizerFlavour::Gemma2,
+        );
+        // Hypothetical Gemma-4 GGUF that *did* ship a `pre` (we still
+        // want Gemma2 — model name dominates).
+        assert_eq!(
+            pick_bpe_flavour("gemma4", "some-future-pre").unwrap(),
+            TokenizerFlavour::Gemma2,
+        );
+        // Existing Qwen2/3 + Llama-3 routes unchanged.
+        assert_eq!(
+            pick_bpe_flavour("gpt2", "qwen2").unwrap(),
+            TokenizerFlavour::Qwen2,
+        );
+        assert_eq!(
+            pick_bpe_flavour("gpt2", "llama-bpe").unwrap(),
+            TokenizerFlavour::Llama3,
+        );
+        // Unknown combinations still error out — the regression guard.
+        assert!(matches!(
+            pick_bpe_flavour("gpt2", "default"),
+            Err(TokenizerError::BadModel(_))
+        ));
+    }
 
     #[test]
     fn byte_unicode_roundtrip_covers_all_256() {
