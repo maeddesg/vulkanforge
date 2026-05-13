@@ -647,7 +647,112 @@ impl LoadedModel {
         if arch_is_gemma4 {
             eprintln!(
                 "Sprint 52A: Gemma-4 GGUF remap — {gemma4_renamed} tensors renamed, \
-                 {gemma4_dropped} dropped (rope_freqs / per_layer_token_embd)"
+                 {gemma4_dropped} dropped (rope_freqs / per_layer_token_embd / \
+                 per_layer_model_proj / per_layer_proj_norm)"
+            );
+        }
+
+        // Sprint 52D — `post_per_layer_input_norm.weight` (one
+        // [hps=256] F32 vector per layer) is missing from
+        // llama.cpp's Gemma-4 GGUFs — the converter doesn't emit it.
+        // VF's forward queries `blk.{i}.post_per_layer_input_norm.weight`
+        // at `arch/common.rs:268` (the PleBlock's hidden-norm step). H1
+        // hypothesis (Sprint 52C report §C): the norm is identity
+        // (γ=1.0) — synthesise a `[hps; 1.0]` FP32 buffer per layer and
+        // upload through the same staging path as the regular tensors.
+        // If the E2B smoke yields coherent output, H1 confirmed; if
+        // not, the per-layer γ values must be recovered from a
+        // SafeTensors reference (Sprint 52D-bisect, out of this scope).
+        let mut synth_norm_count = 0u32;
+        if arch_is_gemma4 {
+            if let Some(gm) = config.gemma4.as_ref() {
+                let hps = gm.hidden_size_per_layer_input as usize;
+                let ones_bytes: Vec<u8> = {
+                    let mut v = Vec::with_capacity(hps * 4);
+                    for _ in 0..hps {
+                        v.extend_from_slice(&1.0f32.to_le_bytes());
+                    }
+                    v
+                };
+                let synth_size = (hps * 4) as u64;
+                for layer in 0..config.n_layers {
+                    let key = format!("blk.{layer}.post_per_layer_input_norm.weight");
+                    if tensors.contains_key(&key) {
+                        continue;
+                    }
+                    // Flush + rewind staging if this synthesis would
+                    // overflow the staging buffer. (For the canonical
+                    // E2B / E4B / 26B all 35 layers × 1024 B = 35 KB,
+                    // well under STAGING_BYTES = 3.5 GB; the check is
+                    // defensive but mirrors the main loop's pattern.)
+                    if staging_off + synth_size > STAGING_BYTES {
+                        if let Err(e) =
+                            Self::flush_batch(dev, &cmd_ctx, &staging, &pending)
+                        {
+                            staging.destroy(&dev.device, allocator);
+                            cmd_ctx.destroy(&dev.device);
+                            for (_, t) in tensors.drain() {
+                                t.buffer.destroy(&dev.device, allocator);
+                            }
+                            return Err(e);
+                        }
+                        pending.clear();
+                        staging_off = 0;
+                    }
+                    let dst = match GpuBuffer::new(
+                        &dev.device,
+                        allocator,
+                        synth_size,
+                        vk::BufferUsageFlags::STORAGE_BUFFER
+                            | vk::BufferUsageFlags::TRANSFER_DST,
+                        MemoryLocation::GpuOnly,
+                        &key,
+                    ) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            staging.destroy(&dev.device, allocator);
+                            cmd_ctx.destroy(&dev.device);
+                            for (_, t) in tensors.drain() {
+                                t.buffer.destroy(&dev.device, allocator);
+                            }
+                            return Err(LoaderError::Buffer(format!(
+                                "synth norm '{key}' alloc: {e}"
+                            )));
+                        }
+                    };
+                    staging
+                        .write_bytes_at(staging_off, &ones_bytes)
+                        .map_err(|e| LoaderError::Buffer(e.to_string()))?;
+                    pending.push((
+                        dst.handle,
+                        vk::BufferCopy::default()
+                            .src_offset(staging_off)
+                            .dst_offset(0)
+                            .size(synth_size),
+                    ));
+                    staging_off += synth_size;
+                    bytes_uploaded += synth_size;
+                    tensors.insert(
+                        key,
+                        GpuTensor {
+                            buffer: dst,
+                            shape: vec![hps as u64],
+                            ggml_type: GgmlType::F32,
+                            byte_size: synth_size,
+                            weight_scale: None,
+                            scale_buffer: None,
+                            scale_block: None,
+                        },
+                    );
+                    synth_norm_count += 1;
+                }
+            }
+        }
+        if synth_norm_count > 0 {
+            eprintln!(
+                "Sprint 52D: synthesised γ=1.0 fallback for {synth_norm_count} \
+                 blk.*.post_per_layer_input_norm.weight tensors \
+                 (not emitted by llama.cpp Gemma-4 GGUF converter)"
             );
         }
 
