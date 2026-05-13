@@ -1289,11 +1289,21 @@ impl DecodeExec {
             //     padded weight columns are quantized zeros so the
             //     extra contributions are exactly 0.
             let down_off = (expert_idx as u64) * down_bytes_per_expert;
+            // Sprint 52M — was passing `mi_padded=768` as the K push-
+            // constant (Sprint 51D-D's row-padding for the SafeTensors
+            // Q4_K quantizer). GGUF Q5_0 down_exps doesn't pad —
+            // shape[0] is K=704 directly (704 ÷ 32 = 22 exact). The
+            // shader iterates K columns, so passing 768 to a 704-K
+            // tensor reads 64 garbage columns per row → wrong logits.
+            // Use the tensor's own innermost-dim shape as K — works
+            // for SafeTensors-padded Q4_K (shape[0]=768) AND GGUF
+            // Q5_0 (shape[0]=704).
+            let down_k = down_t.shape[0] as u32;
             fwd.run_gemv_q4k_at_offset(
                 ctx.dev, ctx.registry, ctx.cmd,
                 down_w, down_off,
                 up_buf, o_buf,
-                mi_padded, h,
+                down_k, h,
                 "moe_down",
                 down_shader,
             );
@@ -2527,12 +2537,18 @@ impl BatchExec {
                 //     extra reads are in-bounds for the buffer (8448
                 //     bytes ≥ mi_padded × 4 = 3072 bytes) and the
                 //     padded weight columns are zero.
+                // Sprint 52M — same `down_k = down_t.shape[0]` fix as
+                // the DEC path; see `step_moe_expert_ffn` (line 1296)
+                // for the rationale. The `up_buf` input-binding range
+                // also uses `down_k` so the shader's input stride
+                // matches the per-tensor K.
+                let down_k = down_t.shape[0] as u32;
                 fwd.run_gemv_q4k_at_offset_inout(
                     ctx.dev, ctx.registry, ctx.cmd,
                     down_w, down_off,
-                    up_buf, 0, (mi_padded as u64) * 4,
+                    up_buf, 0, (down_k as u64) * 4,
                     o_buf, 0, h_bytes,
-                    mi_padded, h,
+                    down_k, h,
                     "moe_down_b",
                     down_shader,
                 );
