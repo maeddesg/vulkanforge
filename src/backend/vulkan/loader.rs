@@ -299,6 +299,173 @@ pub struct MoeRouterLayerData {
     pub per_expert_scale: Vec<f32>,
 }
 
+/// Sprint 52C — dequantize a Q5_K byte buffer into a freshly-allocated
+/// BF16 byte buffer. Used for `per_layer_token_embd.weight` (the PLE
+/// table — llama.cpp stores it as Q5_K in Gemma-4 GGUFs; the runtime
+/// `PleData::build_per_layer_inputs` expects BF16 rows it can index by
+/// `token_id * num_layers * hps * 2`). Block-parallel via rayon (per
+/// `feedback_q4k_per_row_alignment` the 256-aligned block boundary
+/// keeps each Q5_K block independent).
+///
+/// Total elements must be a multiple of `q5k::QUANT_K` (256). The
+/// caller is responsible for size validation against the tensor's
+/// declared shape.
+fn dequant_q5k_to_bf16_bytes(raw: &[u8], total_elements: usize) -> Result<Vec<u8>, LoaderError> {
+    use crate::backend::vulkan::q5k;
+    use rayon::prelude::*;
+    if total_elements % q5k::QUANT_K != 0 {
+        return Err(LoaderError::Buffer(format!(
+            "Q5_K dequant: total_elements {total_elements} not a multiple of {}",
+            q5k::QUANT_K,
+        )));
+    }
+    let n_blocks = total_elements / q5k::QUANT_K;
+    let expected_in_bytes = n_blocks * q5k::BLOCK_BYTES;
+    if raw.len() != expected_in_bytes {
+        return Err(LoaderError::Buffer(format!(
+            "Q5_K dequant: input {} bytes != expected {} ({} blocks × {} B)",
+            raw.len(), expected_in_bytes, n_blocks, q5k::BLOCK_BYTES,
+        )));
+    }
+    let mut out = vec![0u8; total_elements * 2];
+    out.par_chunks_mut(q5k::QUANT_K * 2)
+        .enumerate()
+        .for_each(|(blk_idx, dst)| {
+            let off = blk_idx * q5k::BLOCK_BYTES;
+            let block: &[u8; q5k::BLOCK_BYTES] = raw[off..off + q5k::BLOCK_BYTES]
+                .try_into()
+                .expect("checked");
+            let fp32 = q5k::dequant_block(block);
+            for (i, &f) in fp32.iter().enumerate() {
+                let bits = half::bf16::from_f32(f).to_bits();
+                dst[i * 2] = bits as u8;
+                dst[i * 2 + 1] = (bits >> 8) as u8;
+            }
+        });
+    Ok(out)
+}
+
+/// Sprint 52C — Per-Layer Embedding state from a Gemma-4 GGUF. Reads
+/// the three top-level PLE tensors (`per_layer_token_embd.weight`,
+/// `per_layer_model_proj.weight`, `per_layer_proj_norm.weight`),
+/// dequants the Q5_K table to BF16 bytes, expands the BF16 projection
+/// to FP32, and returns a `PleData` shaped identically to the
+/// SafeTensors path's (so `PleData::build_per_layer_inputs` and the
+/// forward consumer don't have to branch).
+fn build_gemma4_ple_from_gguf(
+    gguf: &GgufFile, config: &ModelConfig,
+) -> Result<Option<PleData>, LoaderError> {
+    let gm = match config.gemma4.as_ref() {
+        Some(g) => g,
+        None => return Ok(None),
+    };
+    let table_info = gguf.tensor("per_layer_token_embd.weight");
+    let proj_info = gguf.tensor("per_layer_model_proj.weight");
+    let norm_info = gguf.tensor("per_layer_proj_norm.weight");
+    let (table_info, proj_info, norm_info) = match (table_info, proj_info, norm_info) {
+        (Some(t), Some(p), Some(n)) => (t, p, n),
+        _ => return Ok(None),
+    };
+
+    let nl = config.n_layers;
+    let hps = gm.hidden_size_per_layer_input;
+    let hidden = config.hidden_dim;
+    // GGUF reports tensor shape with dim0 = innermost (row-major
+    // convention matching numpy). `per_layer_token_embd` shape
+    // `[nl*hps, vocab]` ⇒ `vocab` is the outer dim = number of rows.
+    let vocab = *table_info
+        .dimensions
+        .last()
+        .ok_or_else(|| LoaderError::Buffer(
+            "per_layer_token_embd.weight has no dimensions".into()
+        ))? as u32;
+    let total_table_elems = (vocab as usize) * (nl as usize) * (hps as usize);
+
+    // 1. Dequant Q5_K table → BF16 bytes (E2B: ~4.7 GB result).
+    let t0 = std::time::Instant::now();
+    let embed_table_bf16: Vec<u8> = match table_info.ggml_type {
+        GgmlType::Q5K => dequant_q5k_to_bf16_bytes(
+            gguf.tensor_bytes(table_info), total_table_elems,
+        )?,
+        GgmlType::BF16 => gguf.tensor_bytes(table_info).to_vec(),
+        other => return Err(LoaderError::Buffer(format!(
+            "per_layer_token_embd.weight: ggml type {other:?} not supported (Q5_K or BF16)"
+        ))),
+    };
+    eprintln!(
+        "Sprint 52C PLE GGUF: per_layer_token_embd dequant ({:.1} GB BF16, {:.0} ms, type={:?})",
+        embed_table_bf16.len() as f64 / 1e9,
+        t0.elapsed().as_secs_f64() * 1000.0,
+        table_info.ggml_type,
+    );
+
+    // 2. BF16 projection → FP32 host vec.
+    let proj_elems = (nl as usize) * (hps as usize) * (hidden as usize);
+    let mut per_layer_model_projection = vec![0f32; proj_elems];
+    match proj_info.ggml_type {
+        GgmlType::BF16 => {
+            let raw = gguf.tensor_bytes(proj_info);
+            if raw.len() != proj_elems * 2 {
+                return Err(LoaderError::Buffer(format!(
+                    "per_layer_model_proj.weight size {} != expected {} \
+                     (nl={nl} × hps={hps} × hidden={hidden} × 2 B)",
+                    raw.len(), proj_elems * 2,
+                )));
+            }
+            crate::quantize_avx512::bf16_bytes_to_fp32_dispatch(
+                raw, &mut per_layer_model_projection,
+            );
+        }
+        GgmlType::F32 => {
+            let raw = gguf.tensor_bytes(proj_info);
+            if raw.len() != proj_elems * 4 {
+                return Err(LoaderError::Buffer(format!(
+                    "per_layer_model_proj.weight size {} != expected {} (F32)",
+                    raw.len(), proj_elems * 4,
+                )));
+            }
+            for (i, c) in raw.chunks_exact(4).enumerate() {
+                per_layer_model_projection[i] =
+                    f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            }
+        }
+        other => return Err(LoaderError::Buffer(format!(
+            "per_layer_model_proj.weight: ggml type {other:?} not supported"
+        ))),
+    }
+
+    // 3. Projection norm γ (F32 [hps]).
+    let norm_raw = gguf.tensor_bytes(norm_info);
+    if norm_raw.len() != (hps as usize) * 4 {
+        return Err(LoaderError::Buffer(format!(
+            "per_layer_proj_norm.weight size {} != expected {} (F32 × {})",
+            norm_raw.len(), (hps as usize) * 4, hps,
+        )));
+    }
+    let projection_norm_gamma: Vec<f32> = norm_raw
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    eprintln!(
+        "Sprint 52C PLE GGUF: per_layer_model_proj expanded ({:.1} MB FP32, [{}, {}])",
+        (per_layer_model_projection.len() * 4) as f64 / 1e6,
+        nl * hps, hidden,
+    );
+
+    Ok(Some(PleData {
+        embed_table_bf16,
+        vocab,
+        num_layers: nl,
+        hps,
+        hidden_size: hidden,
+        embed_per_layer_scale: (hps as f32).sqrt(),
+        projection_norm_gamma,
+        rms_norm_eps: config.rms_norm_eps,
+        per_layer_model_projection,
+    }))
+}
+
 impl LoadedModel {
     pub fn load(
         dev: &VulkanDevice,
@@ -501,6 +668,13 @@ impl LoadedModel {
         staging.destroy(&dev.device, allocator);
         cmd_ctx.destroy(&dev.device);
 
+        // Sprint 52C — Gemma-4 PLE state from the three top-level
+        // GGUF tensors (`per_layer_token_embd` Q5_K, `per_layer_model_proj`
+        // BF16, `per_layer_proj_norm` F32). `None` for non-Gemma archs
+        // (build_gemma4_ple_from_gguf short-circuits on
+        // `config.gemma4.is_none()`).
+        let ple_data = build_gemma4_ple_from_gguf(gguf, &config)?;
+
         Ok(Self {
             config,
             tensors,
@@ -511,7 +685,7 @@ impl LoadedModel {
             // GGUF Q6_K (which is already 6-bit on disk and would
             // map directly into a `CpuLmHead` without requantize).
             cpu_lm_head: None,
-            ple_data: None,
+            ple_data,
             // GGUF path: no Gemma-4 MoE models in GGUF land yet. Whenever
             // a GGUF MoE export shows up, `MoeRouterData` can be built
             // from the GGUF tensor table the same way `ple_data` is.
@@ -1585,8 +1759,13 @@ pub(crate) fn gemma4_gguf_remap(name: &str) -> Option<String> {
         | "output.weight" => return Some(name.to_string()),
         // VF computes RoPE freqs on-the-fly; drop the precomputed table.
         "rope_freqs.weight" => return None,
-        // PLE table — Sprint 52C handles the dedicated load route.
-        "per_layer_token_embd.weight" => return None,
+        // PLE tensors — Sprint 52C dedicates a `build_gemma4_ple_from_gguf`
+        // route that constructs the `PleData` struct directly off
+        // `gguf.tensor_bytes(...)`; nothing in the regular `tensors`
+        // map references these names.
+        "per_layer_token_embd.weight"
+        | "per_layer_model_proj.weight"
+        | "per_layer_proj_norm.weight" => return None,
         _ => {}
     }
     let rest = match name.strip_prefix("blk.") {
@@ -2134,7 +2313,11 @@ mod tests {
             Some("output_norm.weight"),
         );
         assert!(gemma4_gguf_remap("rope_freqs.weight").is_none());
+        // All three PLE tensors must drop from the regular `tensors`
+        // map — Sprint 52C builds `PleData` from them directly.
         assert!(gemma4_gguf_remap("per_layer_token_embd.weight").is_none());
+        assert!(gemma4_gguf_remap("per_layer_model_proj.weight").is_none());
+        assert!(gemma4_gguf_remap("per_layer_proj_norm.weight").is_none());
         // Unknown top-level: pass through.
         assert_eq!(
             gemma4_gguf_remap("future_top_level_tensor.weight").as_deref(),
