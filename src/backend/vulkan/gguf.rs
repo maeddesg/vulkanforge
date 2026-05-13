@@ -689,11 +689,29 @@ impl Gemma4Spec {
         let pattern: Vec<bool> = gguf
             .metadata_bool_array("gemma4.attention.sliding_window_pattern")
             .unwrap_or_else(|_| vec![true; n_layers]);
-        // Per-layer FFN intermediate size (already includes the
-        // shared-layer doubling — no `use_double_wide_mlp` flag to apply).
-        let ffl: Vec<u32> = gguf
-            .metadata_u32_array("gemma4.feed_forward_length")
-            .unwrap_or_else(|_| vec![0; n_layers]);
+        // Per-layer FFN intermediate size. Sprint 52V — Gemma-4-26B-A4B
+        // GGUFs store `feed_forward_length` as a SCALAR (since every
+        // layer shares the same dense-FFN intermediate of 2112), but
+        // some converters wrap it in a 1-element array. The strict
+        // `metadata_u32_array` accepts only an array and was returning
+        // `Err` on scalar → fallback `vec![0; n_layers]` → every layer
+        // dispatched the dense FFN branch with `intermediate_size=0` →
+        // missing dense-branch contribution → garbage logits invariant
+        // to weight quant (Sprint 52U narrowed the bug to a
+        // quant-invariant code-path divergence at Layer 0, this fix
+        // closes it). Accept three shapes:
+        //   per-layer u32[n_layers]   → use directly,
+        //   single u32 (or u32[1])    → broadcast to all layers,
+        //   missing/unparseable       → keep the legacy zero-fill.
+        let ffl: Vec<u32> = match gguf.metadata_u32_array("gemma4.feed_forward_length") {
+            Ok(arr) if arr.len() == n_layers => arr,
+            _ => {
+                let scalar = gguf
+                    .metadata_u32_scalar_or_array_max("gemma4.feed_forward_length")
+                    .unwrap_or(0);
+                vec![scalar; n_layers]
+            }
+        };
 
         // Head / RoPE dims, Full and Sliding variants.
         let head_dim_full = gguf
