@@ -150,7 +150,9 @@ fn load_gguf_session(args: &ServeArgs) -> Result<ServerSession, Box<dyn std::err
 
     let gguf = GgufFile::open(&args.model)?;
     let cfg = ModelConfig::from_gguf(&gguf)?;
-    let model = LoadedModel::load(&dev, &mut allocator, &gguf)?;
+    // serve path: no --gamma-from CLI option yet (Sprint 52F scope was
+    // chat only; serve is a follow-up).
+    let model = LoadedModel::load(&dev, &mut allocator, &gguf, None)?;
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
     if max_context > cfg.context_length {
         eprintln!(

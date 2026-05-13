@@ -146,6 +146,16 @@ enum Commands {
         /// `vulkanforge serve --ctx-size`.
         #[arg(long, visible_alias = "ctx-size")]
         max_context: Option<u32>,
+        /// Sprint 52F — paired-SafeTensors override for the Gemma-4
+        /// `post_per_layer_input_norm.weight` tensors that llama.cpp's
+        /// GGUF converter omits (Sprint 52E §P1 finding). When set,
+        /// VF opens the directory as a SafeTensors model and replaces
+        /// the γ=1.0 fallback (Sprint 52D) with the real per-layer
+        /// values. Only the 35 (E2B) / 42 (E4B) / 30 (26B) norm
+        /// tensors are read; everything else stays from the GGUF.
+        /// Has no effect on non-Gemma archs.
+        #[arg(long)]
+        gamma_from: Option<PathBuf>,
     },
     /// Run a small bench: 5-prompt decode + 4-point pp sweep. For the
     /// full 15-prompt and full pp-sweep, use `cargo run --release
@@ -227,11 +237,12 @@ fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
         Commands::Chat { model, tokenizer_from, system, max_tokens, temperature, top_k, top_p,
-                         repetition_penalty, seed, no_think_filter, max_context } => {
+                         repetition_penalty, seed, no_think_filter, max_context, gamma_from } => {
             run_chat(ChatArgs {
                 model: model.unwrap_or_else(default_model_path),
                 tokenizer_from,
                 max_context,
+                gamma_from,
                 // Sprint 43D-4 — default to empty system prompt to match
                 // HF `apply_chat_template(messages, add_generation_prompt=True)`.
                 // Pre-43D-4 the default was DEFAULT_SYSTEM ("You are a helpful
@@ -279,7 +290,7 @@ fn main() {
                         })
                 }),
                 think_filter: !no_think_filter && std::env::var("VF_NO_THINK_FILTER").is_err(),
-            })
+            }) // (gamma_from already moved into ChatArgs above)
         }
         Commands::Bench { model, tokenizer_from, pp_list, runs, max_context } => {
             run_bench(
@@ -332,6 +343,9 @@ struct ChatArgs {
     seed: u64,
     seed_was_explicit: bool,
     think_filter: bool,
+    /// Sprint 52F — paired SafeTensors directory for Gemma-4
+    /// `post_per_layer_input_norm.weight` override.
+    gamma_from: Option<PathBuf>,
 }
 
 fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -386,7 +400,7 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
     let load_start = Instant::now();
     let gguf = GgufFile::open(&model_path)?;
     let cfg = ModelConfig::from_gguf(&gguf)?;
-    let model = LoadedModel::load(&dev, &mut allocator, &gguf)?;
+    let model = LoadedModel::load(&dev, &mut allocator, &gguf, args.gamma_from.as_deref())?;
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
     if max_context > cfg.context_length {
         eprintln!(
@@ -1416,7 +1430,8 @@ fn run_bench(
     let cmd_ctx = CommandContext::new(&dev.device, dev.queue_family_index)?;
     let gguf = GgufFile::open(&model_path)?;
     let cfg = ModelConfig::from_gguf(&gguf)?;
-    let model = LoadedModel::load(&dev, &mut allocator, &gguf)?;
+    // Bench path: no --gamma-from override.
+    let model = LoadedModel::load(&dev, &mut allocator, &gguf, None)?;
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
     let max_pp_local = pp_sizes.iter().copied().max().unwrap_or(64);
     let kv_cache = KvCache::new(

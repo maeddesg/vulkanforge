@@ -721,6 +721,7 @@ pub fn embedding_row(
     use super::q3k;
     use super::q4_0;
     use super::q5k;
+    use super::q6k;
     let info = gguf
         .tensor("token_embd.weight")
         .ok_or("token_embd.weight not in GGUF")?;
@@ -771,6 +772,27 @@ pub fn embedding_row(
                 let block: &[u8; q5k::BLOCK_BYTES] =
                     (&bytes[blk_off..blk_off + q5k::BLOCK_BYTES]).try_into().unwrap();
                 out.extend_from_slice(&q5k::dequant_block(block));
+            }
+            Ok(out)
+        }
+        GgmlType::Q6K => {
+            // Sprint 52F — E4B GGUFs emit `token_embd.weight` as Q6_K
+            // (E2B uses Q4_K, 26B likely Q6_K too). Mirrors the Q5_K
+            // arm above — same block-iteration shape, just calls the
+            // `q6k::dequant_block` we shipped in Sprint 52E P3 for
+            // the PLE-table dequant.
+            let blocks_per_row = (cfg.hidden_dim as usize) / q6k::QUANT_K;
+            let row_bytes = blocks_per_row * q6k::BLOCK_BYTES;
+            let row_off = (token_id as usize) * row_bytes;
+            if row_off + row_bytes > bytes.len() {
+                return Err(format!("token_id {token_id} out of range").into());
+            }
+            let mut out = Vec::with_capacity(cfg.hidden_dim as usize);
+            for b in 0..blocks_per_row {
+                let blk_off = row_off + b * q6k::BLOCK_BYTES;
+                let block: &[u8; q6k::BLOCK_BYTES] =
+                    (&bytes[blk_off..blk_off + q6k::BLOCK_BYTES]).try_into().unwrap();
+                out.extend_from_slice(&q6k::dequant_block(block));
             }
             Ok(out)
         }

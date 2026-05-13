@@ -513,10 +513,18 @@ fn build_gemma4_ple_from_gguf(
 }
 
 impl LoadedModel {
+    /// Sprint 52F — `gamma_from`: optional SafeTensors directory paired
+    /// with the GGUF. When `Some`, the loader replaces the Sprint 52D
+    /// γ=1.0 fallback for `blk.{i}.post_per_layer_input_norm.weight`
+    /// (35 tensors on E2B, 42 on E4B, 30 on 26B) with the real per-layer
+    /// values read from the SafeTensors directory. Other tensors are
+    /// untouched — only the norm-fallback path is overridden. Has no
+    /// effect on non-Gemma archs.
     pub fn load(
         dev: &VulkanDevice,
         allocator: &mut Allocator,
         gguf: &GgufFile,
+        gamma_from: Option<&std::path::Path>,
     ) -> Result<Self, LoaderError> {
         let config = ModelConfig::from_gguf(gguf)?;
 
@@ -716,6 +724,26 @@ impl LoadedModel {
         // the post-conversion math. If E2B output is coherent with
         // this fix, H1 + dim correction = enough. If still gibberish,
         // ship the real γ vectors (Sprint 52E P1.5 follow-up).
+        // Sprint 52F P1 — open the paired SafeTensors directory once
+        // for the γ override (when --gamma-from is set). The
+        // SafeTensorsFile handles both single-file and multi-file
+        // (model.safetensors.index.json) layouts.
+        let gamma_st = if arch_is_gemma4 {
+            match gamma_from {
+                Some(dir) => match crate::safetensors::SafeTensorsFile::open(dir) {
+                    Ok(st) => Some(st),
+                    Err(e) => {
+                        return Err(LoaderError::Buffer(format!(
+                            "--gamma-from {}: {e}", dir.display(),
+                        )));
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+        let mut gamma_loaded_count = 0u32;
         let mut synth_norm_count = 0u32;
         if arch_is_gemma4 {
             if let Some(_gm) = config.gemma4.as_ref() {
@@ -733,6 +761,10 @@ impl LoadedModel {
                     v
                 };
                 let synth_size = (norm_dim * 4) as u64;
+                // Per-layer payload buffer — reused across iterations;
+                // either holds real BF16→FP32 expansion or the γ=1.0
+                // fallback. Always `synth_size` bytes.
+                let mut payload: Vec<u8> = ones_bytes.clone();
                 for layer in 0..config.n_layers {
                     let key = format!("blk.{layer}.post_per_layer_input_norm.weight");
                     if tensors.contains_key(&key) {
@@ -778,8 +810,66 @@ impl LoadedModel {
                             )));
                         }
                     };
+                    // Resolve the payload for this layer: real γ from
+                    // SafeTensors if --gamma-from supplied AND the
+                    // tensor is present + correctly-shaped; else
+                    // γ=1.0 fallback. The `payload` buffer is
+                    // pre-sized to `norm_dim * 4`.
+                    payload.copy_from_slice(&ones_bytes);
+                    let mut loaded_from_st = false;
+                    if let Some(st) = gamma_st.as_ref() {
+                        let hf_name = format!(
+                            "model.language_model.layers.{layer}.post_per_layer_input_norm.weight"
+                        );
+                        if let Some(info) = st.tensor(&hf_name) {
+                            // Validate shape AND dtype before reading.
+                            let shape_ok = info.shape.len() == 1
+                                && info.shape[0] as usize == norm_dim;
+                            if !shape_ok {
+                                return Err(LoaderError::Buffer(format!(
+                                    "{hf_name}: shape {:?} != [{norm_dim}]",
+                                    info.shape,
+                                )));
+                            }
+                            let raw = st.tensor_bytes(info);
+                            match info.dtype {
+                                crate::safetensors::TensorDtype::BF16 => {
+                                    let as_f32: &mut [f32] =
+                                        bytemuck::cast_slice_mut(&mut payload);
+                                    crate::quantize_avx512::bf16_bytes_to_fp32_dispatch(
+                                        raw, as_f32,
+                                    );
+                                    loaded_from_st = true;
+                                    gamma_loaded_count += 1;
+                                }
+                                crate::safetensors::TensorDtype::F32 => {
+                                    if raw.len() != norm_dim * 4 {
+                                        return Err(LoaderError::Buffer(format!(
+                                            "{hf_name}: F32 size {} != {}",
+                                            raw.len(), norm_dim * 4,
+                                        )));
+                                    }
+                                    payload.copy_from_slice(raw);
+                                    loaded_from_st = true;
+                                    gamma_loaded_count += 1;
+                                }
+                                other => {
+                                    return Err(LoaderError::Buffer(format!(
+                                        "{hf_name}: dtype {other:?} not supported \
+                                         (BF16 or F32)"
+                                    )));
+                                }
+                            }
+                        }
+                        // info=None: SafeTensors directory doesn't have
+                        // this tensor — falls through to γ=1.0 (and the
+                        // synth counter increments below).
+                    }
+                    if !loaded_from_st {
+                        synth_norm_count += 1;
+                    }
                     staging
-                        .write_bytes_at(staging_off, &ones_bytes)
+                        .write_bytes_at(staging_off, &payload)
                         .map_err(|e| LoaderError::Buffer(e.to_string()))?;
                     pending.push((
                         dst.handle,
@@ -802,15 +892,13 @@ impl LoadedModel {
                             scale_block: None,
                         },
                     );
-                    synth_norm_count += 1;
                 }
             }
         }
-        if synth_norm_count > 0 {
+        if gamma_loaded_count > 0 || synth_norm_count > 0 {
             eprintln!(
-                "Sprint 52D: synthesised γ=1.0 fallback for {synth_norm_count} \
-                 blk.*.post_per_layer_input_norm.weight tensors \
-                 (not emitted by llama.cpp Gemma-4 GGUF converter)"
+                "Sprint 52F: post_per_layer_input_norm — {gamma_loaded_count} loaded \
+                 from --gamma-from SafeTensors, {synth_norm_count} γ=1.0 fallback"
             );
         }
 
