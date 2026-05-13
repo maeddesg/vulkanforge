@@ -773,17 +773,17 @@ impl Gemma4Spec {
                 .as_ref()
                 .and_then(|a| a.get(i as usize).copied())
                 .unwrap_or(n_kv_global);
-            // E2B: every layer has its own v_proj (attention_k_eq_v
-            // is false). 26B-A4B Full layers under attention_k_eq_v
-            // skip v_proj; that flag isn't in the E2B GGUF and we
-            // default to false. Sprint 52E will surface if 26B GGUFs
-            // need the per-layer override.
-            let attention_k_eq_v = gguf
-                .metadata
-                .get("gemma4.attention.k_eq_v")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let has_v_proj = !(attention_k_eq_v && matches!(kind, Gemma4LayerKind::Full));
+            // Sprint 52K — detect `has_v_proj` via tensor presence
+            // instead of metadata. 26B GGUFs (Google official) omit
+            // `attn_v.weight` for Full layers entirely (the model uses
+            // `attention_k_eq_v=true` semantics — V derived from K), but
+            // they don't emit a `gemma4.attention.k_eq_v` metadata key
+            // for VF to read. Probing the actual tensor table is robust
+            // for both: present → has_v_proj=true (SafeTensors-quantised
+            // model OR future GGUFs that DO emit attn_v), missing →
+            // has_v_proj=false (current 26B GGUF Full layers).
+            let attn_v_name = format!("blk.{i}.attn_v.weight");
+            let has_v_proj = gguf.tensor(&attn_v_name).is_some();
             layers.push(Gemma4LayerSpec {
                 kind,
                 head_dim,

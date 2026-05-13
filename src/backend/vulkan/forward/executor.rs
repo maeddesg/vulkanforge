@@ -1159,7 +1159,7 @@ impl DecodeExec {
     /// `ffn_hidden` weighted by the renormalized router weight.
     fn step_moe_expert_ffn(
         &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx,
-        _n_experts: u32, _top_k: u32, moe_intermediate: u32,
+        n_experts: u32, _top_k: u32, moe_intermediate: u32,
     ) {
         let routing = fwd.moe_routing.take()
             .expect("MoeExpertFfn before MoeRoute populated routing");
@@ -1183,10 +1183,46 @@ impl DecodeExec {
         // 2. `gate_up_proj` always has K=hidden, which is 256-aligned
         // for the shipped Gemma-4 configs, so no padding there.
         let mi_padded: u32 = ((mi + 255) / 256) * 256;
-        let gate_up_bytes_per_expert: u64 =
-            (((2 * mi) as u64) * (h as u64) / 256) * 144;
-        let down_bytes_per_expert: u64 =
-            ((h as u64) * (mi_padded as u64) / 256) * 144;
+        // Sprint 52K — was hardcoded `* 144 / 256` (Q4_K block bytes /
+        // K-quant block size) AND assumed Sprint-51D-D's `mi_padded` row
+        // padding. That's correct for the SafeTensors path where Q4_K
+        // pad-quantises down_proj rows at load (51D-D `padded_rows`
+        // helper), but **wrong for GGUF**: llama.cpp stores 26B's
+        // experts as Q3_K (gate_up) and Q5_0 (down) **without** row
+        // padding, because Q3_K(K=2816) and Q5_0(K=704) are already
+        // multiples of their respective block sizes (256 / 32).
+        //
+        // Robust fix: derive `bytes_per_expert` from the actual tensor's
+        // `byte_size` / `n_experts` — that's the ground truth, padded
+        // or not. Works for both the SafeTensors-quantised Q4_K and the
+        // native GGUF Q3_K / Q5_0. Identical patch lands in
+        // `step_moe_expert_ffn` (DEC path) AND `b_step_moe_expert_ffn`
+        // (BAT path).
+        let gate_up_t = ctx
+            .model
+            .tensor(&format!("blk.{}.moe_experts.gate_up_proj", ctx.layer))
+            .expect("moe_experts.gate_up_proj missing");
+        let down_t = ctx
+            .model
+            .tensor(&format!("blk.{}.moe_experts.down_proj", ctx.layer))
+            .expect("moe_experts.down_proj missing");
+        let gate_up_bytes_per_expert: u64 = gate_up_t.byte_size / (n_experts as u64);
+        let down_bytes_per_expert: u64 = down_t.byte_size / (n_experts as u64);
+        let _ = mi_padded; // still computed for downstream barrier sizes
+        // Sprint 52K — per-expert GEMV shader is now picked from the
+        // actual weight ggml_type (was hardcoded Q4_K). 26B Q3_K_M has
+        // gate_up=Q3_K + down=Q5_0 → without this fix, both dispatch
+        // the Q4_K shader and read wrong block strides → garbage.
+        let gate_up_shader = layer_weight_shader(
+            ctx.model, ctx.layer,
+            "moe_experts.gate_up_proj",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
+        let down_shader = layer_weight_shader(
+            ctx.model, ctx.layer,
+            "moe_experts.down_proj",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
         let gate_up_w = layer_weight(ctx.model, ctx.layer, "moe_experts.gate_up_proj");
         let down_w    = layer_weight(ctx.model, ctx.layer, "moe_experts.down_proj");
 
@@ -1211,6 +1247,7 @@ impl DecodeExec {
                 scratch_b, gate_buf,
                 h, 2 * mi,
                 "moe_gate_up",
+                gate_up_shader,
             );
             fwd.mark_written(&[gate_buf]);
             fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[gate_buf]);
@@ -1258,6 +1295,7 @@ impl DecodeExec {
                 up_buf, o_buf,
                 mi_padded, h,
                 "moe_down",
+                down_shader,
             );
             fwd.mark_written(&[o_buf]);
             fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[o_buf]);
@@ -2361,7 +2399,7 @@ impl BatchExec {
 
     fn b_step_moe_expert_ffn(
         &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx,
-        _n_experts: u32, _top_k: u32, moe_intermediate: u32,
+        n_experts: u32, _top_k: u32, moe_intermediate: u32,
     ) {
         let routing_batch = fwd.moe_routing_batch.take()
             .expect("MoeExpertFfn (batch) before MoeRoute populated routing");
@@ -2372,10 +2410,46 @@ impl BatchExec {
         let mi_bytes = (mi as u64) * 4;
         // Sprint 51D-D — padded-K alignment (see decode-side comment).
         let mi_padded: u32 = ((mi + 255) / 256) * 256;
-        let gate_up_bytes_per_expert: u64 =
-            (((2 * mi) as u64) * (h as u64) / 256) * 144;
-        let down_bytes_per_expert: u64 =
-            ((h as u64) * (mi_padded as u64) / 256) * 144;
+        // Sprint 52K — was hardcoded `* 144 / 256` (Q4_K block bytes /
+        // K-quant block size) AND assumed Sprint-51D-D's `mi_padded` row
+        // padding. That's correct for the SafeTensors path where Q4_K
+        // pad-quantises down_proj rows at load (51D-D `padded_rows`
+        // helper), but **wrong for GGUF**: llama.cpp stores 26B's
+        // experts as Q3_K (gate_up) and Q5_0 (down) **without** row
+        // padding, because Q3_K(K=2816) and Q5_0(K=704) are already
+        // multiples of their respective block sizes (256 / 32).
+        //
+        // Robust fix: derive `bytes_per_expert` from the actual tensor's
+        // `byte_size` / `n_experts` — that's the ground truth, padded
+        // or not. Works for both the SafeTensors-quantised Q4_K and the
+        // native GGUF Q3_K / Q5_0. Identical patch lands in
+        // `step_moe_expert_ffn` (DEC path) AND `b_step_moe_expert_ffn`
+        // (BAT path).
+        let gate_up_t = ctx
+            .model
+            .tensor(&format!("blk.{}.moe_experts.gate_up_proj", ctx.layer))
+            .expect("moe_experts.gate_up_proj missing");
+        let down_t = ctx
+            .model
+            .tensor(&format!("blk.{}.moe_experts.down_proj", ctx.layer))
+            .expect("moe_experts.down_proj missing");
+        let gate_up_bytes_per_expert: u64 = gate_up_t.byte_size / (n_experts as u64);
+        let down_bytes_per_expert: u64 = down_t.byte_size / (n_experts as u64);
+        let _ = mi_padded; // still computed for downstream barrier sizes
+        // Sprint 52K — per-expert GEMV shader is now picked from the
+        // actual weight ggml_type (was hardcoded Q4_K). 26B Q3_K_M has
+        // gate_up=Q3_K + down=Q5_0 → without this fix, both dispatch
+        // the Q4_K shader and read wrong block strides → garbage.
+        let gate_up_shader = layer_weight_shader(
+            ctx.model, ctx.layer,
+            "moe_experts.gate_up_proj",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
+        let down_shader = layer_weight_shader(
+            ctx.model, ctx.layer,
+            "moe_experts.down_proj",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
         let gate_up_w = layer_weight(ctx.model, ctx.layer, "moe_experts.gate_up_proj");
         let down_w    = layer_weight(ctx.model, ctx.layer, "moe_experts.down_proj");
         let batch_in = fwd.batch_o.handle;
@@ -2412,6 +2486,7 @@ impl BatchExec {
                     gate_buf, 0, (2 * mi as u64) * 4,
                     h, 2 * mi,
                     "moe_gate_up_b",
+                    gate_up_shader,
                 );
                 fwd.mark_written(&[gate_buf]);
                 fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[gate_buf]);
@@ -2459,6 +2534,7 @@ impl BatchExec {
                     o_buf, 0, h_bytes,
                     mi_padded, h,
                     "moe_down_b",
+                    down_shader,
                 );
                 fwd.mark_written(&[o_buf]);
                 fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[o_buf]);

@@ -1321,6 +1321,12 @@ impl Forward {
     /// per block — the FP8 per-tensor `weight_scale` push-constant
     /// is unused by the Q4_K shader.
     #[allow(clippy::too_many_arguments)]
+    // Sprint 52K — was hardcoded Q4_K shader. Caller now passes the
+    // ShaderId (typically derived via `layer_weight_shader(...,
+    // "moe_experts.gate_up_proj", subgroup)`) so 26B-A4B's
+    // Q3_K / Q5_0 / Q6_K MoE expert weights pick the right GEMV
+    // pipeline instead of silently reading Q4_K blocks (which
+    // produced NaN propagating into Layer-1 router softmax).
     pub(super) fn run_gemv_q4k_at_offset(
         &mut self,
         dev: &VulkanDevice,
@@ -1333,12 +1339,8 @@ impl Forward {
         k: u32,
         m: u32,
         label: &str,
+        shader: ShaderId,
     ) {
-        let shader = if self.mul_mat_vec_subgroup_enabled {
-            ShaderId::MulMatVecQ4KSubgroup
-        } else {
-            ShaderId::MulMatVecQ4K
-        };
         let kernel = registry.get(shader);
         let set = self.alloc_or_get_set(
             dev, kernel.descriptor_set_layout,
@@ -1382,6 +1384,8 @@ impl Forward {
     /// pass explicit ranges so the descriptor-set cache key
     /// distinguishes per-token slices.
     #[allow(clippy::too_many_arguments)]
+    // Sprint 52K — caller-supplied ShaderId. See sibling
+    // `run_gemv_q4k_at_offset` above for the BAT-vs-DEC rationale.
     pub(super) fn run_gemv_q4k_at_offset_inout(
         &mut self,
         dev: &VulkanDevice,
@@ -1393,12 +1397,8 @@ impl Forward {
         k: u32,
         m: u32,
         label: &str,
+        shader: ShaderId,
     ) {
-        let shader = if self.mul_mat_vec_subgroup_enabled {
-            ShaderId::MulMatVecQ4KSubgroup
-        } else {
-            ShaderId::MulMatVecQ4K
-        };
         let kernel = registry.get(shader);
         let set = self.alloc_or_get_set(
             dev, kernel.descriptor_set_layout,
