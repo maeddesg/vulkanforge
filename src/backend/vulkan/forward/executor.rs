@@ -1289,16 +1289,19 @@ impl DecodeExec {
             //     padded weight columns are quantized zeros so the
             //     extra contributions are exactly 0.
             let down_off = (expert_idx as u64) * down_bytes_per_expert;
-            // Sprint 52M — was passing `mi_padded=768` as the K push-
-            // constant (Sprint 51D-D's row-padding for the SafeTensors
-            // Q4_K quantizer). GGUF Q5_0 down_exps doesn't pad —
-            // shape[0] is K=704 directly (704 ÷ 32 = 22 exact). The
-            // shader iterates K columns, so passing 768 to a 704-K
-            // tensor reads 64 garbage columns per row → wrong logits.
-            // Use the tensor's own innermost-dim shape as K — works
-            // for SafeTensors-padded Q4_K (shape[0]=768) AND GGUF
-            // Q5_0 (shape[0]=704).
-            let down_k = down_t.shape[0] as u32;
+            // Sprint 52P — loader-aware K. GGUF and SafeTensors store
+            // the 3-D MoE tensor with mirrored axis order:
+            //   GGUF:        shape = [K, M, n_experts]
+            //   SafeTensors: shape = [n_experts, M, K]
+            // Sprint 52M used `shape[0]` unconditionally — correct for
+            // GGUF (Q5_0 K=704) but read n_experts=128 on SafeTensors,
+            // turning the down GEMV into a zero-output stride disaster.
+            // Branch on whether `shape[0]` matches `n_experts`.
+            let down_k = if down_t.shape[0] as u32 == n_experts {
+                mi_padded
+            } else {
+                down_t.shape[0] as u32
+            };
             fwd.run_gemv_q4k_at_offset(
                 ctx.dev, ctx.registry, ctx.cmd,
                 down_w, down_off,
@@ -2537,12 +2540,19 @@ impl BatchExec {
                 //     extra reads are in-bounds for the buffer (8448
                 //     bytes ≥ mi_padded × 4 = 3072 bytes) and the
                 //     padded weight columns are zero.
-                // Sprint 52M — same `down_k = down_t.shape[0]` fix as
-                // the DEC path; see `step_moe_expert_ffn` (line 1296)
-                // for the rationale. The `up_buf` input-binding range
-                // also uses `down_k` so the shader's input stride
-                // matches the per-tensor K.
-                let down_k = down_t.shape[0] as u32;
+                // Sprint 52P — loader-aware K (mirror of the DEC fix in
+                // `step_moe_expert_ffn`). GGUF stores [K, M, n_experts]
+                // while SafeTensors stores [n_experts, M, K]; Sprint
+                // 52M's `shape[0]` read K on GGUF but n_experts on
+                // SafeTensors → zero MoE output → 26B regression from
+                // the Sprint 51D-AN "Paris" baseline (b57e935). The
+                // `up_buf` binding range tracks `down_k * 4` so the
+                // shader's input stride matches the per-tensor K.
+                let down_k = if down_t.shape[0] as u32 == n_experts {
+                    mi_padded
+                } else {
+                    down_t.shape[0] as u32
+                };
                 fwd.run_gemv_q4k_at_offset_inout(
                     ctx.dev, ctx.registry, ctx.cmd,
                     down_w, down_off,
