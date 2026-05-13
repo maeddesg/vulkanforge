@@ -345,6 +345,46 @@ fn dequant_q5k_to_bf16_bytes(raw: &[u8], total_elements: usize) -> Result<Vec<u8
     Ok(out)
 }
 
+/// Sprint 52E P3 — Q6_K → BF16 byte buffer (mirrors
+/// `dequant_q5k_to_bf16_bytes`). llama.cpp emits the larger
+/// Gemma-4 GGUFs' `per_layer_token_embd.weight` as Q6_K (E4B, likely
+/// 26B-A4B too). The dequant is block-independent so we parallelise
+/// per block via rayon.
+fn dequant_q6k_to_bf16_bytes(raw: &[u8], total_elements: usize) -> Result<Vec<u8>, LoaderError> {
+    use crate::backend::vulkan::q6k;
+    use rayon::prelude::*;
+    if total_elements % q6k::QUANT_K != 0 {
+        return Err(LoaderError::Buffer(format!(
+            "Q6_K dequant: total_elements {total_elements} not a multiple of {}",
+            q6k::QUANT_K,
+        )));
+    }
+    let n_blocks = total_elements / q6k::QUANT_K;
+    let expected_in_bytes = n_blocks * q6k::BLOCK_BYTES;
+    if raw.len() != expected_in_bytes {
+        return Err(LoaderError::Buffer(format!(
+            "Q6_K dequant: input {} bytes != expected {} ({} blocks × {} B)",
+            raw.len(), expected_in_bytes, n_blocks, q6k::BLOCK_BYTES,
+        )));
+    }
+    let mut out = vec![0u8; total_elements * 2];
+    out.par_chunks_mut(q6k::QUANT_K * 2)
+        .enumerate()
+        .for_each(|(blk_idx, dst)| {
+            let off = blk_idx * q6k::BLOCK_BYTES;
+            let block: &[u8; q6k::BLOCK_BYTES] = raw[off..off + q6k::BLOCK_BYTES]
+                .try_into()
+                .expect("checked");
+            let fp32 = q6k::dequant_block(block);
+            for (i, &f) in fp32.iter().enumerate() {
+                let bits = half::bf16::from_f32(f).to_bits();
+                dst[i * 2] = bits as u8;
+                dst[i * 2 + 1] = (bits >> 8) as u8;
+            }
+        });
+    Ok(out)
+}
+
 /// Sprint 52C — Per-Layer Embedding state from a Gemma-4 GGUF. Reads
 /// the three top-level PLE tensors (`per_layer_token_embd.weight`,
 /// `per_layer_model_proj.weight`, `per_layer_proj_norm.weight`),
@@ -387,9 +427,15 @@ fn build_gemma4_ple_from_gguf(
         GgmlType::Q5K => dequant_q5k_to_bf16_bytes(
             gguf.tensor_bytes(table_info), total_table_elems,
         )?,
+        // Sprint 52E P3 — E4B and 26B GGUFs store this as Q6_K
+        // (imatrix quant keeps the larger PLE tables at higher precision).
+        GgmlType::Q6K => dequant_q6k_to_bf16_bytes(
+            gguf.tensor_bytes(table_info), total_table_elems,
+        )?,
         GgmlType::BF16 => gguf.tensor_bytes(table_info).to_vec(),
         other => return Err(LoaderError::Buffer(format!(
-            "per_layer_token_embd.weight: ggml type {other:?} not supported (Q5_K or BF16)"
+            "per_layer_token_embd.weight: ggml type {other:?} not supported \
+             (Q5_K, Q6_K, or BF16)"
         ))),
     };
     eprintln!(
@@ -652,29 +698,41 @@ impl LoadedModel {
             );
         }
 
-        // Sprint 52D — `post_per_layer_input_norm.weight` (one
-        // [hps=256] F32 vector per layer) is missing from
-        // llama.cpp's Gemma-4 GGUFs — the converter doesn't emit it.
-        // VF's forward queries `blk.{i}.post_per_layer_input_norm.weight`
-        // at `arch/common.rs:268` (the PleBlock's hidden-norm step). H1
-        // hypothesis (Sprint 52C report §C): the norm is identity
-        // (γ=1.0) — synthesise a `[hps; 1.0]` FP32 buffer per layer and
-        // upload through the same staging path as the regular tensors.
-        // If the E2B smoke yields coherent output, H1 confirmed; if
-        // not, the per-layer γ values must be recovered from a
-        // SafeTensors reference (Sprint 52D-bisect, out of this scope).
+        // Sprint 52D + 52E — `post_per_layer_input_norm.weight` is
+        // missing from llama.cpp's Gemma-4 GGUFs (the converter
+        // doesn't emit it). VF's forward queries
+        // `blk.{i}.post_per_layer_input_norm.weight` at
+        // `arch/common.rs:268` (the PleBlock's hidden-norm step).
+        //
+        // Sprint 52D synthesised γ=1.0 at the WRONG dim (`hps=256`).
+        // Sprint 52E P1 extracted the real SafeTensors weights via
+        // `python3 ... post_per_layer_input_norm`: shape is `[1536]`
+        // (= hidden_dim), NOT `[hps=256]`, and γ values vary wildly
+        // per layer (mean 0.02..10.33). The dim is now corrected.
+        //
+        // γ=1.0 fallback theory (H1 from 52C report) is now: if
+        // llama.cpp fuses the original γ into `per_layer_input_gate`
+        // at conversion time, the identity (γ=1.0) post-norm matches
+        // the post-conversion math. If E2B output is coherent with
+        // this fix, H1 + dim correction = enough. If still gibberish,
+        // ship the real γ vectors (Sprint 52E P1.5 follow-up).
         let mut synth_norm_count = 0u32;
         if arch_is_gemma4 {
-            if let Some(gm) = config.gemma4.as_ref() {
-                let hps = gm.hidden_size_per_layer_input as usize;
+            if let Some(_gm) = config.gemma4.as_ref() {
+                // Shape is `[hidden_dim]`, not `[hps]`. The SafeTensors
+                // tensor `model.language_model.layers.{i}.post_per_layer_input_norm.weight`
+                // has dim 1536 on E2B (hidden_size), 2048 on E4B,
+                // 2816 on 26B-A4B. `hps=256` is for the PLE block's
+                // *input* embedding (separate tensor).
+                let norm_dim = config.hidden_dim as usize;
                 let ones_bytes: Vec<u8> = {
-                    let mut v = Vec::with_capacity(hps * 4);
-                    for _ in 0..hps {
+                    let mut v = Vec::with_capacity(norm_dim * 4);
+                    for _ in 0..norm_dim {
                         v.extend_from_slice(&1.0f32.to_le_bytes());
                     }
                     v
                 };
-                let synth_size = (hps * 4) as u64;
+                let synth_size = (norm_dim * 4) as u64;
                 for layer in 0..config.n_layers {
                     let key = format!("blk.{layer}.post_per_layer_input_norm.weight");
                     if tensors.contains_key(&key) {
@@ -736,7 +794,7 @@ impl LoadedModel {
                         key,
                         GpuTensor {
                             buffer: dst,
-                            shape: vec![hps as u64],
+                            shape: vec![norm_dim as u64],
                             ggml_type: GgmlType::F32,
                             byte_size: synth_size,
                             weight_scale: None,
