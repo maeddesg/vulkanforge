@@ -717,16 +717,24 @@ impl Gemma4Spec {
             .and_then(|v| v.as_f32())
             .unwrap_or(10_000.0);
 
-        // 26B-A4B per-layer KV-head divergence. E2B: head_count_kv = 1
-        // for every layer. 26B: 8 sliding / 2 full via a separate
-        // `gemma4.attention.head_count_kv_full` (?) — llama.cpp's
-        // gemma4 arch key wasn't observed in the E2B header, so for
-        // now read `head_count_kv` as the global default. 52E will
-        // verify whether 26B GGUFs ship a per-layer-or-Full override.
+        // Sprint 52H-1 — 26B-A4B per-layer KV-head divergence.
+        // E2B: head_count_kv = 1 (scalar) for every layer.
+        // 26B-A4B: head_count_kv is a u32[30] array `[8,8,8,8,8,2,...]`
+        // — Sliding=8, Full=2 — exactly mirroring `sliding_window_pattern`
+        // (Sliding ≡ `true`, Full ≡ `false`).
+        //
+        // Read both shapes: scalar (E2B) → broadcast to per-layer
+        // global; array (26B) → use the per-layer array directly. The
+        // scalar fallback `n_kv_global` is also the right answer for
+        // every E2B layer.
+        let n_kv_array: Option<Vec<u32>> = gguf
+            .metadata_u32_array("gemma4.attention.head_count_kv")
+            .ok();
         let n_kv_global = gguf
             .metadata
             .get("gemma4.attention.head_count_kv")
             .and_then(|v| v.as_u32())
+            .or_else(|| n_kv_array.as_ref().and_then(|a| a.iter().copied().max()))
             .unwrap_or(1);
 
         // Per-layer kv-source via the publisher algorithm (extracted
@@ -757,12 +765,14 @@ impl Gemma4Spec {
                 // (Sprint 51D-AJ).
                 Gemma4LayerKind::Full => (rope_full, Some(0.25)),
             };
-            // 26B Full layers get `n_kv_heads = 2` via
-            // `num_global_key_value_heads`, sliding gets 8. The GGUF
-            // key for that isn't yet observed; for E2B (head_count_kv=1
-            // for every layer) the global default is correct. Sprint
-            // 52E will revisit if 26B diverges.
-            let n_kv_heads = n_kv_global;
+            // Sprint 52H-1 — 26B-A4B Full layers get n_kv_heads=2,
+            // Sliding=8 via the `gemma4.attention.head_count_kv` u32[30]
+            // array. E2B carries a scalar so `n_kv_array` is `None` and
+            // `n_kv_global` is the right answer for every layer.
+            let n_kv_heads = n_kv_array
+                .as_ref()
+                .and_then(|a| a.get(i as usize).copied())
+                .unwrap_or(n_kv_global);
             // E2B: every layer has its own v_proj (attention_k_eq_v
             // is false). 26B-A4B Full layers under attention_k_eq_v
             // skip v_proj; that flag isn't in the E2B GGUF and we
@@ -860,7 +870,15 @@ impl ModelConfig {
 
         let n_layers = metadata_u32("block_count")?;
         let n_heads = metadata_u32("attention.head_count")?;
-        let n_kv_heads = metadata_u32("attention.head_count_kv")?;
+        // Sprint 52H-1 — Gemma-4-26B-A4B stores `head_count_kv` as a
+        // per-layer u32 array (`[8,8,8,8,8,2, ...]` — Sliding=8, Full=2),
+        // not a scalar. `ModelConfig.n_kv_heads` is a single global value
+        // used for max-buffer sizing → take the array max. Per-layer
+        // values land in `Gemma4LayerSpec.n_kv_heads` (built inside
+        // `Gemma4Spec::from_gguf`). E2B (single u32) keeps its existing
+        // behaviour via the scalar branch.
+        let n_kv_heads =
+            gguf.metadata_u32_scalar_or_array_max(&format!("{arch}.attention.head_count_kv"))?;
         let hidden_dim = metadata_u32("embedding_length")?;
         // Gemma-4 stores `feed_forward_length` as a per-layer u32 array
         // (35 entries for E2B). For `ModelConfig.ffn_dim` (single value,

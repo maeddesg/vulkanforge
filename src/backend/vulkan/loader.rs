@@ -2049,6 +2049,37 @@ pub(crate) fn gemma4_gguf_remap(name: &str) -> Option<String> {
         "layer_output_scale.weight" => "layer_scalar",
         "proj.weight" => "per_layer_projection.weight",
 
+        // Sprint 52H-2 — Gemma-4-26B-A4B MoE tensors. llama.cpp's
+        // names differ from VF's SafeTensors-derived ones; the
+        // forward queries the right-hand side via
+        // `forward/executor.rs::layer_weight(ctx.model, layer,
+        // "moe_experts.gate_up_proj")` etc. (lines 1190-1191).
+        //
+        // VF's SafeTensors path also builds a CPU-side `MoeRouterData`
+        // from `router.proj.weight` / `router.scale` /
+        // `router.per_expert_scale` (loader.rs:1861-1896). For the GGUF
+        // path, that MoeRouterData construction is **Sprint 52H-3
+        // scope** — without it, the chat will surface a clean
+        // `moe_router_data is None` error from `executor.rs:1096`. The
+        // GPU-uploaded copies under `moe_router.*` keys remain unused
+        // even on the SafeTensors path (the runtime reads from the
+        // CPU host vec) but the upload happens for consistency.
+        //
+        // The expert weights drop `.weight` from the source suffix
+        // because the VF runtime convention is `moe_experts.gate_up_proj`
+        // / `moe_experts.down_proj` (no `.weight`). The router tensors
+        // keep their `.weight` / `.scale` suffix structure.
+        "ffn_gate_up_exps.weight" => "moe_experts.gate_up_proj",
+        "ffn_down_exps.weight"    => "moe_experts.down_proj",
+        "ffn_gate_inp.weight"     => "moe_router.proj.weight",
+        "ffn_gate_inp.scale"      => "moe_router.scale",
+        // `ffn_down_exps.scale` is `[n_experts=128]` F32 per-expert
+        // scaling. Shape matches `moe_router.per_expert_scale` in
+        // SafeTensors. Treat as the same role; if the MoeRouterData
+        // construction in Sprint 52H-3 finds the values don't line up
+        // semantically, the mapping may need revisiting.
+        "ffn_down_exps.scale"     => "moe_router.per_expert_scale",
+
         // Unrecognised suffix — pass through so the next sprint can
         // observe what's there. (`post_norm.weight` lands here today.)
         _ => suffix,
@@ -2585,6 +2616,58 @@ mod tests {
         assert_eq!(
             gemma4_gguf_remap("blk.12.post_norm.weight").as_deref(),
             Some("blk.12.post_norm.weight"),
+        );
+    }
+
+    /// Sprint 52H-2 — 26B-A4B MoE per-layer tensor renames.
+    /// llama.cpp names → VF SafeTensors-derived names. The expert
+    /// weights drop `.weight` because VF's runtime queries
+    /// `moe_experts.gate_up_proj` / `moe_experts.down_proj` (no
+    /// `.weight`).
+    #[test]
+    fn gemma4_remap_renames_26b_moe_tensors() {
+        // Expert weights (Q4_K / Q5_1).
+        assert_eq!(
+            gemma4_gguf_remap("blk.0.ffn_gate_up_exps.weight").as_deref(),
+            Some("blk.0.moe_experts.gate_up_proj"),
+        );
+        assert_eq!(
+            gemma4_gguf_remap("blk.29.ffn_down_exps.weight").as_deref(),
+            Some("blk.29.moe_experts.down_proj"),
+        );
+        // Router tensors. `proj.weight` keeps `.weight`; the scales
+        // shed it because the SafeTensors targets also have no `.weight`.
+        assert_eq!(
+            gemma4_gguf_remap("blk.5.ffn_gate_inp.weight").as_deref(),
+            Some("blk.5.moe_router.proj.weight"),
+        );
+        assert_eq!(
+            gemma4_gguf_remap("blk.5.ffn_gate_inp.scale").as_deref(),
+            Some("blk.5.moe_router.scale"),
+        );
+        assert_eq!(
+            gemma4_gguf_remap("blk.5.ffn_down_exps.scale").as_deref(),
+            Some("blk.5.moe_router.per_expert_scale"),
+        );
+    }
+
+    /// Sprint 52H-2 — the existing Dense FFN suffixes (E2B uses them,
+    /// 26B also has them for Dense layers in addition to MoE) must NOT
+    /// collide with the MoE remaps. Verify `ffn_gate` (no `_inp`) and
+    /// `ffn_down` (no `_exps`) pass through unchanged.
+    #[test]
+    fn gemma4_remap_dense_ffn_unaffected_by_moe_renames() {
+        assert_eq!(
+            gemma4_gguf_remap("blk.0.ffn_gate.weight").as_deref(),
+            Some("blk.0.ffn_gate.weight"),
+        );
+        assert_eq!(
+            gemma4_gguf_remap("blk.0.ffn_up.weight").as_deref(),
+            Some("blk.0.ffn_up.weight"),
+        );
+        assert_eq!(
+            gemma4_gguf_remap("blk.0.ffn_down.weight").as_deref(),
+            Some("blk.0.ffn_down.weight"),
         );
     }
 }
