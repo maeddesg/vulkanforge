@@ -1307,7 +1307,14 @@ fn inference_support(arch: &str, file_type: Option<u32>) -> (bool, bool) {
     // bias-add path that some Qwen GGUFs ship attn_q/k/v.bias for
     // is also not implemented for Qwen, so the "Llama lacks bias"
     // delta is already the default.
-    let arch_ok = matches!(arch, "qwen2" | "qwen3" | "llama");
+    // Sprint 52A — `gemma4` joins the GGUF arch_ok list. The
+    // tensor-name remap (`loader.rs::gemma4_gguf_remap`) is in place;
+    // `Gemma4Spec::from_gguf` (Sprint 52B) and the GGUF PLE load
+    // route (Sprint 52C) are NOT yet shipped, so chat will currently
+    // panic later inside `LoadedModel::load` (`gemma4: None` in
+    // `ModelConfig::from_gguf`) with a clear "Gemma4Spec missing"
+    // surface — that's the next sprint's bisect point.
+    let arch_ok = matches!(arch, "qwen2" | "qwen3" | "llama" | "gemma4");
     // Supported file_types:
     //   12 — Q3_K_M  (Q3_K bulk + Q5_K attn_v/ffn_down + Q4_K attn_output + Q6_K output)
     //   15 — Q4_K_M  (production default)

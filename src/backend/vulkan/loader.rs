@@ -307,11 +307,38 @@ impl LoadedModel {
     ) -> Result<Self, LoaderError> {
         let config = ModelConfig::from_gguf(gguf)?;
 
+        // Sprint 52A guard — accept Gemma-4 GGUFs through the
+        // `inference_support` arch_ok gate (so the tensor-name remap
+        // below is exercised), but refuse to proceed to `Forward::new`
+        // because `Gemma4Spec::from_gguf` is not yet implemented
+        // (Sprint 52B). Without the spec, `forward/` would silently
+        // fall back to the Llama plan and produce gibberish — a
+        // clean error here is the brief's intended "STOP after 52A".
+        if config.architecture == "gemma4" && config.gemma4.is_none() {
+            return Err(LoaderError::Buffer(
+                "Sprint 52A WIP: arch='gemma4' GGUF detected, tensor-name remap is wired \
+                 but `Gemma4Spec::from_gguf` is Sprint 52B scope. \
+                 `vulkanforge info` works; chat needs 52B + 52C + 52D before E2E."
+                    .into(),
+            ));
+        }
+
         // Sort tensor names for deterministic upload order — helpful
         // when debugging which tensor a panic came from.
         let mut tensor_names: Vec<&str> =
             gguf.tensors.keys().map(|s| s.as_str()).collect();
         tensor_names.sort_unstable();
+
+        // Sprint 52A — Gemma-4 GGUFs use llama.cpp-style tensor suffixes
+        // that don't all line up 1:1 with what `forward/` queries.
+        // Build a name-translation closure that fires only for
+        // `arch="gemma4"`; non-Gemma archs pass through untouched.
+        let arch_is_gemma4 = gguf
+            .metadata_str("general.architecture")
+            .map(|s| s == "gemma4")
+            .unwrap_or(false);
+        let mut gemma4_dropped: u32 = 0;
+        let mut gemma4_renamed: u32 = 0;
 
         let started = Instant::now();
         let mut tensors: HashMap<String, GpuTensor> =
@@ -337,6 +364,24 @@ impl LoadedModel {
 
         for name in tensor_names {
             let info = gguf.tensor(name).expect("name from same map");
+
+            // Sprint 52A — Gemma-4 GGUF → VF tensor-name remap.
+            // `None` means "drop this tensor" (e.g. `rope_freqs.weight`).
+            // `Some(s)` is the (possibly-renamed) target key.
+            let stored_name: String = if arch_is_gemma4 {
+                match gemma4_gguf_remap(name) {
+                    Some(s) => {
+                        if s != name { gemma4_renamed += 1; }
+                        s
+                    }
+                    None => {
+                        gemma4_dropped += 1;
+                        continue;
+                    }
+                }
+            } else {
+                name.to_string()
+            };
 
             // BF16 (GGML type 30) tensors — Gemma-family GGUFs use these
             // for `token_embd.weight` and a few norm/output weights. VF
@@ -435,7 +480,7 @@ impl LoadedModel {
             bytes_uploaded += size;
 
             tensors.insert(
-                name.to_string(),
+                stored_name,
                 GpuTensor {
                     buffer: dst,
                     shape: info.dimensions.clone(),
@@ -445,6 +490,13 @@ impl LoadedModel {
                     scale_buffer: None,
                     scale_block: None,
                 },
+            );
+        }
+
+        if arch_is_gemma4 {
+            eprintln!(
+                "Sprint 52A: Gemma-4 GGUF remap — {gemma4_renamed} tensors renamed, \
+                 {gemma4_dropped} dropped (rope_freqs / per_layer_token_embd)"
             );
         }
 
@@ -1517,6 +1569,79 @@ fn hf_name_to_vf(hf_name: &str) -> String {
     hf_to_vf_name(hf_name).unwrap_or_else(|| hf_name.to_string())
 }
 
+/// Sprint 52A — translate llama.cpp's Gemma-4 GGUF tensor names to the
+/// names VF's forward expects (= the SafeTensors loader output of
+/// `safetensors::hf_to_vf_name`). Returns `Some(new_name)` when the
+/// tensor should be renamed, `None` when it should be **dropped**
+/// (e.g., `rope_freqs.weight` because VF computes RoPE on-the-fly,
+/// `per_layer_token_embd.weight` because the PLE table needs the
+/// separate load route shipped in Sprint 52C). Pass-through
+/// (`Some(name.to_string())`) for the already-aligned names.
+///
+/// Mapping derived by cross-referencing:
+///   * the `blk.0.*` tensor dump from `gemma-4-E2B-it-Q4_K_M.gguf`
+///   * `src/safetensors.rs::hf_to_vf_name` (the SafeTensors output)
+///   * the per-step tensor lookups in `forward/executor.rs`
+///     (`step_post_attn_norm` reads `ffn_norm.weight`; `step_pre_ffn_norm`
+///     reads `ffn_pre_norm.weight`; the "post-attn" GGUF norm is therefore
+///     VF's `ffn_norm`, NOT `ffn_pre_norm` — that's the brief's error).
+///
+/// `post_norm.weight` is intentionally left unmapped: it has no
+/// 1:1 SafeTensors equivalent (it's likely the Gemma-3-style
+/// "post-self-attn shared norm" or the `post_per_layer_input_norm`,
+/// but verifying that needs Sprint 52C/D smoke tests against a real
+/// forward pass). Sprint 52A leaves it under its GGUF name so it lands
+/// in the `tensors` map; if Sprint 52D shows the forward queries an
+/// unmapped name, we'll know which one to alias here.
+pub(crate) fn gemma4_gguf_remap(name: &str) -> Option<String> {
+    // Top-level (non-`blk.*`) tensors.
+    match name {
+        "token_embd.weight"
+        | "output_norm.weight"
+        | "output.weight" => return Some(name.to_string()),
+        // VF computes RoPE freqs on-the-fly; drop the precomputed table.
+        "rope_freqs.weight" => return None,
+        // PLE table — Sprint 52C handles the dedicated load route.
+        "per_layer_token_embd.weight" => return None,
+        _ => {}
+    }
+    let rest = match name.strip_prefix("blk.") {
+        Some(r) => r,
+        None => return Some(name.to_string()), // unknown top-level: pass through
+    };
+    let (layer_str, suffix) = match rest.split_once('.') {
+        Some(t) => t,
+        None => return Some(name.to_string()),
+    };
+    let new_suffix = match suffix {
+        // Suffixes that line up 1:1 — explicit pass-through so unknown
+        // suffixes can be detected and logged in a future sprint.
+        "attn_q.weight"
+        | "attn_k.weight"
+        | "attn_v.weight"
+        | "attn_output.weight"
+        | "attn_norm.weight"
+        | "attn_q_norm.weight"
+        | "attn_k_norm.weight"
+        | "ffn_gate.weight"
+        | "ffn_up.weight"
+        | "ffn_down.weight" => suffix,
+
+        // The 5 verified Gemma-4 renames.
+        "post_attention_norm.weight" => "ffn_norm.weight",
+        "ffn_norm.weight" => "ffn_pre_norm.weight",
+        "post_ffw_norm.weight" => "ffn_post_norm.weight",
+        "inp_gate.weight" => "per_layer_input_gate.weight",
+        "layer_output_scale.weight" => "layer_scalar",
+        "proj.weight" => "per_layer_projection.weight",
+
+        // Unrecognised suffix — pass through so the next sprint can
+        // observe what's there. (`post_norm.weight` lands here today.)
+        _ => suffix,
+    };
+    Some(format!("blk.{layer_str}.{new_suffix}"))
+}
+
 /// BF16 → FP32 conversion (host-side). BF16 layout (1+8+7 bits) is
 /// the upper half of the matching FP32 value, so the conversion is a
 /// 16-bit left shift; NaN/Inf/denormal/zero all round-trip exactly.
@@ -1928,4 +2053,120 @@ fn hf_to_model_config(hf: &HfConfig) -> Result<ModelConfig, LoaderError> {
         has_qk_norm,
         gemma4: gemma4_spec,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sprint 52A — verify the Gemma-4 GGUF tensor-name remapper.
+    /// Critical correctness item: `post_attention_norm.weight` and
+    /// `ffn_norm.weight` both exist in the GGUF and BOTH need
+    /// renaming, and they swap-rename (post_attention_norm→ffn_norm,
+    /// ffn_norm→ffn_pre_norm). A naive `name.replace("ffn_norm", "ffn_pre_norm")`
+    /// would collide. The exact-suffix-match approach the helper uses
+    /// cannot collide.
+    #[test]
+    fn gemma4_remap_renames_six_known_suffixes() {
+        // The five renames that change the suffix:
+        assert_eq!(
+            gemma4_gguf_remap("blk.5.post_attention_norm.weight").as_deref(),
+            Some("blk.5.ffn_norm.weight"),
+            "post_attention_norm → ffn_norm (= post_attention_layernorm)",
+        );
+        assert_eq!(
+            gemma4_gguf_remap("blk.0.ffn_norm.weight").as_deref(),
+            Some("blk.0.ffn_pre_norm.weight"),
+            "ffn_norm → ffn_pre_norm (= pre_feedforward_layernorm)",
+        );
+        assert_eq!(
+            gemma4_gguf_remap("blk.29.post_ffw_norm.weight").as_deref(),
+            Some("blk.29.ffn_post_norm.weight"),
+            "post_ffw_norm → ffn_post_norm (= post_feedforward_layernorm)",
+        );
+        assert_eq!(
+            gemma4_gguf_remap("blk.10.inp_gate.weight").as_deref(),
+            Some("blk.10.per_layer_input_gate.weight"),
+        );
+        assert_eq!(
+            gemma4_gguf_remap("blk.14.layer_output_scale.weight").as_deref(),
+            Some("blk.14.layer_scalar"),
+        );
+        assert_eq!(
+            gemma4_gguf_remap("blk.0.proj.weight").as_deref(),
+            Some("blk.0.per_layer_projection.weight"),
+        );
+    }
+
+    /// The aligned suffixes (attn_q, attn_k, attn_v, attn_output,
+    /// attn_norm, attn_{q,k}_norm, ffn_gate, ffn_up, ffn_down) must
+    /// NOT be renamed — they line up 1:1 with the SafeTensors loader
+    /// output already.
+    #[test]
+    fn gemma4_remap_passes_through_aligned_suffixes() {
+        for suf in [
+            "attn_q.weight", "attn_k.weight", "attn_v.weight",
+            "attn_output.weight", "attn_norm.weight",
+            "attn_q_norm.weight", "attn_k_norm.weight",
+            "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+        ] {
+            let n = format!("blk.7.{suf}");
+            assert_eq!(
+                gemma4_gguf_remap(&n).as_deref(),
+                Some(n.as_str()),
+                "aligned suffix {suf} should pass through",
+            );
+        }
+    }
+
+    /// Critical regression: `attn_output.weight` and `proj.weight`
+    /// both end in `proj`-adjacent characters. A naive substring
+    /// `.replace("proj", "per_layer_projection")` would turn
+    /// `attn_output.weight` → `attn_output.weight` (no match) but
+    /// would silently corrupt any future suffix that contained
+    /// "proj". The exact-match helper guarantees `attn_output` is
+    /// not touched.
+    #[test]
+    fn gemma4_remap_does_not_corrupt_attn_output() {
+        assert_eq!(
+            gemma4_gguf_remap("blk.3.attn_output.weight").as_deref(),
+            Some("blk.3.attn_output.weight"),
+        );
+    }
+
+    /// Top-level (non-`blk.*`) names: known ones pass through;
+    /// `rope_freqs.weight` and `per_layer_token_embd.weight` return
+    /// `None` (= drop). Unknown top-level names pass through so we
+    /// don't silently swallow tensors a future llama.cpp version
+    /// might add.
+    #[test]
+    fn gemma4_remap_handles_top_level_names() {
+        assert_eq!(
+            gemma4_gguf_remap("token_embd.weight").as_deref(),
+            Some("token_embd.weight"),
+        );
+        assert_eq!(
+            gemma4_gguf_remap("output_norm.weight").as_deref(),
+            Some("output_norm.weight"),
+        );
+        assert!(gemma4_gguf_remap("rope_freqs.weight").is_none());
+        assert!(gemma4_gguf_remap("per_layer_token_embd.weight").is_none());
+        // Unknown top-level: pass through.
+        assert_eq!(
+            gemma4_gguf_remap("future_top_level_tensor.weight").as_deref(),
+            Some("future_top_level_tensor.weight"),
+        );
+    }
+
+    /// Unrecognised `blk.*` suffixes (today: `post_norm.weight`) pass
+    /// through unchanged so the next sprint can observe them in the
+    /// tensor map and decide on a mapping. Dropping them silently
+    /// here would mask Sprint 52B/C/D debugging.
+    #[test]
+    fn gemma4_remap_passes_through_unknown_blk_suffix() {
+        assert_eq!(
+            gemma4_gguf_remap("blk.12.post_norm.weight").as_deref(),
+            Some("blk.12.post_norm.weight"),
+        );
+    }
 }
