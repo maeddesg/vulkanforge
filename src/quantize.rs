@@ -254,7 +254,9 @@ fn unpack_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
 /// Quantize a flat FP32 row to Q4_K_M blocks. Length must be a multiple
 /// of `QK_K` (256). Sprint 50C — block-level rayon parallelism over the
 /// (independent) super-blocks; each block is bit-identical to the serial
-/// path.
+/// path. Phase 2 (v0.4.x) — runtime-detect AVX-512F and dispatch the
+/// hot `make_qkx2` + Step-5 re-quant via SIMD when available. Per-block
+/// output is bit-identical to the scalar path (covered by tests).
 pub fn quantize_f32_to_q4k(input: &[f32]) -> Vec<u8> {
     assert!(
         input.len() % QK_K == 0,
@@ -263,12 +265,23 @@ pub fn quantize_f32_to_q4k(input: &[f32]) -> Vec<u8> {
     );
     let n_blocks = input.len() / QK_K;
     let mut output = vec![0u8; n_blocks * Q4K_BLOCK_BYTES];
+    #[cfg(target_arch = "x86_64")]
+    let use_avx512 = crate::quantize_avx512::avx512_available();
+    #[cfg(not(target_arch = "x86_64"))]
+    let use_avx512 = false;
     output
         .par_chunks_mut(Q4K_BLOCK_BYTES)
         .enumerate()
         .for_each(|(b, yi)| {
             let xi = &input[b * QK_K..(b + 1) * QK_K];
-            quantize_block_q4k(xi, yi);
+            if use_avx512 {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    crate::quantize_avx512::quantize_block_q4k_avx512(xi, yi);
+                }
+            } else {
+                quantize_block_q4k(xi, yi);
+            }
         });
     output
 }
@@ -322,6 +335,10 @@ pub fn quantize_f32_to_q4k_padded_rows(
     let n_blocks_per_row = k_padded / QK_K;
     let total_blocks = n_rows * n_blocks_per_row;
     let mut output = vec![0u8; total_blocks * Q4K_BLOCK_BYTES];
+    #[cfg(target_arch = "x86_64")]
+    let use_avx512 = crate::quantize_avx512::avx512_available();
+    #[cfg(not(target_arch = "x86_64"))]
+    let use_avx512 = false;
     output
         .par_chunks_mut(n_blocks_per_row * Q4K_BLOCK_BYTES)
         .enumerate()
@@ -334,7 +351,14 @@ pub fn quantize_f32_to_q4k_padded_rows(
             for b in 0..n_blocks_per_row {
                 let xi = &padded[b * QK_K..(b + 1) * QK_K];
                 let yi = &mut row_bytes[b * Q4K_BLOCK_BYTES..(b + 1) * Q4K_BLOCK_BYTES];
-                quantize_block_q4k(xi, yi);
+                if use_avx512 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        crate::quantize_avx512::quantize_block_q4k_avx512(xi, yi);
+                    }
+                } else {
+                    quantize_block_q4k(xi, yi);
+                }
             }
         });
     output

@@ -30,6 +30,8 @@ pub mod auto_detect;
 pub mod backend;
 pub mod cpu;
 pub mod quantize;
+#[cfg(target_arch = "x86_64")]
+pub mod quantize_avx512;
 pub mod safetensors;
 pub mod hf_config;
 pub mod server;
