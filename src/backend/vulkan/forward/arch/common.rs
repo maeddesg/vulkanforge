@@ -132,6 +132,33 @@ pub(crate) fn layer_weight_shader_gemm(
             (GemmKind::Mmq,          _,     _,     _,     _    ) => if prefer_l { ShaderId::MulMmqQ5KL } else { ShaderId::MulMmqQ5K },
         };
     }
+    // Sprint 52J — Q5_0 / Q5_1 / Q8_0 early-returns. Only Mmq variants
+    // exist (no coopmat / MulMm / aligned SPVs). 26B-A4B Q3_K_M uses
+    // Q8_0 for attn_k/v (prefill path) → Forward::new forces Mmq when
+    // these quants are present. Same shape as the Q4_0 fallthrough at
+    // line 183 below, but bound to the specific quant type up-front so
+    // the dispatch doesn't fall into the Q4_K case silently.
+    if ggml_type == GgmlType::Q5_0 {
+        return match gemm_kind {
+            GemmKind::Mmq => ShaderId::MulMmqQ5_0,
+            other => panic!(
+                "gemm: Q5_0 only supports Mmq (got {other:?}); \
+                 Forward::new should force Mmq when Q5_0 weights are present",
+            ),
+        };
+    }
+    if ggml_type == GgmlType::Q5_1 {
+        return match gemm_kind {
+            GemmKind::Mmq => ShaderId::MulMmqQ5_1,
+            other => panic!("gemm: Q5_1 only supports Mmq (got {other:?})"),
+        };
+    }
+    if ggml_type == GgmlType::Q8_0 {
+        return match gemm_kind {
+            GemmKind::Mmq => ShaderId::MulMmqQ8_0,
+            other => panic!("gemm: Q8_0 only supports Mmq (got {other:?})"),
+        };
+    }
     match (gemm_kind, q6) {
         (GemmKind::MulMmAligned, true)  => ShaderId::MulMmQ6KAligned,
         (GemmKind::MulMmAligned, false) => ShaderId::MulMmQ4KAligned,
@@ -378,10 +405,28 @@ pub(crate) fn layer_weight_shader(model: &LoadedModel, layer: u32, suffix: &str,
         (GgmlType::Q3K, false) => ShaderId::MulMatVecQ3K,
         (GgmlType::Q5K, true ) => ShaderId::MulMatVecQ5KSubgroup,
         (GgmlType::Q5K, false) => ShaderId::MulMatVecQ5K,
+        (GgmlType::Q4K, true ) => ShaderId::MulMatVecQ4KSubgroup,
+        (GgmlType::Q4K, false) => ShaderId::MulMatVecQ4K,
         (GgmlType::Q4_0, true ) => ShaderId::MulMatVecQ4_0Subgroup,
         (GgmlType::Q4_0, false) => ShaderId::MulMatVecQ4_0,
-        (_,             true ) => ShaderId::MulMatVecQ4KSubgroup,
-        (_,             false) => ShaderId::MulMatVecQ4K,
+        // Sprint 52J — Q5_0 / Q5_1 / Q8_0 explicit arms. Previously
+        // the catch-all `_ => Q4K` silently dispatched these to the
+        // Q4_K shader → wrong dequant → NaN logits → CPU MoE router
+        // `.partial_cmp().unwrap()` panic on 26B-A4B Q3_K_M GGUF.
+        (GgmlType::Q5_0, true ) => ShaderId::MulMatVecQ5_0Subgroup,
+        (GgmlType::Q5_0, false) => ShaderId::MulMatVecQ5_0,
+        (GgmlType::Q5_1, true ) => ShaderId::MulMatVecQ5_1Subgroup,
+        (GgmlType::Q5_1, false) => ShaderId::MulMatVecQ5_1,
+        (GgmlType::Q8_0, true ) => ShaderId::MulMatVecQ8_0Subgroup,
+        (GgmlType::Q8_0, false) => ShaderId::MulMatVecQ8_0,
+        // Sprint 52J — hard error on truly unknown quants. Replaces
+        // the prior silent Q4_K fallthrough so future unsupported
+        // ggml types surface as an explicit panic at shader-pick time
+        // rather than silently producing NaN math.
+        (other, _) => panic!(
+            "gemv_shader_for: no GEMV pipeline for ggml_type {other:?}; \
+             add a `mul_mat_vec.comp` ShaderJob + ShaderId arm",
+        ),
     }
 }
 

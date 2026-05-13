@@ -166,7 +166,14 @@ impl PipelineRegistry {
                 | ShaderId::MulMatVecQ4KSubgroup | ShaderId::MulMatVecQ6KSubgroup
                 | ShaderId::MulMatVecQ3K | ShaderId::MulMatVecQ3KSubgroup
                 | ShaderId::MulMatVecQ5K | ShaderId::MulMatVecQ5KSubgroup
-                | ShaderId::MulMatVecQ4_0 | ShaderId::MulMatVecQ4_0Subgroup => {
+                | ShaderId::MulMatVecQ4_0 | ShaderId::MulMatVecQ4_0Subgroup
+                // Sprint 52J — Q5_0 / Q5_1 / Q8_0 GEMVs share the same
+                // generic mul_mat_vec.comp surface as Q4_0 (spec consts
+                // identical: BLOCK_SIZE / NUM_COLS / NUM_ROWS pinned via
+                // `MMV_SPEC_DATA`, required Wave64 subgroup).
+                | ShaderId::MulMatVecQ5_0 | ShaderId::MulMatVecQ5_0Subgroup
+                | ShaderId::MulMatVecQ5_1 | ShaderId::MulMatVecQ5_1Subgroup
+                | ShaderId::MulMatVecQ8_0 | ShaderId::MulMatVecQ8_0Subgroup => {
                     let entries = [entry(0, 0, 4), entry(1, 4, 4), entry(2, 8, 4)];
                     let bytes = bytemuck::bytes_of(&MMV_SPEC_DATA);
                     // Sprint 14A — pin requiredSubgroupSize=64 for the GEMV
@@ -226,7 +233,11 @@ impl PipelineRegistry {
                 | ShaderId::MulMmqQ4KL | ShaderId::MulMmqQ6KL
                 | ShaderId::MulMmqQ3K | ShaderId::MulMmqQ3KL
                 | ShaderId::MulMmqQ5K | ShaderId::MulMmqQ5KL
-                | ShaderId::MulMmqQ4_0 | ShaderId::MulMmqQ4_0L => {
+                | ShaderId::MulMmqQ4_0 | ShaderId::MulMmqQ4_0L
+                // Sprint 52J — Q5_0 / Q5_1 / Q8_0 Mmq variants share
+                // the same 11-spec-const surface as Q4_0/Q4_K Mmq.
+                | ShaderId::MulMmqQ5_0 | ShaderId::MulMmqQ5_1
+                | ShaderId::MulMmqQ8_0 => {
                     // Phase-3C compile probe — pin the 11 spec
                     // constants llama.cpp's vulkan-shaders-gen pins
                     // for a non-coopmat MMQ build. Layout:

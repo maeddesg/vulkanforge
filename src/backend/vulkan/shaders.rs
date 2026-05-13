@@ -42,6 +42,26 @@ pub enum ShaderId {
     /// / Q8_0 / IQ-quants).
     MulMatVecQ4_0,
     MulMatVecQ4_0Subgroup,
+    /// Sprint 52J — Q5_0 / Q5_1 / Q8_0 decode GEMVs. Mirror the Q4_0
+    /// build path (generic `mul_mat_vec.comp` + `dequant_funcs.glsl`,
+    /// switched via `DATA_A_<quant>` define). The Gemma-4-26B-A4B
+    /// GGUF (google official Q3_K_M) uses Q8_0 for attn_k/v, Q5_0
+    /// for MoE expert down_proj, and Q5_1 for `blk.0.ffn_down`.
+    MulMatVecQ5_0,
+    MulMatVecQ5_0Subgroup,
+    MulMatVecQ5_1,
+    MulMatVecQ5_1Subgroup,
+    MulMatVecQ8_0,
+    MulMatVecQ8_0Subgroup,
+    /// Sprint 52J — Q5_0 / Q5_1 / Q8_0 integer-MMQ prefill. Shared
+    /// SPV with the decode-path GEMV would not work (different
+    /// shader); each Mmq variant compiles `mul_mmq.comp` with a
+    /// matching `DATA_A_<quant>` define. Used during prefill (BAT)
+    /// when seq_len > 1 — 26B's Sliding layers route through this
+    /// (Full layers per-token DEC via Sprint 51D-AN).
+    MulMmqQ5_0,
+    MulMmqQ5_1,
+    MulMmqQ8_0,
     /// Sprint 20-M2 — FP8 E4M3 decode GEMV. Native conversion via
     /// VK_EXT_shader_float8 / GL_EXT_float_e4m3 (`uintBitsToFloate4m3EXT`).
     /// Per-tensor FP32 dequant scale is in the push-constant block;
@@ -380,6 +400,12 @@ impl ShaderId {
             ShaderId::MulMatVecQ5KSubgroup => "mul_mat_vec_q5_k_f32_f32_subgroup",
             ShaderId::MulMatVecQ4_0 => "mul_mat_vec_q4_0_f32_f32",
             ShaderId::MulMatVecQ4_0Subgroup => "mul_mat_vec_q4_0_f32_f32_subgroup",
+            ShaderId::MulMatVecQ5_0 => "mul_mat_vec_q5_0_f32_f32",
+            ShaderId::MulMatVecQ5_0Subgroup => "mul_mat_vec_q5_0_f32_f32_subgroup",
+            ShaderId::MulMatVecQ5_1 => "mul_mat_vec_q5_1_f32_f32",
+            ShaderId::MulMatVecQ5_1Subgroup => "mul_mat_vec_q5_1_f32_f32_subgroup",
+            ShaderId::MulMatVecQ8_0 => "mul_mat_vec_q8_0_f32_f32",
+            ShaderId::MulMatVecQ8_0Subgroup => "mul_mat_vec_q8_0_f32_f32_subgroup",
             ShaderId::MulMatVecFp8 => "mul_mat_vec_fp8",
             ShaderId::MulMatVecF32 => "mul_mat_vec_f32",
             ShaderId::MulMatVecF16 => "mul_mat_vec_f16",
@@ -422,6 +448,9 @@ impl ShaderId {
             ShaderId::MulMmqQ3K | ShaderId::MulMmqQ3KL => "mul_mmq_q3_k_f32",
             ShaderId::MulMmqQ5K | ShaderId::MulMmqQ5KL => "mul_mmq_q5_k_f32",
             ShaderId::MulMmqQ4_0 | ShaderId::MulMmqQ4_0L => "mul_mmq_q4_0_f32",
+            ShaderId::MulMmqQ5_0 => "mul_mmq_q5_0_f32",
+            ShaderId::MulMmqQ5_1 => "mul_mmq_q5_1_f32",
+            ShaderId::MulMmqQ8_0 => "mul_mmq_q8_0_f32",
             ShaderId::MulMmQ4KCoopmat => "mul_mm_q4_k_f32_coopmat",
             ShaderId::MulMmQ6KCoopmat => "mul_mm_q6_k_f32_coopmat",
             ShaderId::MulMmQ4KAlignedCoopmat => "mul_mm_q4_k_f32_aligned_coopmat",
@@ -495,6 +524,12 @@ impl ShaderId {
             ShaderId::MulMatVecQ5KSubgroup => MUL_MAT_VEC_Q5_K_F32_F32_SUBGROUP,
             ShaderId::MulMatVecQ4_0 => MUL_MAT_VEC_Q4_0_F32_F32,
             ShaderId::MulMatVecQ4_0Subgroup => MUL_MAT_VEC_Q4_0_F32_F32_SUBGROUP,
+            ShaderId::MulMatVecQ5_0 => MUL_MAT_VEC_Q5_0_F32_F32,
+            ShaderId::MulMatVecQ5_0Subgroup => MUL_MAT_VEC_Q5_0_F32_F32_SUBGROUP,
+            ShaderId::MulMatVecQ5_1 => MUL_MAT_VEC_Q5_1_F32_F32,
+            ShaderId::MulMatVecQ5_1Subgroup => MUL_MAT_VEC_Q5_1_F32_F32_SUBGROUP,
+            ShaderId::MulMatVecQ8_0 => MUL_MAT_VEC_Q8_0_F32_F32,
+            ShaderId::MulMatVecQ8_0Subgroup => MUL_MAT_VEC_Q8_0_F32_F32_SUBGROUP,
             ShaderId::MulMatVecFp8 => MUL_MAT_VEC_FP8,
             ShaderId::MulMatVecF32 => MUL_MAT_VEC_F32,
             ShaderId::MulMatVecF16 => MUL_MAT_VEC_F16,
@@ -537,6 +572,9 @@ impl ShaderId {
             ShaderId::MulMmqQ3K | ShaderId::MulMmqQ3KL => MUL_MMQ_Q3_K_F32,
             ShaderId::MulMmqQ5K | ShaderId::MulMmqQ5KL => MUL_MMQ_Q5_K_F32,
             ShaderId::MulMmqQ4_0 | ShaderId::MulMmqQ4_0L => MUL_MMQ_Q4_0_F32,
+            ShaderId::MulMmqQ5_0 => MUL_MMQ_Q5_0_F32,
+            ShaderId::MulMmqQ5_1 => MUL_MMQ_Q5_1_F32,
+            ShaderId::MulMmqQ8_0 => MUL_MMQ_Q8_0_F32,
             ShaderId::QuantizeQ8_1 => QUANTIZE_Q8_1_F32,
             ShaderId::FlashAttn => FLASH_ATTN_F32,
             ShaderId::FlashAttnSplit => FLASH_ATTN_SPLIT_F32,
@@ -617,6 +655,12 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::MulMatVecQ5KSubgroup,
     ShaderId::MulMatVecQ4_0,
     ShaderId::MulMatVecQ4_0Subgroup,
+    ShaderId::MulMatVecQ5_0,
+    ShaderId::MulMatVecQ5_0Subgroup,
+    ShaderId::MulMatVecQ5_1,
+    ShaderId::MulMatVecQ5_1Subgroup,
+    ShaderId::MulMatVecQ8_0,
+    ShaderId::MulMatVecQ8_0Subgroup,
     ShaderId::MulMatVecFp8,
     ShaderId::MulMatVecF32,
     ShaderId::MulMatVecF16,
@@ -664,6 +708,9 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::MulMmqQ5KL,
     ShaderId::MulMmqQ4_0,
     ShaderId::MulMmqQ4_0L,
+    ShaderId::MulMmqQ5_0,
+    ShaderId::MulMmqQ5_1,
+    ShaderId::MulMmqQ8_0,
     ShaderId::MulMmQ4KCoopmat,
     ShaderId::MulMmQ6KCoopmat,
     ShaderId::MulMmQ4KAlignedCoopmat,
@@ -761,6 +808,19 @@ pub const MUL_MAT_VEC_Q4_0_F32_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q4_0_f32_f32.spv"));
 pub const MUL_MAT_VEC_Q4_0_F32_F32_SUBGROUP: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q4_0_f32_f32_subgroup.spv"));
+// Sprint 52J — Q5_0 / Q5_1 / Q8_0 GEMV SPVs (generic mul_mat_vec.comp).
+pub const MUL_MAT_VEC_Q5_0_F32_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q5_0_f32_f32.spv"));
+pub const MUL_MAT_VEC_Q5_0_F32_F32_SUBGROUP: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q5_0_f32_f32_subgroup.spv"));
+pub const MUL_MAT_VEC_Q5_1_F32_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q5_1_f32_f32.spv"));
+pub const MUL_MAT_VEC_Q5_1_F32_F32_SUBGROUP: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q5_1_f32_f32_subgroup.spv"));
+pub const MUL_MAT_VEC_Q8_0_F32_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q8_0_f32_f32.spv"));
+pub const MUL_MAT_VEC_Q8_0_F32_F32_SUBGROUP: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q8_0_f32_f32_subgroup.spv"));
 pub const MUL_MAT_VEC_FP8: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_fp8.spv"));
 pub const MUL_MAT_VEC_F32: &[u8] =
@@ -836,6 +896,13 @@ pub const MUL_MMQ_Q5_K_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mmq_q5_k_f32.spv"));
 pub const MUL_MMQ_Q4_0_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mmq_q4_0_f32.spv"));
+// Sprint 52J — Q5_0 / Q5_1 / Q8_0 Mmq SPVs.
+pub const MUL_MMQ_Q5_0_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mmq_q5_0_f32.spv"));
+pub const MUL_MMQ_Q5_1_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mmq_q5_1_f32.spv"));
+pub const MUL_MMQ_Q8_0_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mmq_q8_0_f32.spv"));
 pub const QUANTIZE_Q8_1_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/quantize_q8_1_f32.spv"));
 pub const FLASH_ATTN_F32: &[u8] =

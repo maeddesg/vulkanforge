@@ -2532,11 +2532,21 @@ impl BatchExec {
 
 
         // Sprint 17B/17C/17D — Q4_0 forces MMQ (no MulMm SPV shipped).
-        let attn_q_type = ctx
+        // Sprint 52J — Q5_0 / Q5_1 / Q8_0 also Mmq-only (mul_mm coopmat
+        // variants would each need their own SPV family per quant —
+        // out of scope; the integer-MMQ path covers 26B Q3_K_M's
+        // attn_k/v (Q8_0), MoE down_exps (Q5_0), blk.0.ffn_down (Q5_1)).
+        // Decision is **per-tensor** now (was only attn_q.weight) so
+        // mixed-quant 26B GGUFs route each GEMM site correctly: attn_q
+        // may be Q6_K (uses MulMm), attn_k Q8_0 (forces Mmq), etc.
+        let weight_ggml_type = ctx
             .model
-            .tensor(&format!("blk.{}.attn_q.weight", ctx.layer))
+            .tensor(&format!("blk.{}.{suffix}", ctx.layer))
             .map(|t| t.ggml_type);
-        let force_mmq = matches!(attn_q_type, Some(GgmlType::Q4_0));
+        let force_mmq = matches!(
+            weight_ggml_type,
+            Some(GgmlType::Q4_0 | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0),
+        );
         let gemm_kind = if f32_weight {
             // F32 path: MulMmAligned when seq_len%4==0, MulMm otherwise.
             // Mmq is not a valid choice (no F32 Mmq shader), so we don't

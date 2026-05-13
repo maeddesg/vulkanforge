@@ -209,6 +209,96 @@ const JOBS: &[ShaderJob] = &[
             ("USE_SUBGROUP_ADD", "1"),
         ],
     },
+    // Sprint 52J — Q5_0 / Q5_1 / Q8_0 decode GEMVs. Same generic
+    // `mul_mat_vec.comp` + `dequant_funcs.glsl` infrastructure as
+    // Q4_0, just toggled via a different `DATA_A_<quant>` define.
+    // Needed for the Gemma-4-26B-A4B GGUF (google official Q3_K_M),
+    // which uses Q8_0 for attn_k/v + Q5_0 for MoE expert down_proj +
+    // Q5_1 for blk.0.ffn_down. Without these, the GEMV dispatcher's
+    // silent `_ => MulMatVecQ4K` fallthrough at `arch/common.rs:383`
+    // produced NaN logits and the CPU MoE router panicked at
+    // `executor.rs:180 .partial_cmp().unwrap()`.
+    ShaderJob {
+        out_name: "mul_mat_vec_q5_0_f32_f32.spv",
+        entry_source: "mul_mat_vec.comp",
+        defines: &[
+            ("DATA_A_Q5_0", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mat_vec_q5_0_f32_f32_subgroup.spv",
+        entry_source: "mul_mat_vec.comp",
+        defines: &[
+            ("DATA_A_Q5_0", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("USE_SUBGROUP_ADD", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mat_vec_q5_1_f32_f32.spv",
+        entry_source: "mul_mat_vec.comp",
+        defines: &[
+            ("DATA_A_Q5_1", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mat_vec_q5_1_f32_f32_subgroup.spv",
+        entry_source: "mul_mat_vec.comp",
+        defines: &[
+            ("DATA_A_Q5_1", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("USE_SUBGROUP_ADD", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mat_vec_q8_0_f32_f32.spv",
+        entry_source: "mul_mat_vec.comp",
+        defines: &[
+            ("DATA_A_Q8_0", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mat_vec_q8_0_f32_f32_subgroup.spv",
+        entry_source: "mul_mat_vec.comp",
+        defines: &[
+            ("DATA_A_Q8_0", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("USE_SUBGROUP_ADD", "1"),
+        ],
+    },
     // RMSNorm. generic_binary_head: 3 SSBOs (input A, weight B, output D).
     ShaderJob {
         out_name: "rms_norm_f32.spv",
@@ -889,6 +979,47 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "mul_mmq.comp",
         defines: &[
             ("DATA_A_Q4_0", "1"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("ACC_TYPE", "float"),
+        ],
+    },
+    // Sprint 52J — Q5_0 / Q5_1 / Q8_0 integer-MMQ prefill GEMM. The
+    // 26B-A4B Q3_K_M GGUF uses these for attn_k/v + MoE down_exps +
+    // blk.0.ffn_down. mul_mmq_funcs.glsl + mul_mmq_shmem_types.glsl
+    // already carry the block-cache / shmem paths for these quants
+    // (Sprint 52J-Phase-0 grep confirmed). Without the SPVs, prefill
+    // hit the Q4_K Mmq silent fallthrough at `arch/common.rs:184` and
+    // produced NaN attn_k/v outputs that propagated to the CPU MoE
+    // router softmax → `partial_cmp().unwrap()` panic.
+    ShaderJob {
+        out_name: "mul_mmq_q5_0_f32.spv",
+        entry_source: "mul_mmq.comp",
+        defines: &[
+            ("DATA_A_Q5_0", "1"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("ACC_TYPE", "float"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mmq_q5_1_f32.spv",
+        entry_source: "mul_mmq.comp",
+        defines: &[
+            ("DATA_A_Q5_1", "1"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("ACC_TYPE", "float"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mmq_q8_0_f32.spv",
+        entry_source: "mul_mmq.comp",
+        defines: &[
+            ("DATA_A_Q8_0", "1"),
             ("D_TYPE", "float"),
             ("FLOAT_TYPE", "float"),
             ("FLOAT_TYPEV2", "vec2"),
