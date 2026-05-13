@@ -75,6 +75,14 @@ pub enum GgmlType {
     Q5K = 13,
     Q6K = 14,
     Q8K = 15,
+    /// Brain Float 16 — 1 sign + 8 exponent + 7 mantissa, same exponent
+    /// range as FP32. Appears in Gemma-family GGUFs for norm and
+    /// embedding weights (the ones the quant tooling chose not to
+    /// compress). VF expands BF16 → FP32 at GPU upload time
+    /// (`LoadedModel::load`), so downstream shaders never see this
+    /// dtype — the in-memory `GpuTensor.ggml_type` is `F32` for the
+    /// expanded result.
+    BF16 = 30,
     /// Sprint 20 — native FP8 E4M3 (1 byte / element). Not a GGUF
     /// type number (GGUF stops at 35); we use 100 as an internal
     /// sentinel so SafeTensors models can flow through the same
@@ -101,6 +109,7 @@ impl GgmlType {
             13 => GgmlType::Q5K,
             14 => GgmlType::Q6K,
             15 => GgmlType::Q8K,
+            30 => GgmlType::BF16,
             _ => return Err(GgufError::UnknownTensorType(v)),
         })
     }
@@ -108,7 +117,7 @@ impl GgmlType {
     /// Number of elements per quantisation block. 1 for non-quant types.
     pub fn block_size(self) -> u64 {
         match self {
-            GgmlType::F32 | GgmlType::F16 | GgmlType::F8E4M3 => 1,
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::F8E4M3 => 1,
             GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q5_0 | GgmlType::Q5_1 |
             GgmlType::Q8_0 | GgmlType::Q8_1 => 32,
             GgmlType::Q2K | GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q5K |
@@ -121,6 +130,7 @@ impl GgmlType {
         match self {
             GgmlType::F32 => 4,
             GgmlType::F16 => 2,
+            GgmlType::BF16 => 2,
             GgmlType::F8E4M3 => 1,
             GgmlType::Q4_0 => 18,
             GgmlType::Q4_1 => 20,
@@ -670,4 +680,33 @@ impl<'a> Cursor<'a> {
 
 fn align_up(n: u64, alignment: u64) -> u64 {
     (n + alignment - 1) & !(alignment - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GGML type 30 = BF16. Sprint v0.4.x — Gemma-family GGUFs use it
+    /// for `token_embd.weight` and a few norm/output tensors. The
+    /// parser must accept type 30 and report `block_size=1`,
+    /// `type_size=2`.
+    #[test]
+    fn ggml_type_30_is_bf16() {
+        let t = GgmlType::from_u32(30).expect("type 30 should parse as BF16");
+        assert_eq!(t, GgmlType::BF16);
+        assert_eq!(t.block_size(), 1);
+        assert_eq!(t.type_size(), 2);
+    }
+
+    #[test]
+    fn bf16_tensor_byte_size_is_2x_elements() {
+        let info = TensorInfo {
+            name: "embed".to_string(),
+            dimensions: vec![128, 64],
+            ggml_type: GgmlType::BF16,
+            data_offset: 0,
+        };
+        assert_eq!(info.n_elements(), 128 * 64);
+        assert_eq!(info.byte_size(), 128 * 64 * 2);
+    }
 }

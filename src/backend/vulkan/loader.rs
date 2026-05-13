@@ -337,7 +337,32 @@ impl LoadedModel {
 
         for name in tensor_names {
             let info = gguf.tensor(name).expect("name from same map");
-            let size = info.byte_size();
+
+            // BF16 (GGML type 30) tensors — Gemma-family GGUFs use these
+            // for `token_embd.weight` and a few norm/output weights. VF
+            // shaders don't consume BF16, so expand to FP32 on the host
+            // here and upload as `GgmlType::F32`. AVX-512 path when
+            // available; scalar fallback otherwise. Bit-identical because
+            // BF16→FP32 is a left-shift of the bits.
+            let (upload_type, upload_bytes_owned): (GgmlType, Option<Vec<u8>>) =
+                if info.ggml_type == GgmlType::BF16 {
+                    let n = info.n_elements() as usize;
+                    let mut bytes = vec![0u8; n * 4];
+                    {
+                        let as_f32: &mut [f32] =
+                            bytemuck::cast_slice_mut(&mut bytes);
+                        crate::quantize_avx512::bf16_bytes_to_fp32_dispatch(
+                            gguf.tensor_bytes(info), as_f32,
+                        );
+                    }
+                    (GgmlType::F32, Some(bytes))
+                } else {
+                    (info.ggml_type, None)
+                };
+            let size: u64 = match &upload_bytes_owned {
+                Some(b) => b.len() as u64,
+                None => info.byte_size(),
+            };
             if size > STAGING_BYTES {
                 // Fail loud; no per-tensor staging fallback today.
                 staging.destroy(&dev.device, allocator);
@@ -388,8 +413,13 @@ impl LoadedModel {
                 }
             };
 
-            // Copy mmap → staging.
-            let src_bytes = gguf.tensor_bytes(info);
+            // Copy mmap → staging. For BF16 tensors `upload_bytes_owned`
+            // holds the host-expanded FP32 buffer; otherwise use the
+            // mmap'd source bytes directly.
+            let src_bytes: &[u8] = match &upload_bytes_owned {
+                Some(b) => b.as_slice(),
+                None => gguf.tensor_bytes(info),
+            };
             staging
                 .write_bytes_at(staging_off, src_bytes)
                 .map_err(|e| LoaderError::Buffer(e.to_string()))?;
@@ -409,7 +439,7 @@ impl LoadedModel {
                 GpuTensor {
                     buffer: dst,
                     shape: info.dimensions.clone(),
-                    ggml_type: info.ggml_type,
+                    ggml_type: upload_type,
                     byte_size: size,
                     weight_scale: None,
                     scale_buffer: None,
@@ -744,10 +774,9 @@ impl LoadedModel {
                     if do_quant {
                         let n = info.n_elements();
                         let mut f32_vec = vec![0f32; n];
-                        for i in 0..n {
-                            let bf = u16::from_le_bytes([raw[2 * i], raw[2 * i + 1]]);
-                            f32_vec[i] = bf16_to_f32(bf);
-                        }
+                        crate::quantize_avx512::bf16_bytes_to_fp32_dispatch(
+                            &raw[..n * 2], &mut f32_vec,
+                        );
                         // Sprint 51D-D — 3D expert tensors with
                         // innermost dim not aligned to QK_K need
                         // per-row padding so each row is a whole
@@ -1661,11 +1690,13 @@ fn bf16_to_f32_vec(
             "BF16 tensor '{name}': byte length implies {n} elements, shape implies {expected}"
         )));
     }
+    // AVX-512 dispatch (falls back to scalar when no AVX-512F or
+    // VF_NO_AVX512_QUANT=1 is set). The shift `(bf << 16)` is bit-exact
+    // so this is bit-identical to the prior scalar loop.
     let mut out = vec![0u8; n * 4];
-    for i in 0..n {
-        let bf = u16::from_le_bytes([raw[2 * i], raw[2 * i + 1]]);
-        let f = bf16_to_f32(bf);
-        out[4 * i .. 4 * i + 4].copy_from_slice(&f.to_le_bytes());
+    {
+        let as_f32: &mut [f32] = bytemuck::cast_slice_mut(&mut out);
+        crate::quantize_avx512::bf16_bytes_to_fp32_dispatch(raw, as_f32);
     }
     Ok(out)
 }

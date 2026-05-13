@@ -377,6 +377,54 @@ pub unsafe fn quantize_block_q4k_avx512(input: &[f32], output: &mut [u8]) {
     }
 }
 
+/// Convert a BF16 byte buffer to FP32 using AVX-512F. Processes 16
+/// BF16 (= 32 bytes) → 16 FP32 (= 64 bytes) per loop iteration.
+/// Tail (< 16) is scalar. Bit-identical to the scalar
+/// `f32::from_bits((bf as u32) << 16)`: the same left-shift, just
+/// 16-wide. No rounding involved.
+///
+/// SAFETY: AVX-512F must be available (gated by `#[target_feature]`).
+/// `input_bytes.len() == output.len() * 2`. The byte pointer may be
+/// arbitrarily aligned — `_mm256_loadu_si256` is the unaligned 256-bit
+/// load. The output pointer is 4-byte aligned (Vec<f32> guarantees).
+#[target_feature(enable = "avx512f")]
+pub unsafe fn bf16_bytes_to_fp32_avx512(input_bytes: &[u8], output: &mut [f32]) {
+    debug_assert_eq!(input_bytes.len(), output.len() * 2);
+    let n = output.len();
+    let in_ptr = input_bytes.as_ptr();
+    let out_ptr = output.as_mut_ptr();
+    let mut i: usize = 0;
+    while i + 16 <= n {
+        unsafe {
+            let bf = _mm256_loadu_si256(in_ptr.add(i * 2) as *const __m256i);
+            let lo = _mm512_cvtepu16_epi32(bf);
+            let fp = _mm512_castsi512_ps(_mm512_slli_epi32::<16>(lo));
+            _mm512_storeu_ps(out_ptr.add(i), fp);
+        }
+        i += 16;
+    }
+    while i < n {
+        let bf = u16::from_le_bytes([input_bytes[2 * i], input_bytes[2 * i + 1]]);
+        output[i] = f32::from_bits((bf as u32) << 16);
+        i += 1;
+    }
+}
+
+/// Dispatcher around `bf16_bytes_to_fp32_avx512` — runtime-detects
+/// AVX-512F. Bit-identical to the scalar path on both branches.
+pub fn bf16_bytes_to_fp32_dispatch(input_bytes: &[u8], output: &mut [f32]) {
+    assert_eq!(input_bytes.len(), output.len() * 2);
+    if avx512_available() {
+        unsafe { bf16_bytes_to_fp32_avx512(input_bytes, output) };
+        return;
+    }
+    let n = output.len();
+    for i in 0..n {
+        let bf = u16::from_le_bytes([input_bytes[2 * i], input_bytes[2 * i + 1]]);
+        output[i] = f32::from_bits((bf as u32) << 16);
+    }
+}
+
 #[inline]
 fn nearest_int_scalar(fval: f32) -> i32 {
     debug_assert!(fval.abs() <= 4_194_303.0);
@@ -498,5 +546,101 @@ mod tests {
         let want = is_x86_feature_detected!("avx512f")
             && std::env::var_os("VF_NO_AVX512_QUANT").is_none();
         assert_eq!(avx512_available(), want);
+    }
+
+    /// BF16 → FP32 AVX-512 path: 256 values mixed across signs,
+    /// magnitudes, denormals. Bit-identical to scalar shift.
+    #[test]
+    fn bf16_to_fp32_avx512_bit_identical_to_scalar_256() {
+        if skip_if_no_avx512() { return; }
+        // Build 256 BF16 bit-patterns:  signs, magnitudes (incl. near-zero),
+        // ±inf, ±0. The shift is exact so all patterns round-trip identical
+        // to scalar — no NaN-mantissa concerns here (we don't *interpret*,
+        // we just shift bits).
+        let mut bf16_bytes = Vec::<u8>::with_capacity(256 * 2);
+        for i in 0..256 {
+            let v: u16 = match i {
+                0   => 0x0000,           // +0
+                1   => 0x8000,           // -0
+                2   => 0x7F80,           // +inf
+                3   => 0xFF80,           // -inf
+                4   => 0x0001,           // smallest denormal
+                _   => half::bf16::from_f32(
+                            (i as f32 - 128.0) * 0.0123
+                       ).to_bits(),
+            };
+            bf16_bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let n = bf16_bytes.len() / 2;
+
+        // Scalar reference.
+        let mut scalar = vec![0f32; n];
+        for i in 0..n {
+            let bf = u16::from_le_bytes([bf16_bytes[2*i], bf16_bytes[2*i+1]]);
+            scalar[i] = f32::from_bits((bf as u32) << 16);
+        }
+
+        // AVX-512 path.
+        let mut avx = vec![0f32; n];
+        unsafe { bf16_bytes_to_fp32_avx512(&bf16_bytes, &mut avx) };
+
+        // Bit-identity: compare via bit-pattern so NaN-vs-NaN tests don't
+        // false-mismatch (NaN != NaN under FP cmp, but bit-eq is well-defined).
+        for i in 0..n {
+            assert_eq!(
+                scalar[i].to_bits(), avx[i].to_bits(),
+                "BF16 idx {i}: scalar={:#010x} avx={:#010x}",
+                scalar[i].to_bits(), avx[i].to_bits()
+            );
+        }
+    }
+
+    /// Tail handling: lengths that aren't multiples of 16 must still
+    /// produce bit-identical output (scalar tail loop).
+    #[test]
+    fn bf16_to_fp32_avx512_handles_partial_tail() {
+        if skip_if_no_avx512() { return; }
+        for n in [1, 7, 15, 17, 33, 47] {
+            let mut bf = Vec::<u8>::with_capacity(n * 2);
+            for i in 0..n {
+                let v = half::bf16::from_f32(i as f32 * 0.07).to_bits();
+                bf.extend_from_slice(&v.to_le_bytes());
+            }
+            let mut scalar = vec![0f32; n];
+            for i in 0..n {
+                let bv = u16::from_le_bytes([bf[2*i], bf[2*i+1]]);
+                scalar[i] = f32::from_bits((bv as u32) << 16);
+            }
+            let mut avx = vec![0f32; n];
+            unsafe { bf16_bytes_to_fp32_avx512(&bf, &mut avx) };
+            for i in 0..n {
+                assert_eq!(scalar[i].to_bits(), avx[i].to_bits(),
+                    "tail n={n} idx={i}");
+            }
+        }
+    }
+
+    /// Dispatcher matches scalar path bit-for-bit on a real-ish
+    /// distribution.
+    #[test]
+    fn bf16_dispatcher_bit_identical_to_scalar() {
+        let n = 1024;
+        let mut bf = Vec::<u8>::with_capacity(n * 2);
+        let mut s: u32 = 0xDEAD_BEEF;
+        for _ in 0..n {
+            s = s.wrapping_mul(48271);
+            let v = ((s >> 16) as u16) & 0x7FFF;
+            bf.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut scalar = vec![0f32; n];
+        for i in 0..n {
+            let bv = u16::from_le_bytes([bf[2*i], bf[2*i+1]]);
+            scalar[i] = f32::from_bits((bv as u32) << 16);
+        }
+        let mut dis = vec![0f32; n];
+        bf16_bytes_to_fp32_dispatch(&bf, &mut dis);
+        for i in 0..n {
+            assert_eq!(scalar[i].to_bits(), dis[i].to_bits(), "idx {i}");
+        }
     }
 }
