@@ -1549,7 +1549,7 @@ impl BatchExec {
             fwd.batch_norm.handle,
             fwd.batch_k.handle,
             kv_dim, cfg.hidden_dim, seq_len, "gemm_k",
-            /* quantize_input = */ false,
+            quantize_input_after_q(ctx.model, ctx.layer),
         );
     }
 
@@ -1563,7 +1563,7 @@ impl BatchExec {
             fwd.batch_norm.handle,
             fwd.batch_v.handle,
             kv_dim, cfg.hidden_dim, seq_len, "gemm_v",
-            /* quantize_input = */ false,
+            quantize_input_after_q(ctx.model, ctx.layer),
         );
         // After Q+K+V finished, emit a single barrier (matches the
         // legacy `compute_barrier` after the GEMM block).
@@ -2741,6 +2741,18 @@ impl BatchExec {
             m, n, k, label,
         );
     }
+}
+
+/// Sprint 52ZA — see `feedback_batch_q8_reuse_mixed_quant`.
+fn quantize_input_after_q(model: &LoadedModel, layer: u32) -> bool {
+    let q_type = model
+        .tensor(&format!("blk.{layer}.attn_q.weight"))
+        .map(|t| t.ggml_type);
+    let q_took_mmq = matches!(
+        q_type,
+        Some(GgmlType::Q4_0 | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0),
+    );
+    !q_took_mmq
 }
 
 /// Helper: extract `seq_len` from a Batch ExecCtx.

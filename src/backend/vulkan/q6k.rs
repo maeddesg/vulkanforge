@@ -29,22 +29,20 @@ use half::f16;
 pub const QUANT_K: usize = 256;
 pub const BLOCK_BYTES: usize = 210;
 
-/// Dequantize one 210-byte Q6_K block to 256 f32 weights. Matches
-/// `dequantize_row_q6_K` in `ggml-quants.c`. The reconstruction iterates
-/// in 128-element halves; each half pulls 8 sub-block scales from
-/// `scales[0..8]` (first half) or `scales[8..16]` (second half).
+/// Dequantize one 210-byte Q6_K block to 256 f32 weights. Mirrors
+/// `dequantize_row_q6_K` in `ggml-quants.c` exactly: each 128-element
+/// half consumes 8 sub-block scales (`scales[0..8]` or `scales[8..16]`),
+/// where the 4 reconstruction positions within a half draw from
+/// `sc[is]`, `sc[is + 2]`, `sc[is + 4]`, `sc[is + 6]` with
+/// `is = l / 16`. Sprint 52X fixed an earlier bug where only the first
+/// 4 scales per half were used (sub-blocks were 32-wide instead of 16),
+/// which produced sign flips at ~17 indices per 2816-d Q6_K row.
 pub fn dequant_block(block: &[u8; BLOCK_BYTES]) -> [f32; QUANT_K] {
-    // Layout offsets:
-    //   0..128 : ql (low 4 bits, packed pairs)
-    // 128..192 : qh (high 2 bits, packed quads)
-    // 192..208 : scales (16 × i8)
-    // 208..210 : d (fp16)
     let ql = &block[0..128];
     let qh = &block[128..192];
     let scales_raw = &block[192..208];
     let d = f16::from_le_bytes([block[208], block[209]]).to_f32();
 
-    // Sign-extend the int8 scales.
     let mut scales = [0i8; 16];
     for (i, &b) in scales_raw.iter().enumerate() {
         scales[i] = b as i8;
@@ -52,18 +50,13 @@ pub fn dequant_block(block: &[u8; BLOCK_BYTES]) -> [f32; QUANT_K] {
 
     let mut out = [0.0f32; QUANT_K];
 
-    // Process two 128-element halves. Each half re-bases ql/qh
-    // offsets and uses the corresponding 8 scales.
     for half in 0..2 {
         let ql_base = half * 64;
         let qh_base = half * 32;
         let sc_base = half * 8;
-        // Each half iterates 32 positions in `l ∈ 0..32`; for each
-        // `l`, four 6-bit weights are reconstructed (offsets l,
-        // l+32, l+64, l+96 within the half). The four reconstructions
-        // use scales[sc_base + 0..4] respectively.
         let out_base = half * 128;
         for l in 0..32 {
+            let is = l / 16;
             let q1_low = (ql[ql_base + l] & 0x0F) as i32;
             let q2_low = (ql[ql_base + l + 32] & 0x0F) as i32;
             let q3_low = (ql[ql_base + l] >> 4) as i32;
@@ -77,22 +70,15 @@ pub fn dequant_block(block: &[u8; BLOCK_BYTES]) -> [f32; QUANT_K] {
             let q2 = q2_low | (q2_hi << 4);
             let q3 = q3_low | (q3_hi << 4);
             let q4 = q4_low | (q4_hi << 4);
-            // Sub-block scales: 0..32 → scales[0], 32..64 → scales[1],
-            // 64..96 → scales[2], 96..128 → scales[3]. Re-based per
-            // half via sc_base.
-            let s1 = scales[sc_base] as i32;
-            let s2 = scales[sc_base + 1] as i32;
-            let s3 = scales[sc_base + 2] as i32;
-            let s4 = scales[sc_base + 3] as i32;
+            let s1 = scales[sc_base + is] as i32;
+            let s2 = scales[sc_base + is + 2] as i32;
+            let s3 = scales[sc_base + is + 4] as i32;
+            let s4 = scales[sc_base + is + 6] as i32;
             out[out_base + l] = d * (s1 * (q1 - 32)) as f32;
             out[out_base + l + 32] = d * (s2 * (q2 - 32)) as f32;
             out[out_base + l + 64] = d * (s3 * (q3 - 32)) as f32;
             out[out_base + l + 96] = d * (s4 * (q4 - 32)) as f32;
         }
-        let _ = sc_base; // silence unused warning if iteration unrolls
-        // For half=0 we used scales[0..4]; for half=1 we used
-        // scales[8..12]. Each half therefore covers 128 weights with
-        // 4 sub-block scales, matching the upstream `dequantize_row_q6_K`.
     }
     out
 }
@@ -136,7 +122,53 @@ mod tests {
         let out = dequant_block(&block);
         assert_eq!(out[0], -22.0, "elem 0: 0xBA low-nibble = 10 → 10-32 = -22");
         // ql[0] = 0xBA, low-nibble = 0xA = 10. So elem 0 = -22.
-        // ql[0] >> 4 = 0xB = 11. Elem 64 = (11-32)*scale[2] = -21*1.
+        // ql[0] >> 4 = 0xB = 11. Elem 64 = (11-32)*scale[4] = -21*1.
         assert_eq!(out[64], -21.0, "elem 64: 0xBA high-nibble = 11 → 11-32 = -21");
+    }
+
+    /// Sprint 52X regression: distinguish the correct scale-indexing
+    /// from the pre-52X bug where `out[l + 32/64/96]` read
+    /// `scales[sc_base + 1/2/3]` instead of `scales[sc_base + is + 2/4/6]`.
+    /// Setting all ql/qh to zero (so every `q = 0`, `q - 32 = -32`) and
+    /// using a distinct value per scale lets us observe exactly which
+    /// scale index was applied at each output position.
+    #[test]
+    fn dequant_uses_full_8_scales_per_half() {
+        let mut block = [0u8; BLOCK_BYTES];
+        // ql + qh stay zero → q = 0 at every position → q - 32 = -32.
+        // scales[0..8] = 1, 2, ... 8 ; scales[8..16] = 10, 20, ... 80.
+        for i in 0..8 {
+            block[192 + i] = (i + 1) as u8;
+        }
+        for i in 0..8 {
+            block[192 + 8 + i] = ((i + 1) * 10) as u8;
+        }
+        block[208] = 0x00;
+        block[209] = 0x3C; // d = fp16(1.0)
+        let out = dequant_block(&block);
+
+        // First half, l=0 → is=0 → scales[0], [2], [4], [6].
+        assert_eq!(out[0], -32.0, "l=0 → sc[0]=1 → 1*-32");
+        assert_eq!(out[32], -96.0, "l=0 → sc[2]=3 → 3*-32 (BUG would give sc[1]=2 → -64)");
+        assert_eq!(out[64], -160.0, "l=0 → sc[4]=5 → 5*-32 (BUG would give sc[2]=3 → -96)");
+        assert_eq!(out[96], -224.0, "l=0 → sc[6]=7 → 7*-32 (BUG would give sc[3]=4 → -128)");
+
+        // First half, l=16 → is=1 → scales[1], [3], [5], [7].
+        assert_eq!(out[16], -64.0, "l=16 → sc[1]=2 (BUG would give sc[0]=1 → -32)");
+        assert_eq!(out[48], -128.0, "l=16 → sc[3]=4");
+        assert_eq!(out[80], -192.0, "l=16 → sc[5]=6");
+        assert_eq!(out[112], -256.0, "l=16 → sc[7]=8");
+
+        // Second half, l=0 → is=0, sc_base=8 → scales[8], [10], [12], [14].
+        assert_eq!(out[128], -320.0, "second half l=0 → sc[8]=10");
+        assert_eq!(out[160], -960.0, "second half l=0 → sc[10]=30");
+        assert_eq!(out[192], -1600.0, "second half l=0 → sc[12]=50");
+        assert_eq!(out[224], -2240.0, "second half l=0 → sc[14]=70");
+
+        // Second half, l=16 → is=1, sc_base=8 → scales[9], [11], [13], [15].
+        assert_eq!(out[144], -640.0, "second half l=16 → sc[9]=20");
+        assert_eq!(out[176], -1280.0, "second half l=16 → sc[11]=40");
+        assert_eq!(out[208], -1920.0, "second half l=16 → sc[13]=60");
+        assert_eq!(out[240], -2560.0, "second half l=16 → sc[15]=80");
     }
 }

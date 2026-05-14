@@ -934,10 +934,15 @@ impl ModelConfig {
         // RoPE layout follows the architecture: Qwen* uses NeoX
         // (rotates [i, i+n_dims/2] pairs), llama / mistral / deepseek
         // use the standard adjacent-pair form. Mirrors llama.cpp's
-        // `llama_rope_type()` switch in llama-arch.cpp.
+        // `llama_rope_type()` switch in llama-arch.cpp. Sprint 52ZB —
+        // Gemma-4 also uses NeoX per HF `modular_gemma4.py`; SafeTensors
+        // loader hardcodes Neox (loader.rs:2606) but the GGUF loader was
+        // defaulting to Norm → wrong pair convention → attention Q/K
+        // RoPE rotates the wrong elements → D4 cos 0.51 / D5 cos 0.71
+        // observed in the 26B Q3_K_M attention bisect.
         let rope_variant = match arch {
             "qwen2" | "qwen2moe" | "qwen2vl" | "qwen3" | "qwen3moe" | "phi2" | "phi3"
-            | "gpt-neox" | "gpt-neox-japanese" | "stablelm" => RopeVariant::Neox,
+            | "gpt-neox" | "gpt-neox-japanese" | "stablelm" | "gemma4" => RopeVariant::Neox,
             _ => RopeVariant::Norm,
         };
 
