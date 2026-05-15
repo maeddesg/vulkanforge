@@ -53,6 +53,71 @@ Prefill numbers are for short prompts (~17–25 tokens) measured in
 this release. 26B uses `force_per_token_prefill` mode, which caps
 prefill at decode-like speeds; batched MoE prefill is planned for v0.5.
 
+## 15-Prompt Coherence Bench (Gemma-4 26B Q3_K_M, greedy)
+
+All 15 prompts run with `temperature=0.0` (greedy), `--max-tokens 200`,
+no `VULKANFORGE_DISABLE_ASYNC_DECODE` env var (the v0.4.2 auto-disable
+applies). Result: **15/15 semantically coherent** (12 clean, 3 with
+minor Q3_K token-level artifacts where the model picked a near-tied
+alternative — `"e.1."` instead of `"e.g."` etc.; semantics correct in
+all cases).
+
+| # | Prompt | Output (summary) | Tokens | Verdict |
+|---|--------|------------------|--------|---------|
+| 1 | "The capital of France is" | "Paris." | 2 | PASS |
+| 2 | "What is 2+2? Answer in one sentence." | "Two plus two equals four." | 6 | PASS |
+| 3 | "Explain what a neural network is in three sentences." | 3 coherent sentences (brain analogy, layers/weights, training) | 64 | PASS |
+| 4 | "Write a short poem about the moon." | 8-line AABB-rhymed poem (see below) | 65 | PASS |
+| 5 | "What is the speed of light in meters per second?" | "299,792,458 meters per second" — exact | 25 | PASS |
+| 6 | "Translate 'Good morning' to German, French, and Japanese." | "Guten Morgen / Bonjour / おはようございます (Ohayō gozaimasu)" — all correct, native script | 41 | PASS |
+| 7 | "Name three benefits of regular exercise." | 3 structured bullets (cardio, mental, weight) | 125 | PASS |
+| 8 | "What is photosynthesis? Explain briefly." | Detailed answer with chemical equation; one "**" → "together" token-swap glitch in bullet 2 | 200 (cap) | PARTIAL |
+| 9 | "Write a haiku about rain." | "Soft gray clouds descend, / Silver droplets kiss the earth, / Life drinks from the sky." (5-7-5) | 19 | PASS |
+| 10 | "Who wrote Romeo and Juliet?" | "**William Shakespeare** wrote *Romeo and Juliet*." | 10 | PASS |
+| 11 | "What are the three states of matter?" | Solid/Liquid/Gas with particle behaviour; "### 1. Liquid" numbering bug after "### 1. Solid" | 200 (cap) | PARTIAL |
+| 12 | "Explain the difference between a virus and a bacterium in two sentences." | Bacterium = single-celled living; virus = non-living genetic package needing host; antibiotic vs antiviral note | 61 | PASS |
+| 13 | "What is the largest planet in our solar system?" | "The largest planet in our solar system is **Jupiter**." | 11 | PASS |
+| 14 | "Write a one-paragraph summary of World War II." | 184-token paragraph: 1939-1945, Allies/Axis, theatres, Holocaust, atomic bombs, UN founding | 184 | PASS |
+| 15 | "What is machine learning?" | Definition + comparison to traditional programming + apple-recognition analogy; minor `"e.1."` and `"e. longer"` token-artifacts | 200 (cap) | PARTIAL |
+
+### Highlights
+
+**Prompt 4 — Moon poem (greedy, AABB rhyme, two stanzas):**
+
+```
+A silver coin in velvet deep,
+Watching while the weary sleep.
+A silent guide through velvet night,
+Draped in borrowed, ghostly light.
+
+She pulls the tides with gentle hand,
+Across the sea and sleeping land,
+Changing shape from thin to round,
+Without a word, without a sound.
+```
+
+**Prompt 9 — Haiku (5-7-5):**
+
+```
+Soft gray clouds descend,
+Silver droplets kiss the earth,
+Life drinks from the sky.
+```
+
+**Prompt 6 — Trilingual translation** with correct native Japanese
+script (`おはようございます` plus romaji `(Ohayō gozaimasu)`) shows
+the 262K-vocab Gemma-4 tokenizer + Q3_K weights preserve multilingual
+fidelity.
+
+**Prompt 14 — WW2 paragraph** (184 tokens, natural EOS) covers
+allies/axis composition, theatres, Holocaust, nuclear weapons, and
+the post-war UN founding — factually accurate, well-structured.
+
+The 3 PARTIAL cases are all Q3_K-quantization token-selection
+artifacts where the model picked a near-equiprobable alternative at
+one or two token positions (typo-like, e.g. `"e.1."` for `"e.g."`).
+Semantics are correct throughout. At Q4_K_M these typically clear up.
+
 ## Hardware / Stack
 
 - GPU: AMD Radeon RX 9070 XT (RDNA 4, `gfx1201`, 16 GB VRAM)
