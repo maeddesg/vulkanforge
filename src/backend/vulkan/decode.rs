@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use super::chat_template::ChatTemplate;
 use super::commands::CommandContext;
 use super::device::VulkanDevice;
-use super::forward::Forward;
+use super::forward::{gpu_direct_moe_enabled, Forward};
 use super::gguf::{GgufFile, ModelConfig};
 use super::loader::LoadedModel;
 use super::pipeline_registry::PipelineRegistry;
@@ -557,20 +557,19 @@ pub fn generate_from_tokens(
     // Opt-out: VULKANFORGE_DISABLE_ASYNC_DECODE=1 falls back to the
     // serial path (single CB, record+submit+wait per token).
     //
-    // Sprint 54I — MoE models force-disable async. `step_moe_route`
-    // calls `mid_frame_submit_and_wait` during CB recording to
-    // host-readback `res1` for CPU expert selection. The async
-    // pre_record schedule records this mid-frame submit BEFORE
-    // fill_embed_and_submit writes the current token's embedding to
-    // scratch_a, so the host-readback sees a stale hidden state from
-    // the previous slot occupant — wrong experts cascade into all
-    // subsequent layers and produce stuck-token loops on 26B.
+    // Sprint 56C-3 — async safe again for MoE when the GPU-direct
+    // expert FFN is active. Sprint 56C-2 eliminated the
+    // `mid_frame_submit_and_wait` from `step_moe_route` (no more CPU
+    // readback of routing decisions), so the Sprint 54I stale-scratch_a
+    // race condition cannot fire. The legacy CPU-readback path is
+    // still selectable via `VF_GPU_DIRECT_MOE=0` — in that case async
+    // remains disabled for MoE to preserve the 54I workaround.
     let async_decode = match std::env::var("VULKANFORGE_DISABLE_ASYNC_DECODE") {
         Ok(v) => v != "1" && !v.eq_ignore_ascii_case("true"),
         Err(_) => cfg
             .gemma4
             .as_ref()
-            .map(|g| !g.enable_moe_block)
+            .map(|g| !g.enable_moe_block || gpu_direct_moe_enabled())
             .unwrap_or(true),
     };
 

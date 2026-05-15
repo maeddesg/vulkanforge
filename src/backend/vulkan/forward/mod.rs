@@ -74,6 +74,25 @@ mod state;
 pub use state::{
     DebugTarget, Forward, ForwardStats, ForwardTokenProfile, IntermediateSlot,
 };
+
+/// Sprint 56C-3 — global env-var switch for the GPU-direct MoE expert
+/// FFN path (default ON; `VF_GPU_DIRECT_MOE=0` reverts to the legacy
+/// CPU-readback). Cached after first read.
+///
+/// Lives in `forward/mod.rs` (not `executor/moe.rs`) because both
+/// `executor::moe::step_moe_route` and `super::decode.rs::run_decode`
+/// need to query it — the latter pairs the flag with async-decode
+/// safety (mid_frame_submit_and_wait is only inserted when this
+/// returns false, so async stays safe for MoE when the flag is on).
+pub(crate) fn gpu_direct_moe_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("VF_GPU_DIRECT_MOE")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
+    })
+}
 use arch::compute_barrier;
 use state::BindingSignature;
 

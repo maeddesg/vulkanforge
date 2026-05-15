@@ -25,25 +25,7 @@ use super::super::super::shaders::ShaderId;
 
 use ash::vk;
 
-/// Sprint 56C-2 — `VF_GPU_DIRECT_MOE=1` (cached after first read)
-/// switches the MoE route + expert-FFN steps to the GPU-direct path:
-/// the router output (indices + weights) is consumed directly from
-/// GPU buffers via the indexed-GEMV / indexed-FMA pipelines registered
-/// in 56C-1, eliminating the `mid_frame_submit_and_wait` readback.
-///
-/// Default OFF. Requires `fwd.moe_router_gpu.is_some()` (GPU router
-/// initialised in Sprint 56B). Active only for the env-gated path —
-/// the CPU-readback codepath remains the production default until
-/// Sprint 56C-3 flips it after async-decode re-enable.
-fn gpu_direct_moe_enabled() -> bool {
-    use std::sync::OnceLock;
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("VF_GPU_DIRECT_MOE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
-}
+use super::super::gpu_direct_moe_enabled;
 
 impl DecodeExec {
     // === Sprint 51D-B Block 1 — Gemma-4-26B-A4B MoE FFN-Block norms + add ===
