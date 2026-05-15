@@ -556,9 +556,23 @@ pub fn generate_from_tokens(
     //   slot rotates 0/1, repeat
     // Opt-out: VULKANFORGE_DISABLE_ASYNC_DECODE=1 falls back to the
     // serial path (single CB, record+submit+wait per token).
-    let async_decode = std::env::var("VULKANFORGE_DISABLE_ASYNC_DECODE")
-        .map(|v| v != "1" && !v.eq_ignore_ascii_case("true"))
-        .unwrap_or(true);
+    //
+    // Sprint 54I — MoE models force-disable async. `step_moe_route`
+    // calls `mid_frame_submit_and_wait` during CB recording to
+    // host-readback `res1` for CPU expert selection. The async
+    // pre_record schedule records this mid-frame submit BEFORE
+    // fill_embed_and_submit writes the current token's embedding to
+    // scratch_a, so the host-readback sees a stale hidden state from
+    // the previous slot occupant — wrong experts cascade into all
+    // subsequent layers and produce stuck-token loops on 26B.
+    let async_decode = match std::env::var("VULKANFORGE_DISABLE_ASYNC_DECODE") {
+        Ok(v) => v != "1" && !v.eq_ignore_ascii_case("true"),
+        Err(_) => cfg
+            .gemma4
+            .as_ref()
+            .map(|g| !g.enable_moe_block)
+            .unwrap_or(true),
+    };
 
     if async_decode {
         // ---- Async 3-stage pipeline ----
