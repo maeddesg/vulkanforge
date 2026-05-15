@@ -173,7 +173,15 @@ impl PipelineRegistry {
                 // `MMV_SPEC_DATA`, required Wave64 subgroup).
                 | ShaderId::MulMatVecQ5_0 | ShaderId::MulMatVecQ5_0Subgroup
                 | ShaderId::MulMatVecQ5_1 | ShaderId::MulMatVecQ5_1Subgroup
-                | ShaderId::MulMatVecQ8_0 | ShaderId::MulMatVecQ8_0Subgroup => {
+                | ShaderId::MulMatVecQ8_0 | ShaderId::MulMatVecQ8_0Subgroup
+                // Sprint 56C-1 — Indexed-GEMV variants share the same
+                // 3-spec-constant surface (BLOCK_SIZE / NUM_ROWS /
+                // NUM_COLS via MMV_SPEC_DATA) and Wave64 subgroup pin.
+                // Extra SSBO bindings (3=fuse0, 4=fuse1, 5=ids) are
+                // auto-derived from SPIR-V reflection.
+                | ShaderId::MulMatVecQ3KId | ShaderId::MulMatVecQ3KIdSubgroup
+                | ShaderId::MulMatVecQ4KId | ShaderId::MulMatVecQ4KIdSubgroup
+                | ShaderId::MulMatVecQ5_0Id | ShaderId::MulMatVecQ5_0IdSubgroup => {
                     let entries = [entry(0, 0, 4), entry(1, 4, 4), entry(2, 8, 4)];
                     let bytes = bytemuck::bytes_of(&MMV_SPEC_DATA);
                     // Sprint 14A — pin requiredSubgroupSize=64 for the GEMV
@@ -216,7 +224,11 @@ impl PipelineRegistry {
                 | ShaderId::Copy
                 | ShaderId::RopeNorm
                 | ShaderId::RopeNeox
-                | ShaderId::FmaAdd => {
+                | ShaderId::FmaAdd
+                // Sprint 56C-1 — Indexed FMA accumulator. Same shader
+                // shape as FmaAdd (local_size_x = 256, no spec constants);
+                // adds a 3rd SSBO for the per-expert weights buffer.
+                | ShaderId::FmaAddIndexed => {
                     ComputeKernel::from_spv(device, &words, cache)
                 }
                 ShaderId::ScalarAttn => {

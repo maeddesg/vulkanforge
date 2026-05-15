@@ -1,0 +1,31 @@
+#version 450
+
+// Sprint 56C-1 — Indexed FMA accumulator: out[i] += weights[slot] * in[i].
+//
+// Variant of fma_add.comp where the per-expert weight is read from a
+// GPU buffer (`weights_scratch` populated by the GPU MoE router in
+// Sprint 56B) instead of being passed as a push-constant. Enables
+// GPU-direct expert FFN dispatch — the routing decision lives entirely
+// on the GPU and the CPU loop iterates only over the 8 Top-K slots
+// without ever reading the indices/weights back.
+//
+// 3 SSBOs (in, out, weights) + 2 push constants. The descriptor-set
+// layout is derived by SPIR-V reflection.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0, std430) readonly buffer InBuf      { float data_a[]; };
+layout (binding = 1, std430) buffer        OutBuf      { float data_d[]; };
+layout (binding = 2, std430) readonly buffer WeightBuf { float weights[]; };
+
+layout (push_constant) uniform Params {
+    uint ne;          // element count (= hidden_size)
+    uint slot_index;  // 0..top_k-1, indexes into weights[]
+} p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.ne) return;
+    float w = weights[p.slot_index];
+    data_d[i] = data_d[i] + w * data_a[i];
+}

@@ -299,6 +299,114 @@ const JOBS: &[ShaderJob] = &[
             ("USE_SUBGROUP_ADD", "1"),
         ],
     },
+    // Sprint 56C-1 — Indexed-GEMV variants for GPU-direct MoE expert FFN.
+    // The shader source (`mul_mat_vec_base.glsl`) already has a
+    // `#ifdef MUL_MAT_ID` path that adds an `IDS` SSBO at binding 5
+    // and reads `expert_id = data_ids[expert_i0 + expert_i1 * nbi1]`;
+    // the weight offset is then `expert_id * (batch_stride_a / QUANT_K)`
+    // block units (port of llama.cpp upstream's id-fused GEMV). These
+    // variants compile the SAME source as their non-ID counterparts
+    // with an additional `MUL_MAT_ID=1` define. Quant types target
+    // Gemma-4-26B-A4B MoE: Q3_K (GGUF gate_up), Q4_K (SafeTensors
+    // gate_up + down), Q5_0 (GGUF down). Sprint 56C-1 only compiles
+    // and registers the pipelines — no dispatch wiring; that lands in
+    // 56C-2 behind `VF_GPU_DIRECT_MOE=1`.
+    ShaderJob {
+        out_name: "mul_mat_vec_q3_k_f32_f32_id.spv",
+        entry_source: "mul_mat_vec_q3_k.comp",
+        defines: &[
+            ("DATA_A_Q3_K", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("MUL_MAT_ID", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mat_vec_q3_k_f32_f32_id_subgroup.spv",
+        entry_source: "mul_mat_vec_q3_k.comp",
+        defines: &[
+            ("DATA_A_Q3_K", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("USE_SUBGROUP_ADD", "1"),
+            ("MUL_MAT_ID", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mat_vec_q4_k_f32_f32_id.spv",
+        entry_source: "mul_mat_vec_q4_k.comp",
+        defines: &[
+            ("DATA_A_Q4_K", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("MUL_MAT_ID", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mat_vec_q4_k_f32_f32_id_subgroup.spv",
+        entry_source: "mul_mat_vec_q4_k.comp",
+        defines: &[
+            ("DATA_A_Q4_K", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("USE_SUBGROUP_ADD", "1"),
+            ("MUL_MAT_ID", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mat_vec_q5_0_f32_f32_id.spv",
+        entry_source: "mul_mat_vec.comp",
+        defines: &[
+            ("DATA_A_Q5_0", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("MUL_MAT_ID", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mat_vec_q5_0_f32_f32_id_subgroup.spv",
+        entry_source: "mul_mat_vec.comp",
+        defines: &[
+            ("DATA_A_Q5_0", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("USE_SUBGROUP_ADD", "1"),
+            ("MUL_MAT_ID", "1"),
+        ],
+    },
+    // Sprint 56C-1 — Indexed FMA accumulator (out[i] += weights[slot] *
+    // in[i]). Pendant to `fma_add.comp`; reads per-expert weight from
+    // an SSBO instead of a push-constant scalar. Used by the GPU-direct
+    // MoE expert FFN to avoid a CPU readback of the router weights.
+    ShaderJob {
+        out_name: "fma_add_indexed_f32.spv",
+        entry_source: "fma_add_indexed.comp",
+        defines: &[],
+    },
     // RMSNorm. generic_binary_head: 3 SSBOs (input A, weight B, output D).
     ShaderJob {
         out_name: "rms_norm_f32.spv",

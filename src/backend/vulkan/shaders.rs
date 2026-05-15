@@ -389,6 +389,23 @@ pub enum ShaderId {
     // bindings + push constants via SPIR-V reflection.
     MoeRouterNormGemv,
     MoeRouterSoftmaxTopk,
+    // Sprint 56C-1 — Indexed-GEMV variants for GPU-direct MoE expert
+    // FFN (port of llama.cpp's MUL_MAT_ID id-fused GEMV path). Pipelines
+    // are registered but not yet dispatched; Sprint 56C-2 wires them
+    // behind `VF_GPU_DIRECT_MOE=1`. Three quant types cover Gemma-4-26B-A4B:
+    // Q3_K (GGUF gate_up), Q4_K (SafeTensors gate_up + down), Q5_0
+    // (GGUF down). Stock + subgroup variants for each.
+    MulMatVecQ3KId,
+    MulMatVecQ3KIdSubgroup,
+    MulMatVecQ4KId,
+    MulMatVecQ4KIdSubgroup,
+    MulMatVecQ5_0Id,
+    MulMatVecQ5_0IdSubgroup,
+    // Sprint 56C-1 — Pendant to `FmaAdd` that reads the per-expert
+    // weight from an SSBO (`weights[slot_index]`) instead of a
+    // push-constant scalar. Lets the GPU-direct MoE path skip the
+    // CPU readback of router weights.
+    FmaAddIndexed,
 }
 
 impl ShaderId {
@@ -515,6 +532,13 @@ impl ShaderId {
             ShaderId::MulCoopmatQ4KNaivePaddedFp8 => "mul_coopmat_q4k_naive_padded_fp8",
             ShaderId::MoeRouterNormGemv => "moe_router_norm_gemv",
             ShaderId::MoeRouterSoftmaxTopk => "moe_router_softmax_topk",
+            ShaderId::MulMatVecQ3KId => "mul_mat_vec_q3_k_f32_f32_id",
+            ShaderId::MulMatVecQ3KIdSubgroup => "mul_mat_vec_q3_k_f32_f32_id_subgroup",
+            ShaderId::MulMatVecQ4KId => "mul_mat_vec_q4_k_f32_f32_id",
+            ShaderId::MulMatVecQ4KIdSubgroup => "mul_mat_vec_q4_k_f32_f32_id_subgroup",
+            ShaderId::MulMatVecQ5_0Id => "mul_mat_vec_q5_0_f32_f32_id",
+            ShaderId::MulMatVecQ5_0IdSubgroup => "mul_mat_vec_q5_0_f32_f32_id_subgroup",
+            ShaderId::FmaAddIndexed => "fma_add_indexed_f32",
         }
     }
 
@@ -648,6 +672,13 @@ impl ShaderId {
             ShaderId::MulCoopmatQ4KNaivePaddedFp8 => MUL_COOPMAT_Q4K_NAIVE_PADDED_FP8,
             ShaderId::MoeRouterNormGemv => MOE_ROUTER_NORM_GEMV,
             ShaderId::MoeRouterSoftmaxTopk => MOE_ROUTER_SOFTMAX_TOPK,
+            ShaderId::MulMatVecQ3KId => MUL_MAT_VEC_Q3_K_F32_F32_ID,
+            ShaderId::MulMatVecQ3KIdSubgroup => MUL_MAT_VEC_Q3_K_F32_F32_ID_SUBGROUP,
+            ShaderId::MulMatVecQ4KId => MUL_MAT_VEC_Q4_K_F32_F32_ID,
+            ShaderId::MulMatVecQ4KIdSubgroup => MUL_MAT_VEC_Q4_K_F32_F32_ID_SUBGROUP,
+            ShaderId::MulMatVecQ5_0Id => MUL_MAT_VEC_Q5_0_F32_F32_ID,
+            ShaderId::MulMatVecQ5_0IdSubgroup => MUL_MAT_VEC_Q5_0_F32_F32_ID_SUBGROUP,
+            ShaderId::FmaAddIndexed => FMA_ADD_INDEXED_F32,
         }
     }
 }
@@ -777,6 +808,16 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     // Sprint 56B — GPU-side MoE router (always-on, used by Gemma-4 26B-A4B).
     ShaderId::MoeRouterNormGemv,
     ShaderId::MoeRouterSoftmaxTopk,
+    // Sprint 56C-1 — Indexed-GEMV + indexed-FMA pipelines. Registered
+    // always so the pipeline cache picks them up at startup; dispatched
+    // only when Sprint 56C-2 lands the GPU-direct MoE path.
+    ShaderId::MulMatVecQ3KId,
+    ShaderId::MulMatVecQ3KIdSubgroup,
+    ShaderId::MulMatVecQ4KId,
+    ShaderId::MulMatVecQ4KIdSubgroup,
+    ShaderId::MulMatVecQ5_0Id,
+    ShaderId::MulMatVecQ5_0IdSubgroup,
+    ShaderId::FmaAddIndexed,
 ];
 
 /// Sprint 16C — Sprint-3 era Q4_K coopmat GEMM variants gated behind
@@ -1006,6 +1047,23 @@ pub const MOE_ROUTER_NORM_GEMV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/moe_router_norm_gemv.spv"));
 pub const MOE_ROUTER_SOFTMAX_TOPK: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/moe_router_softmax_topk.spv"));
+
+// Sprint 56C-1 — Indexed-GEMV variants for GPU-direct MoE expert FFN.
+// Same source as the non-Id variants, compiled with `MUL_MAT_ID=1`.
+pub const MUL_MAT_VEC_Q3_K_F32_F32_ID: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q3_k_f32_f32_id.spv"));
+pub const MUL_MAT_VEC_Q3_K_F32_F32_ID_SUBGROUP: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q3_k_f32_f32_id_subgroup.spv"));
+pub const MUL_MAT_VEC_Q4_K_F32_F32_ID: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q4_k_f32_f32_id.spv"));
+pub const MUL_MAT_VEC_Q4_K_F32_F32_ID_SUBGROUP: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q4_k_f32_f32_id_subgroup.spv"));
+pub const MUL_MAT_VEC_Q5_0_F32_F32_ID: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q5_0_f32_f32_id.spv"));
+pub const MUL_MAT_VEC_Q5_0_F32_F32_ID_SUBGROUP: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q5_0_f32_f32_id_subgroup.spv"));
+pub const FMA_ADD_INDEXED_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/fma_add_indexed_f32.spv"));
 
 /// Decode a SPIR-V byte blob into u32 words. Vulkan consumes SPIR-V
 /// as `&[u32]`; `include_bytes!` only gives us `&[u8]` whose alignment
