@@ -272,10 +272,16 @@ impl KvCache {
             dev.queue_family_index,
         )?;
         let bytes = self.bytes_per_buffer();
-        cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| unsafe {
+        let result = cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| unsafe {
             dev.device.cmd_fill_buffer(cmd, self.k_buffer.handle, 0, bytes, 0);
             dev.device.cmd_fill_buffer(cmd, self.v_buffer.handle, 0, bytes, 0);
-        })?;
+        });
+        // Sprint 55A — CommandContext has no Drop impl; destroy
+        // explicitly to avoid the 3-leaked-objects (CB + Fence + Pool)
+        // warning at vkDestroyDevice time. Pattern mirrors every other
+        // CommandContext::new call site that follows it with destroy().
+        cmd_ctx.destroy(&dev.device);
+        result?;
         Ok(())
     }
 
