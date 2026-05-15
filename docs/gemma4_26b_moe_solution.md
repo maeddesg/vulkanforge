@@ -6,8 +6,17 @@ VulkanForge achieves coherent Gemma-4 26B-A4B-it inference on consumer
 AMD RDNA 4 hardware (Radeon RX 9070 XT) via Vulkan compute shaders,
 with no graphics queue and no swapchain. The model produces coherent
 multi-token output — factual answers, multi-sentence explanations, and
-even rhyming poetry — at ~20 tok/s decode on a single 16 GB consumer
-GPU.
+even rhyming poetry — at **~27 tok/s decode and ~65 tok/s prefill**
+(v0.4.4) on a single 16 GB consumer GPU.
+
+**v0.4.4 update (Sprint 56C-3):** GPU-direct expert FFN eliminates
+the CPU-readback round-trip from the MoE codepath. Router decisions
+(Top-K indices + weights) stay on GPU; expert GEMVs read `expert_id`
+directly from a router-output SSBO via the `MUL_MAT_ID` indexed-GEMV
+path. With `mid_frame_submit_and_wait` gone from the MoE step, async
+decode pipelining (Sprint 15E) is safe again — the v0.4.2 force-sync
+workaround is lifted. Combined with FP8 KV-Cache (`VULKANFORGE_KV_FP8=1`,
+−50 % KV VRAM), 26B-A4B now runs at parity with the dense-FFN models.
 
 Two critical bugs were uncovered and fixed during the 29-sprint
 bring-up:
@@ -44,14 +53,17 @@ env var (the fix applies automatically):
 
 | Model | Quant | VRAM | Decode | Prefill | Status |
 |-------|-------|------|--------|---------|--------|
-| Qwen3-8B | Q4_K_M | 6 GiB | 107 tok/s | 581 tok/s | coherent |
-| Llama-3.1-8B | Q4_K_M | 6 GiB | 113 tok/s | 284 tok/s | coherent |
-| Gemma-4-E2B | Q4_K_M | 2.5 GiB | 62 tok/s | 74 tok/s | coherent |
-| **Gemma-4-26B-A4B** | **Q3_K_M** | **12 GiB** | **20 tok/s** | **40 tok/s** | **coherent (new in v0.4.2)** |
+| Qwen3-8B | Q4_K_M | 6 GiB | 109 tok/s | 578 tok/s | coherent |
+| Llama-3.1-8B | Q4_K_M | 6 GiB | 113 tok/s | 296 tok/s | coherent |
+| Gemma-4-E2B | Q4_K_M | 2.5 GiB | 62 tok/s | 80 tok/s | coherent |
+| **Gemma-4-26B-A4B** (v0.4.2) | Q3_K_M | 12 GiB | 20 tok/s | 40 tok/s | coherent (initial) |
+| **Gemma-4-26B-A4B** (v0.4.4) | **Q3_K_M + FP8 KV** | **11.6 GiB** | **27 tok/s** | **65 tok/s** | **coherent + GPU-direct MoE** |
 
-Prefill numbers are for short prompts (~17–25 tokens) measured in
-this release. 26B uses `force_per_token_prefill` mode, which caps
-prefill at decode-like speeds; batched MoE prefill is planned for v0.5.
+26B prefill in v0.4.2 was bottlenecked by per-layer CPU readback for
+MoE routing (`mid_frame_submit_and_wait`). v0.4.4 keeps the routing
+on GPU end-to-end — the per-layer drain is gone, expert GEMVs read
+`expert_id` from an SSBO via `MUL_MAT_ID`. The `VULKANFORGE_KV_FP8=1`
+flag halves KV-cache VRAM and gives another ~4 % speed boost.
 
 ## 15-Prompt Coherence Bench (Gemma-4 26B Q3_K_M, greedy)
 

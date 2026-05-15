@@ -1,6 +1,26 @@
 # P1: Faster Batch Prefill for Gemma-4 26B-A4B (MoE)
 
-**Status:** v0.4.3 ships at ~40 tok/s prefill for 26B (vs 580 tok/s for
+**Status (updated 2026-05-15, v0.4.4):**
+
+| Phase | Sprint | Outcome | Prefill |
+|-------|--------|---------|---------|
+| Phase 0 — Profile | 55C | ✅ identified `mid_frame_submit` per-layer drain | 40 t/s |
+| Phase 1' — GPU Router | 56A → 56B | ✅ router on GPU, bit-exact vs CPU | 50 t/s |
+| Phase 1' — GPU-direct Expert FFN | 56C-1 → 56C-2 | ✅ `MUL_MAT_ID` indexed-GEMV, env-gated | 62 t/s |
+| Phase 1' — Default flip + Async re-enable | 56C-3 | ✅ default ON, `mid_frame_submit` gone | **65 t/s** |
+| Phase 2' — Batched Slot Dispatch | open | top_k=8 slots in one dispatch (workgroup.y) | target 80 t/s |
+| Phase 3 — Coopmat Expert GEMM | open | INT8-WMMA on expert weights | target 100+ t/s |
+
+v0.4.4 closed the v0.4.3→v0.4.x performance gap (+62 % prefill, +35 %
+decode). Remaining gap to dense-FFN models (Qwen3-8B at 578 t/s
+prefill) is bounded by the 8× per-token slot dispatches; Phase 2'
+batched-slot dispatch is the next mechanical lever.
+
+---
+
+## Original v0.4.3 Analysis (kept for reference)
+
+v0.4.3 ships at ~40 tok/s prefill for 26B (vs 580 tok/s for
 Qwen3-8B). This document analyzes the bottleneck and proposes the
 v0.5 fix.
 

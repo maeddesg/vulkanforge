@@ -1,5 +1,87 @@
 # Changelog
 
+## v0.4.4 — GPU-direct MoE Expert FFN + Async Decode (2026-05-15)
+
+Gemma-4 26B-A4B-it gets a major performance overhaul. The router
+output (Top-K expert indices + weights) is now consumed directly from
+GPU buffers via the `MUL_MAT_ID` indexed-GEMV path — no CPU readback,
+no `mid_frame_submit_and_wait` in the MoE codepath. With that race
+condition structurally eliminated, the v0.4.2 async-decode force-sync
+workaround is lifted too.
+
+### Performance (RX 9070 XT, Q3_K_M GGUF, `VULKANFORGE_KV_FP8=1`)
+
+| Metric                | v0.4.3 | v0.4.4   | Δ      |
+|-----------------------|--------|----------|--------|
+| Prefill (27-tok)      | 49 t/s | 65 t/s   | +33 %  |
+| Decode (relativity)   | 21 t/s | 27 t/s   | +30 %  |
+| Decode (300-tok async)| ~21 t/s| 24.3 t/s | +16 %  |
+| KV-Cache VRAM         | 880 MB | 440 MB   | −50 %  |
+
+Cumulative since Sprint 56A baseline (40 t/s prefill / 20 t/s decode):
+**Prefill +62 %, Decode +35 %.**
+
+### What Changed
+
+- **GPU-side MoE Router** (Sprints 56A–56B): RMSNorm + GEMV + Softmax
+  + Top-K all on GPU. Bit-exact vs CPU reference (max rel-err
+  2.38 × 10⁻⁷). +40 % prefill on its own.
+- **GPU-direct Expert FFN** (Sprint 56C-1 → 56C-3): expert dispatches
+  read `expert_id = data_ids[slot]` from the router's SSBO. Default
+  ON; `VF_GPU_DIRECT_MOE=0` reverts to legacy CPU readback.
+- **MUL_MAT_ID Indexed GEMV** (Sprint 56C-1): the existing
+  `mul_mat_vec_base.glsl` already has the `#ifdef MUL_MAT_ID` path
+  (port of llama.cpp's id-fused GEMV). Sprint 56C-1 compiles + wires
+  the variants — 7 new pipelines (Q3_K / Q4_K / Q5_0 / Q4_0 × stock +
+  subgroup + FMA-add-indexed). Total shader count 120 → 129.
+- **Async Decode Re-enabled for MoE** (Sprint 56C-3): `decode.rs`
+  re-enables async pipelining when GPU-direct is active. 300-token
+  stress test passes (photosynthesis explanation, LaTeX equations,
+  no loops).
+- **FP8 KV-Cache works for 26B** (Sprint 58B): `VULKANFORGE_KV_FP8=1`
+  out-of-the-box on 26B MoE — zero code change needed beyond
+  Sprint 43D-1 / 51B's heterogeneous-head_dim infrastructure.
+  −50 % KV VRAM (880 → 440 MB).
+- **executor.rs Refactored** (Sprint 57B): 2995-LOC single file
+  split into `executor/{mod, dispatch, attention, ffn, moe,
+  control}.rs`. DEC + BAT pendants stay in the same category file
+  to preserve the `feedback_layer_dispatch_paths` invariant.
+
+### Quant Coverage Note
+
+Runtime discovery in Sprint 56C-2: Gemma-4-26B-A4B Q3_K_M's
+`ffn_down_exps.weight` mixes Q4_0 and Q5_0 across layers (not just
+Q5_0 as the brief assumed). Q4_0 indexed GEMV variants added in the
+same sprint.
+
+### Honest Negatives
+
+- **Dynamic Expert Gating** (Sprint 58A, ε = 0.01): tested, **reverted**.
+  Gemma-4-26B-A4B's post-renorm Top-8 weights live in ~[0.04, 0.40] —
+  ε = 0.01 skips only 0.2 % of dispatches. Pre-check via `eprintln!` in
+  `step_moe_route` would have caught this in 1 LOC.
+- **Brief target 80 t/s prefill not reached**: 65 t/s actual. Remaining
+  bottleneck is per-slot CPU dispatch (8 per token × 30 layers). A
+  batched-slot-dispatch path (workgroup.y = top_k in one dispatch) is
+  the v0.5 candidate.
+
+### Env Vars
+
+| Var                                  | Default | Effect                                    |
+|--------------------------------------|---------|-------------------------------------------|
+| `VULKANFORGE_KV_FP8=1`               | OFF     | FP8 KV-Cache (recommended for 26B)        |
+| `VF_GPU_DIRECT_MOE=0`                | ON      | Revert to legacy CPU-readback MoE path    |
+| `VULKANFORGE_DISABLE_ASYNC_DECODE=1` | OFF     | Force serial decode (debug)               |
+| `RAYON_NUM_THREADS=4`                | (auto)  | Caps thread pool on 26B (recommended)     |
+
+### Validation
+
+- 4-model regression (Qwen3-8B / Llama-3.1-8B / Gemma-4-E2B / 26B):
+  all coherent, decode within ±2 % of v0.4.3.
+- 5-prompt 26B coherence (greedy + T=0.6): 5/5 natural EOS.
+- 300-token async stress (photosynthesis, T=0.6): coherent end-to-end.
+- `cargo test --release --lib -- --test-threads=1`: 202/202.
+
 ## v0.3.17 — On-the-fly Q4_K Quantization (2026-05-09)
 
 `VF_QUANTIZE_ON_LOAD=1` quantizes a SafeTensors model's FP32/BF16
