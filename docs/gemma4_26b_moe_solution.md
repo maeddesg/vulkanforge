@@ -25,6 +25,34 @@ output was hard-stuck on `"Paris Paris Paris…"` or multilingual
 garbage — looking for all the world like a model-quality or
 quantization issue rather than a GPU synchronization issue.
 
+## Results
+
+With both fixes applied, Gemma-4 26B-A4B-it produces coherent
+multi-token output on a single RX 9070 XT, all measured on Q3_K_M GGUF
+(12 GiB VRAM), with natural EOS, no `VULKANFORGE_DISABLE_ASYNC_DECODE`
+env var (the fix applies automatically):
+
+| Prompt | Output | Tokens | Decode |
+|--------|--------|--------|--------|
+| `"The capital of France is"` | `"Paris."` | 2 | 20.2 tok/s |
+| `"What is 2+2? Answer in one sentence."` | `"Two plus two equals four."` | 6 | 20.3 tok/s |
+| `"Was ist die Hauptstadt von Deutschland?"` | `"Die Hauptstadt von Deutschland ist **Berlin**."` | 8 | 20.6 tok/s |
+| `"Explain what a neural network is in three sentences."` (temp=0.6) | `"A neural network is a computational model inspired by the structure and function of the human brain. It consists of interconnected layers of artificial neurons that process data by assigning mathematical weights to different inputs. By adjusting these weights through a process called training, the network learns to recognize complex patterns and make accurate predictions."` | 59 | 18.5 tok/s |
+| `"Write a short poem about the moon."` (temp=0.6) | An 8-line AABB-rhymed poem (see Sample Output section below) | 67 | 18.7 tok/s |
+
+## Performance (RX 9070 XT, RDNA 4)
+
+| Model | Quant | VRAM | Decode | Prefill | Status |
+|-------|-------|------|--------|---------|--------|
+| Qwen3-8B | Q4_K_M | 6 GiB | 107 tok/s | 581 tok/s | coherent |
+| Llama-3.1-8B | Q4_K_M | 6 GiB | 113 tok/s | 284 tok/s | coherent |
+| Gemma-4-E2B | Q4_K_M | 2.5 GiB | 62 tok/s | 74 tok/s | coherent |
+| **Gemma-4-26B-A4B** | **Q3_K_M** | **12 GiB** | **20 tok/s** | **40 tok/s** | **coherent (new in v0.4.2)** |
+
+Prefill numbers are for short prompts (~17–25 tokens) measured in
+this release. 26B uses `force_per_token_prefill` mode, which caps
+prefill at decode-like speeds; batched MoE prefill is planned for v0.5.
+
 ## Hardware / Stack
 
 - GPU: AMD Radeon RX 9070 XT (RDNA 4, `gfx1201`, 16 GB VRAM)
@@ -102,6 +130,31 @@ wrong expert weights (because routing was decided against the
 *previous* slot occupant's stale data, two iterations ago since slots
 alternate 0/1). The wrong-expert FFN output then cascades through the
 remaining layers, producing 18× too-large logits at the output.
+
+### The Race Visualized
+
+```
+SYNC (correct):
+  ┌──────────────┐    ┌──────────────────────┐    ┌────────┐
+  │ Write embed  │───▶│      Record CB       │───▶│ Submit │
+  │ to scratch_a │    │   mid_frame_submit   │    │  CB    │
+  └──────────────┘    │   reads CURRENT      │    └────────┘
+                      │   scratch_a → right  │
+                      │   expert routing     │
+                      └──────────────────────┘
+
+ASYNC (broken for MoE):
+  ┌──────────────────────┐    ┌──────────────┐    ┌────────┐
+  │      Record CB       │───▶│ Write embed  │───▶│ Submit │
+  │   mid_frame_submit   │    │ to scratch_a │    └────────┘
+  │   reads STALE        │    └──────────────┘
+  │   scratch_a (prev    │                       (CB now runs against
+  │   slot occupant)     │                        wrong expert routing
+  │                      │                        baked in at record-
+  │   → WRONG routing    │                        time → cascade of
+  │     baked into CB    │                        wrong FFN outputs →
+  └──────────────────────┘                        18× logits explosion)
+```
 
 ### Fix
 
@@ -248,27 +301,57 @@ Gemma-4-E2B Q4_K_M: "\"2+2\" is a very simple arithmetic     62 tok/s
 All three keep their pre-fix decode speed because the fix only
 disables async for `gemma4.enable_moe_block == true`.
 
-## Relevance to Other Engines
+## Relevance to Other Vulkan Inference Engines
 
-The async-pre-record + `mid_frame_submit_and_wait` race is not
-specific to VulkanForge — it's a general pattern hazard for any Vulkan
-inference engine that:
+The async decode + MoE mid-frame-submit race condition is not specific
+to VulkanForge. Any Vulkan-based inference engine that:
 
-1. Pre-records command buffers ahead of the corresponding data write,
-   *and*
-2. Uses CPU-side MoE routing or any other GPU→CPU readback that fires
-   from inside the command-buffer recording.
+1. **Pre-records command buffers** before writing the current token's
+   input data (a standard latency-hiding pattern), AND
+2. **Uses GPU→CPU readback during CB recording** for MoE expert
+   selection (because Vulkan compute lacks a single-pass GPU top-k
+   primitive at the time of writing)
 
-[llama.cpp Issue
-#21516](https://github.com/ggml-org/llama.cpp/issues/21516) reports
-the same symptom (Gemma-4 infinite loops on Vulkan). If ggml's Vulkan
-backend uses a similar CB-pre-recording pipeline for MoE models, the
-underlying cause may be identical.
+will hit the same race. The symptoms are deceptive: the output looks
+like a model-quality, quantization, or attention-math bug — not a
+synchronization issue. We spent 29 sprints (and falsified 12+
+hypotheses, including RoPE pair convention, attention softcapping,
+attention scaling, post-norm γ outliers, MoE-router math, embed_scale,
+and L29-specific divergence) before locating the actual root cause.
+
+### Possible Mitigations
+
+- **Force synchronous decode for MoE** (our current fix; –4% decode
+  for the affected models, no change for non-MoE).
+- **GPU-side MoE routing** — implement the whole router (parameterless
+  RMSNorm + per-channel scale + GEMM + softmax + top-k + per-expert
+  scale) as compute shaders, eliminating the CPU round-trip entirely.
+  This is the proper long-term solution and re-enables async
+  pipelining for MoE models.
+- **Double-buffered routing input** — copy the pre-attention residual
+  to a dedicated staging buffer in a slot-stable location *before* CB
+  recording begins, so `mid_frame_submit_and_wait` always reads the
+  right data regardless of slot rotation.
 
 The V-race (Bug 2) is a more conventional missing-barrier issue and
-affects any code path that mixes a SHADER-write upstream with a
-TRANSFER-read downstream on the same buffer without an explicit
-pipeline barrier.
+affects any code path that mixes a `SHADER_WRITE` upstream with a
+`TRANSFER_READ` downstream on the same buffer without an explicit
+pipeline barrier — easy to introduce, easy to miss in validation
+because most drivers serialize compute-queue submissions far enough
+that the race only triggers reliably under specific scheduling
+patterns (like the async pipeline above, where slot rotation
+guarantees the stale data has known structure).
+
+## Related Issues
+
+- **[llama.cpp Issue #21516](https://github.com/ggml-org/llama.cpp/issues/21516)**
+  — *"Eval bug: Gemma 4 generates &lt;unused&gt; tokens in infinite
+  loop on Vulkan backend."* Same end-user-visible symptom (Gemma-4
+  Vulkan infinite loops), still open. The async + mid-frame-submit
+  pattern described above may be relevant if ggml's Vulkan backend
+  uses similar CB pre-recording for MoE models. We have not audited
+  the ggml Vulkan path; the writeup here is shared as a data point
+  for that investigation.
 
 ## Source
 
