@@ -1582,6 +1582,18 @@ const JOBS: &[ShaderJob] = &[
             ("COOPMAT", "1"),
         ],
     },
+    // Sprint 56A — GPU-side MoE router (Stage 1: RMSNorm + scale + GEMV).
+    ShaderJob {
+        out_name: "moe_router_norm_gemv.spv",
+        entry_source: "moe_router_norm_gemv.comp",
+        defines: &[],
+    },
+    // Sprint 56A — GPU-side MoE router (Stage 2: softmax + top-K + renorm + pes).
+    ShaderJob {
+        out_name: "moe_router_softmax_topk.spv",
+        entry_source: "moe_router_softmax_topk.comp",
+        defines: &[],
+    },
 ];
 
 fn main() {

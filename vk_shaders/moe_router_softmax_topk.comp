@@ -1,0 +1,129 @@
+#version 450
+
+// Sprint 56A — GPU-side MoE router, stage 2.
+//
+// Consumes the expert logits produced by `moe_router_norm_gemv.comp`
+// and runs the cpu_moe_route steps (4)-(7): numerically-stable softmax
+// over n_experts, top-K selection (K=8 for 26B), renormalisation of the
+// top-K weights to sum=1, and per-expert scale multiplication.
+//
+// Inputs:
+//   binding 0  ExpertLogits      [seq_len, n_experts]   FP32
+//   binding 1  PerExpertScale    [n_experts]            FP32
+// Outputs:
+//   binding 2  ExpertIndices     [seq_len, top_k]       uint32
+//   binding 3  ExpertWeights     [seq_len, top_k]       FP32  (post pes, sum=1 before pes)
+//
+// Push constants: seq_len, n_experts, top_k
+//
+// Dispatch: one workgroup per token. local_size_x = TPB (128) for the
+// softmax reduction; thread 0 within the workgroup handles top-K and
+// per-expert-scale (small, sequential — ≤8 max-find passes over 128
+// elements is trivial).
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly buffer ExpertLogits { float data[]; } logits;
+layout(set = 0, binding = 1) readonly buffer PerExpertScale { float data[]; } pes;
+layout(set = 0, binding = 2) writeonly buffer ExpertIndices { uint data[]; } indices;
+layout(set = 0, binding = 3) writeonly buffer ExpertWeights { float data[]; } weights;
+
+layout(push_constant) uniform PushConstants {
+    uint seq_len;
+    uint n_experts;
+    uint top_k;
+} pc;
+
+const uint TPB = 128;
+const uint MAX_TOPK = 16;  // 26B uses top_k=8; cushion in case of future configs.
+
+shared float s_probs[TPB];    // also reused as max-reduction scratchpad
+shared uint  s_used[TPB];
+shared float s_max;           // step 1 result
+shared float s_sum;           // step 2 result
+
+void main() {
+    uint token = gl_WorkGroupID.x;
+    uint tid   = gl_LocalInvocationID.x;
+
+    if (token >= pc.seq_len) return;
+
+    uint logit_base = token * pc.n_experts;
+
+    // ─── Step 1: max(logits) for stable softmax. ───
+    float v = (tid < pc.n_experts) ? logits.data[logit_base + tid] : -1e38;
+    s_probs[tid] = v;
+    barrier();
+    for (uint stride = TPB / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            s_probs[tid] = max(s_probs[tid], s_probs[tid + stride]);
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        s_max = s_probs[0];
+    }
+    barrier();
+
+    // ─── Step 2: exp(v - max), sum reduction → softmax ───
+    float p = (tid < pc.n_experts) ? exp(v - s_max) : 0.0;
+    s_probs[tid] = p;
+    barrier();
+    // Sum reduction (reuses s_probs once the per-thread `p` has been
+    // captured into a local — we restore the per-thread prob at the
+    // end of the reduction).
+    float my_p = p;
+    for (uint stride = TPB / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            s_probs[tid] += s_probs[tid + stride];
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        s_sum = s_probs[0];
+    }
+    barrier();
+    // Restore softmax probs to s_probs (we trampled them in the sum
+    // reduction). Initialise s_used to 0 in the same pass.
+    if (tid < pc.n_experts) {
+        s_probs[tid] = my_p / s_sum;
+        s_used[tid]  = 0u;
+    } else {
+        s_probs[tid] = 0.0;
+        s_used[tid]  = 1u;
+    }
+    barrier();
+
+    // ─── Step 3: Top-K via sequential max-find + Step 4: renorm + ───
+    // ─── Step 5: per-expert scale. All within thread 0 since top_k=8
+    //              and n_experts=128 → 1024 compares is trivial.       ───
+    if (tid == 0u) {
+        float top_sum = 0.0;
+        uint  picked_idx[MAX_TOPK];
+        float picked_prob[MAX_TOPK];
+
+        for (uint k = 0u; k < pc.top_k && k < MAX_TOPK; k++) {
+            float best = -1e38;
+            uint  best_idx = 0u;
+            for (uint i = 0u; i < pc.n_experts; i++) {
+                if (s_used[i] == 0u && s_probs[i] > best) {
+                    best = s_probs[i];
+                    best_idx = i;
+                }
+            }
+            picked_idx[k]  = best_idx;
+            picked_prob[k] = best;
+            s_used[best_idx] = 1u;
+            top_sum += best;
+        }
+
+        float renorm = (top_sum > 0.0) ? (1.0 / top_sum) : 0.0;
+        uint out_base = token * pc.top_k;
+        for (uint k = 0u; k < pc.top_k && k < MAX_TOPK; k++) {
+            uint e = picked_idx[k];
+            float w = picked_prob[k] * renorm * pes.data[e];
+            indices.data[out_base + k] = e;
+            weights.data[out_base + k] = w;
+        }
+    }
+}

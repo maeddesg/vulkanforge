@@ -1,0 +1,102 @@
+#version 450
+
+// Sprint 56A — GPU-side MoE router, stage 1.
+//
+// Replaces the CPU loop in `cpu_moe_route` steps (1)-(3): parameterless
+// RMSNorm of the post-attention residual, per-channel scale × inv_sqrt
+// (hidden_size), and the [n_experts, hidden_size] matmul producing the
+// pre-softmax expert logits. `per_expert_scale` is NOT applied here —
+// matching cpu_moe_route's order it lands AFTER the softmax/top-K
+// renormalisation in `moe_router_softmax_topk.comp`.
+//
+// Inputs:
+//   binding 0  Hidden        [seq_len, hidden_size]    FP32  (post-attn residual)
+//   binding 1  RouterProj    [n_experts, hidden_size]  FP32  (row-major)
+//   binding 2  RouterScale   [hidden_size]             FP32
+// Output:
+//   binding 3  ExpertLogits  [seq_len, n_experts]      FP32
+//
+// Push constants:
+//   seq_len, hidden_size, n_experts, rms_norm_eps
+//
+// Dispatch:
+//   one workgroup per token (gl_WorkGroupID.x = token index)
+//   local_size_x = N_EXPERTS_TPB threads cooperate on RMSNorm and then
+//   one thread per expert computes its logit.
+//
+// Shared memory budget:
+//   normed_scaled[hidden_size] FP32 ≈ 11 KB at hidden_size=2816.
+//   Reused as `redux[]` for the in-workgroup sum reduction; the layout
+//   reserves max(hidden_size, TPB) slots.
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly buffer Hidden { float data[]; } hidden;
+layout(set = 0, binding = 1) readonly buffer RouterProj { float data[]; } proj;
+layout(set = 0, binding = 2) readonly buffer RouterScale { float data[]; } chan_scale;
+layout(set = 0, binding = 3) writeonly buffer ExpertLogits { float data[]; } logits;
+
+layout(push_constant) uniform PushConstants {
+    uint seq_len;
+    uint hidden_size;
+    uint n_experts;
+    float rms_norm_eps;
+} pc;
+
+// Upper bounds; the shader operates correctly for any hidden_size <=
+// MAX_HIDDEN and n_experts <= TPB. Gemma-4-26B-A4B uses
+// hidden_size=2816, n_experts=128 — well within bounds.
+const uint TPB = 128;
+const uint MAX_HIDDEN = 4096;
+
+shared float s_normed[MAX_HIDDEN];
+shared float s_redux[TPB];
+
+void main() {
+    uint token = gl_WorkGroupID.x;
+    uint tid   = gl_LocalInvocationID.x;
+
+    if (token >= pc.seq_len) return;
+
+    uint base = token * pc.hidden_size;
+
+    // ─── Step 1: RMSNorm — compute mean(x^2) cooperatively. ───
+    float local_sum_sq = 0.0;
+    for (uint i = tid; i < pc.hidden_size; i += TPB) {
+        float v = hidden.data[base + i];
+        local_sum_sq += v * v;
+    }
+    s_redux[tid] = local_sum_sq;
+    barrier();
+
+    // Tree reduction TPB → 1.
+    for (uint stride = TPB / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            s_redux[tid] += s_redux[tid + stride];
+        }
+        barrier();
+    }
+    float mean_sq = s_redux[0] / float(pc.hidden_size);
+    float rms_inv = inversesqrt(mean_sq + pc.rms_norm_eps);
+    barrier();
+
+    // ─── Step 2: per-channel scale × inv_sqrt(hidden_size). ───
+    // cpu_moe_route folds rms_inv, inv_sqrt(h), and chan_scale into a
+    // single per-channel multiplier — we do the same.
+    float inv_sqrt_h = inversesqrt(float(pc.hidden_size));
+    for (uint i = tid; i < pc.hidden_size; i += TPB) {
+        s_normed[i] = hidden.data[base + i] * rms_inv * inv_sqrt_h * chan_scale.data[i];
+    }
+    barrier();
+
+    // ─── Step 3: GEMV — proj[expert, :] · normed_scaled → logit ───
+    // One thread per expert (assumes TPB == n_experts == 128 for 26B).
+    if (tid < pc.n_experts) {
+        float acc = 0.0;
+        uint row_base = tid * pc.hidden_size;
+        for (uint i = 0; i < pc.hidden_size; i++) {
+            acc += proj.data[row_base + i] * s_normed[i];
+        }
+        logits.data[token * pc.n_experts + tid] = acc;
+    }
+}
