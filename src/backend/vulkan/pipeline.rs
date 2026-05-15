@@ -189,6 +189,28 @@ pub struct BenchInt8CmGemmPushConstants {
 }
 const _: () = assert!(std::mem::size_of::<BenchInt8CmGemmPushConstants>() == 16);
 
+/// Sprint 56A — push block for `moe_router_norm_gemv.comp`. 16 B.
+/// Field order matches the shader's `layout(push_constant) uniform`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct MoeRouterNormGemvPushConstants {
+    pub seq_len: u32,
+    pub hidden_size: u32,
+    pub n_experts: u32,
+    pub rms_norm_eps: f32,
+}
+const _: () = assert!(std::mem::size_of::<MoeRouterNormGemvPushConstants>() == 16);
+
+/// Sprint 56A — push block for `moe_router_softmax_topk.comp`. 12 B.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct MoeRouterSoftmaxTopkPushConstants {
+    pub seq_len: u32,
+    pub n_experts: u32,
+    pub top_k: u32,
+}
+const _: () = assert!(std::mem::size_of::<MoeRouterSoftmaxTopkPushConstants>() == 12);
+
 /// v0.2.1 Sprint 11G-C — push block for `bench_int8cm_q4k.comp`.
 /// 3 × u32 = 12 B. Same M/N/K convention as `MmqPushConstants` (M = weight
 /// rows, N = sequence length / activation tokens, K = hidden dim, multiple

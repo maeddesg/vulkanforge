@@ -685,6 +685,11 @@ impl Forward {
             moe_route_staging,
             moe_routing: None,
             moe_routing_batch: None,
+            // Sprint 56B — populated post-construction by
+            // `Forward::init_moe_router_gpu(model)` (see decode.rs setup
+            // path). `None` for non-MoE models and until the loader's
+            // `moe_router_data` is uploaded.
+            moe_router_gpu: None,
             logits_buf,
             logits_staging,
             hidden_staging,
@@ -729,6 +734,115 @@ impl Forward {
             native_fp8_wmma: dev.native_fp8_wmma,
         })
     }
+
+    /// Sprint 56B — upload `LoadedModel::moe_router_data` to GPU buffers
+    /// and allocate per-prefill scratch space. Call once, after the
+    /// model is loaded and before the first forward. No-op when the
+    /// model has no router data (non-Gemma-4 or Gemma-4 without
+    /// `enable_moe_block`).
+    ///
+    /// Buffer sizing (26B-A4B, hidden=2816, n_experts=128, top_k=8):
+    /// - proj: 128 × 2816 × 4 = 1.37 MB per layer (25 MoE layers on 26B)
+    /// - scale: 2816 × 4 = 11 KB per layer
+    /// - pes: 128 × 4 = 512 B per layer
+    /// - Total per-layer: ~1.38 MB × 25 layers ≈ 34.5 MB VRAM
+    /// - logits_scratch: max_seq × 128 × 4 (= 2 MB at max_seq=4096)
+    /// - indices/weights_scratch: max_seq × 8 × 4 each (= 128 KB each)
+    /// - readback_staging: max_seq × 64 (host-visible)
+    pub fn init_moe_router_gpu(
+        &mut self,
+        dev: &VulkanDevice,
+        allocator: &mut Allocator,
+        model: &super::super::loader::LoadedModel,
+        max_seq: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let router_data = match model.moe_router_data.as_ref() {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+        let device = &dev.device;
+        let n_layers = self.config.n_layers as usize;
+        let n_experts = router_data.n_experts;
+        let top_k = router_data.top_k;
+        let hidden_size = router_data.hidden_size;
+
+        let mk_storage = |allocator: &mut Allocator, size: u64, loc: MemoryLocation, name: &str|
+            -> Result<GpuBuffer, Box<dyn std::error::Error>> {
+            Ok(GpuBuffer::new(
+                device, allocator, size,
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_SRC
+                    | vk::BufferUsageFlags::TRANSFER_DST,
+                loc, name,
+            )?)
+        };
+
+        let mut layers: Vec<super::state::MoeRouterGpuLayer> = Vec::new();
+        let mut layer_to_gpu_idx: Vec<u32> = vec![u32::MAX; n_layers];
+
+        for (layer_idx, ld) in router_data.layers.iter().enumerate() {
+            // Skip layers that have no real router data (proj empty =
+            // non-MoE layer on a per-layer-gated config).
+            if ld.proj.is_empty() {
+                continue;
+            }
+            let proj_bytes = (ld.proj.len() as u64) * 4;
+            let scale_bytes = (ld.scale.len() as u64) * 4;
+            let pes_bytes = (ld.per_expert_scale.len() as u64) * 4;
+
+            // Sprint 56B — these buffers are populated once at init and
+            // never written again on the GPU; CpuToGpu (host-mapped) is
+            // the right memory type to avoid a staging round-trip.
+            let mut proj_buf = mk_storage(
+                allocator, proj_bytes, MemoryLocation::CpuToGpu,
+                &format!("moe_router_proj_L{layer_idx}"))?;
+            let mut scale_buf = mk_storage(
+                allocator, scale_bytes, MemoryLocation::CpuToGpu,
+                &format!("moe_router_scale_L{layer_idx}"))?;
+            let mut pes_buf = mk_storage(
+                allocator, pes_bytes, MemoryLocation::CpuToGpu,
+                &format!("moe_router_pes_L{layer_idx}"))?;
+            proj_buf.write_bytes(bytemuck::cast_slice(&ld.proj))?;
+            scale_buf.write_bytes(bytemuck::cast_slice(&ld.scale))?;
+            pes_buf.write_bytes(bytemuck::cast_slice(&ld.per_expert_scale))?;
+
+            layer_to_gpu_idx[layer_idx] = layers.len() as u32;
+            layers.push(super::state::MoeRouterGpuLayer {
+                proj: proj_buf,
+                scale: scale_buf,
+                pes: pes_buf,
+            });
+        }
+
+        let logits_bytes = (max_seq as u64) * (n_experts as u64) * 4;
+        let indices_bytes = (max_seq as u64) * (top_k as u64) * 4;
+        let weights_bytes = indices_bytes;
+        let readback_bytes = (max_seq as u64) * (top_k as u64) * 8; // u32 idx + f32 weight
+
+        let logits_scratch = mk_storage(
+            allocator, logits_bytes, MemoryLocation::GpuOnly, "moe_router_logits_scratch")?;
+        let indices_scratch = mk_storage(
+            allocator, indices_bytes, MemoryLocation::GpuOnly, "moe_router_indices_scratch")?;
+        let weights_scratch = mk_storage(
+            allocator, weights_bytes, MemoryLocation::GpuOnly, "moe_router_weights_scratch")?;
+        let readback_staging = mk_storage(
+            allocator, readback_bytes, MemoryLocation::GpuToCpu, "moe_router_readback_staging")?;
+
+        self.moe_router_gpu = Some(super::state::MoeRouterGpu {
+            layers,
+            layer_to_gpu_idx,
+            logits_scratch,
+            indices_scratch,
+            weights_scratch,
+            readback_staging,
+            n_experts,
+            top_k,
+            hidden_size,
+            rms_norm_eps: router_data.rms_norm_eps,
+        });
+        Ok(())
+    }
+
     pub fn destroy(self, device: &ash::Device, allocator: &mut Allocator) {
         // Sprint 44B-2 — harness-pipeline teardown collapsed into one
         // call per pipeline (Sprint 24-Inline / 35 / 36 / 29).
@@ -803,6 +917,18 @@ impl Forward {
         self.batch_ffn_out.destroy(device, allocator);
         // Sprint 51D-D — MoE router staging.
         self.moe_route_staging.destroy(device, allocator);
+        // Sprint 56B — GPU-side MoE router buffers.
+        if let Some(gpu) = self.moe_router_gpu {
+            for layer in gpu.layers {
+                layer.proj.destroy(device, allocator);
+                layer.scale.destroy(device, allocator);
+                layer.pes.destroy(device, allocator);
+            }
+            gpu.logits_scratch.destroy(device, allocator);
+            gpu.indices_scratch.destroy(device, allocator);
+            gpu.weights_scratch.destroy(device, allocator);
+            gpu.readback_staging.destroy(device, allocator);
+        }
         self.kv_cache.destroy(device, allocator);
         if let Some(p) = self.profiler {
             p.destroy(device);

@@ -183,6 +183,47 @@ impl ForwardTokenProfile {
 ///
 /// Prefill (`dispatch_layer_batch`) is single-shot per prompt — async
 /// pipelining adds nothing, so it always uses `slots[0]` for any decode
+/// Sprint 56B — per-layer GPU buffers for the GPU-side MoE router.
+/// Populated once at model load from `LoadedModel::moe_router_data`.
+/// Layout matches `cpu_moe_route`'s host vectors: `proj` is
+/// `[n_experts × hidden_size]` FP32 row-major, `scale` is
+/// `[hidden_size]` FP32, `pes` (per-expert-scale) is `[n_experts]` FP32.
+/// Entries for non-MoE layers (5 of 30 on 26B-A4B's SSSSF pattern) are
+/// omitted via a parallel `layer_to_gpu_idx` lookup on `MoeRouterGpu`.
+pub struct MoeRouterGpuLayer {
+    pub proj: GpuBuffer,
+    pub scale: GpuBuffer,
+    pub pes: GpuBuffer,
+}
+
+/// Sprint 56B — GPU-side MoE router state. `layers` is indexed by
+/// `layer_to_gpu_idx[i]` for layer `i` (only populated for MoE-bearing
+/// layers; non-MoE layers have `u32::MAX` in the lookup table and never
+/// dispatch the router). `logits_scratch`, `indices_scratch`,
+/// `weights_scratch` are workspace buffers shared across all layers,
+/// sized for the max prefill batch.
+pub struct MoeRouterGpu {
+    pub layers: Vec<MoeRouterGpuLayer>,
+    /// `layer_to_gpu_idx[layer_idx]` returns the index into `layers`,
+    /// or `u32::MAX` if layer `layer_idx` has no MoE block.
+    pub layer_to_gpu_idx: Vec<u32>,
+    /// `[max_seq × n_experts]` FP32. Output of `moe_router_norm_gemv`,
+    /// input to `moe_router_softmax_topk`.
+    pub logits_scratch: GpuBuffer,
+    /// `[max_seq × top_k]` u32. Top-K expert indices per token.
+    pub indices_scratch: GpuBuffer,
+    /// `[max_seq × top_k]` FP32. Renormalised + pes-scaled weights.
+    pub weights_scratch: GpuBuffer,
+    /// Host-readable copy of `indices_scratch ++ weights_scratch` for
+    /// the small (top_k × 8 bytes / token) readback consumed by
+    /// `step_moe_expert_ffn`. Sized for max_seq tokens.
+    pub readback_staging: GpuBuffer,
+    pub n_experts: u32,
+    pub top_k: u32,
+    pub hidden_size: u32,
+    pub rms_norm_eps: f32,
+}
+
 /// scratch it shares with the per-token path (currently just
 /// `scratch_a` for the first layer's input upload).
 pub struct IntermediateSlot {
@@ -276,6 +317,15 @@ pub struct Forward {
     /// `moe_routing` above. Populated by `b_step_moe_route` once per
     /// MoE-bearing layer; consumed by `b_step_moe_expert_ffn`.
     pub(super) moe_routing_batch: Option<Vec<Vec<(u32, f32)>>>,
+    /// Sprint 56B — GPU-side MoE router. `Some` only for Gemma-4 models
+    /// with `enable_moe_block = true`; for those, `step_moe_route`/
+    /// `b_step_moe_route` dispatch two compute shaders that produce the
+    /// routing decisions on GPU and a small (top_k × 8 bytes / token)
+    /// readback delivers `(expert_idx, weight)` tuples to the CPU for
+    /// `step_moe_expert_ffn`. Replaces the 11 KB / token host readback
+    /// + CPU RMSNorm/GEMV that previously cost 51% of prefill wall-time
+    /// on 26B Q3_K_M (Sprint 55C profile).
+    pub(super) moe_router_gpu: Option<MoeRouterGpu>,
     pub(super) logits_buf: GpuBuffer,
     /// Sprint 27 — host-readable staging copy of `logits_buf`.
     /// `logits_buf` is now `GpuOnly` (fast GPU-local writes from

@@ -1128,16 +1128,96 @@ impl DecodeExec {
         debug_assert_eq!(router_data.n_experts, n_experts);
         debug_assert_eq!(router_data.top_k, top_k);
         let hidden = router_data.hidden_size;
-        let bytes = (hidden as u64) * 4;
 
-        // (1) Compute → Transfer barrier on `res1` (written by
-        //     step_attn_residual_add earlier in this layer; intervening
-        //     steps — PreFfnNorm, GateProj, …, DownProj, PostDenseMlpNorm —
-        //     read but do not overwrite res1).
+        // ─── Sprint 56B: GPU-side router (if init_moe_router_gpu ran) ───
+        if fwd.moe_router_gpu.is_some() {
+            let res1 = fwd.cur().res1.handle;
+            // Make the SHADER_WRITE on res1 (from step_attn_residual_add)
+            // visible to the router's SHADER_READ. dispatch_layer's
+            // maybe_compute_barrier doesn't fire here because res1 isn't
+            // in the pending-writes set after the intervening dense FFN
+            // pass — emit the barrier inline.
+            let bar_pre = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            unsafe {
+                ctx.dev.device.cmd_pipeline_barrier(
+                    ctx.cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&bar_pre), &[], &[],
+                );
+            }
+            fwd.run_moe_router_gpu(
+                ctx.dev, ctx.registry, ctx.cmd, ctx.layer, 1, res1, 0,
+            );
+
+            // Copy indices + weights into a single host-visible staging
+            // buffer. The two GPU buffers are addressed independently;
+            // we lay them out in `readback_staging` as
+            // [indices | weights], each `top_k * 4` bytes.
+            let router = fwd.moe_router_gpu.as_ref().unwrap();
+            let topk_bytes = (top_k as u64) * 4;
+            let indices_h = router.indices_scratch.handle;
+            let weights_h = router.weights_scratch.handle;
+            let staging_h = router.readback_staging.handle;
+            // Compute → Transfer barrier on both indices + weights.
+            let bar_post = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            unsafe {
+                ctx.dev.device.cmd_pipeline_barrier(
+                    ctx.cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&bar_post), &[], &[],
+                );
+                let cp_idx = vk::BufferCopy { src_offset: 0, dst_offset: 0, size: topk_bytes };
+                ctx.dev.device.cmd_copy_buffer(
+                    ctx.cmd, indices_h, staging_h, std::slice::from_ref(&cp_idx),
+                );
+                let cp_w = vk::BufferCopy {
+                    src_offset: 0,
+                    dst_offset: topk_bytes,
+                    size: topk_bytes,
+                };
+                ctx.dev.device.cmd_copy_buffer(
+                    ctx.cmd, weights_h, staging_h, std::slice::from_ref(&cp_w),
+                );
+            }
+            transfer_to_host_barrier(ctx.dev, ctx.cmd);
+            fwd.mid_frame_submit_and_wait(ctx.dev, ctx.cmd)
+                .expect("mid_frame_submit_and_wait failed (GPU router readback)");
+
+            // Read the staging blob and decode into (u32, f32) pairs.
+            let raw = fwd.moe_router_gpu.as_ref().unwrap()
+                .readback_staging.read_bytes()
+                .expect("router readback staging not host-visible");
+            let topk_usize = top_k as usize;
+            let idx_slice: &[u32] = bytemuck::cast_slice(&raw[..(topk_usize * 4)]);
+            let w_slice: &[f32] = bytemuck::cast_slice(
+                &raw[(topk_usize * 4)..(topk_usize * 8)]
+            );
+            let routing: Vec<(u32, f32)> = idx_slice.iter()
+                .zip(w_slice.iter())
+                .map(|(&i, &w)| (i, w))
+                .collect();
+
+            if ctx.layer == 0
+                && !MOE_LAYER0_LOGGED.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                log_router_decision(0, &routing);
+            }
+            fwd.moe_routing = Some(routing);
+            return;
+        }
+
+        // ─── CPU fallback (legacy path, retained for non-Gemma-4 / unit tests) ───
+        let bytes = (hidden as u64) * 4;
         let res1 = fwd.cur().res1.handle;
         compute_to_transfer_barrier(ctx.dev, ctx.cmd);
-
-        // (2) Copy res1 → moe_route_staging.
         let staging = fwd.moe_route_staging.handle;
         unsafe {
             let region = vk::BufferCopy { src_offset: 0, dst_offset: 0, size: bytes };
@@ -1145,39 +1225,24 @@ impl DecodeExec {
                 ctx.cmd, res1, staging, std::slice::from_ref(&region),
             );
         }
-
-        // (3) Transfer → Host barrier so the staging mmap is visible
-        //     to host reads after `mid_frame_submit_and_wait`.
         transfer_to_host_barrier(ctx.dev, ctx.cmd);
-
-        // (4) Submit + wait + reset+begin (Sprint 51D-C primitive).
         fwd.mid_frame_submit_and_wait(ctx.dev, ctx.cmd)
             .expect("mid_frame_submit_and_wait failed (decode MoE route)");
-
-        // (5) Read host-visible staging slice.
         let raw = fwd.moe_route_staging.read_bytes()
             .expect("moe_route_staging not host-visible");
         let hidden_state: Vec<f32> = raw[..(bytes as usize)]
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-
-        // (6) CPU route. `model.moe_router_data` is keyed by layer.
         let layer_data = &router_data.layers[ctx.layer as usize];
         let routing = cpu_moe_route(
             &hidden_state, layer_data,
-            hidden as usize,
-            n_experts as usize,
-            top_k as usize,
+            hidden as usize, n_experts as usize, top_k as usize,
             router_data.rms_norm_eps,
         );
-
-        // (7) Sanity log on layer 0, first token (helps spot router
-        //     bugs without polluting decode-token logs).
         if ctx.layer == 0 && !MOE_LAYER0_LOGGED.swap(true, std::sync::atomic::Ordering::SeqCst) {
             log_router_decision(0, &routing);
         }
-
         fwd.moe_routing = Some(routing);
     }
 
@@ -2420,14 +2485,91 @@ impl BatchExec {
             .expect("MoeRoute step (batch) emitted but model has no MoeRouterData");
         let hidden = router_data.hidden_size;
         let seq_len = batch_seq_len(ctx);
-        let total_bytes = (seq_len as u64) * (hidden as u64) * 4;
 
-        // Sprint 51D-F: route on the RAW post-attention residual,
-        // matching HF `Gemma4TextDecoderLayer.forward`. The router does
-        // its own parameterless RMS-norm + `scale × inv_sqrt(hidden)`
-        // internally; feeding it `pre_ff_norm_2(residual)` distorts
-        // direction by per-channel γ_2 and selects wrong Top-K experts.
-        // PreMoeNorm now runs AFTER MoeRoute (see layer_plan.rs).
+        // ─── Sprint 56B: GPU-side router (if init_moe_router_gpu ran) ───
+        if fwd.moe_router_gpu.is_some() {
+            let batch_in = fwd.batch_residual.handle;
+            // SHADER_WRITE → SHADER_READ on batch_residual: the
+            // attn_residual_add step writes it earlier in the layer.
+            let bar_pre = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            unsafe {
+                ctx.dev.device.cmd_pipeline_barrier(
+                    ctx.cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&bar_pre), &[], &[],
+                );
+            }
+            fwd.run_moe_router_gpu(
+                ctx.dev, ctx.registry, ctx.cmd, ctx.layer, seq_len, batch_in, 0,
+            );
+
+            // Copy seq_len × top_k × (4+4) bytes into readback_staging.
+            let router = fwd.moe_router_gpu.as_ref().unwrap();
+            let topk_bytes = (top_k as u64) * 4;
+            let all_topk_bytes = (seq_len as u64) * topk_bytes;
+            let indices_h = router.indices_scratch.handle;
+            let weights_h = router.weights_scratch.handle;
+            let staging_h = router.readback_staging.handle;
+            let bar_post = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            unsafe {
+                ctx.dev.device.cmd_pipeline_barrier(
+                    ctx.cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&bar_post), &[], &[],
+                );
+                let cp_idx = vk::BufferCopy {
+                    src_offset: 0, dst_offset: 0, size: all_topk_bytes,
+                };
+                ctx.dev.device.cmd_copy_buffer(
+                    ctx.cmd, indices_h, staging_h, std::slice::from_ref(&cp_idx),
+                );
+                let cp_w = vk::BufferCopy {
+                    src_offset: 0, dst_offset: all_topk_bytes, size: all_topk_bytes,
+                };
+                ctx.dev.device.cmd_copy_buffer(
+                    ctx.cmd, weights_h, staging_h, std::slice::from_ref(&cp_w),
+                );
+            }
+            transfer_to_host_barrier(ctx.dev, ctx.cmd);
+            fwd.mid_frame_submit_and_wait(ctx.dev, ctx.cmd)
+                .expect("mid_frame_submit_and_wait failed (batch GPU router readback)");
+
+            let raw = fwd.moe_router_gpu.as_ref().unwrap()
+                .readback_staging.read_bytes()
+                .expect("router readback staging not host-visible");
+            let topk_usize = top_k as usize;
+            let total_topk = (seq_len as usize) * topk_usize;
+            let idx_slice: &[u32] = bytemuck::cast_slice(&raw[..(total_topk * 4)]);
+            let w_slice: &[f32] = bytemuck::cast_slice(
+                &raw[(total_topk * 4)..(total_topk * 8)]
+            );
+            let mut all_routing: Vec<Vec<(u32, f32)>> = Vec::with_capacity(seq_len as usize);
+            for t in 0..(seq_len as usize) {
+                let off = t * topk_usize;
+                let routing: Vec<(u32, f32)> = (0..topk_usize)
+                    .map(|k| (idx_slice[off + k], w_slice[off + k]))
+                    .collect();
+                if ctx.layer == 0 && t == 0
+                    && !MOE_LAYER0_LOGGED.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    log_router_decision(0, &routing);
+                }
+                all_routing.push(routing);
+            }
+            fwd.moe_routing_batch = Some(all_routing);
+            return;
+        }
+
+        // ─── CPU fallback (legacy) ───
+        let total_bytes = (seq_len as u64) * (hidden as u64) * 4;
         let batch_in = fwd.batch_residual.handle;
         compute_to_transfer_barrier(ctx.dev, ctx.cmd);
         let staging = fwd.moe_route_staging.handle;
@@ -2440,8 +2582,6 @@ impl BatchExec {
         transfer_to_host_barrier(ctx.dev, ctx.cmd);
         fwd.mid_frame_submit_and_wait(ctx.dev, ctx.cmd)
             .expect("mid_frame_submit_and_wait failed (batch MoE route)");
-
-        // CPU-side per-token routing.
         let raw = fwd.moe_route_staging.read_bytes()
             .expect("moe_route_staging not host-visible");
         let mut all_routing: Vec<Vec<(u32, f32)>> = Vec::with_capacity(seq_len as usize);
@@ -2458,7 +2598,6 @@ impl BatchExec {
                 h_usize, n_experts as usize, top_k as usize,
                 router_data.rms_norm_eps,
             );
-            // Same one-shot log as decode path, gated on token 0 layer 0.
             if ctx.layer == 0 && t == 0
                 && !MOE_LAYER0_LOGGED.swap(true, std::sync::atomic::Ordering::SeqCst)
             {

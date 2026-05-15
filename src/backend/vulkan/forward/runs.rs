@@ -31,6 +31,7 @@ use super::super::pipeline::{
     FlashAttnSplitPushConstants, Fp8BlockwiseGemmPushConstants,
     Fp8BlockwiseGemvPushConstants, Fp8GemmPushConstants, GenericBinaryPushConstants,
     KvCopyFp16PushConstants, MatVecPushConstants, MmqPushConstants,
+    MoeRouterNormGemvPushConstants, MoeRouterSoftmaxTopkPushConstants,
     MultiAddRmsPushConstants, Q8_1QuantizePushConstants, RmsNormMulRopePushConstants,
     RopePushConstants, ScalarAttnPushConstants, SwigluPushConstants,
 };
@@ -2290,5 +2291,123 @@ impl Forward {
         unsafe {
             dev.device.cmd_copy_buffer(cmd, src, dst, std::slice::from_ref(&copy));
         }
+    }
+
+    /// Sprint 56B — dispatch the two GPU MoE router shaders for one
+    /// layer × `seq_len` tokens. The input is the post-attention
+    /// residual at `input_buf[input_offset..]`; outputs land in the
+    /// shared scratch buffers under `moe_router_gpu` (indices +
+    /// weights, top_k per token). Caller is responsible for any
+    /// `mid_frame_submit` + readback after this returns.
+    ///
+    /// Both shaders are bind-and-dispatch only — no `mark_written`
+    /// because the consumer (`step_moe_expert_ffn` after a readback,
+    /// or a future GPU-direct expert dispatch) reads via explicit
+    /// barriers in its own step.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_moe_router_gpu(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        layer_idx: u32,
+        seq_len: u32,
+        input_buf: vk::Buffer,
+        input_offset: u64,
+    ) {
+        let router = self.moe_router_gpu.as_ref()
+            .expect("run_moe_router_gpu called without init");
+        let gpu_idx = router.layer_to_gpu_idx[layer_idx as usize];
+        debug_assert!(gpu_idx != u32::MAX, "layer {layer_idx} not an MoE layer");
+        let layer = &router.layers[gpu_idx as usize];
+        let n_experts = router.n_experts;
+        let hidden_size = router.hidden_size;
+        let top_k = router.top_k;
+        let rms_eps = router.rms_norm_eps;
+
+        let proj_buf = layer.proj.handle;
+        let scale_buf = layer.scale.handle;
+        let pes_buf = layer.pes.handle;
+        let logits_buf = router.logits_scratch.handle;
+        let indices_buf = router.indices_scratch.handle;
+        let weights_buf = router.weights_scratch.handle;
+        let input_bytes = (seq_len as u64) * (hidden_size as u64) * 4;
+        let logits_bytes = (seq_len as u64) * (n_experts as u64) * 4;
+        let topk_bytes = (seq_len as u64) * (top_k as u64) * 4;
+
+        // ─── Shader 1: norm + scale + GEMV → logits ───
+        let k1 = registry.get(ShaderId::MoeRouterNormGemv);
+        let set1 = self.alloc_or_get_set(
+            dev,
+            k1.descriptor_set_layout,
+            &[
+                (0, input_buf, input_offset, input_bytes),
+                (1, proj_buf, 0, 0),
+                (2, scale_buf, 0, 0),
+                (3, logits_buf, 0, logits_bytes),
+            ],
+        );
+        let pc1 = MoeRouterNormGemvPushConstants {
+            seq_len,
+            hidden_size,
+            n_experts,
+            rms_norm_eps: rms_eps,
+        };
+        let layout1 = k1.pipeline_layout;
+        let pipeline1 = k1.pipeline;
+        self.profile("moe_router_norm_gemv", dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline1);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout1, 0, &[set1], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout1, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc1),
+            );
+            dev.device.cmd_dispatch(cmd, seq_len, 1, 1);
+        });
+
+        // ─── Barrier: shader-write logits → shader-read logits ───
+        let bar = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ);
+        unsafe {
+            dev.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                std::slice::from_ref(&bar), &[], &[],
+            );
+        }
+
+        // ─── Shader 2: softmax + top-K + renorm + pes → indices + weights ───
+        let k2 = registry.get(ShaderId::MoeRouterSoftmaxTopk);
+        let set2 = self.alloc_or_get_set(
+            dev,
+            k2.descriptor_set_layout,
+            &[
+                (0, logits_buf, 0, logits_bytes),
+                (1, pes_buf, 0, 0),
+                (2, indices_buf, 0, topk_bytes),
+                (3, weights_buf, 0, topk_bytes),
+            ],
+        );
+        let pc2 = MoeRouterSoftmaxTopkPushConstants {
+            seq_len,
+            n_experts,
+            top_k,
+        };
+        let layout2 = k2.pipeline_layout;
+        let pipeline2 = k2.pipeline;
+        self.profile("moe_router_softmax_topk", dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline2);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout2, 0, &[set2], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout2, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc2),
+            );
+            dev.device.cmd_dispatch(cmd, seq_len, 1, 1);
+        });
     }
 }

@@ -385,6 +385,10 @@ pub enum ShaderId {
     // bug is eliminated.
     MulCoopmatQ4KNaivePaddedBf16,
     MulCoopmatQ4KNaivePaddedFp8,
+    // Sprint 56A/56B — GPU-side MoE router. Both pipelines auto-derive
+    // bindings + push constants via SPIR-V reflection.
+    MoeRouterNormGemv,
+    MoeRouterSoftmaxTopk,
 }
 
 impl ShaderId {
@@ -509,6 +513,8 @@ impl ShaderId {
             ShaderId::MulCoopmatQ4KNaiveBf16 => "mul_coopmat_q4k_naive_bf16",
             ShaderId::MulCoopmatQ4KNaivePaddedBf16 => "mul_coopmat_q4k_naive_padded_bf16",
             ShaderId::MulCoopmatQ4KNaivePaddedFp8 => "mul_coopmat_q4k_naive_padded_fp8",
+            ShaderId::MoeRouterNormGemv => "moe_router_norm_gemv",
+            ShaderId::MoeRouterSoftmaxTopk => "moe_router_softmax_topk",
         }
     }
 
@@ -640,6 +646,8 @@ impl ShaderId {
             ShaderId::MulCoopmatQ4KNaiveBf16 => MUL_COOPMAT_Q4K_NAIVE_BF16,
             ShaderId::MulCoopmatQ4KNaivePaddedBf16 => MUL_COOPMAT_Q4K_NAIVE_PADDED_BF16,
             ShaderId::MulCoopmatQ4KNaivePaddedFp8 => MUL_COOPMAT_Q4K_NAIVE_PADDED_FP8,
+            ShaderId::MoeRouterNormGemv => MOE_ROUTER_NORM_GEMV,
+            ShaderId::MoeRouterSoftmaxTopk => MOE_ROUTER_SOFTMAX_TOPK,
         }
     }
 }
@@ -766,6 +774,9 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     // mul_mm family. Wired into BatchExec (Gemma-4 path) in 46C.
     ShaderId::MulMmF32,
     ShaderId::MulMmF32Aligned,
+    // Sprint 56B — GPU-side MoE router (always-on, used by Gemma-4 26B-A4B).
+    ShaderId::MoeRouterNormGemv,
+    ShaderId::MoeRouterSoftmaxTopk,
 ];
 
 /// Sprint 16C — Sprint-3 era Q4_K coopmat GEMM variants gated behind
@@ -990,6 +1001,11 @@ pub const MUL_COOPMAT_Q4K_NAIVE_PADDED_BF16: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_q4k_naive_padded_bf16.spv"));
 pub const MUL_COOPMAT_Q4K_NAIVE_PADDED_FP8: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_coopmat_q4k_naive_padded_fp8.spv"));
+// Sprint 56A — GPU-side MoE router (production pipelines).
+pub const MOE_ROUTER_NORM_GEMV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/moe_router_norm_gemv.spv"));
+pub const MOE_ROUTER_SOFTMAX_TOPK: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/moe_router_softmax_topk.spv"));
 
 /// Decode a SPIR-V byte blob into u32 words. Vulkan consumes SPIR-V
 /// as `&[u32]`; `include_bytes!` only gives us `&[u8]` whose alignment

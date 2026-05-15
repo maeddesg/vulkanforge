@@ -479,7 +479,9 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
     // unwritten); harmless for Llama / Qwen (every pos slot is
     // fully overwritten by its layer).
     kv_cache.zero_fill(&dev)?;
-    let forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;
+    let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;
+    // Sprint 56B — GPU-side MoE router init. No-op for non-MoE models.
+    forward.init_moe_router_gpu(&dev, &mut allocator, &model, max_context)?;
 
     print_banner(
         &model_path,
@@ -859,6 +861,8 @@ fn run_chat_safetensors(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>
     // fully overwritten by its layer).
     kv_cache.zero_fill(&dev)?;
     let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;
+    // Sprint 56B — GPU-side MoE router init (no-op for non-MoE / SafeTensors-without-router).
+    forward.init_moe_router_gpu(&dev, &mut allocator, &model, max_context)?;
 
     println!();
     println!("VulkanForge — native FP8 chat (Sprint 20-M3)");

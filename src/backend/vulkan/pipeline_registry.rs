@@ -643,6 +643,16 @@ impl PipelineRegistry {
                     // Q4_K naive kernel's wave assumption.
                     ComputeKernel::from_spv(device, &words, cache)
                 }
+                ShaderId::MoeRouterNormGemv | ShaderId::MoeRouterSoftmaxTopk => {
+                    // Sprint 56A — GPU-side MoE router. No spec
+                    // constants; workgroup size is `local_size_x = 128`
+                    // in the shader source. Bindings + push constants
+                    // come from SPIR-V reflection. No required
+                    // subgroup size — the reductions use shared
+                    // memory rather than subgroup ops, so they
+                    // work uniformly on Wave32/Wave64.
+                    ComputeKernel::from_spv(device, &words, cache)
+                }
             };
             let kernel = match result {
                 Ok(k) => k,
