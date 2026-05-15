@@ -51,6 +51,11 @@ use super::layer_plan::{ActivationKind, LayerPlan, LayerStep};
 use super::state::Forward;
 use super::super::loader::MoeRouterLayerData;
 
+// Sprint 57B — submodule split. `dispatch` holds both `execute_step`
+// matches + the Llama-fusion helpers (the keystone of the
+// add-a-LayerStep-variant-fails-to-compile invariant).
+mod dispatch;
+
 /// Sprint 51D-D — one-shot log-on-first-call for the layer-0 router
 /// decision (debug aid). Prevents flooding decode-token logs with
 /// per-token prints; only the first decode token reports.
@@ -272,96 +277,6 @@ impl DecodeExec {
             }
             self.execute_step(fwd, &plan[i], &cfg, ctx);
             i += 1;
-        }
-    }
-
-    /// Fused `multi_add_rms`: `res1 = input + o_buf; hidden_norm =
-    /// rms_norm(res1) * ffn_norm.weight`. Llama path only.
-    fn fused_attn_residual_norm(
-        &self,
-        fwd: &mut Forward,
-        cfg: &ModelConfig,
-        ctx: &ExecCtx,
-    ) {
-        let (input, _) = decode_io(ctx);
-        let o_buf = fwd.cur().o_buf.handle;
-        let res1 = fwd.cur().res1.handle;
-        let hidden_norm = fwd.cur().hidden_norm.handle;
-        let w = layer_weight(ctx.model, ctx.layer, "ffn_norm.weight");
-        // Read deps for this fused dispatch: input + o_buf.
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[input, o_buf]);
-        fwd.run_multi_add_rms(
-            ctx.dev, ctx.registry, ctx.cmd,
-            input, o_buf, w,
-            res1, hidden_norm,
-            cfg.hidden_dim, 1, cfg.rms_norm_eps, "add_rms_ffn",
-        );
-        fwd.mark_written(&[res1, hidden_norm]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[hidden_norm]);
-    }
-
-    /// Per-step dispatcher. Match must be exhaustive over `LayerStep`.
-    /// Adding a variant breaks compilation here until handled.
-    fn execute_step(
-        &self,
-        fwd: &mut Forward,
-        step: &LayerStep,
-        cfg: &ModelConfig,
-        ctx: &ExecCtx,
-    ) {
-        match step {
-            LayerStep::AttnNorm => self.step_attn_norm(fwd, cfg, ctx),
-            LayerStep::QProj => self.step_q_proj(fwd, cfg, ctx),
-            LayerStep::KProj => self.step_k_proj(fwd, cfg, ctx),
-            LayerStep::VProj => self.step_v_proj(fwd, cfg, ctx),
-            LayerStep::VFromKRaw => self.step_v_from_k_raw(fwd, cfg, ctx),
-            LayerStep::QBiasAdd => self.step_q_bias(fwd, cfg, ctx),
-            LayerStep::KBiasAdd => self.step_k_bias(fwd, cfg, ctx),
-            LayerStep::VBiasAdd => self.step_v_bias(fwd, cfg, ctx),
-            LayerStep::QNormRope { rotary_dim, freq_base, theta_scale } => {
-                self.step_q_norm_rope(fwd, cfg, ctx, *rotary_dim, *freq_base, *theta_scale)
-            }
-            LayerStep::KNormRope { rotary_dim, freq_base, theta_scale } => {
-                self.step_k_norm_rope(fwd, cfg, ctx, *rotary_dim, *freq_base, *theta_scale)
-            }
-            LayerStep::QRope { rotary_dim, freq_base, theta_scale } => {
-                self.step_q_rope(fwd, cfg, ctx, *rotary_dim, *freq_base, *theta_scale)
-            }
-            LayerStep::KRope { rotary_dim, freq_base, theta_scale } => {
-                self.step_k_rope(fwd, cfg, ctx, *rotary_dim, *freq_base, *theta_scale)
-            }
-            LayerStep::VNorm => self.step_v_norm(fwd, cfg, ctx),
-            LayerStep::KvWrite => self.step_kv_write(fwd, cfg, ctx),
-            LayerStep::Attention { kv_layer: _, kv_start: _ } => {
-                self.step_attention(fwd, cfg, ctx)
-            }
-            LayerStep::OProj => self.step_o_proj(fwd, cfg, ctx),
-            LayerStep::PostAttnNorm => self.step_post_attn_norm(fwd, cfg, ctx),
-            LayerStep::AttnResidualAdd => self.step_attn_residual_add(fwd, cfg, ctx),
-            LayerStep::PreFfnNorm => self.step_pre_ffn_norm(fwd, cfg, ctx),
-            LayerStep::GateProj => self.step_gate_proj(fwd, cfg, ctx),
-            LayerStep::UpProj => self.step_up_proj(fwd, cfg, ctx),
-            LayerStep::Activation { kind } => self.step_activation(fwd, cfg, ctx, *kind),
-            LayerStep::DownProj => self.step_down_proj(fwd, cfg, ctx),
-            LayerStep::PostFfnNorm => self.step_post_ffn_norm(fwd, cfg, ctx),
-            LayerStep::FfnResidualAdd => self.step_ffn_residual_add(fwd, cfg, ctx),
-            LayerStep::PleBlock => self.step_ple_block(fwd, cfg, ctx),
-            LayerStep::LayerScalarMul => self.step_layer_scalar_mul(fwd, cfg, ctx),
-            // Sprint 51C — Gemma-4-26B-A4B MoE-block stubs. The
-            // layer-plan builder gates these on `enable_moe_block`,
-            // so E2B / Qwen3 / Llama never hit them. Loader rejects
-            // 26B-A4B with a clear error until Sprint 51D wires the
-            // tensor upload + dispatch.
-            LayerStep::PostDenseMlpNorm => self.step_post_dense_mlp_norm(fwd, cfg, ctx),
-            LayerStep::PreMoeNorm => self.step_pre_moe_norm(fwd, cfg, ctx),
-            LayerStep::MoeRoute { n_experts, top_k } => {
-                self.step_moe_route(fwd, cfg, ctx, *n_experts, *top_k)
-            }
-            LayerStep::MoeExpertFfn { n_experts, top_k, moe_intermediate } => {
-                self.step_moe_expert_ffn(fwd, cfg, ctx, *n_experts, *top_k, *moe_intermediate)
-            }
-            LayerStep::PostMoeNorm => self.step_post_moe_norm(fwd, cfg, ctx),
-            LayerStep::MoeBranchAdd => self.step_moe_branch_add(fwd, cfg, ctx),
         }
     }
 
@@ -1503,91 +1418,7 @@ impl BatchExec {
         }
     }
 
-    fn execute_step(
-        &self,
-        fwd: &mut Forward,
-        step: &LayerStep,
-        cfg: &ModelConfig,
-        ctx: &ExecCtx,
-    ) {
-        match step {
-            LayerStep::AttnNorm => self.b_step_attn_norm(fwd, cfg, ctx),
-            LayerStep::QProj => self.b_step_q_proj(fwd, cfg, ctx),
-            LayerStep::KProj => self.b_step_k_proj(fwd, cfg, ctx),
-            LayerStep::VProj => self.b_step_v_proj(fwd, cfg, ctx),
-            LayerStep::VFromKRaw => self.b_step_v_from_k_raw(fwd, cfg, ctx),
-            LayerStep::QBiasAdd => self.b_step_q_bias(fwd, cfg, ctx),
-            LayerStep::KBiasAdd => self.b_step_k_bias(fwd, cfg, ctx),
-            LayerStep::VBiasAdd => self.b_step_v_bias(fwd, cfg, ctx),
-            LayerStep::QNormRope { rotary_dim, freq_base, theta_scale } => {
-                self.b_step_q_norm_rope(fwd, cfg, ctx, *rotary_dim, *freq_base, *theta_scale)
-            }
-            LayerStep::KNormRope { rotary_dim, freq_base, theta_scale } => {
-                self.b_step_k_norm_rope(fwd, cfg, ctx, *rotary_dim, *freq_base, *theta_scale)
-            }
-            LayerStep::QRope { rotary_dim, freq_base, theta_scale } => {
-                self.b_step_q_rope(fwd, cfg, ctx, *rotary_dim, *freq_base, *theta_scale)
-            }
-            LayerStep::KRope { rotary_dim, freq_base, theta_scale } => {
-                self.b_step_k_rope(fwd, cfg, ctx, *rotary_dim, *freq_base, *theta_scale)
-            }
-            LayerStep::VNorm => self.b_step_v_norm(fwd, cfg, ctx),
-            LayerStep::KvWrite => self.b_step_kv_write(fwd, cfg, ctx),
-            LayerStep::Attention { kv_layer, kv_start } => {
-                self.b_step_attention(fwd, cfg, ctx, *kv_layer, *kv_start)
-            }
-            LayerStep::OProj => self.b_step_o_proj(fwd, cfg, ctx),
-            LayerStep::PostAttnNorm => self.b_step_post_attn_norm(fwd, cfg, ctx),
-            LayerStep::AttnResidualAdd => self.b_step_attn_residual_add(fwd, cfg, ctx),
-            LayerStep::PreFfnNorm => self.b_step_pre_ffn_norm(fwd, cfg, ctx),
-            LayerStep::GateProj => self.b_step_gate_proj(fwd, cfg, ctx),
-            LayerStep::UpProj => self.b_step_up_proj(fwd, cfg, ctx),
-            LayerStep::Activation { kind } => self.b_step_activation(fwd, cfg, ctx, *kind),
-            LayerStep::DownProj => self.b_step_down_proj(fwd, cfg, ctx),
-            LayerStep::PostFfnNorm => self.b_step_post_ffn_norm(fwd, cfg, ctx),
-            LayerStep::FfnResidualAdd => self.b_step_ffn_residual_add(fwd, cfg, ctx),
-            LayerStep::PleBlock => self.b_step_ple_block(fwd, cfg, ctx),
-            LayerStep::LayerScalarMul => self.b_step_layer_scalar_mul(fwd, cfg, ctx),
-            // Sprint 51C — same MoE stubs as DecodeExec (see comment
-            // on the DecodeExec match-arm). BatchExec is loaded
-            // through the same `enable_moe_block` gate; never hit on
-            // E2B / Qwen3 / Llama.
-            LayerStep::PostDenseMlpNorm => self.b_step_post_dense_mlp_norm(fwd, cfg, ctx),
-            LayerStep::PreMoeNorm => self.b_step_pre_moe_norm(fwd, cfg, ctx),
-            LayerStep::MoeRoute { n_experts, top_k } => {
-                self.b_step_moe_route(fwd, cfg, ctx, *n_experts, *top_k)
-            }
-            LayerStep::MoeExpertFfn { n_experts, top_k, moe_intermediate } => {
-                self.b_step_moe_expert_ffn(fwd, cfg, ctx, *n_experts, *top_k, *moe_intermediate)
-            }
-            LayerStep::PostMoeNorm => self.b_step_post_moe_norm(fwd, cfg, ctx),
-            LayerStep::MoeBranchAdd => self.b_step_moe_branch_add(fwd, cfg, ctx),
-        }
-    }
-
     // ── per-step impls ────────────────────────────────────────────────
-
-    /// Llama-path Sprint-9b fusion: `multi_add_rms(batch_residual,
-    /// batch_o, ffn_norm.weight → batch_residual, batch_norm)`.
-    /// Replaces the AttnResidualAdd + PreFfnNorm pair when the
-    /// loop driver detects the Llama pattern (no PostAttnNorm
-    /// preceding).
-    fn b_fused_attn_residual_norm(
-        &self,
-        fwd: &mut Forward,
-        cfg: &ModelConfig,
-        ctx: &ExecCtx,
-    ) {
-        let seq_len = batch_seq_len(ctx);
-        let w_ffn = layer_weight(ctx.model, ctx.layer, "ffn_norm.weight");
-        fwd.run_multi_add_rms(
-            ctx.dev, ctx.registry, ctx.cmd,
-            fwd.batch_residual.handle, fwd.batch_o.handle, w_ffn,
-            fwd.batch_residual.handle, fwd.batch_norm.handle,
-            cfg.hidden_dim, seq_len, cfg.rms_norm_eps, "add_rms_ffn_b",
-        );
-        compute_barrier(ctx.dev, ctx.cmd);
-    }
 
     fn b_step_attn_norm(&self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx) {
         // No-op. `batch_norm` is pre-seeded:
@@ -2954,7 +2785,7 @@ fn quantize_input_after_q(model: &LoadedModel, layer: u32) -> bool {
 }
 
 /// Helper: extract `seq_len` from a Batch ExecCtx.
-fn batch_seq_len(ctx: &ExecCtx) -> u32 {
+pub(super) fn batch_seq_len(ctx: &ExecCtx) -> u32 {
     match ctx.mode {
         ExecMode::Batch { seq_len, .. } => seq_len,
         _ => unreachable!("BatchExec invoked with Decode mode"),
@@ -2962,7 +2793,7 @@ fn batch_seq_len(ctx: &ExecCtx) -> u32 {
 }
 
 /// Helper: extract `(seq_len, base_pos)` from a Batch ExecCtx.
-fn batch_seq_pos(ctx: &ExecCtx) -> (u32, u32) {
+pub(super) fn batch_seq_pos(ctx: &ExecCtx) -> (u32, u32) {
     match ctx.mode {
         ExecMode::Batch { seq_len, base_pos, .. } => (seq_len, base_pos),
         _ => unreachable!("BatchExec invoked with Decode mode"),
@@ -2971,14 +2802,14 @@ fn batch_seq_pos(ctx: &ExecCtx) -> (u32, u32) {
 
 // ── helpers ──────────────────────────────────────────────────────────
 
-fn decode_io(ctx: &ExecCtx) -> (vk::Buffer, vk::Buffer) {
+pub(super) fn decode_io(ctx: &ExecCtx) -> (vk::Buffer, vk::Buffer) {
     match ctx.mode {
         ExecMode::Decode { input, output, .. } => (input, output),
         ExecMode::Batch { .. } => unreachable!("DecodeExec invoked with Batch mode"),
     }
 }
 
-fn decode_position(ctx: &ExecCtx) -> u32 {
+pub(super) fn decode_position(ctx: &ExecCtx) -> u32 {
     match ctx.mode {
         ExecMode::Decode { position, .. } => position,
         ExecMode::Batch { .. } => unreachable!("DecodeExec invoked with Batch mode"),
@@ -2987,9 +2818,9 @@ fn decode_position(ctx: &ExecCtx) -> u32 {
 
 /// Re-export of `arch::common::layer_dims` for the per-step helpers.
 /// Returns `(head_dim, ffn_dim, rope_theta, rotary_dim)` per layer.
-use super::arch::layer_dims as layer_dims_local;
+pub(super) use super::arch::layer_dims as layer_dims_local;
 
 /// Sprint 51B-pre — per-layer KV-head count (8 / 2 split for the
 /// Gemma-4-26B-A4B sliding / full pattern). Falls back to the
 /// uniform `ModelConfig::n_kv_heads` for non-Gemma-4 architectures.
-use super::arch::n_kv_heads_for;
+pub(super) use super::arch::n_kv_heads_for;
