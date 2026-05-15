@@ -445,13 +445,42 @@ impl DecodeExec {
         let k_buf = fwd.cur().k_buf.handle;
         let v_buf = fwd.cur().v_buf.handle;
         let copy = vk::BufferCopy::default().src_offset(0).dst_offset(0).size(bytes);
+        // Sprint 54D — SHADER_WRITE → TRANSFER_READ barrier on k_buf so
+        // step_k_proj's GEMV output is visible to the cmd_copy_buffer
+        // below. Without this, the transfer races against the compute
+        // write and reads stale k_buf left over from the previous token's
+        // CB (V[pos=0] = 0; V[pos=N] = K[pos=N-1] regression signature).
+        let pre = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+        unsafe {
+            ctx.dev.device.cmd_pipeline_barrier(
+                ctx.cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                std::slice::from_ref(&pre), &[], &[],
+            );
+        }
         fwd.profile("v_from_k_raw", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
             dev.device.cmd_copy_buffer(cmd, k_buf, v_buf, std::slice::from_ref(&copy));
         });
-        // V depends on K's raw output → ensure step_k_proj's writes
-        // are visible to this transfer; downstream VNorm's compute
-        // read sees v_buf via the transfer→compute barrier emitted by
-        // mark_written + maybe_compute_barrier.
+        // TRANSFER_WRITE → SHADER_READ barrier on v_buf so downstream
+        // step_v_norm's compute read sees the copied bytes — the
+        // COMPUTE→COMPUTE barrier issued by maybe_compute_barrier does
+        // not cover a prior TRANSFER_WRITE.
+        let post = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ);
+        unsafe {
+            ctx.dev.device.cmd_pipeline_barrier(
+                ctx.cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                std::slice::from_ref(&post), &[], &[],
+            );
+        }
         fwd.mark_written(&[v_buf]);
     }
 
@@ -1583,10 +1612,40 @@ impl BatchExec {
         let src = fwd.batch_k.handle;
         let dst = fwd.batch_v.handle;
         let copy = vk::BufferCopy::default().src_offset(0).dst_offset(0).size(bytes);
+        // Sprint 54D — SHADER_WRITE → TRANSFER_READ barrier on batch_k so
+        // b_step_k_proj's GEMM output is visible to the transfer below
+        // (same race that hit the decode path: cmd_copy_buffer was reading
+        // stale K data from the previous chunk).
+        let pre = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+        unsafe {
+            ctx.dev.device.cmd_pipeline_barrier(
+                ctx.cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                std::slice::from_ref(&pre), &[], &[],
+            );
+        }
         fwd.profile("v_from_k_raw_b", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
             dev.device.cmd_copy_buffer(cmd, src, dst, std::slice::from_ref(&copy));
         });
-        compute_barrier(ctx.dev, ctx.cmd);
+        // TRANSFER_WRITE → SHADER_READ barrier on batch_v for downstream
+        // b_step_v_norm. The bare compute_barrier here previously only
+        // covered SHADER→SHADER, leaving the transfer write un-flushed.
+        let post = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ);
+        unsafe {
+            ctx.dev.device.cmd_pipeline_barrier(
+                ctx.cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                std::slice::from_ref(&post), &[], &[],
+            );
+        }
     }
 
     fn b_step_q_bias(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
