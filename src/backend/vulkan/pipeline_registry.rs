@@ -181,7 +181,8 @@ impl PipelineRegistry {
                 // auto-derived from SPIR-V reflection.
                 | ShaderId::MulMatVecQ3KId | ShaderId::MulMatVecQ3KIdSubgroup
                 | ShaderId::MulMatVecQ4KId | ShaderId::MulMatVecQ4KIdSubgroup
-                | ShaderId::MulMatVecQ5_0Id | ShaderId::MulMatVecQ5_0IdSubgroup => {
+                | ShaderId::MulMatVecQ5_0Id | ShaderId::MulMatVecQ5_0IdSubgroup
+                | ShaderId::MulMatVecQ4_0Id | ShaderId::MulMatVecQ4_0IdSubgroup => {
                     let entries = [entry(0, 0, 4), entry(1, 4, 4), entry(2, 8, 4)];
                     let bytes = bytemuck::bytes_of(&MMV_SPEC_DATA);
                     // Sprint 14A — pin requiredSubgroupSize=64 for the GEMV

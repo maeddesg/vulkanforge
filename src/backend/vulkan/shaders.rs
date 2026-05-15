@@ -401,6 +401,11 @@ pub enum ShaderId {
     MulMatVecQ4KIdSubgroup,
     MulMatVecQ5_0Id,
     MulMatVecQ5_0IdSubgroup,
+    /// Sprint 56C-2 — Q4_0 indexed variant. Discovered during 56C-2
+    /// runtime test that Gemma-4-26B-A4B Q3_K_M mixes Q4_0 + Q5_0 for
+    /// per-layer down_exps weights (some layers Q4_0, some Q5_0).
+    MulMatVecQ4_0Id,
+    MulMatVecQ4_0IdSubgroup,
     // Sprint 56C-1 — Pendant to `FmaAdd` that reads the per-expert
     // weight from an SSBO (`weights[slot_index]`) instead of a
     // push-constant scalar. Lets the GPU-direct MoE path skip the
@@ -538,6 +543,8 @@ impl ShaderId {
             ShaderId::MulMatVecQ4KIdSubgroup => "mul_mat_vec_q4_k_f32_f32_id_subgroup",
             ShaderId::MulMatVecQ5_0Id => "mul_mat_vec_q5_0_f32_f32_id",
             ShaderId::MulMatVecQ5_0IdSubgroup => "mul_mat_vec_q5_0_f32_f32_id_subgroup",
+            ShaderId::MulMatVecQ4_0Id => "mul_mat_vec_q4_0_f32_f32_id",
+            ShaderId::MulMatVecQ4_0IdSubgroup => "mul_mat_vec_q4_0_f32_f32_id_subgroup",
             ShaderId::FmaAddIndexed => "fma_add_indexed_f32",
         }
     }
@@ -678,6 +685,8 @@ impl ShaderId {
             ShaderId::MulMatVecQ4KIdSubgroup => MUL_MAT_VEC_Q4_K_F32_F32_ID_SUBGROUP,
             ShaderId::MulMatVecQ5_0Id => MUL_MAT_VEC_Q5_0_F32_F32_ID,
             ShaderId::MulMatVecQ5_0IdSubgroup => MUL_MAT_VEC_Q5_0_F32_F32_ID_SUBGROUP,
+            ShaderId::MulMatVecQ4_0Id => MUL_MAT_VEC_Q4_0_F32_F32_ID,
+            ShaderId::MulMatVecQ4_0IdSubgroup => MUL_MAT_VEC_Q4_0_F32_F32_ID_SUBGROUP,
             ShaderId::FmaAddIndexed => FMA_ADD_INDEXED_F32,
         }
     }
@@ -817,6 +826,8 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::MulMatVecQ4KIdSubgroup,
     ShaderId::MulMatVecQ5_0Id,
     ShaderId::MulMatVecQ5_0IdSubgroup,
+    ShaderId::MulMatVecQ4_0Id,
+    ShaderId::MulMatVecQ4_0IdSubgroup,
     ShaderId::FmaAddIndexed,
 ];
 
@@ -1062,6 +1073,10 @@ pub const MUL_MAT_VEC_Q5_0_F32_F32_ID: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q5_0_f32_f32_id.spv"));
 pub const MUL_MAT_VEC_Q5_0_F32_F32_ID_SUBGROUP: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q5_0_f32_f32_id_subgroup.spv"));
+pub const MUL_MAT_VEC_Q4_0_F32_F32_ID: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q4_0_f32_f32_id.spv"));
+pub const MUL_MAT_VEC_Q4_0_F32_F32_ID_SUBGROUP: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q4_0_f32_f32_id_subgroup.spv"));
 pub const FMA_ADD_INDEXED_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/fma_add_indexed_f32.spv"));
 

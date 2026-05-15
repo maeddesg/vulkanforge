@@ -15,7 +15,8 @@ use super::{
     MOE_LAYER0_LOGGED,
 };
 use super::super::arch::{
-    compute_barrier, layer_weight, layer_weight_shader, transfer_to_compute_barrier,
+    compute_barrier, layer_weight, layer_weight_indexed_shader, layer_weight_shader,
+    transfer_to_compute_barrier,
 };
 use super::super::state::Forward;
 use super::super::super::gguf::ModelConfig;
@@ -23,6 +24,26 @@ use super::super::super::pipeline::SwigluPushConstants;
 use super::super::super::shaders::ShaderId;
 
 use ash::vk;
+
+/// Sprint 56C-2 — `VF_GPU_DIRECT_MOE=1` (cached after first read)
+/// switches the MoE route + expert-FFN steps to the GPU-direct path:
+/// the router output (indices + weights) is consumed directly from
+/// GPU buffers via the indexed-GEMV / indexed-FMA pipelines registered
+/// in 56C-1, eliminating the `mid_frame_submit_and_wait` readback.
+///
+/// Default OFF. Requires `fwd.moe_router_gpu.is_some()` (GPU router
+/// initialised in Sprint 56B). Active only for the env-gated path —
+/// the CPU-readback codepath remains the production default until
+/// Sprint 56C-3 flips it after async-decode re-enable.
+fn gpu_direct_moe_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("VF_GPU_DIRECT_MOE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
 
 impl DecodeExec {
     // === Sprint 51D-B Block 1 — Gemma-4-26B-A4B MoE FFN-Block norms + add ===
@@ -136,6 +157,17 @@ impl DecodeExec {
                 ctx.dev, ctx.registry, ctx.cmd, ctx.layer, 1, res1, 0,
             );
 
+            // Sprint 56C-2 — GPU-direct path: skip the readback. Emit a
+            // COMPUTE→COMPUTE barrier so the indexed GEMV in
+            // step_moe_expert_ffn sees the router's writes to
+            // indices_scratch + weights_scratch. `fwd.moe_routing` is
+            // intentionally left None — the expert FFN reads the values
+            // from GPU buffers via `data_ids[]` / `weights[slot]` SSBOs.
+            if gpu_direct_moe_enabled() {
+                compute_barrier(ctx.dev, ctx.cmd);
+                return;
+            }
+
             // Copy indices + weights into a single host-visible staging
             // buffer. The two GPU buffers are addressed independently;
             // we lay them out in `readback_staging` as
@@ -236,8 +268,16 @@ impl DecodeExec {
     /// `ffn_hidden` weighted by the renormalized router weight.
     pub(super) fn step_moe_expert_ffn(
         &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx,
-        n_experts: u32, _top_k: u32, moe_intermediate: u32,
+        n_experts: u32, top_k: u32, moe_intermediate: u32,
     ) {
+        // Sprint 56C-2 — GPU-direct branch (env-gated, requires GPU router).
+        // Replaces the CPU-readback slot loop with indexed GEMV + indexed
+        // FMA dispatches that read `expert_id = data_ids[slot]` and
+        // `weight = weights[slot]` from the router's GPU buffers.
+        if gpu_direct_moe_enabled() && fwd.moe_router_gpu.is_some() {
+            self.step_moe_expert_ffn_gpu_direct(fwd, cfg, ctx, n_experts, top_k, moe_intermediate);
+            return;
+        }
         let routing = fwd.moe_routing.take()
             .expect("MoeExpertFfn before MoeRoute populated routing");
         let scratch_b   = fwd.cur().scratch_b.handle;
@@ -400,6 +440,164 @@ impl DecodeExec {
             fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[ffn_hidden]);
         }
     }
+
+    /// Sprint 56C-2 — GPU-direct DEC expert FFN. Mirrors
+    /// `step_moe_expert_ffn` but the per-slot `expert_id` and `weight`
+    /// are read from the router's GPU buffers (`indices_scratch`,
+    /// `weights_scratch`) via the `MUL_MAT_ID` indexed-GEMV +
+    /// indexed-FMA-Add pipelines. No CPU readback, no
+    /// `mid_frame_submit_and_wait`.
+    fn step_moe_expert_ffn_gpu_direct(
+        &self,
+        fwd: &mut Forward,
+        cfg: &ModelConfig,
+        ctx: &ExecCtx,
+        n_experts: u32,
+        top_k: u32,
+        moe_intermediate: u32,
+    ) {
+        let scratch_b  = fwd.cur().scratch_b.handle;
+        let gate_buf   = fwd.cur().gate_buf.handle;
+        let up_buf     = fwd.cur().up_buf.handle;
+        let o_buf      = fwd.cur().o_buf.handle;
+        let ffn_hidden = fwd.cur().ffn_hidden.handle;
+        let h          = cfg.hidden_dim;
+        let mi         = moe_intermediate;
+        let mi_padded: u32 = ((mi + 255) / 256) * 256;
+
+        let gate_up_t = ctx.model
+            .tensor(&format!("blk.{}.moe_experts.gate_up_proj", ctx.layer))
+            .expect("moe_experts.gate_up_proj missing");
+        let down_t = ctx.model
+            .tensor(&format!("blk.{}.moe_experts.down_proj", ctx.layer))
+            .expect("moe_experts.down_proj missing");
+
+        // Elements per expert: bytes_per_expert × block_size / type_size.
+        // The MUL_MAT_ID shader computes `a_offset = expert_id *
+        // (batch_stride_a / QUANT_K)` so `batch_stride_a` is in
+        // **elements** and the per-quant block size divides correctly.
+        let gate_up_block_size = gate_up_t.ggml_type.block_size() as u32;
+        let gate_up_type_size  = gate_up_t.ggml_type.type_size() as u32;
+        let gate_up_bytes_per_expert = (gate_up_t.byte_size / (n_experts as u64)) as u32;
+        let gate_up_elems_per_expert =
+            gate_up_bytes_per_expert / gate_up_type_size * gate_up_block_size;
+
+        let down_block_size = down_t.ggml_type.block_size() as u32;
+        let down_type_size  = down_t.ggml_type.type_size() as u32;
+        let down_bytes_per_expert = (down_t.byte_size / (n_experts as u64)) as u32;
+        let down_elems_per_expert =
+            down_bytes_per_expert / down_type_size * down_block_size;
+
+        // Sprint 52P loader-aware K (mirror of CPU-readback path).
+        let down_k = if down_t.shape[0] as u32 == n_experts {
+            mi_padded
+        } else {
+            down_t.shape[0] as u32
+        };
+
+        let gate_up_shader = layer_weight_indexed_shader(
+            ctx.model, ctx.layer,
+            "moe_experts.gate_up_proj",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
+        let down_shader = layer_weight_indexed_shader(
+            ctx.model, ctx.layer,
+            "moe_experts.down_proj",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
+        let gate_up_w = layer_weight(ctx.model, ctx.layer, "moe_experts.gate_up_proj");
+        let down_w    = layer_weight(ctx.model, ctx.layer, "moe_experts.down_proj");
+
+        let router = fwd.moe_router_gpu.as_ref()
+            .expect("step_moe_expert_ffn_gpu_direct requires moe_router_gpu");
+        let indices_buf = router.indices_scratch.handle;
+        let weights_buf = router.weights_scratch.handle;
+
+        // Zero the accumulator before the per-slot loop, same as the
+        // CPU-readback path.
+        unsafe {
+            ctx.dev.device.cmd_fill_buffer(
+                ctx.cmd, ffn_hidden, 0, (h as u64) * 4, 0,
+            );
+        }
+        transfer_to_compute_barrier(ctx.dev, ctx.cmd);
+
+        let h_bytes  = (h as u64) * 4;
+        let mi_bytes = (mi as u64) * 4;
+
+        for slot in 0..top_k {
+            // (a) gate_up GEMV (indexed): scratch_b × experts.gate_up_proj[indices[slot]] → gate_buf.
+            fwd.run_gemv_indexed_at_offset(
+                ctx.dev, ctx.registry, ctx.cmd,
+                gate_up_w,
+                scratch_b, 0, h_bytes,
+                gate_buf, 0, 2 * mi_bytes,
+                indices_buf,
+                h, 2 * mi,
+                gate_up_elems_per_expert,
+                slot,
+                "moe_gate_up_id",
+                gate_up_shader,
+            );
+            fwd.mark_written(&[gate_buf]);
+            fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[gate_buf]);
+
+            // (b) GeluPytorchTanhGlu (unchanged from CPU-readback path).
+            let kernel = ctx.registry.get(ShaderId::GeluPytorchTanhGlu);
+            let set = fwd.alloc_or_get_set(
+                ctx.dev, kernel.descriptor_set_layout,
+                &[
+                    (0, gate_buf, 0, mi_bytes),
+                    (1, gate_buf, mi_bytes, mi_bytes),
+                    (2, up_buf, 0, mi_bytes),
+                ],
+            );
+            let pc = SwigluPushConstants { n: mi };
+            let dispatch_x = (mi + 255) / 256;
+            let layout = kernel.pipeline_layout;
+            let pipeline = kernel.pipeline;
+            fwd.profile("moe_glu_id", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
+                dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                dev.device.cmd_bind_descriptor_sets(
+                    cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+                );
+                dev.device.cmd_push_constants(
+                    cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+                );
+                dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
+            });
+            fwd.mark_written(&[up_buf]);
+            fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[up_buf]);
+
+            // (c) down GEMV (indexed): up_buf × experts.down_proj[indices[slot]] → o_buf.
+            fwd.run_gemv_indexed_at_offset(
+                ctx.dev, ctx.registry, ctx.cmd,
+                down_w,
+                up_buf, 0, (down_k as u64) * 4,
+                o_buf, 0, h_bytes,
+                indices_buf,
+                down_k, h,
+                down_elems_per_expert,
+                slot,
+                "moe_down_id",
+                down_shader,
+            );
+            fwd.mark_written(&[o_buf]);
+            fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[o_buf]);
+
+            // (d) Indexed FMA: ffn_hidden += weights[slot] * o_buf.
+            fwd.run_fma_add_indexed(
+                ctx.dev, ctx.registry, ctx.cmd,
+                o_buf, 0,
+                ffn_hidden, 0,
+                weights_buf,
+                h, slot,
+                "moe_fma_add_id",
+            );
+            fwd.mark_written(&[ffn_hidden]);
+            fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[ffn_hidden]);
+        }
+    }
 }
 
 impl BatchExec {
@@ -495,6 +693,16 @@ impl BatchExec {
             fwd.run_moe_router_gpu(
                 ctx.dev, ctx.registry, ctx.cmd, ctx.layer, seq_len, batch_in, 0,
             );
+
+            // Sprint 56C-2 — GPU-direct path: skip the readback. Emit a
+            // COMPUTE→COMPUTE barrier so b_step_moe_expert_ffn's indexed
+            // GEMVs see the router's writes. `fwd.moe_routing_batch`
+            // stays None — the BAT expert FFN reads from GPU buffers
+            // via flat slot index `t * top_k + k`.
+            if gpu_direct_moe_enabled() {
+                compute_barrier(ctx.dev, ctx.cmd);
+                return;
+            }
 
             // Copy seq_len × top_k × (4+4) bytes into readback_staging.
             let router = fwd.moe_router_gpu.as_ref().unwrap();
@@ -599,8 +807,15 @@ impl BatchExec {
 
     pub(super) fn b_step_moe_expert_ffn(
         &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx,
-        n_experts: u32, _top_k: u32, moe_intermediate: u32,
+        n_experts: u32, top_k: u32, moe_intermediate: u32,
     ) {
+        // Sprint 56C-2 — GPU-direct BAT branch.
+        if gpu_direct_moe_enabled() && fwd.moe_router_gpu.is_some() {
+            self.b_step_moe_expert_ffn_gpu_direct(
+                fwd, cfg, ctx, n_experts, top_k, moe_intermediate,
+            );
+            return;
+        }
         let routing_batch = fwd.moe_routing_batch.take()
             .expect("MoeExpertFfn (batch) before MoeRoute populated routing");
         let seq_len = batch_seq_len(ctx);
@@ -767,6 +982,165 @@ impl BatchExec {
         // Final compute_barrier so the next step (PostMoeNorm) sees a
         // clean dirty-tracker; mirrors the trailing barrier the other
         // batch steps emit.
+        compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    /// Sprint 56C-2 — GPU-direct BAT expert FFN. Per-(token, slot) loop
+    /// where each dispatch reads its `expert_id` and `weight` from the
+    /// router's GPU buffers via `data_ids[t*top_k + k]` /
+    /// `weights[t*top_k + k]`. Mirrors the CPU-readback `b_step_moe_expert_ffn`
+    /// structure but skips the host iteration of routing tuples.
+    fn b_step_moe_expert_ffn_gpu_direct(
+        &self,
+        fwd: &mut Forward,
+        cfg: &ModelConfig,
+        ctx: &ExecCtx,
+        n_experts: u32,
+        top_k: u32,
+        moe_intermediate: u32,
+    ) {
+        let seq_len = batch_seq_len(ctx);
+        let h  = cfg.hidden_dim;
+        let mi = moe_intermediate;
+        let h_bytes  = (h as u64) * 4;
+        let mi_bytes = (mi as u64) * 4;
+        let mi_padded: u32 = ((mi + 255) / 256) * 256;
+
+        let gate_up_t = ctx.model
+            .tensor(&format!("blk.{}.moe_experts.gate_up_proj", ctx.layer))
+            .expect("moe_experts.gate_up_proj missing");
+        let down_t = ctx.model
+            .tensor(&format!("blk.{}.moe_experts.down_proj", ctx.layer))
+            .expect("moe_experts.down_proj missing");
+        let gate_up_block_size = gate_up_t.ggml_type.block_size() as u32;
+        let gate_up_type_size  = gate_up_t.ggml_type.type_size() as u32;
+        let gate_up_bytes_per_expert = (gate_up_t.byte_size / (n_experts as u64)) as u32;
+        let gate_up_elems_per_expert =
+            gate_up_bytes_per_expert / gate_up_type_size * gate_up_block_size;
+
+        let down_block_size = down_t.ggml_type.block_size() as u32;
+        let down_type_size  = down_t.ggml_type.type_size() as u32;
+        let down_bytes_per_expert = (down_t.byte_size / (n_experts as u64)) as u32;
+        let down_elems_per_expert =
+            down_bytes_per_expert / down_type_size * down_block_size;
+
+        let down_k = if down_t.shape[0] as u32 == n_experts {
+            mi_padded
+        } else {
+            down_t.shape[0] as u32
+        };
+
+        let gate_up_shader = layer_weight_indexed_shader(
+            ctx.model, ctx.layer,
+            "moe_experts.gate_up_proj",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
+        let down_shader = layer_weight_indexed_shader(
+            ctx.model, ctx.layer,
+            "moe_experts.down_proj",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
+        let gate_up_w = layer_weight(ctx.model, ctx.layer, "moe_experts.gate_up_proj");
+        let down_w    = layer_weight(ctx.model, ctx.layer, "moe_experts.down_proj");
+
+        let router = fwd.moe_router_gpu.as_ref()
+            .expect("b_step_moe_expert_ffn_gpu_direct requires moe_router_gpu");
+        let indices_buf = router.indices_scratch.handle;
+        let weights_buf = router.weights_scratch.handle;
+
+        let batch_in  = fwd.batch_o.handle;
+        let batch_out = fwd.batch_ffn_hidden.handle;
+
+        // Zero the full batch_ffn_hidden output slab once.
+        unsafe {
+            ctx.dev.device.cmd_fill_buffer(
+                ctx.cmd, batch_out, 0, (seq_len as u64) * h_bytes, 0,
+            );
+        }
+        transfer_to_compute_barrier(ctx.dev, ctx.cmd);
+
+        let gate_buf = fwd.cur().gate_buf.handle;
+        let up_buf   = fwd.cur().up_buf.handle;
+        let o_buf    = fwd.cur().o_buf.handle;
+        for t in 0..(seq_len as usize) {
+            let in_off  = (t as u64) * h_bytes;
+            let out_off = (t as u64) * h_bytes;
+            for k in 0..top_k {
+                let flat_slot = (t as u32) * top_k + k;
+
+                // (a) gate_up indexed GEMV.
+                fwd.run_gemv_indexed_at_offset(
+                    ctx.dev, ctx.registry, ctx.cmd,
+                    gate_up_w,
+                    batch_in, in_off, h_bytes,
+                    gate_buf, 0, 2 * mi_bytes,
+                    indices_buf,
+                    h, 2 * mi,
+                    gate_up_elems_per_expert,
+                    flat_slot,
+                    "moe_gate_up_id_b",
+                    gate_up_shader,
+                );
+                fwd.mark_written(&[gate_buf]);
+                fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[gate_buf]);
+
+                // (b) GLU.
+                let kernel = ctx.registry.get(ShaderId::GeluPytorchTanhGlu);
+                let set = fwd.alloc_or_get_set(
+                    ctx.dev, kernel.descriptor_set_layout,
+                    &[
+                        (0, gate_buf, 0, mi_bytes),
+                        (1, gate_buf, mi_bytes, mi_bytes),
+                        (2, up_buf, 0, mi_bytes),
+                    ],
+                );
+                let pc = SwigluPushConstants { n: mi };
+                let dispatch_x = (mi + 255) / 256;
+                let layout = kernel.pipeline_layout;
+                let pipeline = kernel.pipeline;
+                fwd.profile("moe_glu_id_b", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
+                    dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                    dev.device.cmd_bind_descriptor_sets(
+                        cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+                    );
+                    dev.device.cmd_push_constants(
+                        cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+                    );
+                    dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
+                });
+                fwd.mark_written(&[up_buf]);
+                fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[up_buf]);
+
+                // (c) down indexed GEMV.
+                fwd.run_gemv_indexed_at_offset(
+                    ctx.dev, ctx.registry, ctx.cmd,
+                    down_w,
+                    up_buf, 0, (down_k as u64) * 4,
+                    o_buf, 0, h_bytes,
+                    indices_buf,
+                    down_k, h,
+                    down_elems_per_expert,
+                    flat_slot,
+                    "moe_down_id_b",
+                    down_shader,
+                );
+                fwd.mark_written(&[o_buf]);
+                fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[o_buf]);
+
+                // (d) Indexed FMA into per-token slot of batch_out.
+                fwd.run_fma_add_indexed(
+                    ctx.dev, ctx.registry, ctx.cmd,
+                    o_buf, 0,
+                    batch_out, out_off,
+                    weights_buf,
+                    h, flat_slot,
+                    "moe_fma_add_id_b",
+                );
+                fwd.mark_written(&[batch_out]);
+                fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[batch_out]);
+            }
+        }
+        // Final barrier mirroring the CPU-readback path.
         compute_barrier(ctx.dev, ctx.cmd);
     }
 }

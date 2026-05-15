@@ -43,6 +43,35 @@ pub struct MatVecPushConstants {
 const _: () =
     assert!(std::mem::size_of::<MatVecPushConstants>() == PUSH_CONSTANT_BYTES as usize);
 
+/// Sprint 56C-2 — Push constants for the `MUL_MAT_ID` GEMV variants.
+/// llama.cpp's id-fused path uses 12 × u32 = 48 B (one u32 less than
+/// the non-id `MatVecPushConstants` — the latter ends in `broadcast3`
+/// which has no analogue in the id path). The first 8 u32s are
+/// identical; the last 4 differ in semantics:
+///   - `nei0`      — number of expert-index rows (= 1 in our slot-loop)
+///   - `ne11`      — input column-block divisor (= 1)
+///   - `expert_i1` — slot index into `data_ids[]` (caller varies)
+///   - `nbi1`      — stride into `data_ids[]` (= 1)
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct MatVecIdPushConstants {
+    pub ncols: u32,
+    pub stride_a: u32,
+    pub stride_b: u32,
+    pub stride_d: u32,
+    pub batch_stride_a: u32,
+    pub batch_stride_b: u32,
+    pub batch_stride_d: u32,
+    pub fusion_flags: u32,
+    pub nei0: u32,
+    pub ne11: u32,
+    pub expert_i1: u32,
+    pub nbi1: u32,
+}
+
+const _: () =
+    assert!(std::mem::size_of::<MatVecIdPushConstants>() == 48);
+
 /// Sprint 20-Wire — push constants for `mul_coopmat_fp8_naive.comp`
 /// (the FP8 prefill GEMM). 7 × u32 = 28 B. The kernel expects
 /// `weight_scale_bits = f32::to_bits(scale)` so the same descriptor

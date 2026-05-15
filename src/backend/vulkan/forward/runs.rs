@@ -30,7 +30,7 @@ use super::super::pipeline::{
     CoopmatPushConstants, FlashAttnBatchPushConstants, FlashAttnReducePushConstants,
     FlashAttnSplitPushConstants, Fp8BlockwiseGemmPushConstants,
     Fp8BlockwiseGemvPushConstants, Fp8GemmPushConstants, GenericBinaryPushConstants,
-    KvCopyFp16PushConstants, MatVecPushConstants, MmqPushConstants,
+    KvCopyFp16PushConstants, MatVecIdPushConstants, MatVecPushConstants, MmqPushConstants,
     MoeRouterNormGemvPushConstants, MoeRouterSoftmaxTopkPushConstants,
     MultiAddRmsPushConstants, Q8_1QuantizePushConstants, RmsNormMulRopePushConstants,
     RopePushConstants, ScalarAttnPushConstants, SwigluPushConstants,
@@ -1502,6 +1502,115 @@ impl Forward {
         );
         // Custom 8-byte push block matching `Params { uint ne; float scale; }`.
         let pc: [u32; 2] = [n, scale.to_bits()];
+        let dispatch_x = (n + 255) / 256;
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
+        });
+    }
+
+    /// Sprint 56C-2 — Indexed GEMV dispatch for GPU-direct MoE expert
+    /// FFN. Wraps the `MUL_MAT_ID` shader variants registered in 56C-1.
+    /// One dispatch covers a single (token, slot) pair: the shader
+    /// reads `expert_id = data_ids[expert_i1]` from the indices SSBO
+    /// (binding 5) and uses it as the row-offset into the contiguous
+    /// expert-weight buffer.
+    ///
+    /// Uses the 48 B `MatVecIdPushConstants` block (one u32 smaller than
+    /// the non-id variant — llama.cpp's id-fused shader drops the
+    /// `broadcast3` field).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_gemv_indexed_at_offset(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        weights: vk::Buffer,
+        input: vk::Buffer, input_offset: u64, input_range: u64,
+        output: vk::Buffer, output_offset: u64, output_range: u64,
+        indices: vk::Buffer,
+        k: u32,                       // input columns
+        m: u32,                       // output rows per expert
+        elements_per_expert: u32,     // `batch_stride_a` (M × K_padded in elements)
+        slot_index: u32,              // expert_i1 — flat index into data_ids
+        label: &str,
+        shader: ShaderId,             // one of the MulMatVec*Id variants
+    ) {
+        let kernel = registry.get(shader);
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[
+                (0, weights, 0, 0),
+                (1, input,  input_offset,  input_range),
+                (2, output, output_offset, output_range),
+                (3, self.fuse0.handle, 0, 0),
+                (4, self.fuse1.handle, 0, 0),
+                (5, indices, 0, 0),
+            ],
+        );
+        let pc = MatVecIdPushConstants {
+            ncols: k, stride_a: k, stride_b: k, stride_d: m,
+            batch_stride_a: elements_per_expert,
+            batch_stride_b: 0,
+            batch_stride_d: 0,
+            fusion_flags: 0,
+            nei0: 1,
+            ne11: 1,
+            expert_i1: slot_index,
+            nbi1: 1,
+        };
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            let n_rows = crate::backend::vulkan::pipeline_registry::MMV_NUM_ROWS;
+            let groups = (m + n_rows - 1) / n_rows;
+            dev.device.cmd_dispatch(cmd, groups, 1, 1);
+        });
+    }
+
+    /// Sprint 56C-2 — Indexed FMA add: `out[i] += weights[slot] * in[i]`.
+    /// Reads the per-expert routing weight from a GPU SSBO instead of
+    /// a push-constant scalar. Pairs with `run_gemv_indexed_at_offset`
+    /// for the GPU-direct MoE expert FFN.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_fma_add_indexed(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        in_buf: vk::Buffer, in_offset: u64,
+        out_buf: vk::Buffer, out_offset: u64,
+        weights: vk::Buffer,
+        n: u32,
+        slot_index: u32,
+        label: &str,
+    ) {
+        let kernel = registry.get(ShaderId::FmaAddIndexed);
+        let n_bytes = (n as u64) * 4;
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[
+                (0, in_buf,  in_offset,  n_bytes),
+                (1, out_buf, out_offset, n_bytes),
+                (2, weights, 0, 0),
+            ],
+        );
+        let pc: [u32; 2] = [n, slot_index];
         let dispatch_x = (n + 255) / 256;
         let layout = kernel.pipeline_layout;
         let pipeline = kernel.pipeline;

@@ -398,6 +398,38 @@ const JOBS: &[ShaderJob] = &[
             ("MUL_MAT_ID", "1"),
         ],
     },
+    // Sprint 56C-2 — Q4_0 indexed variant. Gemma-4-26B-A4B Q3_K_M
+    // GGUF mixes Q4_0 and Q5_0 for the per-layer down_exps weights;
+    // both branches need an indexed pipeline.
+    ShaderJob {
+        out_name: "mul_mat_vec_q4_0_f32_f32_id.spv",
+        entry_source: "mul_mat_vec.comp",
+        defines: &[
+            ("DATA_A_Q4_0", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("MUL_MAT_ID", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mat_vec_q4_0_f32_f32_id_subgroup.spv",
+        entry_source: "mul_mat_vec.comp",
+        defines: &[
+            ("DATA_A_Q4_0", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("USE_SUBGROUP_ADD", "1"),
+            ("MUL_MAT_ID", "1"),
+        ],
+    },
     // Sprint 56C-1 — Indexed FMA accumulator (out[i] += weights[slot] *
     // in[i]). Pendant to `fma_add.comp`; reads per-expert weight from
     // an SSBO instead of a push-constant scalar. Used by the GPU-direct

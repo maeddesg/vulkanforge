@@ -430,6 +430,47 @@ pub(crate) fn layer_weight_shader(model: &LoadedModel, layer: u32, suffix: &str,
     }
 }
 
+/// Sprint 56C-2 — Per-layer wrapper around `gemv_indexed_shader_for`.
+/// Looks up the tensor's `ggml_type` and dispatches to the matching
+/// `MulMatVec*Id` pipeline.
+pub(crate) fn layer_weight_indexed_shader(
+    model: &LoadedModel,
+    layer: u32,
+    suffix: &str,
+    subgroup: bool,
+) -> ShaderId {
+    let key = format!("blk.{layer}.{suffix}");
+    let ggml_type = model
+        .tensor(&key)
+        .unwrap_or_else(|| panic!("missing tensor '{key}'"))
+        .ggml_type;
+    gemv_indexed_shader_for(ggml_type, subgroup)
+}
+
+/// Sprint 56C-2 — Indexed GEMV variant selector for GPU-direct MoE
+/// expert FFN. Maps a quantization type + subgroup capability to the
+/// `MulMatVec*Id` pipeline registered in Sprint 56C-1. Only the three
+/// quants currently used by Gemma-4-26B-A4B's expert tensors are
+/// supported (Q3_K gate_up on GGUF, Q4_K on SafeTensors, Q5_0 down on
+/// GGUF). Other quants panic to surface dispatch-pick mistakes early.
+pub(crate) fn gemv_indexed_shader_for(ggml_type: GgmlType, subgroup: bool) -> ShaderId {
+    match (ggml_type, subgroup) {
+        (GgmlType::Q3K, true ) => ShaderId::MulMatVecQ3KIdSubgroup,
+        (GgmlType::Q3K, false) => ShaderId::MulMatVecQ3KId,
+        (GgmlType::Q4K, true ) => ShaderId::MulMatVecQ4KIdSubgroup,
+        (GgmlType::Q4K, false) => ShaderId::MulMatVecQ4KId,
+        (GgmlType::Q5_0, true ) => ShaderId::MulMatVecQ5_0IdSubgroup,
+        (GgmlType::Q5_0, false) => ShaderId::MulMatVecQ5_0Id,
+        (GgmlType::Q4_0, true ) => ShaderId::MulMatVecQ4_0IdSubgroup,
+        (GgmlType::Q4_0, false) => ShaderId::MulMatVecQ4_0Id,
+        (other, _) => panic!(
+            "gemv_indexed_shader_for: no indexed GEMV pipeline for \
+             ggml_type {other:?}; add a `MulMatVec*Id` build.rs ShaderJob \
+             + ShaderId arm",
+        ),
+    }
+}
+
 pub(crate) fn compute_barrier(dev: &VulkanDevice, cmd: vk::CommandBuffer) {
     let mb = vk::MemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::SHADER_WRITE)
