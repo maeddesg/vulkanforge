@@ -9,16 +9,15 @@
 
 use super::{
     batch_seq_len, batch_seq_pos, decode_io, decode_position, layer_dims_local,
-    n_kv_heads_for, quantize_input_after_q, BatchExec, DecodeExec, ExecCtx, ExecMode,
+    n_kv_heads_for, quantize_input_after_q, BatchExec, DecodeExec, ExecCtx,
 };
 use super::super::arch::{
-    compute_barrier, gemma4_kv_read_layer, gemma4_kv_start, layer_weight,
+    compute_barrier, layer_weight,
     layer_weight_opt, layer_weight_scale_block, layer_weight_scale_buf,
     layer_weight_scale_scalar, layer_weight_shader,
 };
 use super::super::state::Forward;
 use super::super::super::gguf::ModelConfig;
-use super::super::super::pipeline::RopePushConstants;
 use super::super::super::shaders::ShaderId;
 
 use ash::vk;
