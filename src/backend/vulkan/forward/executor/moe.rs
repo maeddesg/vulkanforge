@@ -1194,9 +1194,17 @@ impl BatchExec {
         cfg: &ModelConfig,
         ctx: &ExecCtx,
         n_experts: u32,
-        top_k: u32,
+        top_k_real: u32,
         moe_intermediate: u32,
     ) {
+        // Sprint 61G Test 1: VF_MOE_SINGLE_EXPERT=1 forces top_k=1 to
+        // isolate Multi-Expert FMA accumulation as the bug source. With
+        // top_k=1, only the highest-weighted expert per token runs and
+        // there's no FMA chain — just one dispatch per slot per token.
+        // If output becomes "Paris.", the bug is in Multi-Expert FMA.
+        let single_expert = std::env::var("VF_MOE_SINGLE_EXPERT")
+            .map(|v| v == "1").unwrap_or(false);
+        let top_k = if single_expert { 1 } else { top_k_real };
         let seq_len = batch_seq_len(ctx);
         let h = cfg.hidden_dim;
         let mi = moe_intermediate;
@@ -1238,12 +1246,11 @@ impl BatchExec {
         let batch_out = fwd.batch_ffn_hidden.handle;
 
         // -------- 2. Readback router indices+weights for grouping --------
-        // The Sprint 56C GPU-direct b_step_moe_route emits a
-        // compute_barrier and returns when gpu_direct_moe_enabled
-        // — so indices/weights are GPU-resident here. Issue a small
-        // (seq_len × top_k × 8 B) copy → submit → wait → CPU sort.
-        let topk_bytes = (top_k as u64) * 4;
-        let all_topk_bytes = (seq_len as u64) * topk_bytes;
+        // Read the FULL `seq_len × top_k_real` to staging, then on CPU
+        // either pass through (normal mode) or extract slot 0 per token
+        // (single_expert mode).
+        let topk_real_bytes = (top_k_real as u64) * 4;
+        let all_topk_real_bytes = (seq_len as u64) * topk_real_bytes;
         let bar_pre = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
             .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
@@ -1256,14 +1263,14 @@ impl BatchExec {
                 std::slice::from_ref(&bar_pre), &[], &[],
             );
             let cp_idx = vk::BufferCopy {
-                src_offset: 0, dst_offset: 0, size: all_topk_bytes,
+                src_offset: 0, dst_offset: 0, size: all_topk_real_bytes,
             };
             ctx.dev.device.cmd_copy_buffer(
                 ctx.cmd, router_indices, router_readback_staging,
                 std::slice::from_ref(&cp_idx),
             );
             let cp_w = vk::BufferCopy {
-                src_offset: 0, dst_offset: all_topk_bytes, size: all_topk_bytes,
+                src_offset: 0, dst_offset: all_topk_real_bytes, size: all_topk_real_bytes,
             };
             ctx.dev.device.cmd_copy_buffer(
                 ctx.cmd, router_weights, router_readback_staging,
@@ -1275,38 +1282,41 @@ impl BatchExec {
             .expect("mid_frame_submit_and_wait failed (grouped readback)");
 
         // -------- 3. CPU read of router indices/weights + count tally --------
-        // CRITICAL: mul_mmq.comp's MUL_MAT_ID branch indexes IDS as
-        // `data_ids[ii1 * nbi1 + ii0] = EXPERT_ID for token=ii1 slot=ii0`
-        // (the *raw* router layout, not a sorted-by-expert order). The
-        // shader scans IDS per workgroup-Z (expert) and gathers matching
-        // (ii0, ii1) into shared `row_ids[]`. So we upload `idx_slice`
-        // unchanged — NO counting-sort. Only `data_counts[expert]` is
-        // computed CPU-side (used by the workgroup early-exit). FMA-add
-        // also iterates (token, slot) in original order; output cell
-        // `[t × top_k + s]` in `grouped_down_out` already lands at the
-        // right place because the shader's D-write uses the *same*
-        // (row_idx.y=token, row_idx.x=slot) it gathered from IDS.
         let (counts_vec, indices_host, weights_host) = {
             let raw = fwd.moe_router_gpu.as_ref().unwrap()
                 .readback_staging.read_bytes()
                 .expect("readback_staging not host-visible");
-            let total_topk = (seq_len as usize) * (top_k as usize);
-            let idx_slice: &[u32] = bytemuck::cast_slice(&raw[..(total_topk * 4)]);
-            let w_slice: &[f32] = bytemuck::cast_slice(
-                &raw[(total_topk * 4)..(total_topk * 8)],
+            let total_topk_real = (seq_len as usize) * (top_k_real as usize);
+            let idx_slice_full: &[u32] = bytemuck::cast_slice(&raw[..(total_topk_real * 4)]);
+            let w_slice_full: &[f32] = bytemuck::cast_slice(
+                &raw[(total_topk_real * 4)..(total_topk_real * 8)],
             );
             if ctx.layer == 0
                 && !MOE_LAYER0_LOGGED.swap(true, std::sync::atomic::Ordering::SeqCst)
             {
-                let routing0: Vec<(u32, f32)> = (0..(top_k as usize))
-                    .map(|k| (idx_slice[k], w_slice[k])).collect();
+                let routing0: Vec<(u32, f32)> = (0..(top_k_real as usize))
+                    .map(|k| (idx_slice_full[k], w_slice_full[k])).collect();
                 log_router_decision(0, &routing0);
             }
+            // For single_expert mode: extract slot 0 per token only,
+            // re-normalize weight to 1.0 (since we drop the rest of
+            // the top-K mass) so the FMA sums match unit weight.
+            let (idx_v, w_v): (Vec<u32>, Vec<f32>) = if single_expert {
+                let mut iv = Vec::with_capacity(seq_len as usize);
+                let mut wv = Vec::with_capacity(seq_len as usize);
+                for t in 0..(seq_len as usize) {
+                    iv.push(idx_slice_full[t * (top_k_real as usize)]);
+                    wv.push(1.0); // single-expert: full weight
+                }
+                (iv, wv)
+            } else {
+                (idx_slice_full.to_vec(), w_slice_full.to_vec())
+            };
             let mut counts = vec![0u32; n_experts as usize];
-            for &e in idx_slice {
+            for &e in &idx_v {
                 counts[e as usize] += 1;
             }
-            (counts, idx_slice.to_vec(), w_slice.to_vec())
+            (counts, idx_v, w_v)
         };
 
         // -------- 4. Upload indices + counts to GPU SSBOs --------
@@ -1690,14 +1700,16 @@ impl BatchExec {
                         "moe_fma_add_grouped",
                     );
                 }
-                // Sprint 61E note: tried injecting per-FMA
-                // compute_barrier here (the 8 FMAs for the same token
-                // all read-and-write `batch_out[t*h..(t+1)*h]`), but
-                // it produced empty output. Bisect path uses
-                // `maybe_compute_barrier(&[batch_out])` which seems to
-                // handle the RAW chain differently. Left out for
-                // matching the 61C state; Sprint 61F should re-examine
-                // whether the per-FMA barrier is actually correct.
+                // Sprint 61G — Per-FMA barrier confirmed necessary.
+                // Single-expert mode (top_k=1, no FMA chain) produces
+                // "Paris." correctly; multi-expert (top_k=8) without
+                // this barrier produces coherent-irrelevant output
+                // because the 8 FMAs for each token race on
+                // `batch_out[t*h..(t+1)*h]`. The bisect-side equivalent
+                // is `maybe_compute_barrier(&[batch_out])` after each
+                // `run_fma_add_indexed`. Emitting the same Vulkan
+                // primitive directly here.
+                compute_barrier(ctx.dev, ctx.cmd);
             }
         }
         compute_barrier(ctx.dev, ctx.cmd);
