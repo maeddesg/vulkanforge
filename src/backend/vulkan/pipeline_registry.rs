@@ -429,7 +429,15 @@ impl PipelineRegistry {
                 // BLOCK_SIZE / BM / BN / WM / WN / WMITER / TM / TN /
                 // TK / WARP values map 1:1 to the K-quant pipelines so
                 // the LDS footprint and warp geometry stay consistent.
-                | ShaderId::MulMmF32 | ShaderId::MulMmF32Aligned => {
+                | ShaderId::MulMmF32 | ShaderId::MulMmF32Aligned
+                // Sprint 61D — MUL_MAT_ID mul_mm variants for the grouped
+                // expert-FFN down dispatch. Share the same 11-spec-const
+                // surface as the stock mul_mm pipelines; the MUL_MAT_ID
+                // branch only changes push-constant semantics + adds
+                // bindings 3/4 (IDS, Counts), neither of which touches
+                // the spec block.
+                | ShaderId::MulMmQ3KMatId | ShaderId::MulMmQ4KMatId
+                | ShaderId::MulMmQ4_0MatId | ShaderId::MulMmQ5_0MatId => {
                     // Phase 6 v0.1.2 — mul_mm.comp port. Same spec-
                     // constant layout as MulMmqQ4K/Q6K but no
                     // ACC_TYPEV2 (the build defines that as `vec2` —

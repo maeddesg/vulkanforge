@@ -15,8 +15,8 @@ use super::{
     MOE_LAYER0_LOGGED,
 };
 use super::super::arch::{
-    compute_barrier, layer_weight, layer_weight_indexed_shader, layer_weight_mmq_id_shader,
-    layer_weight_shader, transfer_to_compute_barrier,
+    compute_barrier, layer_weight, layer_weight_indexed_shader, layer_weight_mm_id_shader,
+    layer_weight_mmq_id_shader, layer_weight_shader, transfer_to_compute_barrier,
 };
 use super::super::state::Forward;
 use super::super::super::gguf::ModelConfig;
@@ -1532,6 +1532,18 @@ impl BatchExec {
         }
 
         // -------- 8. Q8_1 quantize GLU output → grouped_glu_q8 --------
+        //
+        // Sprint 61D attempted to skip this Q8_1 step by switching the
+        // down dispatch from `mul_mmq_id` (Q8_1 B) to `mul_mm_id`
+        // (FP32 B). The mul_mm_id SPVs are built and registered for
+        // Q3_K / Q4_K / Q4_0 / Q5_0, but empirical test showed
+        // `run_mmq_id_grouped` with a mul_mm shader writes ALL ZEROS
+        // to `grouped_down_out` — the quant-A indexing math in
+        // `mul_mm.comp` (uses `/LOAD_VEC_A`) doesn't map trivially to
+        // the `/BK` units the helper assumes. Reverting to mul_mmq_id
+        // (Sprint 61C state — coherent-but-incorrect output due to
+        // Q8_1 noise compounding) to preserve a working build until
+        // Sprint 61E does the proper mul_mm_id quant-A param work.
         fwd.run_quantize_q8_1(
             ctx.dev, ctx.registry, ctx.cmd,
             grouped_glu_out, grouped_glu_q8,
@@ -1540,7 +1552,7 @@ impl BatchExec {
         );
         compute_barrier(ctx.dev, ctx.cmd);
 
-        // -------- 9. down MMQ_ID (1 dispatch over all experts) --------
+        // -------- 9. down MMQ_ID (Q8_1 B, 1 dispatch over all experts) --------
         let down_t = ctx.model
             .tensor(&format!("blk.{}.moe_experts.down_proj", ctx.layer))
             .expect("moe_experts.down_proj missing");

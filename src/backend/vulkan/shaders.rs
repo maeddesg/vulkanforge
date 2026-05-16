@@ -426,6 +426,16 @@ pub enum ShaderId {
     MulMmqQ4_0MatIdSubgroup,
     MulMmqQ5_0MatId,
     MulMmqQ5_0MatIdSubgroup,
+    // Sprint 61D — mul_mm MUL_MAT_ID variants (FP32 B input).
+    // Used by `b_step_moe_expert_ffn_grouped` for the down dispatch
+    // to skip the second `quantize_q8_1` step that Sprint 61C-3
+    // showed was causing the cumulative logit drift. gate_up stays
+    // on `MulMmq*MatId` (Q8_1 B) since one Q8_1 round per layer
+    // proved tolerable in the 61C-2 bisect.
+    MulMmQ3KMatId,
+    MulMmQ4KMatId,
+    MulMmQ4_0MatId,
+    MulMmQ5_0MatId,
 }
 
 impl ShaderId {
@@ -569,6 +579,10 @@ impl ShaderId {
             ShaderId::MulMmqQ4_0MatIdSubgroup => "mul_mmq_q4_0_f32_id_subgroup",
             ShaderId::MulMmqQ5_0MatId => "mul_mmq_q5_0_f32_id",
             ShaderId::MulMmqQ5_0MatIdSubgroup => "mul_mmq_q5_0_f32_id_subgroup",
+            ShaderId::MulMmQ3KMatId => "mul_mm_q3_k_f32_id",
+            ShaderId::MulMmQ4KMatId => "mul_mm_q4_k_f32_id",
+            ShaderId::MulMmQ4_0MatId => "mul_mm_q4_0_f32_id",
+            ShaderId::MulMmQ5_0MatId => "mul_mm_q5_0_f32_id",
         }
     }
 
@@ -719,6 +733,10 @@ impl ShaderId {
             ShaderId::MulMmqQ4_0MatIdSubgroup => MUL_MMQ_Q4_0_F32_ID_SUBGROUP,
             ShaderId::MulMmqQ5_0MatId => MUL_MMQ_Q5_0_F32_ID,
             ShaderId::MulMmqQ5_0MatIdSubgroup => MUL_MMQ_Q5_0_F32_ID_SUBGROUP,
+            ShaderId::MulMmQ3KMatId => MUL_MM_Q3_K_F32_ID,
+            ShaderId::MulMmQ4KMatId => MUL_MM_Q4_K_F32_ID,
+            ShaderId::MulMmQ4_0MatId => MUL_MM_Q4_0_F32_ID,
+            ShaderId::MulMmQ5_0MatId => MUL_MM_Q5_0_F32_ID,
         }
     }
 }
@@ -869,6 +887,11 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::MulMmqQ4_0MatIdSubgroup,
     ShaderId::MulMmqQ5_0MatId,
     ShaderId::MulMmqQ5_0MatIdSubgroup,
+    // Sprint 61D — mul_mm MUL_MAT_ID variants (FP32 B) for grouped down.
+    ShaderId::MulMmQ3KMatId,
+    ShaderId::MulMmQ4KMatId,
+    ShaderId::MulMmQ4_0MatId,
+    ShaderId::MulMmQ5_0MatId,
 ];
 
 /// Sprint 16C — Sprint-3 era Q4_K coopmat GEMM variants gated behind
@@ -1140,6 +1163,19 @@ pub const MUL_MMQ_Q5_0_F32_ID: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mmq_q5_0_f32_id.spv"));
 pub const MUL_MMQ_Q5_0_F32_ID_SUBGROUP: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mmq_q5_0_f32_id_subgroup.spv"));
+
+// Sprint 61D — mul_mm MUL_MAT_ID variants (FP32 B). Same push-constant
+// layout as the mul_mmq variants above (52 B / 13 u32), reuses
+// `MmqIdPushConstants`. Bindings 0-4 are A/B/D/IDS/Counts (auto-derived
+// from SPIR-V reflection).
+pub const MUL_MM_Q3_K_F32_ID: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q3_k_f32_id.spv"));
+pub const MUL_MM_Q4_K_F32_ID: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q4_k_f32_id.spv"));
+pub const MUL_MM_Q4_0_F32_ID: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q4_0_f32_id.spv"));
+pub const MUL_MM_Q5_0_F32_ID: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mm_q5_0_f32_id.spv"));
 
 /// Decode a SPIR-V byte blob into u32 words. Vulkan consumes SPIR-V
 /// as `&[u32]`; `include_bytes!` only gives us `&[u8]` whose alignment

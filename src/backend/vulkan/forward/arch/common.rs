@@ -512,6 +512,42 @@ pub(crate) fn layer_weight_mmq_id_shader(
     mmq_id_shader_for(ggml_type, subgroup)
 }
 
+/// Sprint 61D — MUL_MAT_ID `mul_mm` (FP32 B) variant selector. Picks
+/// the `MulMm*MatId` SPV registered in 61D. Used by the grouped
+/// expert-FFN **down** dispatch to skip the second `quantize_q8_1` step
+/// that 61C-3 element-dumps proved was compounding into ~13 % logit-tail
+/// drift across 25 MoE layers.
+///
+/// No subgroup parameter yet — 61D ships the stock builds only;
+/// subgroup variants can be added later if they prove faster.
+pub(crate) fn mm_id_shader_for(ggml_type: GgmlType) -> ShaderId {
+    match ggml_type {
+        GgmlType::Q3K  => ShaderId::MulMmQ3KMatId,
+        GgmlType::Q4K  => ShaderId::MulMmQ4KMatId,
+        GgmlType::Q4_0 => ShaderId::MulMmQ4_0MatId,
+        GgmlType::Q5_0 => ShaderId::MulMmQ5_0MatId,
+        other => panic!(
+            "mm_id_shader_for: no mul_mm MUL_MAT_ID pipeline for \
+             ggml_type {other:?}; add a `MulMm*MatId` build.rs ShaderJob \
+             + ShaderId arm",
+        ),
+    }
+}
+
+/// Sprint 61D — model-driven mul_mm MUL_MAT_ID shader selector.
+pub(crate) fn layer_weight_mm_id_shader(
+    model: &LoadedModel,
+    layer: u32,
+    suffix: &str,
+) -> ShaderId {
+    let key = format!("blk.{layer}.{suffix}");
+    let ggml_type = model
+        .tensor(&key)
+        .unwrap_or_else(|| panic!("missing tensor '{key}'"))
+        .ggml_type;
+    mm_id_shader_for(ggml_type)
+}
+
 pub(crate) fn compute_barrier(dev: &VulkanDevice, cmd: vk::CommandBuffer) {
     let mb = vk::MemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::SHADER_WRITE)

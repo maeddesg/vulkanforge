@@ -1285,6 +1285,83 @@ const JOBS: &[ShaderJob] = &[
             ("MUL_MAT_ID_USE_SUBGROUPS", "1"),
         ],
     },
+    // Sprint 61D — mul_mm.comp MUL_MAT_ID variants (FP32 B input).
+    // Same source as the stock mul_mm builds above with MUL_MAT_ID=1
+    // added; eliminates the second `quantize_q8_1` step that
+    // Sprint 61C-3 element-dumps proved is the dominant source of
+    // numerical drift in the grouped expert-FFN path (50 extra Q8_1
+    // rounds across 25 MoE layers compounds to a ~13 % logit-tail
+    // drift, flipping LM-head argmax even at cos ≥ 0.9999 per-layer).
+    //
+    // Sprint 61C-2 bisect proved that ONE Q8_1 (gate_up input) per
+    // MoE layer is tolerable, so only the **down** dispatch swaps to
+    // mul_mm_id. The gate_up dispatch stays on mul_mmq_id for now.
+    //
+    // Push-constants and bindings are bit-identical to mul_mmq.comp's
+    // MUL_MAT_ID branch (52 B / 13 u32, 5 SSBOs), so the registry
+    // arm + push-constant struct are shared with 61B.
+    ShaderJob {
+        out_name: "mul_mm_q3_k_f32_id.spv",
+        entry_source: "mul_mm.comp",
+        defines: &[
+            ("DATA_A_Q3_K", "1"),
+            ("A_TYPE", "block_q3_K"),
+            ("A_TYPE_PACKED16", "block_q3_K_packed16"),
+            ("B_TYPE", "float"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("ACC_TYPE", "float"),
+            ("ACC_TYPEV2", "vec2"),
+            ("LOAD_VEC_A", "2"),
+            ("MUL_MAT_ID", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mm_q4_k_f32_id.spv",
+        entry_source: "mul_mm.comp",
+        defines: &[
+            ("DATA_A_Q4_K", "1"),
+            ("A_TYPE", "block_q4_K"),
+            ("A_TYPE_PACKED32", "block_q4_K_packed32"),
+            ("B_TYPE", "float"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("ACC_TYPE", "float"),
+            ("ACC_TYPEV2", "vec2"),
+            ("LOAD_VEC_A", "4"),
+            ("MUL_MAT_ID", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mm_q4_0_f32_id.spv",
+        entry_source: "mul_mm.comp",
+        defines: &[
+            ("DATA_A_Q4_0", "1"),
+            ("B_TYPE", "float"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("ACC_TYPE", "float"),
+            ("ACC_TYPEV2", "vec2"),
+            ("MUL_MAT_ID", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mm_q5_0_f32_id.spv",
+        entry_source: "mul_mm.comp",
+        defines: &[
+            ("DATA_A_Q5_0", "1"),
+            ("B_TYPE", "float"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("ACC_TYPE", "float"),
+            ("ACC_TYPEV2", "vec2"),
+            ("MUL_MAT_ID", "1"),
+        ],
+    },
     // Quantize FP32 activations → block_q8_1_x4 — needed before each
     // mul_mmq dispatch since B is consumed as Q8_1.
     ShaderJob {
