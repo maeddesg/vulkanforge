@@ -1533,17 +1533,19 @@ impl BatchExec {
 
         // -------- 8. Q8_1 quantize GLU output → grouped_glu_q8 --------
         //
-        // Sprint 61D attempted to skip this Q8_1 step by switching the
-        // down dispatch from `mul_mmq_id` (Q8_1 B) to `mul_mm_id`
-        // (FP32 B). The mul_mm_id SPVs are built and registered for
-        // Q3_K / Q4_K / Q4_0 / Q5_0, but empirical test showed
-        // `run_mmq_id_grouped` with a mul_mm shader writes ALL ZEROS
-        // to `grouped_down_out` — the quant-A indexing math in
-        // `mul_mm.comp` (uses `/LOAD_VEC_A`) doesn't map trivially to
-        // the `/BK` units the helper assumes. Reverting to mul_mmq_id
-        // (Sprint 61C state — coherent-but-incorrect output due to
-        // Q8_1 noise compounding) to preserve a working build until
-        // Sprint 61E does the proper mul_mm_id quant-A param work.
+        // Sprint 61E PROGRESS: switched the down dispatch from
+        // `mul_mmq_id` (Q8_1 B) to `mul_mm_id` (FP32 B) with
+        // LOAD_VEC_A=4 for Q4_0/Q5_0 to eliminate the second Q8_1
+        // round-trip. Element-dump confirmed layer-0 down output is
+        // BIT-CORRECT (cos ≥ 0.9999 vs the legacy per-slot GEMV
+        // reference). But the full-prefill output still drifted
+        // ("0000…", "n / The provided text…") even after adding
+        // per-FMA compute_barriers. Root cause not isolated in 61E's
+        // budget — likely later-layer drift or an FMA-loop race the
+        // bisect's `maybe_compute_barrier` sidesteps via different
+        // memory hazard tracking. Reverted to mul_mmq_id to preserve
+        // a working build until Sprint 61F can do per-layer dumps +
+        // race analysis.
         fwd.run_quantize_q8_1(
             ctx.dev, ctx.registry, ctx.cmd,
             grouped_glu_out, grouped_glu_q8,
@@ -1688,6 +1690,14 @@ impl BatchExec {
                         "moe_fma_add_grouped",
                     );
                 }
+                // Sprint 61E note: tried injecting per-FMA
+                // compute_barrier here (the 8 FMAs for the same token
+                // all read-and-write `batch_out[t*h..(t+1)*h]`), but
+                // it produced empty output. Bisect path uses
+                // `maybe_compute_barrier(&[batch_out])` which seems to
+                // handle the RAW chain differently. Left out for
+                // matching the 61C state; Sprint 61F should re-examine
+                // whether the per-FMA barrier is actually correct.
             }
         }
         compute_barrier(ctx.dev, ctx.cmd);

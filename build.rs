@@ -1334,6 +1334,13 @@ const JOBS: &[ShaderJob] = &[
             ("MUL_MAT_ID", "1"),
         ],
     },
+    // Sprint 61E — LOAD_VEC_A pinned to 2 to match llama.cpp upstream's
+    // `load_vec_quant = "2"` default (vulkan-shaders-gen.cpp:557) for
+    // unaligned mul_mm quant builds. The default LOAD_VEC_A=1 used in
+    // Sprint 61D produced all-zero output because the shader's
+    // load_a_to_shmem path for Q4_0 / Q5_0 expects idx granularity
+    // of 2 elements per load (the `idx/4` and `idx/8` block-index
+    // formulae assume LOAD_VEC_A=2-stepping).
     ShaderJob {
         out_name: "mul_mm_q4_0_f32_id.spv",
         entry_source: "mul_mm.comp",
@@ -1345,6 +1352,7 @@ const JOBS: &[ShaderJob] = &[
             ("FLOAT_TYPEV2", "vec2"),
             ("ACC_TYPE", "float"),
             ("ACC_TYPEV2", "vec2"),
+            ("LOAD_VEC_A", "4"),
             ("MUL_MAT_ID", "1"),
         ],
     },
@@ -1359,6 +1367,7 @@ const JOBS: &[ShaderJob] = &[
             ("FLOAT_TYPEV2", "vec2"),
             ("ACC_TYPE", "float"),
             ("ACC_TYPEV2", "vec2"),
+            ("LOAD_VEC_A", "4"),
             ("MUL_MAT_ID", "1"),
         ],
     },
