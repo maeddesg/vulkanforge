@@ -198,14 +198,43 @@ impl BatchExec {
             // (1) gate_t = per_layer_input_gate @ output[t]  (1536 → 256).
             {
                 let kernel = ctx.registry.get(s_gate);
-                let set = fwd.alloc_or_get_set(
-                    ctx.dev, kernel.descriptor_set_layout,
-                    &[
-                        (0, w_gate, 0, 0),
-                        (1, output, out_off, hidden_bytes),
-                        (2, scratch_gate, gate_off, hps_bytes),
-                    ],
+                // K-quant GEMV variants (MulMatVecQ*) include `Fuse0` /
+                // `Fuse1` at bindings 3+4 via mul_mat_vec_iface.glsl;
+                // their descriptor-set layout has 5 bindings. F32 / F16
+                // / FP8 variants drop those (compiler eliminates the
+                // declared-but-unused dummies) and have 3-binding
+                // layouts. Bind appropriately to silence validation
+                // ("descriptor Fuse0 never updated" for the 5-binding
+                // pipelines when only bindings 0-2 are written).
+                let is_one_per_row = matches!(
+                    s_gate,
+                    ShaderId::MulMatVecFp8
+                        | ShaderId::MulMatVecF32
+                        | ShaderId::MulMatVecF16,
                 );
+                let set = if is_one_per_row {
+                    fwd.alloc_or_get_set(
+                        ctx.dev, kernel.descriptor_set_layout,
+                        &[
+                            (0, w_gate, 0, 0),
+                            (1, output, out_off, hidden_bytes),
+                            (2, scratch_gate, gate_off, hps_bytes),
+                        ],
+                    )
+                } else {
+                    let fuse0 = fwd.fuse0.handle;
+                    let fuse1 = fwd.fuse1.handle;
+                    fwd.alloc_or_get_set(
+                        ctx.dev, kernel.descriptor_set_layout,
+                        &[
+                            (0, w_gate, 0, 0),
+                            (1, output, out_off, hidden_bytes),
+                            (2, scratch_gate, gate_off, hps_bytes),
+                            (3, fuse0, 0, 0),
+                            (4, fuse1, 0, 0),
+                        ],
+                    )
+                };
                 let pc = MatVecPushConstants {
                     ncols: hidden, stride_a: hidden, stride_b: hidden, stride_d: hps,
                     batch_stride_a: hidden * hps, batch_stride_b: hidden, batch_stride_d: hps,
@@ -259,14 +288,35 @@ impl BatchExec {
             // (3) proj_t = per_layer_projection @ gate_t  (256 → 1536).
             {
                 let kernel = ctx.registry.get(s_proj);
-                let set = fwd.alloc_or_get_set(
-                    ctx.dev, kernel.descriptor_set_layout,
-                    &[
-                        (0, w_proj, 0, 0),
-                        (1, scratch_gate, gate_off, hps_bytes),
-                        (2, scratch_proj, proj_off, hidden_bytes),
-                    ],
+                let is_one_per_row = matches!(
+                    s_proj,
+                    ShaderId::MulMatVecFp8
+                        | ShaderId::MulMatVecF32
+                        | ShaderId::MulMatVecF16,
                 );
+                let set = if is_one_per_row {
+                    fwd.alloc_or_get_set(
+                        ctx.dev, kernel.descriptor_set_layout,
+                        &[
+                            (0, w_proj, 0, 0),
+                            (1, scratch_gate, gate_off, hps_bytes),
+                            (2, scratch_proj, proj_off, hidden_bytes),
+                        ],
+                    )
+                } else {
+                    let fuse0 = fwd.fuse0.handle;
+                    let fuse1 = fwd.fuse1.handle;
+                    fwd.alloc_or_get_set(
+                        ctx.dev, kernel.descriptor_set_layout,
+                        &[
+                            (0, w_proj, 0, 0),
+                            (1, scratch_gate, gate_off, hps_bytes),
+                            (2, scratch_proj, proj_off, hidden_bytes),
+                            (3, fuse0, 0, 0),
+                            (4, fuse1, 0, 0),
+                        ],
+                    )
+                };
                 let pc = MatVecPushConstants {
                     ncols: hps, stride_a: hps, stride_b: hps, stride_d: hidden,
                     batch_stride_a: hps * hidden, batch_stride_b: hps, batch_stride_d: hidden,
