@@ -55,6 +55,23 @@ pub(crate) fn moe_grouped_subgroup_enabled() -> bool {
     })
 }
 
+/// Sprint P4-1 — env-gated batched-GEMV decode MoE path. Reduces
+/// gate_up / down dispatches from `top_k` each to 1 each (Y-dispatch
+/// = top_k workgroups in a single `vkCmdDispatch`). Requires the
+/// decode-scale grouped scratch buffers allocated in `setup.rs` under
+/// the same env flag; the path `unwrap`s on `moe_router_gpu` so it's
+/// gated on the GPU router being live (same precondition as the
+/// existing `step_moe_expert_ffn_gpu_direct` slot-loop).
+pub(crate) fn batched_decode_moe_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("VF_MOE_BATCHED_DECODE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 impl DecodeExec {
     // === Sprint 51D-B Block 1 — Gemma-4-26B-A4B MoE FFN-Block norms + add ===
 
@@ -466,6 +483,17 @@ impl DecodeExec {
         top_k: u32,
         moe_intermediate: u32,
     ) {
+        // Sprint P4-1 — env-gated batched-GEMV decode path. Reduces 8
+        // gate_up + 8 down dispatches to 2 (one Y-dispatched dispatch
+        // each). Per-slot GLU and FMA loops stay (defer FMA fusion to
+        // P4-2). Default off — only the slot-loop path is regression-
+        // gated.
+        if batched_decode_moe_enabled() {
+            self.step_moe_expert_ffn_gpu_direct_batched(
+                fwd, cfg, ctx, n_experts, top_k, moe_intermediate,
+            );
+            return;
+        }
         let scratch_b  = fwd.cur().scratch_b.handle;
         let gate_buf   = fwd.cur().gate_buf.handle;
         let up_buf     = fwd.cur().up_buf.handle;
@@ -603,6 +631,208 @@ impl DecodeExec {
                 weights_buf,
                 h, slot,
                 "moe_fma_add_id",
+            );
+            fwd.mark_written(&[ffn_hidden]);
+            fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[ffn_hidden]);
+        }
+    }
+
+    /// Sprint P4-1 — batched-GEMV decode MoE FFN. Y-dispatches the
+    /// indexed GEMV over `top_k` slots in ONE dispatch each for
+    /// `gate_up` and `down` (was 16 dispatches → 2). Per-slot GLU
+    /// reads from `grouped_gate_up_out[k]` and writes
+    /// `grouped_glu_out[k]`; per-slot indexed FMA reads from
+    /// `grouped_down_out[k]` and accumulates into `ffn_hidden`. Net
+    /// per layer: 1 + top_k + 1 + top_k = 2 + 2*top_k (vs 4*top_k
+    /// for the slot-loop path).
+    ///
+    /// Buffer reuse: `grouped_gate_up_out` / `grouped_glu_out` /
+    /// `grouped_down_out` from `MoeRouterGpu`. Setup allocates them
+    /// at decode scale (`top_k * per-slot-size`, ~155 KiB total)
+    /// when `VF_MOE_BATCHED_DECODE=1` is set.
+    #[allow(clippy::too_many_arguments)]
+    fn step_moe_expert_ffn_gpu_direct_batched(
+        &self,
+        fwd: &mut Forward,
+        cfg: &ModelConfig,
+        ctx: &ExecCtx,
+        n_experts: u32,
+        top_k: u32,
+        moe_intermediate: u32,
+    ) {
+        let scratch_b  = fwd.cur().scratch_b.handle;
+        let ffn_hidden = fwd.cur().ffn_hidden.handle;
+        let h          = cfg.hidden_dim;
+        let mi         = moe_intermediate;
+        let mi_padded: u32 = ((mi + 255) / 256) * 256;
+
+        let gate_up_t = ctx.model
+            .tensor(&format!("blk.{}.moe_experts.gate_up_proj", ctx.layer))
+            .expect("moe_experts.gate_up_proj missing");
+        let down_t = ctx.model
+            .tensor(&format!("blk.{}.moe_experts.down_proj", ctx.layer))
+            .expect("moe_experts.down_proj missing");
+
+        let gate_up_block_size = gate_up_t.ggml_type.block_size() as u32;
+        let gate_up_type_size  = gate_up_t.ggml_type.type_size() as u32;
+        let gate_up_bytes_per_expert = (gate_up_t.byte_size / (n_experts as u64)) as u32;
+        let gate_up_elems_per_expert =
+            gate_up_bytes_per_expert / gate_up_type_size * gate_up_block_size;
+
+        let down_block_size = down_t.ggml_type.block_size() as u32;
+        let down_type_size  = down_t.ggml_type.type_size() as u32;
+        let down_bytes_per_expert = (down_t.byte_size / (n_experts as u64)) as u32;
+        let down_elems_per_expert =
+            down_bytes_per_expert / down_type_size * down_block_size;
+
+        let down_k = if down_t.shape[0] as u32 == n_experts {
+            mi_padded
+        } else {
+            down_t.shape[0] as u32
+        };
+
+        let gate_up_shader = layer_weight_indexed_shader(
+            ctx.model, ctx.layer,
+            "moe_experts.gate_up_proj",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
+        let down_shader = layer_weight_indexed_shader(
+            ctx.model, ctx.layer,
+            "moe_experts.down_proj",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
+        let gate_up_w = layer_weight(ctx.model, ctx.layer, "moe_experts.gate_up_proj");
+        let down_w    = layer_weight(ctx.model, ctx.layer, "moe_experts.down_proj");
+
+        // Snapshot router + batched-scratch buffer handles up-front so
+        // subsequent `&mut self` calls on Forward don't fight the
+        // borrow checker (same pattern as `b_step_moe_expert_ffn_grouped`).
+        let (
+            indices_buf,
+            weights_buf,
+            gate_up_out,
+            glu_out,
+            down_out,
+        ) = {
+            let router = fwd.moe_router_gpu.as_ref()
+                .expect("step_moe_expert_ffn_gpu_direct_batched requires moe_router_gpu");
+            (
+                router.indices_scratch.handle,
+                router.weights_scratch.handle,
+                router.grouped_gate_up_out.handle,
+                router.grouped_glu_out.handle,
+                router.grouped_down_out.handle,
+            )
+        };
+
+        // Zero the accumulator before per-slot FMA chain. fill_buffer
+        // → COMPUTE barrier (Sprint 51D-D pattern).
+        unsafe {
+            ctx.dev.device.cmd_fill_buffer(
+                ctx.cmd, ffn_hidden, 0, (h as u64) * 4, 0,
+            );
+        }
+        transfer_to_compute_barrier(ctx.dev, ctx.cmd);
+
+        let h_bytes  = (h as u64) * 4;
+        let mi_bytes = (mi as u64) * 4;
+        let two_mi_bytes = 2 * mi_bytes;
+        let gate_up_out_total = (top_k as u64) * two_mi_bytes;
+        let down_out_total    = (top_k as u64) * h_bytes;
+
+        // (1) Batched gate_up indexed GEMV. One dispatch covers all
+        //     `top_k` slots: Y workgroups index into `indices_scratch`
+        //     by `gl_WorkGroupID.y` and each writes its 2*mi outputs
+        //     to `gate_up_out[k * 2*mi]`. All slots read the same B
+        //     (shared token hidden), so ne11=1 / stride_b=0.
+        fwd.run_gemv_indexed_batched(
+            ctx.dev, ctx.registry, ctx.cmd,
+            gate_up_w,
+            scratch_b, 0, h_bytes,
+            gate_up_out, 0, gate_up_out_total,
+            indices_buf,
+            h, 2 * mi,
+            gate_up_elems_per_expert,
+            top_k,
+            0,     // stride_b_per_slot (shared B)
+            1,     // ne11 = 1 (shared B)
+            "moe_gate_up_batched",
+            gate_up_shader,
+        );
+        fwd.mark_written(&[gate_up_out]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[gate_up_out]);
+
+        // (2) Per-slot GLU. Each iteration reads slot k's gate
+        //     [k*2*mi .. k*2*mi + mi] and up [k*2*mi + mi .. (k+1)*2*mi]
+        //     from gate_up_out, writes glu_out[k*mi .. (k+1)*mi]. The
+        //     existing GeluPytorchTanhGlu shader takes 3 SSBOs at
+        //     descriptor offsets, so per-slot the descriptor set
+        //     rebinds with new offsets.
+        for k in 0..(top_k as u64) {
+            let gate_off = k * two_mi_bytes;
+            let up_off   = gate_off + mi_bytes;
+            let out_off  = k * mi_bytes;
+            let kernel = ctx.registry.get(ShaderId::GeluPytorchTanhGlu);
+            let set = fwd.alloc_or_get_set(
+                ctx.dev, kernel.descriptor_set_layout,
+                &[
+                    (0, gate_up_out, gate_off, mi_bytes),
+                    (1, gate_up_out, up_off,   mi_bytes),
+                    (2, glu_out,     out_off,  mi_bytes),
+                ],
+            );
+            let pc = SwigluPushConstants { n: mi };
+            let dispatch_x = (mi + 255) / 256;
+            let layout = kernel.pipeline_layout;
+            let pipeline = kernel.pipeline;
+            fwd.profile("moe_glu_batched", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
+                dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                dev.device.cmd_bind_descriptor_sets(
+                    cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+                );
+                dev.device.cmd_push_constants(
+                    cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+                );
+                dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
+            });
+        }
+        fwd.mark_written(&[glu_out]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[glu_out]);
+
+        // (3) Batched down indexed GEMV. Per-slot B: slot k reads its
+        //     own mi-block of glu_out at offset `k * down_k`, so
+        //     ne11=top_k / stride_b=down_k. Output `down_out[k * h]`.
+        fwd.run_gemv_indexed_batched(
+            ctx.dev, ctx.registry, ctx.cmd,
+            down_w,
+            glu_out, 0, (top_k as u64) * (down_k as u64) * 4,
+            down_out, 0, down_out_total,
+            indices_buf,
+            down_k, h,
+            down_elems_per_expert,
+            top_k,
+            down_k,   // stride_b_per_slot = K (one mi-block per slot)
+            top_k,    // ne11 = top_k (per-slot B)
+            "moe_down_batched",
+            down_shader,
+        );
+        fwd.mark_written(&[down_out]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[down_out]);
+
+        // (4) Per-slot indexed FMA: ffn_hidden += weights[k] * down_out[k*h..(k+1)*h].
+        //     Sprint 61G — `compute_barrier` after each FMA serialises
+        //     the accumulator chain (the bug that bit grouped path was
+        //     the same multi-FMA race on `batch_out`; preserved here
+        //     by mirroring the slot-loop's per-slot barrier).
+        for slot in 0..top_k {
+            let in_off = (slot as u64) * h_bytes;
+            fwd.run_fma_add_indexed(
+                ctx.dev, ctx.registry, ctx.cmd,
+                down_out, in_off,
+                ffn_hidden, 0,
+                weights_buf,
+                h, slot,
+                "moe_fma_add_batched",
             );
             fwd.mark_written(&[ffn_hidden]);
             fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[ffn_hidden]);

@@ -1584,6 +1584,79 @@ impl Forward {
         });
     }
 
+    /// Sprint P4-1 — Batched indexed GEMV: one dispatch covers ALL
+    /// `n_slots` slots for a single token by dispatching `Y = n_slots`
+    /// workgroups along the slot axis. The shader uses
+    /// `gl_WorkGroupID.y` as `expert_i0`, so each Y workgroup reads its
+    /// own `expert_id = data_ids[expert_i0]` (with `expert_i1=0, nbi1=1`)
+    /// and writes to `data_d[expert_i0 * stride_d + row]`.
+    ///
+    /// Output buffer must hold `n_slots * stride_d * 4` bytes contiguous;
+    /// slot k's M output rows land at byte offset `k * stride_d * 4`.
+    ///
+    /// `stride_b_per_slot` and `ne11` control the per-slot B (input)
+    /// stride: `ne11=1, stride_b=0` for shared B (gate_up — same token
+    /// hidden state fed to all 8 experts); `ne11=n_slots,
+    /// stride_b=K` for per-slot B (down — each expert reads its own
+    /// `mi`-block of GLU outputs).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_gemv_indexed_batched(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        weights: vk::Buffer,
+        input: vk::Buffer, input_offset: u64, input_range: u64,
+        output: vk::Buffer, output_offset: u64, output_range: u64,
+        indices: vk::Buffer,
+        k: u32,                       // input columns
+        m: u32,                       // output rows per slot
+        elements_per_expert: u32,     // `batch_stride_a` in elements
+        n_slots: u32,                 // top_k — number of Y workgroups
+        stride_b_per_slot: u32,       // per-slot K-stride in B (0 if shared)
+        ne11: u32,                    // 1 = shared B, n_slots = per-slot B
+        label: &str,
+        shader: ShaderId,
+    ) {
+        let kernel = registry.get(shader);
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[
+                (0, weights, 0, 0),
+                (1, input,  input_offset,  input_range),
+                (2, output, output_offset, output_range),
+                (3, self.fuse0.handle, 0, 0),
+                (4, self.fuse1.handle, 0, 0),
+                (5, indices, 0, 0),
+            ],
+        );
+        let pc = MatVecIdPushConstants {
+            ncols: k, stride_a: k, stride_b: stride_b_per_slot, stride_d: m,
+            batch_stride_a: elements_per_expert,
+            batch_stride_b: 0,
+            batch_stride_d: 0,
+            fusion_flags: 0,
+            nei0: n_slots,
+            ne11,
+            expert_i1: 0,
+            nbi1: 1,
+        };
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            let n_rows = crate::backend::vulkan::pipeline_registry::MMV_NUM_ROWS;
+            let groups_x = (m + n_rows - 1) / n_rows;
+            dev.device.cmd_dispatch(cmd, groups_x, n_slots, 1);
+        });
+    }
+
     /// Sprint 56C-2 — Indexed FMA add: `out[i] += weights[slot] * in[i]`.
     /// Reads the per-expert routing weight from a GPU SSBO instead of
     /// a push-constant scalar. Pairs with `run_gemv_indexed_at_offset`
