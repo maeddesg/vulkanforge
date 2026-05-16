@@ -180,36 +180,27 @@ impl VulkanDevice {
         // the extension and request `cooperativeMatrix` on the feature
         // struct, otherwise the validation layer (correctly) errors.
         //
-        // Sprint 18-M1 — VK_EXT_shader_float8 lets shaders use the
-        // native E4M3 / E5M2 types and the FP8 cooperative-matrix
-        // path. The extension is opt-in: only enabled when
-        // `VULKANFORGE_ENABLE_FP8=1`, since ash 0.38 doesn't ship
-        // bindings yet (we use a raw FFI shim) and we don't want
-        // the smoke-test path to affect every chat/bench run. The
-        // chain is built the same way the existing features are.
-        // Sprint 18A — VULKANFORGE_KV_FP8=1 implies the device-feature
-        // opt-in too, since the FP8 KV-cache shaders declare Float8EXT
-        // and need shaderFloat8 enabled on the device.
-        let fp8_opt_in = std::env::var("VULKANFORGE_ENABLE_FP8")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-            || std::env::var("VULKANFORGE_KV_FP8")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-
+        // Sprint 18-M1 / 42C / [this sprint] — VK_EXT_shader_float8 lets
+        // shaders use the native E4M3 / E5M2 types and the FP8
+        // cooperative-matrix path. The extension was originally opt-in
+        // (via `VULKANFORGE_ENABLE_FP8` / `VULKANFORGE_KV_FP8`), but the
+        // FP8-capable shader pipelines (FP8 KV-cache, FP8 WMMA, FP8 GEMV
+        // variants) are registered at startup REGARDLESS of whether
+        // those env-vars are set — and they declare `SPV_EXT_float8`
+        // capability, which the validation layer flags as "Float8EXT
+        // capability declared without VK_EXT_shader_float8 feature
+        // enabled" on every shader-module create (≈20 errors per
+        // startup). Mirror the bfloat16 pattern below: enable the
+        // extension + feature whenever the driver advertises it; the
+        // env-vars now only gate runtime ACTIVATION of the FP8 paths,
+        // not the device-feature opt-in.
         let mut device_extensions: Vec<*const i8> =
             vec![vk::KHR_COOPERATIVE_MATRIX_NAME.as_ptr()];
 
-        // Sprint 42C / v0.3.12 — probe `VK_EXT_shader_float8` availability
-        // before requesting it. Pre-v0.3.12 device.rs pushed the extension
-        // unconditionally on `fp8_opt_in`, which crashed with
-        // `VK_ERROR_EXTENSION_NOT_PRESENT` on drivers that didn't
-        // advertise it. Probing makes `VF_FP8=auto` safe everywhere
-        // (no native WMMA, but no hard crash either) and feeds
-        // `native_fp8_wmma` so the FP8 GEMM routing reflects the
-        // device's *actual* capability (Sprint 47B made the routing
-        // capability-driven; the legacy `VF_FP8_NATIVE_WMMA` env-var
-        // was removed).
+        // Probe `VK_EXT_shader_float8` availability. Pre-v0.3.12
+        // device.rs pushed the extension unconditionally, which
+        // crashed with `VK_ERROR_EXTENSION_NOT_PRESENT` on drivers
+        // that didn't advertise it. Probing keeps that safety net.
         let fp8_ext_available = unsafe {
             instance
                 .enumerate_device_extension_properties(physical_device)
@@ -221,15 +212,9 @@ impl VulkanDevice {
                 })
                 .unwrap_or(false)
         };
-        let push_fp8_ext = fp8_opt_in && fp8_ext_available;
+        let push_fp8_ext = fp8_ext_available;
         if push_fp8_ext {
             device_extensions.push(crate::backend::vulkan::fp8_ext::SHADER_FLOAT8_EXT_NAME.as_ptr());
-        } else if fp8_opt_in && !fp8_ext_available {
-            eprintln!(
-                "VulkanForge: VK_EXT_shader_float8 not advertised by driver — \
-                 falling back to BF16 conversion path. Update to a driver \
-                 that exposes shaderFloat8CooperativeMatrix for native FP8 WMMA."
-            );
         }
 
         // Sprint 39 — `VK_KHR_shader_bfloat16`. The BF16-narrow FP8 GEMM
