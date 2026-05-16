@@ -1405,6 +1405,87 @@ impl BatchExec {
         }
         compute_barrier(ctx.dev, ctx.cmd);
 
+        // -------- Sprint 61C-2 bisect option: per-slot down GEMV --------
+        // `VF_MOE_GROUPED_LEGACY_DOWN=1` swaps the grouped down MMQ_ID
+        // (+ scatter-FMA loop) for a per-slot indexed-GEMV down + FMA,
+        // reading the GLU output from `grouped_glu_out` at the per-slot
+        // offset. If this branch produces "Paris.", the bug lies in the
+        // grouped down MMQ_ID dispatch (Suspect #1 in 61C report); if
+        // still wrong, the bug is upstream (gate_up MMQ_ID or GLU).
+        if std::env::var("VF_MOE_GROUPED_LEGACY_DOWN")
+            .map(|v| v == "1") .unwrap_or(false)
+        {
+            let down_t = ctx.model
+                .tensor(&format!("blk.{}.moe_experts.down_proj", ctx.layer))
+                .expect("moe_experts.down_proj missing");
+            let down_block_size = down_t.ggml_type.block_size() as u32;
+            let down_type_size = down_t.ggml_type.type_size() as u32;
+            let down_bytes_per_expert = (down_t.byte_size / (n_experts as u64)) as u32;
+            let down_elems_per_expert =
+                down_bytes_per_expert / down_type_size * down_block_size;
+            let mi_padded: u32 = ((mi + 255) / 256) * 256;
+            let down_k = if down_t.shape[0] as u32 == n_experts {
+                mi_padded
+            } else {
+                down_t.shape[0] as u32
+            };
+            let down_shader_gemv = layer_weight_indexed_shader(
+                ctx.model, ctx.layer, "moe_experts.down_proj",
+                fwd.mul_mat_vec_subgroup_enabled,
+            );
+            let down_w = layer_weight(ctx.model, ctx.layer, "moe_experts.down_proj");
+            let router_idx = router_indices;
+            let router_w = router_weights;
+            let o_buf = fwd.cur().o_buf.handle;
+
+            // Zero the output accumulator
+            unsafe {
+                ctx.dev.device.cmd_fill_buffer(
+                    ctx.cmd, batch_out, 0, (seq_len as u64) * h_bytes, 0,
+                );
+            }
+            transfer_to_compute_barrier(ctx.dev, ctx.cmd);
+
+            for t in 0..(seq_len as u64) {
+                let out_off = t * h_bytes;
+                for k in 0..(top_k as u64) {
+                    let slot_flat = (t * (top_k as u64) + k) as u32;
+                    let glu_off = (slot_flat as u64) * mi_bytes;
+
+                    // (a) Per-slot down GEMV, reading from grouped_glu_out
+                    //     at the slot's mi-block offset.
+                    fwd.run_gemv_indexed_at_offset(
+                        ctx.dev, ctx.registry, ctx.cmd,
+                        down_w,
+                        grouped_glu_out, glu_off, (down_k as u64) * 4,
+                        o_buf, 0, h_bytes,
+                        router_idx,
+                        down_k, h,
+                        down_elems_per_expert,
+                        slot_flat,
+                        "moe_down_bisect",
+                        down_shader_gemv,
+                    );
+                    fwd.mark_written(&[o_buf]);
+                    fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[o_buf]);
+
+                    // (b) Indexed FMA into per-token slot of batch_out.
+                    fwd.run_fma_add_indexed(
+                        ctx.dev, ctx.registry, ctx.cmd,
+                        o_buf, 0,
+                        batch_out, out_off,
+                        router_w,
+                        h, slot_flat,
+                        "moe_fma_bisect",
+                    );
+                    fwd.mark_written(&[batch_out]);
+                    fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[batch_out]);
+                }
+            }
+            compute_barrier(ctx.dev, ctx.cmd);
+            return;
+        }
+
         // -------- 8. Q8_1 quantize GLU output → grouped_glu_q8 --------
         fwd.run_quantize_q8_1(
             ctx.dev, ctx.registry, ctx.cmd,
@@ -1461,19 +1542,37 @@ impl BatchExec {
         // original router order so the weight at position
         // `t * top_k + s` matches the down_out lane at
         // `(t * top_k + s) * hidden`.
+        //
+        // Sprint 61C-2 diagnostic: `VF_MOE_GROUPED_INDEXED_FMA=1`
+        // swaps run_fma_add_at_offset (scalar push-constant weight)
+        // for run_fma_add_indexed (weight from router.weights_scratch).
+        // If output becomes correct → bug was in the scalar FMA path.
+        let use_indexed_fma = std::env::var("VF_MOE_GROUPED_INDEXED_FMA")
+            .map(|v| v == "1").unwrap_or(false);
         for t in 0..(seq_len as u64) {
             for k in 0..(top_k as u64) {
                 let flat = (t * (top_k as u64) + k) as usize;
-                let weight = weights_host[flat];
                 let in_off = (flat as u64) * h_bytes;
                 let out_off = t * h_bytes;
-                fwd.run_fma_add_at_offset(
-                    ctx.dev, ctx.registry, ctx.cmd,
-                    grouped_down_out, in_off,
-                    batch_out, out_off,
-                    h, weight,
-                    "moe_fma_add_grouped",
-                );
+                if use_indexed_fma {
+                    fwd.run_fma_add_indexed(
+                        ctx.dev, ctx.registry, ctx.cmd,
+                        grouped_down_out, in_off,
+                        batch_out, out_off,
+                        router_weights,
+                        h, flat as u32,
+                        "moe_fma_add_grouped_idx",
+                    );
+                } else {
+                    let weight = weights_host[flat];
+                    fwd.run_fma_add_at_offset(
+                        ctx.dev, ctx.registry, ctx.cmd,
+                        grouped_down_out, in_off,
+                        batch_out, out_off,
+                        h, weight,
+                        "moe_fma_add_grouped",
+                    );
+                }
             }
         }
         compute_barrier(ctx.dev, ctx.cmd);
