@@ -61,6 +61,20 @@ impl Forward {
         profiler: Option<ShaderProfiler>,
         max_prefill_tokens: u32,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Sprint [vram-budget]: VRAM budget probe. Reads sysfs
+        // mem_info_vram_used + mem_info_vram_total for the AMD GPU
+        // and prints a one-line budget report. Triggers a warning
+        // (not a hard error) when the predicted total is within
+        // 1 GiB of capacity — that's the regime where Wayland/KDE
+        // can lock up because kwin can't render a frame.
+        //
+        // Heuristic: at this point in Forward::new, weights are
+        // already on the GPU (loader.rs) and we're about to add
+        // scratch + KV-cache. Use current `mem_info_vram_used` as
+        // the "after-weights" baseline and warn if free < 1 GiB.
+        // No-op when sysfs isn't readable (different distro,
+        // dGPU not AMD, etc.).
+        Self::print_vram_budget(dev);
         let device = &dev.device;
         let mut mk_storage = |size: u64, location: MemoryLocation, name: &str| {
             GpuBuffer::new(
@@ -844,13 +858,36 @@ impl Forward {
             // (n + 127) / 128 * 144
             ((n_elems + 127) / 128) * 144
         };
-        let input_q8_bytes = q8_1_bytes((max_seq as u64) * (hidden_size as u64));
-        let gate_up_out_bytes = (max_seq as u64) * (top_k as u64) * 2 * (mi as u64) * 4;
-        let glu_out_bytes = (max_seq as u64) * (top_k as u64) * (mi as u64) * 4;
-        let glu_q8_bytes = q8_1_bytes((max_seq as u64) * (top_k as u64) * (mi as u64));
-        let down_out_bytes = (max_seq as u64) * (top_k as u64) * (hidden_size as u64) * 4;
-        let data_ids_bytes = (max_seq as u64) * (top_k as u64) * 4;
-        let data_counts_bytes = (n_experts as u64) * 4;
+        // Sprint [vram-budget]: allocate the grouped buffers full-size
+        // only when VF_MOE_GROUPED=1 is set. Otherwise allocate 16-byte
+        // stubs so the MoeRouterGpu struct stays uniform (saves
+        // ~200-500 MiB VRAM for the default GPU-direct path that never
+        // touches these buffers). The grouped step `unwrap`s on the
+        // env-gate, so it never reaches a stub buffer.
+        let grouped_path_active = std::env::var("VF_MOE_GROUPED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let (
+            input_q8_bytes,
+            gate_up_out_bytes,
+            glu_out_bytes,
+            glu_q8_bytes,
+            down_out_bytes,
+            data_ids_bytes,
+            data_counts_bytes,
+        ) = if grouped_path_active {
+            (
+                q8_1_bytes((max_seq as u64) * (hidden_size as u64)),
+                (max_seq as u64) * (top_k as u64) * 2 * (mi as u64) * 4,
+                (max_seq as u64) * (top_k as u64) * (mi as u64) * 4,
+                q8_1_bytes((max_seq as u64) * (top_k as u64) * (mi as u64)),
+                (max_seq as u64) * (top_k as u64) * (hidden_size as u64) * 4,
+                (max_seq as u64) * (top_k as u64) * 4,
+                (n_experts as u64) * 4,
+            )
+        } else {
+            (16, 16, 16, 16, 16, 16, 16) // 7×16 B = 112 B total stubs
+        };
 
         let grouped_input_q8 = mk_storage(
             allocator, input_q8_bytes, MemoryLocation::GpuOnly, "moe_grouped_input_q8")?;
@@ -895,6 +932,55 @@ impl Forward {
             max_seq,
         });
         Ok(())
+    }
+
+    /// Sprint [vram-budget]: print AMD GPU VRAM usage at Forward::new
+    /// time, warn when free is below 1 GiB. AMD GPU is auto-detected by
+    /// scanning /sys/class/drm/card*/device/vendor for 0x1002. A
+    /// non-readable sysfs (different distro, no AMD GPU) returns
+    /// silently — this is diagnostic, not load-blocking.
+    fn print_vram_budget(_dev: &VulkanDevice) {
+        let amd_card = (0..8).find_map(|i| {
+            let path = format!("/sys/class/drm/card{i}/device/vendor");
+            match std::fs::read_to_string(&path) {
+                Ok(v) if v.trim() == "0x1002" => Some(i),
+                _ => None,
+            }
+        });
+        let Some(card) = amd_card else { return; };
+        let used = std::fs::read_to_string(format!(
+            "/sys/class/drm/card{card}/device/mem_info_vram_used"
+        ))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok());
+        let total = std::fs::read_to_string(format!(
+            "/sys/class/drm/card{card}/device/mem_info_vram_total"
+        ))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok());
+        let (Some(used), Some(total)) = (used, total) else { return; };
+        let free = total.saturating_sub(used);
+        let gib = |b: u64| (b as f64) / (1024.0 * 1024.0 * 1024.0);
+        println!(
+            "VulkanForge: VRAM budget {:.2} GiB used / {:.2} GiB total ({:.2} GiB free)",
+            gib(used), gib(total), gib(free),
+        );
+        let headroom_gib = std::env::var("VF_VRAM_HEADROOM_GIB")
+            .ok().and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(1.0);
+        let headroom = (headroom_gib * 1024.0 * 1024.0 * 1024.0) as u64;
+        if free < headroom {
+            eprintln!(
+                "VulkanForge: ⚠️  VRAM free ({:.2} GiB) is below the {:.1} GiB \
+                 compositor-headroom budget. Further allocations (KV cache, \
+                 scratch buffers) may exhaust VRAM and freeze Wayland/KDE.",
+                gib(free), headroom_gib,
+            );
+            eprintln!(
+                "VulkanForge: Options: close browser/IDE, lower --max-context, \
+                 use a smaller quant, or VF_VRAM_HEADROOM_GIB=0 to silence."
+            );
+        }
     }
 
     pub fn destroy(self, device: &ash::Device, allocator: &mut Allocator) {
