@@ -23,6 +23,37 @@ use crate::hf_config::{HfConfig, Llama3RopeScaling};
 use crate::quantize::{quantize_f32_to_q4k, quantize_f32_to_q4k_padded_rows, QK_K};
 use crate::safetensors::{hf_to_vf_name, SafeTensorsFile, TensorDtype, TensorInfo};
 
+/// Tensor-loading progress bar on stderr. Throttled to at most one
+/// update per ~1 % of the total (or every final tick) so a 700-tensor
+/// 5 min load gets ~100 updates instead of 700, and a 300-tensor fast
+/// load still shows movement. Uses `\r` overwrite + `eprint!` so the
+/// progress line never pollutes stdout. `VF_NO_LOAD_PROGRESS=1`
+/// disables the bar entirely (useful for CI logs).
+fn print_load_progress(current: usize, total: usize, start: Instant, force_final: bool) {
+    if std::env::var("VF_NO_LOAD_PROGRESS").is_ok() {
+        return;
+    }
+    let total = total.max(1);
+    let step = (total / 100).max(1);
+    if !force_final && current % step != 0 {
+        return;
+    }
+    let pct = (current * 100) / total;
+    let filled = (pct * 40) / 100;
+    let empty = 40 - filled;
+    let elapsed = start.elapsed().as_secs_f32();
+    let bar: String = "█".repeat(filled) + &"░".repeat(empty);
+    eprint!(
+        "\r  [{}] {:>3}% ({}/{} tensors) {:>5.1}s",
+        bar, pct, current, total, elapsed,
+    );
+    use std::io::Write;
+    let _ = std::io::stderr().flush();
+    if force_final {
+        eprintln!();
+    }
+}
+
 /// Staging-buffer size used for batched uploads. Sprint 20-M1
 /// bumped this from 1 GiB → 2.5 GiB so the 8B Llama lm_head
 /// (128256 × 4096 × 4 B = 2.1 GiB after BF16→FP32 expansion) fits
@@ -661,7 +692,25 @@ impl LoadedModel {
         // (dst_buffer_handle, src_offset_in_staging, dst_offset, size)
         let mut pending: Vec<(vk::Buffer, vk::BufferCopy)> = Vec::new();
 
+        // Load-progress bar (stderr, env-toggleable). For a 360-tensor
+        // Gemma-4 GGUF this fires ~100 times; for an 8B Q4_K_M (~290
+        // tensors) it fires ~100 times too. Cost: one `eprint!` per
+        // ~1 % of total tensors.
+        let load_progress_total = tensor_names.len();
+        let load_progress_start = Instant::now();
+        let mut load_progress_i: usize = 0;
+        eprintln!("  Loading {} GGUF tensors...", load_progress_total);
+
         for name in tensor_names {
+            // Progress: counted before any `continue` path so dropped
+            // tensors (e.g. Gemma-4 remap drops) still tick the bar
+            // and the final iteration always hits 100 %.
+            load_progress_i += 1;
+            print_load_progress(
+                load_progress_i, load_progress_total,
+                load_progress_start, load_progress_i == load_progress_total,
+            );
+
             let info = gguf.tensor(name).expect("name from same map");
 
             // Sprint 52A — Gemma-4 GGUF → VF tensor-name remap.
@@ -1502,7 +1551,21 @@ impl LoadedModel {
         let mut staging_off: u64 = 0;
         let mut pending: Vec<(vk::Buffer, vk::BufferCopy)> = Vec::new();
 
+        // Load-progress bar. SafeTensors loads are slow (BF16/FP8
+        // dequant + on-the-fly Q4_K quantization for Gemma-4-26B-A4B
+        // can take 5+ min); the bar makes that wait observable.
+        let load_progress_total = plans.len();
+        let load_progress_start = Instant::now();
+        let mut load_progress_i: usize = 0;
+        eprintln!("  Loading {} SafeTensors weight tensors...", load_progress_total);
+
         for plan in plans.iter() {
+            load_progress_i += 1;
+            print_load_progress(
+                load_progress_i, load_progress_total,
+                load_progress_start, load_progress_i == load_progress_total,
+            );
+
             let src = plan.bytes.as_slice();
             let size = src.len() as u64;
             if size > STAGING_BYTES {
