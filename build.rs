@@ -1166,6 +1166,125 @@ const JOBS: &[ShaderJob] = &[
             ("ACC_TYPE", "float"),
         ],
     },
+    // Sprint 61B — MUL_MAT_ID variants of mul_mmq for Phase 2'
+    // Expert-Grouped Dispatch. Same defines as the stock mul_mmq
+    // SPVs (above) plus MUL_MAT_ID=1; the `_subgroup` siblings add
+    // MUL_MAT_ID_USE_SUBGROUPS=1 to enable the wave-ballot fast path
+    // in mul_mm_id_funcs.glsl. RDNA4 supports both; subgroup is
+    // expected to be faster on hot experts but stock is the safer
+    // first land. Bindings 3 (IDS) + 4 (Counts) come from SPIR-V
+    // reflection, push-constant block grows to 52 B (13 u32) per
+    // the shader's #ifdef MUL_MAT_ID branch (mul_mmq.comp:54-58).
+    //
+    // Currently dead code; wired in Sprint 61C.
+    ShaderJob {
+        out_name: "mul_mmq_q3_k_f32_id.spv",
+        entry_source: "mul_mmq.comp",
+        defines: &[
+            ("DATA_A_Q3_K", "1"),
+            ("A_TYPE", "block_q3_K"),
+            ("A_TYPE_PACKED16", "block_q3_K_packed16"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("ACC_TYPE", "float"),
+            ("MUL_MAT_ID", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mmq_q3_k_f32_id_subgroup.spv",
+        entry_source: "mul_mmq.comp",
+        defines: &[
+            ("DATA_A_Q3_K", "1"),
+            ("A_TYPE", "block_q3_K"),
+            ("A_TYPE_PACKED16", "block_q3_K_packed16"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("ACC_TYPE", "float"),
+            ("MUL_MAT_ID", "1"),
+            ("MUL_MAT_ID_USE_SUBGROUPS", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mmq_q4_k_f32_id.spv",
+        entry_source: "mul_mmq.comp",
+        defines: &[
+            ("DATA_A_Q4_K", "1"),
+            ("A_TYPE", "block_q4_K"),
+            ("A_TYPE_PACKED32", "block_q4_K_packed32"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("ACC_TYPE", "float"),
+            ("MUL_MAT_ID", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mmq_q4_k_f32_id_subgroup.spv",
+        entry_source: "mul_mmq.comp",
+        defines: &[
+            ("DATA_A_Q4_K", "1"),
+            ("A_TYPE", "block_q4_K"),
+            ("A_TYPE_PACKED32", "block_q4_K_packed32"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("ACC_TYPE", "float"),
+            ("MUL_MAT_ID", "1"),
+            ("MUL_MAT_ID_USE_SUBGROUPS", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mmq_q4_0_f32_id.spv",
+        entry_source: "mul_mmq.comp",
+        defines: &[
+            ("DATA_A_Q4_0", "1"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("ACC_TYPE", "float"),
+            ("MUL_MAT_ID", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mmq_q4_0_f32_id_subgroup.spv",
+        entry_source: "mul_mmq.comp",
+        defines: &[
+            ("DATA_A_Q4_0", "1"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("ACC_TYPE", "float"),
+            ("MUL_MAT_ID", "1"),
+            ("MUL_MAT_ID_USE_SUBGROUPS", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mmq_q5_0_f32_id.spv",
+        entry_source: "mul_mmq.comp",
+        defines: &[
+            ("DATA_A_Q5_0", "1"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("ACC_TYPE", "float"),
+            ("MUL_MAT_ID", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mmq_q5_0_f32_id_subgroup.spv",
+        entry_source: "mul_mmq.comp",
+        defines: &[
+            ("DATA_A_Q5_0", "1"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("ACC_TYPE", "float"),
+            ("MUL_MAT_ID", "1"),
+            ("MUL_MAT_ID_USE_SUBGROUPS", "1"),
+        ],
+    },
     // Quantize FP32 activations → block_q8_1_x4 — needed before each
     // mul_mmq dispatch since B is consumed as Q8_1.
     ShaderJob {

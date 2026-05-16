@@ -250,7 +250,15 @@ impl PipelineRegistry {
                 // Sprint 52J — Q5_0 / Q5_1 / Q8_0 Mmq variants share
                 // the same 11-spec-const surface as Q4_0/Q4_K Mmq.
                 | ShaderId::MulMmqQ5_0 | ShaderId::MulMmqQ5_1
-                | ShaderId::MulMmqQ8_0 => {
+                | ShaderId::MulMmqQ8_0
+                // Sprint 61B — MUL_MAT_ID mul_mmq variants for Phase 2'.
+                // Same 10-spec-const surface; the MUL_MAT_ID branch in
+                // mul_mmq.comp leaves the spec block untouched (only
+                // the push-constant block and the bindings differ).
+                | ShaderId::MulMmqQ3KMatId | ShaderId::MulMmqQ3KMatIdSubgroup
+                | ShaderId::MulMmqQ4KMatId | ShaderId::MulMmqQ4KMatIdSubgroup
+                | ShaderId::MulMmqQ4_0MatId | ShaderId::MulMmqQ4_0MatIdSubgroup
+                | ShaderId::MulMmqQ5_0MatId | ShaderId::MulMmqQ5_0MatIdSubgroup => {
                     // Phase-3C compile probe — pin the 11 spec
                     // constants llama.cpp's vulkan-shaders-gen pins
                     // for a non-coopmat MMQ build. Layout:

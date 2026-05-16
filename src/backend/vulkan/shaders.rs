@@ -411,6 +411,21 @@ pub enum ShaderId {
     // push-constant scalar. Lets the GPU-direct MoE path skip the
     // CPU readback of router weights.
     FmaAddIndexed,
+    // Sprint 61B — MUL_MAT_ID variants of mul_mmq for Phase 2'
+    // Expert-Grouped Dispatch. One workgroup per (BM-tile, BN-tile,
+    // expert) covers all tokens routed to that expert in a single
+    // GEMM dispatch (vs the per-(token, slot) GEMV chain of 56C).
+    // Stock + subgroup variant per quant; 4 quants cover 26B
+    // (Q3_K/Q4_K GGUF/SafeTensors gate_up, Q4_0/Q5_0 GGUF down).
+    // Currently dead code (wired in Sprint 61C).
+    MulMmqQ3KMatId,
+    MulMmqQ3KMatIdSubgroup,
+    MulMmqQ4KMatId,
+    MulMmqQ4KMatIdSubgroup,
+    MulMmqQ4_0MatId,
+    MulMmqQ4_0MatIdSubgroup,
+    MulMmqQ5_0MatId,
+    MulMmqQ5_0MatIdSubgroup,
 }
 
 impl ShaderId {
@@ -546,6 +561,14 @@ impl ShaderId {
             ShaderId::MulMatVecQ4_0Id => "mul_mat_vec_q4_0_f32_f32_id",
             ShaderId::MulMatVecQ4_0IdSubgroup => "mul_mat_vec_q4_0_f32_f32_id_subgroup",
             ShaderId::FmaAddIndexed => "fma_add_indexed_f32",
+            ShaderId::MulMmqQ3KMatId => "mul_mmq_q3_k_f32_id",
+            ShaderId::MulMmqQ3KMatIdSubgroup => "mul_mmq_q3_k_f32_id_subgroup",
+            ShaderId::MulMmqQ4KMatId => "mul_mmq_q4_k_f32_id",
+            ShaderId::MulMmqQ4KMatIdSubgroup => "mul_mmq_q4_k_f32_id_subgroup",
+            ShaderId::MulMmqQ4_0MatId => "mul_mmq_q4_0_f32_id",
+            ShaderId::MulMmqQ4_0MatIdSubgroup => "mul_mmq_q4_0_f32_id_subgroup",
+            ShaderId::MulMmqQ5_0MatId => "mul_mmq_q5_0_f32_id",
+            ShaderId::MulMmqQ5_0MatIdSubgroup => "mul_mmq_q5_0_f32_id_subgroup",
         }
     }
 
@@ -688,6 +711,14 @@ impl ShaderId {
             ShaderId::MulMatVecQ4_0Id => MUL_MAT_VEC_Q4_0_F32_F32_ID,
             ShaderId::MulMatVecQ4_0IdSubgroup => MUL_MAT_VEC_Q4_0_F32_F32_ID_SUBGROUP,
             ShaderId::FmaAddIndexed => FMA_ADD_INDEXED_F32,
+            ShaderId::MulMmqQ3KMatId => MUL_MMQ_Q3_K_F32_ID,
+            ShaderId::MulMmqQ3KMatIdSubgroup => MUL_MMQ_Q3_K_F32_ID_SUBGROUP,
+            ShaderId::MulMmqQ4KMatId => MUL_MMQ_Q4_K_F32_ID,
+            ShaderId::MulMmqQ4KMatIdSubgroup => MUL_MMQ_Q4_K_F32_ID_SUBGROUP,
+            ShaderId::MulMmqQ4_0MatId => MUL_MMQ_Q4_0_F32_ID,
+            ShaderId::MulMmqQ4_0MatIdSubgroup => MUL_MMQ_Q4_0_F32_ID_SUBGROUP,
+            ShaderId::MulMmqQ5_0MatId => MUL_MMQ_Q5_0_F32_ID,
+            ShaderId::MulMmqQ5_0MatIdSubgroup => MUL_MMQ_Q5_0_F32_ID_SUBGROUP,
         }
     }
 }
@@ -829,6 +860,15 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::MulMatVecQ4_0Id,
     ShaderId::MulMatVecQ4_0IdSubgroup,
     ShaderId::FmaAddIndexed,
+    // Sprint 61B — MUL_MAT_ID mul_mmq variants for Phase 2'.
+    ShaderId::MulMmqQ3KMatId,
+    ShaderId::MulMmqQ3KMatIdSubgroup,
+    ShaderId::MulMmqQ4KMatId,
+    ShaderId::MulMmqQ4KMatIdSubgroup,
+    ShaderId::MulMmqQ4_0MatId,
+    ShaderId::MulMmqQ4_0MatIdSubgroup,
+    ShaderId::MulMmqQ5_0MatId,
+    ShaderId::MulMmqQ5_0MatIdSubgroup,
 ];
 
 /// Sprint 16C — Sprint-3 era Q4_K coopmat GEMM variants gated behind
@@ -1079,6 +1119,27 @@ pub const MUL_MAT_VEC_Q4_0_F32_F32_ID_SUBGROUP: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q4_0_f32_f32_id_subgroup.spv"));
 pub const FMA_ADD_INDEXED_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/fma_add_indexed_f32.spv"));
+
+// Sprint 61B — MUL_MAT_ID variants of mul_mmq for Phase 2'
+// Expert-Grouped Dispatch. See `MmqIdPushConstants` (52 B) in
+// `pipeline.rs` for the push-constant layout; bindings 3 (IDS) and
+// 4 (Counts) come from SPIR-V reflection at pipeline creation.
+pub const MUL_MMQ_Q3_K_F32_ID: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mmq_q3_k_f32_id.spv"));
+pub const MUL_MMQ_Q3_K_F32_ID_SUBGROUP: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mmq_q3_k_f32_id_subgroup.spv"));
+pub const MUL_MMQ_Q4_K_F32_ID: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mmq_q4_k_f32_id.spv"));
+pub const MUL_MMQ_Q4_K_F32_ID_SUBGROUP: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mmq_q4_k_f32_id_subgroup.spv"));
+pub const MUL_MMQ_Q4_0_F32_ID: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mmq_q4_0_f32_id.spv"));
+pub const MUL_MMQ_Q4_0_F32_ID_SUBGROUP: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mmq_q4_0_f32_id_subgroup.spv"));
+pub const MUL_MMQ_Q5_0_F32_ID: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mmq_q5_0_f32_id.spv"));
+pub const MUL_MMQ_Q5_0_F32_ID_SUBGROUP: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mmq_q5_0_f32_id_subgroup.spv"));
 
 /// Decode a SPIR-V byte blob into u32 words. Vulkan consumes SPIR-V
 /// as `&[u32]`; `include_bytes!` only gives us `&[u8]` whose alignment

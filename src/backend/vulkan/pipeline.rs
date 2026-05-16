@@ -72,6 +72,39 @@ pub struct MatVecIdPushConstants {
 const _: () =
     assert!(std::mem::size_of::<MatVecIdPushConstants>() == 48);
 
+/// Sprint 61B — Push constants for the `MUL_MAT_ID` mul_mm / mul_mmq
+/// variants used by Phase 2' Expert-Grouped Dispatch. 13 × u32 = 52 B.
+/// Mirrors the `#ifdef MUL_MAT_ID` branch of `mul_mmq.comp:42-67`:
+/// the first 9 u32s are the same as the non-id mmq push block (M, N,
+/// K, three row strides, three batch strides); the last 4 are the
+/// indexing parameters that select which experts/tokens each
+/// workgroup gathers (`nei0` = top_k, `nei1` = seq_len, `nbi1` =
+/// IDS-row stride, `ne11` = input-row count).
+///
+/// Workgroup launch: `(ceil(M/BM), ceil(N/BN), n_experts)` — one
+/// workgroup column per expert. The shader's prologue early-exits
+/// when `ic * BN >= data_expert_count[expert_idx]`, so workgroups
+/// for under-loaded experts cost almost nothing.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct MmqIdPushConstants {
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    pub stride_a: u32,
+    pub stride_b: u32,
+    pub stride_d: u32,
+    pub batch_stride_a: u32,
+    pub batch_stride_b: u32,
+    pub batch_stride_d: u32,
+    pub nei0: u32,
+    pub nei1: u32,
+    pub nbi1: u32,
+    pub ne11: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<MmqIdPushConstants>() == 52);
+
 /// Sprint 20-Wire — push constants for `mul_coopmat_fp8_naive.comp`
 /// (the FP8 prefill GEMM). 7 × u32 = 28 B. The kernel expects
 /// `weight_scale_bits = f32::to_bits(scale)` so the same descriptor
