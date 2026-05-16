@@ -471,6 +471,47 @@ pub(crate) fn gemv_indexed_shader_for(ggml_type: GgmlType, subgroup: bool) -> Sh
     }
 }
 
+/// Sprint 61C — Phase 2' MMQ_ID variant selector. Mirror of
+/// `gemv_indexed_shader_for` but returns the `mul_mmq.comp + MUL_MAT_ID`
+/// pipelines registered in Sprint 61B. Used by
+/// `b_step_moe_expert_ffn_grouped` to pick gate_up / down kernels.
+///
+/// Subgroup variant is preferred on RDNA4 (wave-ballot fast path), with
+/// the stock variant available as a fallback under
+/// `VF_MOE_GROUPED_SUBGROUP=0` (Sprint 61B build proved both compile).
+pub(crate) fn mmq_id_shader_for(ggml_type: GgmlType, subgroup: bool) -> ShaderId {
+    match (ggml_type, subgroup) {
+        (GgmlType::Q3K, true ) => ShaderId::MulMmqQ3KMatIdSubgroup,
+        (GgmlType::Q3K, false) => ShaderId::MulMmqQ3KMatId,
+        (GgmlType::Q4K, true ) => ShaderId::MulMmqQ4KMatIdSubgroup,
+        (GgmlType::Q4K, false) => ShaderId::MulMmqQ4KMatId,
+        (GgmlType::Q5_0, true ) => ShaderId::MulMmqQ5_0MatIdSubgroup,
+        (GgmlType::Q5_0, false) => ShaderId::MulMmqQ5_0MatId,
+        (GgmlType::Q4_0, true ) => ShaderId::MulMmqQ4_0MatIdSubgroup,
+        (GgmlType::Q4_0, false) => ShaderId::MulMmqQ4_0MatId,
+        (other, _) => panic!(
+            "mmq_id_shader_for: no MMQ_ID pipeline for ggml_type {other:?}; \
+             add a `MulMmq*MatId` build.rs ShaderJob + ShaderId arm",
+        ),
+    }
+}
+
+/// Sprint 61C — model-driven MMQ_ID shader selector (mirror of
+/// `layer_weight_indexed_shader`).
+pub(crate) fn layer_weight_mmq_id_shader(
+    model: &LoadedModel,
+    layer: u32,
+    suffix: &str,
+    subgroup: bool,
+) -> ShaderId {
+    let key = format!("blk.{layer}.{suffix}");
+    let ggml_type = model
+        .tensor(&key)
+        .unwrap_or_else(|| panic!("missing tensor '{key}'"))
+        .ggml_type;
+    mmq_id_shader_for(ggml_type, subgroup)
+}
+
 pub(crate) fn compute_barrier(dev: &VulkanDevice, cmd: vk::CommandBuffer) {
     let mb = vk::MemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::SHADER_WRITE)

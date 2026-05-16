@@ -30,7 +30,8 @@ use super::super::pipeline::{
     CoopmatPushConstants, FlashAttnBatchPushConstants, FlashAttnReducePushConstants,
     FlashAttnSplitPushConstants, Fp8BlockwiseGemmPushConstants,
     Fp8BlockwiseGemvPushConstants, Fp8GemmPushConstants, GenericBinaryPushConstants,
-    KvCopyFp16PushConstants, MatVecIdPushConstants, MatVecPushConstants, MmqPushConstants,
+    KvCopyFp16PushConstants, MatVecIdPushConstants, MatVecPushConstants,
+    MmqIdPushConstants, MmqPushConstants,
     MoeRouterNormGemvPushConstants, MoeRouterSoftmaxTopkPushConstants,
     MultiAddRmsPushConstants, Q8_1QuantizePushConstants, RmsNormMulRopePushConstants,
     RopePushConstants, ScalarAttnPushConstants, SwigluPushConstants,
@@ -1623,6 +1624,125 @@ impl Forward {
                 cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
             );
             dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
+        });
+    }
+
+    /// Sprint 61C — Phase 2' Expert-Grouped GEMM via `mul_mmq` +
+    /// `MUL_MAT_ID`. One dispatch consolidates a batched GEMM over all
+    /// `n_experts` × `n_routed_per_expert` × `M` × `K` work units that
+    /// the indexed-GEMV slot loop (56C) issues as `seq_len × top_k`
+    /// separate dispatches.
+    ///
+    /// ## Memory layout assumed by the shader
+    ///
+    /// - **A weights** (`weights`): `[n_experts × M × K]` packed in the
+    ///   quant block layout matching `shader_id`. Per-expert stride
+    ///   `batch_stride_a = elems_per_expert` (= M × K in elements, used
+    ///   by the shader as `expert_idx * batch_stride_a / BK`).
+    /// - **B activations** (`input_q8`): Q8_1 packed
+    ///   `block_q8_1_x4_packed128` blocks. Per-token K-stride
+    ///   `batch_stride_b`; per-slot K-stride `stride_b` (selected by
+    ///   `row_idx.x % ne11`). For gate_up the slot doesn't affect the
+    ///   B-row (`ne11 = 1`); for down the slot picks one of `top_k`
+    ///   intra-token blocks (`ne11 = top_k`, `stride_b = K`,
+    ///   `batch_stride_b = top_k × K`).
+    /// - **D output**: FP32 `[seq_len × top_k × M]` with
+    ///   `batch_stride_d` per token and `stride_d` per slot. Output
+    ///   cell `(token, slot, m)` lands at
+    ///   `data_d[token * batch_stride_d + slot * stride_d + m]`.
+    /// - **IDS** (`data_ids`): u32 `[nei1 × nbi1]`. The shader scans
+    ///   IDS per workgroup-Z (= expert_idx) and gathers up to BN rows
+    ///   into shared `row_ids[]`. For our caller `nei0 = top_k`,
+    ///   `nei1 = seq_len`, `nbi1 = top_k`, and entries hold token-ids
+    ///   (the **post-counting-sort** mapping is via `data_counts[]`).
+    ///   See `b_step_moe_expert_ffn_grouped` for the CPU sort.
+    /// - **Counts** (`data_counts`): u32 `[n_experts]` — total
+    ///   routed pairs per expert, used by the workgroup early-exit at
+    ///   `ic * BN >= data_expert_count[expert_idx]`.
+    ///
+    /// ## Workgroup launch
+    /// - x: `ceil(M / BM)` (BM = 64 per the shared MMQ spec block)
+    /// - y: `ceil((seq_len * top_k) / BN)` — worst-case all routed
+    ///   pairs land on one expert (BN = 64; usually only 1-2 Y groups
+    ///   per expert are non-trivial, the rest early-exit)
+    /// - z: `n_experts` — one workgroup-column per expert. Cold experts
+    ///   exit at the top of `main()` after a single counts-read.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_mmq_id_grouped(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        shader_id: ShaderId,
+        weights: vk::Buffer,
+        input_q8: vk::Buffer,
+        output: vk::Buffer,
+        data_ids: vk::Buffer,
+        data_counts: vk::Buffer,
+        // Dimensions
+        m: u32,
+        k: u32,
+        seq_len: u32,
+        top_k: u32,
+        n_experts: u32,
+        batch_stride_a: u32,
+        // B / D strides (per-row + per-token-block) — see doc above.
+        stride_b: u32,
+        batch_stride_b: u32,
+        // The slot-broadcast dim: 1 for gate_up (slot doesn't pick B),
+        // `top_k` for down (slot picks one of top_k intra-token blocks).
+        ne11: u32,
+        label: &str,
+    ) {
+        let kernel = registry.get(shader_id);
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[
+                (0, weights,     0, 0),
+                (1, input_q8,    0, 0),
+                (2, output,      0, 0),
+                (3, data_ids,    0, 0),
+                (4, data_counts, 0, 0),
+            ],
+        );
+        let pc = MmqIdPushConstants {
+            m,
+            n: seq_len * top_k,   // upper bound on _ne1 (not strictly read for ID path)
+            k,
+            stride_a: k,
+            stride_b,
+            stride_d: m,
+            batch_stride_a,
+            batch_stride_b,
+            batch_stride_d: top_k * m,
+            nei0: top_k,
+            nei1: seq_len,
+            nbi1: top_k,
+            ne11,
+        };
+        // BM/BN come from the non-coopmat MMQ spec block — same 10
+        // spec constants as the stock mul_mmq pipeline (Sprint 61B
+        // extended the registry match-arm to cover the *MatId variants).
+        // S-tile defaults are 64/64 unless env-overridden, matching
+        // run_gemm's S-tile branch.
+        let bm: u32 = std::env::var("VULKANFORGE_GEMM_BM")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(64);
+        let bn: u32 = std::env::var("VULKANFORGE_GEMM_BN")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(64);
+        let groups_x = (m + bm - 1) / bm;
+        let groups_y = (seq_len * top_k + bn - 1) / bn;
+        let groups_z = n_experts;
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, groups_x, groups_y, groups_z);
         });
     }
 

@@ -828,6 +828,45 @@ impl Forward {
         let readback_staging = mk_storage(
             allocator, readback_bytes, MemoryLocation::GpuToCpu, "moe_router_readback_staging")?;
 
+        // Sprint 61C — Phase 2' Expert-Grouped Dispatch scratch.
+        // Sized for the worst-case prefill batch. All buffers are
+        // STORAGE_BUFFER + TRANSFER_DST so cmd_update_buffer can
+        // populate data_ids / data_counts directly from CB.
+        //
+        // Q8_1 packs 128 elements into 144 bytes; rounded up to whole
+        // blocks. FP32 outputs are sized for (max_seq × top_k × M)
+        // where M is 2*moe_int (gate_up), moe_int (glu_out), or
+        // hidden_size (down_out).
+        let mi = self.config.gemma4.as_ref()
+            .map(|g| g.moe_intermediate_size)
+            .unwrap_or(0);
+        let q8_1_bytes = |n_elems: u64| -> u64 {
+            // (n + 127) / 128 * 144
+            ((n_elems + 127) / 128) * 144
+        };
+        let input_q8_bytes = q8_1_bytes((max_seq as u64) * (hidden_size as u64));
+        let gate_up_out_bytes = (max_seq as u64) * (top_k as u64) * 2 * (mi as u64) * 4;
+        let glu_out_bytes = (max_seq as u64) * (top_k as u64) * (mi as u64) * 4;
+        let glu_q8_bytes = q8_1_bytes((max_seq as u64) * (top_k as u64) * (mi as u64));
+        let down_out_bytes = (max_seq as u64) * (top_k as u64) * (hidden_size as u64) * 4;
+        let data_ids_bytes = (max_seq as u64) * (top_k as u64) * 4;
+        let data_counts_bytes = (n_experts as u64) * 4;
+
+        let grouped_input_q8 = mk_storage(
+            allocator, input_q8_bytes, MemoryLocation::GpuOnly, "moe_grouped_input_q8")?;
+        let grouped_gate_up_out = mk_storage(
+            allocator, gate_up_out_bytes, MemoryLocation::GpuOnly, "moe_grouped_gate_up_out")?;
+        let grouped_glu_out = mk_storage(
+            allocator, glu_out_bytes, MemoryLocation::GpuOnly, "moe_grouped_glu_out")?;
+        let grouped_glu_q8 = mk_storage(
+            allocator, glu_q8_bytes, MemoryLocation::GpuOnly, "moe_grouped_glu_q8")?;
+        let grouped_down_out = mk_storage(
+            allocator, down_out_bytes, MemoryLocation::GpuOnly, "moe_grouped_down_out")?;
+        let grouped_data_ids = mk_storage(
+            allocator, data_ids_bytes, MemoryLocation::GpuOnly, "moe_grouped_data_ids")?;
+        let grouped_data_counts = mk_storage(
+            allocator, data_counts_bytes, MemoryLocation::GpuOnly, "moe_grouped_data_counts")?;
+
         self.moe_router_gpu = Some(super::state::MoeRouterGpu {
             layers,
             layer_to_gpu_idx,
@@ -839,6 +878,21 @@ impl Forward {
             top_k,
             hidden_size,
             rms_norm_eps: router_data.rms_norm_eps,
+            grouped_input_q8,
+            grouped_gate_up_out,
+            grouped_glu_out,
+            grouped_glu_q8,
+            grouped_down_out,
+            grouped_data_ids,
+            grouped_data_counts,
+            grouped_weights_host: std::sync::Mutex::new(Vec::with_capacity(
+                (max_seq as usize) * (top_k as usize),
+            )),
+            grouped_data_ids_host: std::sync::Mutex::new(Vec::with_capacity(
+                (max_seq as usize) * (top_k as usize),
+            )),
+            moe_intermediate: mi,
+            max_seq,
         });
         Ok(())
     }
@@ -928,6 +982,14 @@ impl Forward {
             gpu.indices_scratch.destroy(device, allocator);
             gpu.weights_scratch.destroy(device, allocator);
             gpu.readback_staging.destroy(device, allocator);
+            // Sprint 61C — Phase 2' Expert-Grouped Dispatch scratch.
+            gpu.grouped_input_q8.destroy(device, allocator);
+            gpu.grouped_gate_up_out.destroy(device, allocator);
+            gpu.grouped_glu_out.destroy(device, allocator);
+            gpu.grouped_glu_q8.destroy(device, allocator);
+            gpu.grouped_down_out.destroy(device, allocator);
+            gpu.grouped_data_ids.destroy(device, allocator);
+            gpu.grouped_data_counts.destroy(device, allocator);
         }
         self.kv_cache.destroy(device, allocator);
         if let Some(p) = self.profiler {

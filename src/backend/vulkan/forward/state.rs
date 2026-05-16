@@ -222,6 +222,48 @@ pub struct MoeRouterGpu {
     pub top_k: u32,
     pub hidden_size: u32,
     pub rms_norm_eps: f32,
+    // Sprint 61C — Phase 2' Expert-Grouped Dispatch (env-gated via
+    // VF_MOE_GROUPED=1). The five FP32 / Q8_1 scratch buffers below
+    // back the grouped MMQ_ID expert FFN path. Sized for the worst
+    // case (max_seq × top_k × {2*moe_intermediate, moe_intermediate,
+    // hidden_size}). The `data_ids` / `data_counts` SSBOs are read by
+    // the mul_mmq_id shader (bindings 3, 4); they're populated via
+    // cmd_update_buffer per layer after CPU-side counting-sort.
+    /// Q8_1 of `batch_o` (gate_up GEMM B input). `[max_seq × hidden]`.
+    pub grouped_input_q8: GpuBuffer,
+    /// FP32 `[max_seq × top_k × 2 * moe_intermediate]`. Output of
+    /// gate_up MMQ_ID; consumed slot-wise by the per-slot GLU dispatches.
+    pub grouped_gate_up_out: GpuBuffer,
+    /// FP32 `[max_seq × top_k × moe_intermediate]`. Output of the
+    /// per-slot GLU; quantized into `grouped_glu_q8` before down GEMM.
+    pub grouped_glu_out: GpuBuffer,
+    /// Q8_1 of `grouped_glu_out`. `[max_seq × top_k × moe_intermediate]`.
+    pub grouped_glu_q8: GpuBuffer,
+    /// FP32 `[max_seq × top_k × hidden]`. Output of down MMQ_ID;
+    /// consumed slot-wise by per-slot FMA add into `batch_ffn_hidden`.
+    pub grouped_down_out: GpuBuffer,
+    /// u32 `[max_seq × top_k]`. Per-routed-pair: TOKEN index. Sorted
+    /// by `expert_id` (groups are contiguous). Read by mul_mmq_id at
+    /// binding 3. Uploaded via cmd_update_buffer.
+    pub grouped_data_ids: GpuBuffer,
+    /// u32 `[n_experts]`. Per-expert count of routed pairs. Read by
+    /// mul_mmq_id at binding 4. Uploaded via cmd_update_buffer.
+    pub grouped_data_counts: GpuBuffer,
+    /// Sprint 61C — the per-routed-pair routing weight in the same
+    /// order as `grouped_data_ids`. Computed alongside data_ids by the
+    /// CPU counting-sort. Used by the per-slot FMA loop (host-side
+    /// scalar from this vec, passed as push-constant).
+    pub grouped_weights_host: std::sync::Mutex<Vec<f32>>,
+    /// Companion host-side cache of `grouped_data_ids` so the FMA
+    /// per-slot loop knows which token to accumulate into without
+    /// another GPU readback.
+    pub grouped_data_ids_host: std::sync::Mutex<Vec<u32>>,
+    /// Cached `moe_intermediate` size used to dimension the scratch
+    /// buffers above. Loader fills it during init_moe_router_gpu.
+    pub moe_intermediate: u32,
+    /// Cached `max_seq` (= max_prefill_tokens) used to dimension the
+    /// scratch buffers above.
+    pub max_seq: u32,
 }
 
 /// scratch it shares with the per-token path (currently just

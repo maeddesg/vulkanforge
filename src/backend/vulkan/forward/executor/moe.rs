@@ -15,8 +15,8 @@ use super::{
     MOE_LAYER0_LOGGED,
 };
 use super::super::arch::{
-    compute_barrier, layer_weight, layer_weight_indexed_shader, layer_weight_shader,
-    transfer_to_compute_barrier,
+    compute_barrier, layer_weight, layer_weight_indexed_shader, layer_weight_mmq_id_shader,
+    layer_weight_shader, transfer_to_compute_barrier,
 };
 use super::super::state::Forward;
 use super::super::super::gguf::ModelConfig;
@@ -26,6 +26,34 @@ use super::super::super::shaders::ShaderId;
 use ash::vk;
 
 use super::super::gpu_direct_moe_enabled;
+
+/// Sprint 61C — Phase 2' env-gate. `VF_MOE_GROUPED=1` activates the
+/// MMQ_ID Expert-Grouped batched dispatch in `b_step_moe_expert_ffn`;
+/// any other value (including unset) keeps the GPU-direct GEMV slot
+/// loop from Sprint 56C-3 as the default. Cached after first read.
+pub(crate) fn moe_grouped_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("VF_MOE_GROUPED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Sprint 61C — Subgroup-ballot vs scalar IDS-scan toggle for the
+/// MMQ_ID kernels. `VF_MOE_GROUPED_SUBGROUP=0` falls back to the
+/// stock variant; default ON since the subgroup build proved to load
+/// cleanly on Mesa 26.1-rc3 / gfx1201 in Sprint 61B.
+pub(crate) fn moe_grouped_subgroup_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("VF_MOE_GROUPED_SUBGROUP")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
+    })
+}
 
 impl DecodeExec {
     // === Sprint 51D-B Block 1 — Gemma-4-26B-A4B MoE FFN-Block norms + add ===
@@ -791,6 +819,16 @@ impl BatchExec {
         &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx,
         n_experts: u32, top_k: u32, moe_intermediate: u32,
     ) {
+        // Sprint 61C — Phase 2' Expert-Grouped MMQ_ID branch.
+        // Requires the GPU router so we can read indices_scratch /
+        // weights_scratch for the CPU counting-sort. Skipped if the
+        // env-gate is off (default).
+        if moe_grouped_enabled() && fwd.moe_router_gpu.is_some() {
+            self.b_step_moe_expert_ffn_grouped(
+                fwd, cfg, ctx, n_experts, top_k, moe_intermediate,
+            );
+            return;
+        }
         // Sprint 56C-2 — GPU-direct BAT branch.
         if gpu_direct_moe_enabled() && fwd.moe_router_gpu.is_some() {
             self.b_step_moe_expert_ffn_gpu_direct(
@@ -1123,6 +1161,321 @@ impl BatchExec {
             }
         }
         // Final barrier mirroring the CPU-readback path.
+        compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    /// Sprint 61C — Phase 2' Expert-Grouped Dispatch (env-gated).
+    ///
+    /// Replaces the per-(token × slot) indexed-GEMV slot loop from
+    /// Sprint 56C with two batched `mul_mmq` MUL_MAT_ID GEMMs (gate_up
+    /// + down). Tokens are grouped by expert via a tiny CPU counting-
+    /// sort run from a readback of `indices_scratch` / `weights_scratch`.
+    /// GLU and FMA-add stay per-slot for the pragmatic first land (no
+    /// new shaders); the win is the 2× gate_up + 2× down GEMV-per-
+    /// (token,slot) → 1× MMQ_ID per kernel collapse plus the 5×
+    /// arithmetic intensity from M=`active_tokens_per_expert` row-batched
+    /// per-expert weights fetch.
+    ///
+    /// Dispatch count per layer (seq=25, top_k=8, GGUF Q3_K_M):
+    /// - Current (56C indexed-GEMV): 25 × 8 × 4 = 800
+    /// - This path: 1 (q8_1) + 1 (gate_up MMQ_ID) + 25×8 (GLU)
+    ///   + 1 (q8_1) + 1 (down MMQ_ID) + 25×8 (FMA add) = 404
+    /// → ~2× CB-record overhead saving plus weight-fetch consolidation.
+    ///
+    /// The `mid_frame_submit_and_wait` to drain `indices_scratch` for
+    /// CPU sort is the trade-off; Sprint 61A measured the previous
+    /// per-layer drain at ~26 ms each (25 layers = 647 ms wall), but
+    /// the readback here is *only* `seq_len × top_k × 8 B` (≈1.6 KB)
+    /// vs the 51C-era `seq_len × hidden × 4 B` (~290 KB) so the drain
+    /// is dominated by the submit-and-wait overhead, not the copy.
+    fn b_step_moe_expert_ffn_grouped(
+        &self,
+        fwd: &mut Forward,
+        cfg: &ModelConfig,
+        ctx: &ExecCtx,
+        n_experts: u32,
+        top_k: u32,
+        moe_intermediate: u32,
+    ) {
+        let seq_len = batch_seq_len(ctx);
+        let h = cfg.hidden_dim;
+        let mi = moe_intermediate;
+        let h_bytes = (h as u64) * 4;
+        let mi_bytes = (mi as u64) * 4;
+        let two_mi_bytes = 2 * mi_bytes;
+
+        // -------- 1. Snapshot all buffer handles --------
+        // (Sprint 56B pattern: extract handles once so subsequent
+        // &mut self calls don't fight the borrow checker.)
+        let (
+            router_indices,
+            router_weights,
+            router_readback_staging,
+            grouped_data_ids,
+            grouped_data_counts,
+            grouped_input_q8,
+            grouped_gate_up_out,
+            grouped_glu_out,
+            grouped_glu_q8,
+            grouped_down_out,
+        ) = {
+            let router = fwd.moe_router_gpu.as_ref()
+                .expect("Phase 2' grouped path requires moe_router_gpu");
+            (
+                router.indices_scratch.handle,
+                router.weights_scratch.handle,
+                router.readback_staging.handle,
+                router.grouped_data_ids.handle,
+                router.grouped_data_counts.handle,
+                router.grouped_input_q8.handle,
+                router.grouped_gate_up_out.handle,
+                router.grouped_glu_out.handle,
+                router.grouped_glu_q8.handle,
+                router.grouped_down_out.handle,
+            )
+        };
+        let batch_o_h = fwd.batch_o.handle;
+        let batch_out = fwd.batch_ffn_hidden.handle;
+
+        // -------- 2. Readback router indices+weights for grouping --------
+        // The Sprint 56C GPU-direct b_step_moe_route emits a
+        // compute_barrier and returns when gpu_direct_moe_enabled
+        // — so indices/weights are GPU-resident here. Issue a small
+        // (seq_len × top_k × 8 B) copy → submit → wait → CPU sort.
+        let topk_bytes = (top_k as u64) * 4;
+        let all_topk_bytes = (seq_len as u64) * topk_bytes;
+        let bar_pre = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+        unsafe {
+            ctx.dev.device.cmd_pipeline_barrier(
+                ctx.cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                std::slice::from_ref(&bar_pre), &[], &[],
+            );
+            let cp_idx = vk::BufferCopy {
+                src_offset: 0, dst_offset: 0, size: all_topk_bytes,
+            };
+            ctx.dev.device.cmd_copy_buffer(
+                ctx.cmd, router_indices, router_readback_staging,
+                std::slice::from_ref(&cp_idx),
+            );
+            let cp_w = vk::BufferCopy {
+                src_offset: 0, dst_offset: all_topk_bytes, size: all_topk_bytes,
+            };
+            ctx.dev.device.cmd_copy_buffer(
+                ctx.cmd, router_weights, router_readback_staging,
+                std::slice::from_ref(&cp_w),
+            );
+        }
+        transfer_to_host_barrier(ctx.dev, ctx.cmd);
+        fwd.mid_frame_submit_and_wait(ctx.dev, ctx.cmd)
+            .expect("mid_frame_submit_and_wait failed (grouped readback)");
+
+        // -------- 3. CPU read of router indices/weights + count tally --------
+        // CRITICAL: mul_mmq.comp's MUL_MAT_ID branch indexes IDS as
+        // `data_ids[ii1 * nbi1 + ii0] = EXPERT_ID for token=ii1 slot=ii0`
+        // (the *raw* router layout, not a sorted-by-expert order). The
+        // shader scans IDS per workgroup-Z (expert) and gathers matching
+        // (ii0, ii1) into shared `row_ids[]`. So we upload `idx_slice`
+        // unchanged — NO counting-sort. Only `data_counts[expert]` is
+        // computed CPU-side (used by the workgroup early-exit). FMA-add
+        // also iterates (token, slot) in original order; output cell
+        // `[t × top_k + s]` in `grouped_down_out` already lands at the
+        // right place because the shader's D-write uses the *same*
+        // (row_idx.y=token, row_idx.x=slot) it gathered from IDS.
+        let (counts_vec, indices_host, weights_host) = {
+            let raw = fwd.moe_router_gpu.as_ref().unwrap()
+                .readback_staging.read_bytes()
+                .expect("readback_staging not host-visible");
+            let total_topk = (seq_len as usize) * (top_k as usize);
+            let idx_slice: &[u32] = bytemuck::cast_slice(&raw[..(total_topk * 4)]);
+            let w_slice: &[f32] = bytemuck::cast_slice(
+                &raw[(total_topk * 4)..(total_topk * 8)],
+            );
+            if ctx.layer == 0
+                && !MOE_LAYER0_LOGGED.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                let routing0: Vec<(u32, f32)> = (0..(top_k as usize))
+                    .map(|k| (idx_slice[k], w_slice[k])).collect();
+                log_router_decision(0, &routing0);
+            }
+            let mut counts = vec![0u32; n_experts as usize];
+            for &e in idx_slice {
+                counts[e as usize] += 1;
+            }
+            (counts, idx_slice.to_vec(), w_slice.to_vec())
+        };
+
+        // -------- 4. Upload indices + counts to GPU SSBOs --------
+        // cmd_update_buffer caps at 64 KB; for routine prefill batches
+        // it's 25×8×4 = 800 B for data_ids, 128×4 = 512 B for counts.
+        unsafe {
+            ctx.dev.device.cmd_update_buffer(
+                ctx.cmd, grouped_data_ids, 0,
+                bytemuck::cast_slice(&indices_host),
+            );
+            ctx.dev.device.cmd_update_buffer(
+                ctx.cmd, grouped_data_counts, 0,
+                bytemuck::cast_slice(&counts_vec),
+            );
+        }
+        transfer_to_compute_barrier(ctx.dev, ctx.cmd);
+
+        // -------- 5. Q8_1 quantize batch_o → grouped_input_q8 --------
+        fwd.run_quantize_q8_1(
+            ctx.dev, ctx.registry, ctx.cmd,
+            batch_o_h, grouped_input_q8,
+            seq_len * h,
+            "moe_q8_input_b",
+        );
+        compute_barrier(ctx.dev, ctx.cmd);
+
+        // -------- 6. gate_up MMQ_ID (1 dispatch over all experts) --------
+        let gate_up_t = ctx.model
+            .tensor(&format!("blk.{}.moe_experts.gate_up_proj", ctx.layer))
+            .expect("moe_experts.gate_up_proj missing");
+        let gate_up_block_size = gate_up_t.ggml_type.block_size() as u32;
+        let gate_up_type_size = gate_up_t.ggml_type.type_size() as u32;
+        let gate_up_bytes_per_expert = (gate_up_t.byte_size / (n_experts as u64)) as u32;
+        let gate_up_elems_per_expert =
+            gate_up_bytes_per_expert / gate_up_type_size * gate_up_block_size;
+        let subgroup = moe_grouped_subgroup_enabled();
+        let gate_up_shader = layer_weight_mmq_id_shader(
+            ctx.model, ctx.layer, "moe_experts.gate_up_proj", subgroup,
+        );
+        let gate_up_w = layer_weight(ctx.model, ctx.layer, "moe_experts.gate_up_proj");
+        fwd.run_mmq_id_grouped(
+            ctx.dev, ctx.registry, ctx.cmd,
+            gate_up_shader,
+            gate_up_w,
+            grouped_input_q8,
+            grouped_gate_up_out,
+            grouped_data_ids,
+            grouped_data_counts,
+            2 * mi, // M
+            h,      // K
+            seq_len, top_k, n_experts,
+            gate_up_elems_per_expert,
+            h,      // stride_b (harmless with ne11=1)
+            h,      // batch_stride_b (per-token K-stride in [seq_len × hidden] B)
+            1,      // ne11=1: slot doesn't pick within-token B slice
+            "moe_gate_up_grouped",
+        );
+        compute_barrier(ctx.dev, ctx.cmd);
+
+        // -------- 7. Per-(token, slot) GLU --------
+        // gate_up_out layout: [seq_len × top_k × 2*mi], so slot offset
+        // is `(t * top_k + s) * 2*mi`. Gate occupies the first mi
+        // elements of each slot block; up occupies the second mi.
+        // GLU writes mi floats per slot into grouped_glu_out at
+        // `(t * top_k + s) * mi`.
+        for t in 0..(seq_len as u64) {
+            for k in 0..(top_k as u64) {
+                let slot_flat = t * (top_k as u64) + k;
+                let gate_off = slot_flat * two_mi_bytes;
+                let up_off = gate_off + mi_bytes;
+                let out_off = slot_flat * mi_bytes;
+                let kernel = ctx.registry.get(ShaderId::GeluPytorchTanhGlu);
+                let set = fwd.alloc_or_get_set(
+                    ctx.dev, kernel.descriptor_set_layout,
+                    &[
+                        (0, grouped_gate_up_out, gate_off, mi_bytes),
+                        (1, grouped_gate_up_out, up_off,   mi_bytes),
+                        (2, grouped_glu_out,     out_off,  mi_bytes),
+                    ],
+                );
+                let pc = SwigluPushConstants { n: mi };
+                let dispatch_x = (mi + 255) / 256;
+                let layout = kernel.pipeline_layout;
+                let pipeline = kernel.pipeline;
+                fwd.profile("moe_glu_grouped", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
+                    dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                    dev.device.cmd_bind_descriptor_sets(
+                        cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+                    );
+                    dev.device.cmd_push_constants(
+                        cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+                    );
+                    dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
+                });
+            }
+        }
+        compute_barrier(ctx.dev, ctx.cmd);
+
+        // -------- 8. Q8_1 quantize GLU output → grouped_glu_q8 --------
+        fwd.run_quantize_q8_1(
+            ctx.dev, ctx.registry, ctx.cmd,
+            grouped_glu_out, grouped_glu_q8,
+            seq_len * top_k * mi,
+            "moe_q8_glu_b",
+        );
+        compute_barrier(ctx.dev, ctx.cmd);
+
+        // -------- 9. down MMQ_ID (1 dispatch over all experts) --------
+        let down_t = ctx.model
+            .tensor(&format!("blk.{}.moe_experts.down_proj", ctx.layer))
+            .expect("moe_experts.down_proj missing");
+        let down_block_size = down_t.ggml_type.block_size() as u32;
+        let down_type_size = down_t.ggml_type.type_size() as u32;
+        let down_bytes_per_expert = (down_t.byte_size / (n_experts as u64)) as u32;
+        let down_elems_per_expert =
+            down_bytes_per_expert / down_type_size * down_block_size;
+        let down_shader = layer_weight_mmq_id_shader(
+            ctx.model, ctx.layer, "moe_experts.down_proj", subgroup,
+        );
+        let down_w = layer_weight(ctx.model, ctx.layer, "moe_experts.down_proj");
+        fwd.run_mmq_id_grouped(
+            ctx.dev, ctx.registry, ctx.cmd,
+            down_shader,
+            down_w,
+            grouped_glu_q8,
+            grouped_down_out,
+            grouped_data_ids,
+            grouped_data_counts,
+            h,       // M = hidden
+            mi,      // K
+            seq_len, top_k, n_experts,
+            down_elems_per_expert,
+            mi,            // stride_b — slot picks within-token block
+            top_k * mi,    // batch_stride_b — per-token block size in B
+            top_k,         // ne11 = top_k (slot ∈ [0, top_k) maps to mi-block)
+            "moe_down_grouped",
+        );
+        compute_barrier(ctx.dev, ctx.cmd);
+
+        // -------- 10. Zero output accumulator --------
+        unsafe {
+            ctx.dev.device.cmd_fill_buffer(
+                ctx.cmd, batch_out, 0, (seq_len as u64) * h_bytes, 0,
+            );
+        }
+        transfer_to_compute_barrier(ctx.dev, ctx.cmd);
+
+        // -------- 11. Per-(token, slot) scalar-weight FMA add --------
+        // grouped_down_out layout: [seq_len × top_k × hidden] indexed by
+        // (token, slot) — the MMQ_ID kernel wrote each output to its
+        // (row_idx.y=token, row_idx.x=slot) lane. Iterate in the
+        // original router order so the weight at position
+        // `t * top_k + s` matches the down_out lane at
+        // `(t * top_k + s) * hidden`.
+        for t in 0..(seq_len as u64) {
+            for k in 0..(top_k as u64) {
+                let flat = (t * (top_k as u64) + k) as usize;
+                let weight = weights_host[flat];
+                let in_off = (flat as u64) * h_bytes;
+                let out_off = t * h_bytes;
+                fwd.run_fma_add_at_offset(
+                    ctx.dev, ctx.registry, ctx.cmd,
+                    grouped_down_out, in_off,
+                    batch_out, out_off,
+                    h, weight,
+                    "moe_fma_add_grouped",
+                );
+            }
+        }
         compute_barrier(ctx.dev, ctx.cmd);
     }
 }
