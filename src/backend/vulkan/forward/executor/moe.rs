@@ -1463,11 +1463,56 @@ impl BatchExec {
                         down_k, h,
                         down_elems_per_expert,
                         slot_flat,
-                        "moe_down_bisect",
+                        "moe_down_bisect_gemv",
                         down_shader_gemv,
                     );
                     fwd.mark_written(&[o_buf]);
                     fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[o_buf]);
+
+                    // Sprint 61C-3 dump: o_buf is the down GEMV output for
+                    // this (t, slot) pair, before FMA-weighting. Dump first
+                    // 16 floats at layer 0 for t=0 / slot=0 + slot=1.
+                    if ctx.layer == 0 && t == 0 && k < 2
+                        && std::env::var("VF_GROUPED_DUMP")
+                            .map(|v| v == "1").unwrap_or(false)
+                    {
+                        let staging_h = fwd.moe_route_staging.handle;
+                        let dump_bytes: u64 = 16 * 4;
+                        let bar = vk::MemoryBarrier::default()
+                            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+                        unsafe {
+                            ctx.dev.device.cmd_pipeline_barrier(
+                                ctx.cmd,
+                                vk::PipelineStageFlags::COMPUTE_SHADER,
+                                vk::PipelineStageFlags::TRANSFER,
+                                vk::DependencyFlags::empty(),
+                                std::slice::from_ref(&bar), &[], &[],
+                            );
+                            let cp = vk::BufferCopy {
+                                src_offset: 0, dst_offset: 0, size: dump_bytes,
+                            };
+                            ctx.dev.device.cmd_copy_buffer(
+                                ctx.cmd, o_buf, staging_h,
+                                std::slice::from_ref(&cp),
+                            );
+                        }
+                        transfer_to_host_barrier(ctx.dev, ctx.cmd);
+                        fwd.mid_frame_submit_and_wait(ctx.dev, ctx.cmd)
+                            .expect("bisect dump submit");
+                        let raw = fwd.moe_route_staging.read_bytes()
+                            .expect("staging read");
+                        let vals: Vec<f32> = raw[..16*4].chunks(4)
+                            .map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]]))
+                            .collect();
+                        eprintln!(
+                            "[DIRECT  DOWN L0 T0 S{} expert={}] {:?}",
+                            k,
+                            // Read expert id from indices_host
+                            indices_host[(t * (top_k as u64) + k) as usize],
+                            vals,
+                        );
+                    }
 
                     // (b) Indexed FMA into per-token slot of batch_out.
                     fwd.run_fma_add_indexed(
@@ -1526,6 +1571,64 @@ impl BatchExec {
             "moe_down_grouped",
         );
         compute_barrier(ctx.dev, ctx.cmd);
+
+        // Sprint 61C-3 dump: grouped_down_out is laid out as
+        // [seq × top_k × h] FP32. Dump first 16 floats at (t=0, s=0)
+        // and (t=0, s=1) at layer 0 for direct comparison with the
+        // bisect (legacy) path's o_buf dumps above.
+        if ctx.layer == 0
+            && std::env::var("VF_GROUPED_DUMP")
+                .map(|v| v == "1").unwrap_or(false)
+        {
+            let staging_h = fwd.moe_route_staging.handle;
+            let dump_bytes: u64 = 16 * 4;
+            let bar = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            unsafe {
+                ctx.dev.device.cmd_pipeline_barrier(
+                    ctx.cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&bar), &[], &[],
+                );
+                let cp0 = vk::BufferCopy {
+                    src_offset: 0, dst_offset: 0, size: dump_bytes,
+                };
+                ctx.dev.device.cmd_copy_buffer(
+                    ctx.cmd, grouped_down_out, staging_h,
+                    std::slice::from_ref(&cp0),
+                );
+                let cp1 = vk::BufferCopy {
+                    src_offset: h_bytes, dst_offset: dump_bytes,
+                    size: dump_bytes,
+                };
+                ctx.dev.device.cmd_copy_buffer(
+                    ctx.cmd, grouped_down_out, staging_h,
+                    std::slice::from_ref(&cp1),
+                );
+            }
+            transfer_to_host_barrier(ctx.dev, ctx.cmd);
+            fwd.mid_frame_submit_and_wait(ctx.dev, ctx.cmd)
+                .expect("grouped down dump submit");
+            let raw = fwd.moe_route_staging.read_bytes()
+                .expect("staging read");
+            let vals0: Vec<f32> = raw[..16*4].chunks(4)
+                .map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]]))
+                .collect();
+            let vals1: Vec<f32> = raw[16*4..32*4].chunks(4)
+                .map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]]))
+                .collect();
+            eprintln!(
+                "[GROUPED DOWN L0 T0 S0 expert={}] {:?}",
+                indices_host[0], vals0,
+            );
+            eprintln!(
+                "[GROUPED DOWN L0 T0 S1 expert={}] {:?}",
+                indices_host[1], vals1,
+            );
+        }
 
         // -------- 10. Zero output accumulator --------
         unsafe {
