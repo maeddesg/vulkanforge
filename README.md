@@ -189,6 +189,11 @@ flag is a default-on candidate for 14B FP8 on Zen 4.
 | Native FP8 WMMA      | (auto)                     | `shaderFloat8CooperativeMatrix` (Mesa 26.1+) | +45–58 % FP8 prefill |
 | CPU `lm_head` offload| `VF_CPU_LM_HEAD=1`         | AVX-512F + BW + VL (Zen 4 / Ice Lake+) | −970 MB VRAM, 14B +32 % decode |
 | On-the-fly Q4_K      | `VF_QUANTIZE_ON_LOAD=1`    | SafeTensors model with FP32 / BF16 weights | Quantize 2D weights to Q4_K_M at load; ~7× VRAM compression on quantized tensors, routes through the Q4_K shader pipeline. Gemma-4-E2B: decode +54 %, power −41 %, tok/s/W 1.39 |
+| FP8 KV-cache         | `VULKANFORGE_KV_FP8=1`     | Mesa 26.1+ (heterogeneous head_dim auto-handled) | −50 % KV-cache VRAM. Gemma-4-26B-A4B: 880 → 440 MB. |
+| Expert-Grouped MoE prefill (v0.4.5) | `VF_MOE_GROUPED=1` | MoE model (Gemma-4-26B-A4B et al.) | +43 % prefill on Gemma-4-26B-A4B Q3_K_M (65 → 93 t/s). Per-MoE-layer dispatch ~800 → ~450. |
+| Batched MoE decode (v0.4.5)         | `VF_MOE_BATCHED_DECODE=1` | MoE model | +4.8 % decode on Gemma-4-26B-A4B Q3_K_M (27.3 → 28.6 t/s). 800 → 450 MoE dispatches/token. |
+| VRAM budget probe (v0.4.5)          | (auto)                    | Linux sysfs `/sys/class/drm/card*/device/mem_info_vram_*` | Diagnostic. Warns when free VRAM < `VF_VRAM_HEADROOM_GIB` (default 1.0). |
+| Tensor-load progress bar (v0.4.5)   | (auto, suppress with `VF_NO_LOAD_PROGRESS=1`) | — | `\r`-overwritten stderr progress bar during GGUF / SafeTensors upload. |
 
 All features are opt-in. Without flags, VulkanForge runs GGUF models
 on Mesa 26.1+ with no special configuration. `VF_FP8=auto` picks
@@ -251,7 +256,8 @@ vulkanforge serve  --model <PATH> [--host 127.0.0.1] [--port 8080] [--cors]
 
 `vulkanforge chat --help` lists every flag (sampling, max-tokens,
 think-filter, max-context). The chat REPL accepts `/help`, `/quit`,
-and a single-shot mode via `VF_PROMPT="..."`.
+`/reset` (clear KV cache + history without reloading the model), and
+a single-shot mode via `VF_PROMPT="..."`.
 
 ## API Server (v0.4)
 
