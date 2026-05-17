@@ -1,5 +1,141 @@
 # Changelog
 
+## v0.4.5 — Expert-Grouped MoE Prefill + Batched Decode + UX/Validation Fixes (2026-05-17)
+
+Opt-in Expert-Grouped Dispatch lands for the Gemma-4-26B-A4B MoE
+expert FFN, plus a batched decode-side counterpart, plus three
+quality-of-life fixes (tensor-load progress bar, sysfs VRAM budget
+probe, zero Vulkan validation errors on all tested paths).
+
+### Performance (RX 9070 XT, Gemma-4-26B-A4B Q3_K_M, `VULKANFORGE_KV_FP8=1`)
+
+| Path                                         | Prefill | Decode |
+|----------------------------------------------|--------:|-------:|
+| Default GPU-direct (v0.4.4 baseline)         | 65 t/s  | 27 t/s |
+| `VF_MOE_GROUPED=1` (Expert-Grouped Prefill)  | **93 t/s** | 27 t/s |
+| `VF_MOE_BATCHED_DECODE=1` (Batched Decode)   | 65 t/s  | **28.6 t/s** |
+
+Prefill +43 % (65 → 93 t/s) on the 41-token relativity prompt;
+decode +4.8 % (27.3 → 28.6 t/s) on the same prompt. Both flags
+opt-in and compose freely with `VULKANFORGE_KV_FP8=1`. Output is
+byte-identical to baseline on a 5-prompt coherence smoke
+(Paris / 2+2 / Berlin / haiku / neural networks).
+
+Other models regression-clean: **Qwen3-8B Q4_K_M 549 / 108 t/s**,
+**Llama-3.1-8B Q4_K_M 282 / 114 t/s**, **Gemma-4-E2B Q4_K_M 78 / 62 t/s**.
+
+### What Changed
+
+- **Expert-Grouped Dispatch** (Sprints 61A–61G, opt-in via
+  `VF_MOE_GROUPED=1`): collapses the per-(token, slot) gate_up + down
+  GEMV dispatches into two batched `mul_mmq` MUL_MAT_ID calls
+  covering all routed pairs. Per-MoE-layer dispatch count
+  ~800 → ~450; per-expert weight cache reused across the ~5 tokens-
+  per-active-expert routed group. 8 new MMQ_ID SPV variants
+  (Q3_K/Q4_K/Q4_0/Q5_0 × stock+subgroup) + 4 mul_mm MUL_MAT_ID
+  variants. Total shader pipelines 129 → **141**.
+- **Sprint 61G Multi-Expert FMA-race fix**: per-(token, slot) FMA
+  loop into `batch_out[t*h..(t+1)*h]` now emits an unconditional
+  `compute_barrier` after each FMA — the 8 FMAs all RW the same
+  slice and the GPU was pipelining them. Caused the coherent-but-
+  wrong output that blocked Sprints 61C–61E. Single-expert
+  isolation (`VF_MOE_SINGLE_EXPERT=1`, kept as a documented
+  diagnostic gate) cracked the diagnosis in 10 min.
+- **Batched MoE Decode** (Sprint P4-1, opt-in via
+  `VF_MOE_BATCHED_DECODE=1`): the MUL_MAT_ID indexed-GEMV shader
+  already uses `gl_WorkGroupID.y` as the slot dimension, so setting
+  `nei0=top_k`, `expert_i1=0`, `dispatch.y=top_k` reduces gate_up +
+  down from 8 per-slot dispatches each to 1 Y-dispatched workgroup
+  count each — **no shader changes required**. Per MoE layer
+  32 → 18 dispatches (−14); per token 800 → 450 (−350).
+
+### UX
+
+- **Tensor-load progress bar** (`src/backend/vulkan/loader.rs`): both
+  GGUF and SafeTensors loaders print a `\r`-overwritten progress bar
+  on stderr during the upload loop. Especially useful for 26B-A4B
+  SafeTensors BF16 → Q4_K on-the-fly quantization (~5 min).
+  Throttled to ~1 print per 1 %; disable via `VF_NO_LOAD_PROGRESS=1`.
+- **VRAM budget probe**: `Forward::new` reads
+  `/sys/class/drm/card*/device/mem_info_vram_{used,total}` (AMD GPU
+  vendor 0x1002 auto-detection) and prints a one-line budget report
+  at startup. Warns to stderr when free VRAM drops below
+  `VF_VRAM_HEADROOM_GIB` (default 1.0 GiB) — **diagnostic, not
+  load-blocking**. Prevents the Wayland/KDE compositor freeze that
+  happens when 26B SafeTensors Q4_K loading (~13 GiB) overruns a
+  crowded 16 GiB GPU.
+- **Lazy grouped buffers**: the 7 grouped-dispatch GPU buffers
+  introduced by Sprint 61C are now allocated full-size only when
+  `VF_MOE_GROUPED=1`. Default path keeps 16-byte stubs. Saves
+  ~200–500 MiB VRAM on the default GPU-direct path.
+
+### Fixes
+
+- **`VK_EXT_shader_float8` enabled whenever the driver supports it**:
+  the FP8 shaders (FP8 KV-cache, FP8 WMMA, FP8 GEMV) were emitting
+  ~10 validation errors per startup on Mesa 26.1+ when the
+  extension was present but the device-extension array didn't
+  include it. Now enabled unconditionally on capable drivers.
+- **Fuse0/Fuse1 descriptors bound in `b_step_ple_block` K-quant
+  GEMVs**: the BATCH PLE block's two inline K-quant GEMV dispatches
+  (per_layer_input_gate.weight, per_layer_projection.weight) were
+  only writing 3 SSBOs, but K-quant GEMV shaders declare 5 SSBOs
+  (Fuse0/Fuse1 at bindings 3+4 for the conditional MoE-fusion
+  broadcast path). Fired ~10 validation errors per E2B SafeTensors
+  prompt with `VF_QUANTIZE_ON_LOAD=1`. Match on shader id at each
+  inline dispatch: 3 bindings for fp8/f32/f16 variants, 5 for
+  K-quant variants. **Validation errors: 0** on all tested paths.
+
+### New Env Vars
+
+| Variable                    | Effect                                                     |
+|-----------------------------|------------------------------------------------------------|
+| `VF_MOE_GROUPED=1`          | Expert-Grouped Prefill (+43 % on 26B-A4B Q3_K_M)           |
+| `VF_MOE_BATCHED_DECODE=1`   | Batched MoE Decode (+4.8 % on 26B-A4B Q3_K_M)              |
+| `VF_VRAM_HEADROOM_GIB=N`    | Free-VRAM warning threshold (default 1.0)                  |
+| `VF_NO_LOAD_PROGRESS=1`     | Suppress tensor-load progress bar (for CI logs)            |
+| `VF_MOE_SINGLE_EXPERT=1`    | Diagnostic: force MoE `top_k=1` for race-isolation bisects |
+
+### Honest Negatives (parking lot)
+
+- **`mul_mm_id` (FP32 B) grouped Down swap**: built the 4
+  pipelines (Q3_K/Q4_K/Q4_0/Q5_0), unblocked layer-0 correctness via
+  `LOAD_VEC_A=4` (Sprint 61E), but full-prefill output still drifts
+  vs the `mul_mmq_id` Q8_1 baseline. Reproduced TWICE post-61G ⇒
+  not the same race 61G fixed. Needs a layer-Δ-dump bisect (Sprint
+  53C/53G pattern) before another attempt. Grouped Down stays on
+  `mul_mmq_id` Q8_1 B for v0.4.5.
+- **CPU `lm_head` for Gemma-4-26B / Qwen3-8B**: Sprint P5 explored
+  extending v0.3.10's CPU-`lm_head` offload (working on Llama-8B)
+  to 26B-A4B and Qwen3-8B. Both produced garbage output. Distinct
+  bugs: Q6_K block-layout mismatch between VF's `Q6KBlock` and
+  upstream `block_q6_K` (210 B same size, different element
+  packing); plus a weight-distribution-dependent correctness bug
+  in the AVX-512 + scalar GEMV paths that the unit test doesn't
+  catch. The CPU `lm_head` for Llama-8B (v0.3.10) is unchanged
+  and still works.
+
+### Tests / Validation
+
+- `cargo test --release --lib`: **202 / 202** green.
+- **5-prompt coherence smoke** on all opt-in combinations (default /
+  grouped / batched-decode / both) for Gemma-4-26B Q3_K_M:
+  byte-identical output.
+- **0 Vulkan validation errors** on Qwen3-8B, Llama-3.1-8B,
+  Gemma-4-E2B (GGUF + SafeTensors `VF_QUANTIZE_ON_LOAD=1`),
+  Gemma-4-26B (GGUF + FP8 KV).
+- Total shader pipelines compiled at startup: 129 → **141**.
+
+### Default-Flip Plan
+
+`VF_MOE_GROUPED=1` and `VF_MOE_BATCHED_DECODE=1` stay **opt-in**
+in v0.4.5 — they're young (single-sprint hardening on the Multi-
+Expert FMA race) and the diagnostic env-gate surface lets us bisect
+quickly if a regression surfaces elsewhere. Default-flip target is
+v0.5.0 after a soak window.
+
+---
+
 ## v0.4.4 — GPU-direct MoE Expert FFN + Async Decode (2026-05-15)
 
 Gemma-4 26B-A4B-it gets a major performance overhaul. The router
