@@ -96,7 +96,9 @@ impl ChatTemplate {
         // those to the Mistral [INST] template, which is the only
         // SPM-style template we currently render.
         match tokenizer.flavour() {
-            Some(TokenizerFlavour::Qwen2) => ChatTemplate::ChatML,
+            // Qwen3.5/3.6 share the ChatML special-token layout with
+            // Qwen2 (`<|im_start|>` / `<|im_end|>` / `<|endoftext|>`).
+            Some(TokenizerFlavour::Qwen2 | TokenizerFlavour::Qwen35) => ChatTemplate::ChatML,
             Some(TokenizerFlavour::Llama3) => ChatTemplate::Llama3,
             Some(TokenizerFlavour::Gemma2) => ChatTemplate::Gemma4,
             None => ChatTemplate::Mistral,
@@ -168,7 +170,9 @@ impl ChatTemplate {
             return ChatTemplate::Gemma4;
         }
         match tokenizer.flavour() {
-            Some(TokenizerFlavour::Qwen2) => ChatTemplate::ChatML,
+            // Qwen3.5/3.6 share the ChatML special-token layout with
+            // Qwen2 (`<|im_start|>` / `<|im_end|>` / `<|endoftext|>`).
+            Some(TokenizerFlavour::Qwen2 | TokenizerFlavour::Qwen35) => ChatTemplate::ChatML,
             Some(TokenizerFlavour::Llama3) => ChatTemplate::Llama3,
             Some(TokenizerFlavour::Gemma2) => ChatTemplate::Gemma4,
             None => ChatTemplate::Mistral,

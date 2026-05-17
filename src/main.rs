@@ -1369,8 +1369,17 @@ fn inference_support(arch: &str, file_type: Option<u32>) -> (bool, bool) {
     // panic later inside `LoadedModel::load` (`gemma4: None` in
     // `ModelConfig::from_gguf`) with a clear "Gemma4Spec missing"
     // surface — that's the next sprint's bisect point.
-    let arch_ok = matches!(arch, "qwen2" | "qwen3" | "llama" | "gemma4");
+    // Sprint C (v0.4.6 prep) — `qwen35` joins the preflight list so
+    // the GGUF loader exercises tensor upload end-to-end. Forward::new
+    // catches the actual inference attempt with a clean error message
+    // (see src/backend/vulkan/forward/setup.rs). Symmetric with the
+    // Sprint 52A `gemma4` lift above.
+    let arch_ok = matches!(arch, "qwen2" | "qwen3" | "llama" | "gemma4" | "qwen35");
     // Supported file_types:
+    //   11 — Q3_K_S  (Q3_K bulk + Q6_K output + F32 norms — strict subset
+    //                  of Q3_K_M; unsloth/Qwen3.6 ships these. Lifted in
+    //                  Sprint C — VF already had Q3_K, Q6_K, and F32 since
+    //                  Sprint 17B/17C.)
     //   12 — Q3_K_M  (Q3_K bulk + Q5_K attn_v/ffn_down + Q4_K attn_output + Q6_K output)
     //   15 — Q4_K_M  (production default)
     //   16 — Q5_K_S  (Q5_K bulk + Q6_K output)
@@ -1388,7 +1397,7 @@ fn inference_support(arch: &str, file_type: Option<u32>) -> (bool, bool) {
     // (Qwen2.5-7B/14B's ffn_down), and Q8_0 shader (Qwen2.5-0.5B's
     // output.weight). Q4_0 infrastructure stays in main and is
     // ready for an arch-Qwen2.5 sprint.
-    let quant_ok = matches!(file_type, Some(12 | 15 | 16 | 17));
+    let quant_ok = matches!(file_type, Some(11 | 12 | 15 | 16 | 17));
     (arch_ok, quant_ok)
 }
 

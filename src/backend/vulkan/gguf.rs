@@ -941,8 +941,9 @@ impl ModelConfig {
         // RoPE rotates the wrong elements → D4 cos 0.51 / D5 cos 0.71
         // observed in the 26B Q3_K_M attention bisect.
         let rope_variant = match arch {
-            "qwen2" | "qwen2moe" | "qwen2vl" | "qwen3" | "qwen3moe" | "phi2" | "phi3"
-            | "gpt-neox" | "gpt-neox-japanese" | "stablelm" | "gemma4" => RopeVariant::Neox,
+            "qwen2" | "qwen2moe" | "qwen2vl" | "qwen3" | "qwen3moe" | "qwen35"
+            | "qwen35moe" | "phi2" | "phi3" | "gpt-neox" | "gpt-neox-japanese"
+            | "stablelm" | "gemma4" => RopeVariant::Neox,
             _ => RopeVariant::Norm,
         };
 

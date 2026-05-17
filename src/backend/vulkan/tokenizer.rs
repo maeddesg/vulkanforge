@@ -58,6 +58,23 @@ const LLAMA3_PRE_REGEX: &str = "(?i:'s|'t|'re|'ve|'m|'ll|'d)\
 |\\s+(?!\\S)\
 |\\s+";
 
+/// Qwen3.5 / Qwen3.6 pre-tokenizer regex. Three differences vs Qwen2:
+///   1. Letter runs also absorb Unicode combining marks (`\p{M}`),
+///      so accented forms ('café' as one token, not 'caf' + 'é').
+///   2. Number runs are *not* greedy — single `\p{N}` instead of
+///      `\p{N}+`. Each digit becomes its own pre-token.
+///   3. The "punctuation/symbol" class excludes combining marks in
+///      addition to letters and digits.
+/// Source: llama.cpp `src/unicode.cpp:608` (header comment for the
+/// `unicode_regex_split_custom_qwen35` handwritten splitter).
+const QWEN35_PRE_REGEX: &str = "(?i:'s|'t|'re|'ve|'m|'ll|'d)\
+|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+\
+|\\p{N}\
+| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*\
+|\\s*[\\r\\n]+\
+|\\s+(?!\\S)\
+|\\s+";
+
 #[derive(Debug)]
 pub enum TokenizerError {
     MissingMetadata(&'static str),
@@ -96,6 +113,10 @@ impl std::error::Error for TokenizerError {}
 pub enum TokenizerFlavour {
     /// Qwen2 / Qwen3 — `pre="qwen2"`. ChatML special tokens.
     Qwen2,
+    /// Qwen3.5 / Qwen3.6 — `pre="qwen35"`. Same ChatML specials as
+    /// Qwen2; the pre-tokenizer regex differs in three small ways
+    /// (see `QWEN35_PRE_REGEX`). Sprint C (v0.4.6 prep).
+    Qwen35,
     /// Llama-3 family — `pre="llama-bpe"`. Header-id / eot_id specials.
     Llama3,
     /// Sprint 43B-2 — Gemma-4 family. `▁`-prefixed SP-style BPE with
@@ -151,6 +172,7 @@ pub struct Tokenizer {
 fn pick_bpe_flavour(model: &str, pre: &str) -> Result<TokenizerFlavour, TokenizerError> {
     match (model, pre) {
         (_, "qwen2") => Ok(TokenizerFlavour::Qwen2),
+        (_, "qwen35") => Ok(TokenizerFlavour::Qwen35),
         (_, "llama-bpe") => Ok(TokenizerFlavour::Llama3),
         // Gemma-4 GGUFs (model="gemma4") skip the `pre` key — detect
         // by model name.
@@ -190,6 +212,7 @@ impl Tokenizer {
         let flavour = pick_bpe_flavour(model, pre)?;
         let pre_regex = match flavour {
             TokenizerFlavour::Qwen2 => QWEN2_PRE_REGEX,
+            TokenizerFlavour::Qwen35 => QWEN35_PRE_REGEX,
             TokenizerFlavour::Llama3 => LLAMA3_PRE_REGEX,
             // Sprint 43B-2 — Gemma-4 isn't reachable from the GGUF
             // path (no llama.cpp Gemma-4 support); arm exists for
@@ -263,7 +286,10 @@ impl Tokenizer {
         // primary `eos_id` covers one, the other goes into extras.
         let mut extra_eos_ids: Vec<u32> = Vec::new();
         match flavour {
-            TokenizerFlavour::Qwen2 => {
+            // Qwen3.5/3.6 share ChatML specials with Qwen2 — same
+            // extra-EOS handling (`<|endoftext|>` added when distinct
+            // from the primary EOS).
+            TokenizerFlavour::Qwen2 | TokenizerFlavour::Qwen35 => {
                 if let Some(et) = endoftext_id {
                     if et != eos_id {
                         extra_eos_ids.push(et);
@@ -462,6 +488,7 @@ impl Tokenizer {
         };
         let pre_regex = match flavour {
             TokenizerFlavour::Qwen2 => QWEN2_PRE_REGEX,
+            TokenizerFlavour::Qwen35 => QWEN35_PRE_REGEX,
             TokenizerFlavour::Llama3 => LLAMA3_PRE_REGEX,
             // Gemma-4 doesn't actually need a pre-split regex — its
             // pre_tokenizer is `Split` on " " with `MergedWithPrevious`
@@ -507,7 +534,9 @@ impl Tokenizer {
         // pin one (some upstream models leave eos_token unset).
         let eos_id = eos_id_opt
             .or_else(|| match flavour {
-                TokenizerFlavour::Qwen2 => token_to_id.get("<|im_end|>").copied(),
+                TokenizerFlavour::Qwen2 | TokenizerFlavour::Qwen35 => {
+                    token_to_id.get("<|im_end|>").copied()
+                }
                 TokenizerFlavour::Llama3 => token_to_id.get("<|eot_id|>").copied(),
                 // Gemma-4 ships `<eos>` (id=1) as the canonical end-
                 // of-stream and `<turn|>` (id=106) as the per-turn
@@ -524,7 +553,10 @@ impl Tokenizer {
 
         let mut extra_eos_ids: Vec<u32> = Vec::new();
         match flavour {
-            TokenizerFlavour::Qwen2 => {
+            // Qwen3.5/3.6 share ChatML specials with Qwen2 — same
+            // extra-EOS handling (`<|endoftext|>` added when distinct
+            // from the primary EOS).
+            TokenizerFlavour::Qwen2 | TokenizerFlavour::Qwen35 => {
                 if let Some(et) = endoftext_id {
                     if et != eos_id {
                         extra_eos_ids.push(et);
@@ -1078,11 +1110,74 @@ mod tests {
             pick_bpe_flavour("gpt2", "llama-bpe").unwrap(),
             TokenizerFlavour::Llama3,
         );
+        // Sprint C (v0.4.6): Qwen3.5 / Qwen3.6 GGUFs declare
+        // `tokenizer.ggml.pre = "qwen35"` and must route to the new
+        // Qwen35 flavour, not Qwen2 — the pre-tokenizer regex differs
+        // in three places (see QWEN35_PRE_REGEX).
+        assert_eq!(
+            pick_bpe_flavour("gpt2", "qwen35").unwrap(),
+            TokenizerFlavour::Qwen35,
+        );
         // Unknown combinations still error out — the regression guard.
         assert!(matches!(
             pick_bpe_flavour("gpt2", "default"),
             Err(TokenizerError::BadModel(_))
         ));
+    }
+
+    /// Sprint C — `QWEN35_PRE_REGEX` must compile under the same
+    /// `regex` crate features VF already enables for `QWEN2_PRE_REGEX`
+    /// (Unicode property classes, lookahead via `fancy_regex`).
+    /// Without `\p{M}` support the regex would fail at construction
+    /// rather than at first use; this test catches that early.
+    #[test]
+    fn qwen35_pre_regex_compiles() {
+        let re = Regex::new(QWEN35_PRE_REGEX).expect("QWEN35_PRE_REGEX must compile");
+        // ASCII smoke — Qwen3.5 must split a basic sentence identically
+        // to Qwen2 in spirit: contractions, words, punctuation, spaces.
+        let text = "Don't worry, it's fine.";
+        let matches: Vec<&str> = re
+            .find_iter(text)
+            .map(|m| m.unwrap().as_str())
+            .collect();
+        // Expect at least: "Don", "'t", " worry", ",", " it", "'s",
+        // " fine", "." — 8 segments. Tolerate ± per-engine boundary
+        // (Rust regex vs fancy_regex chooses slightly different
+        // segment lengths for trailing whitespace).
+        assert!(
+            matches.len() >= 7,
+            "expected >=7 splits, got {}: {:?}",
+            matches.len(),
+            matches
+        );
+    }
+
+    /// Sprint C — verify the documented difference between Qwen2 and
+    /// Qwen3.5: a string with a Unicode combining mark must be a
+    /// SINGLE token under Qwen35 (the letter run absorbs `\p{M}`)
+    /// while Qwen2 splits it (because `\p{L}+` stops at the combining
+    /// mark). Uses the canonical decomposed form `e` + U+0301 (combining
+    /// acute) to keep the test independent of NFC vs NFD input
+    /// normalisation.
+    #[test]
+    fn qwen35_letter_run_absorbs_combining_marks() {
+        let re_q35 = Regex::new(QWEN35_PRE_REGEX).unwrap();
+        let re_q2 = Regex::new(QWEN2_PRE_REGEX).unwrap();
+        let text = "cafe\u{0301}"; // "café" (decomposed: e + combining acute)
+        let q35: Vec<&str> = re_q35
+            .find_iter(text)
+            .map(|m| m.unwrap().as_str())
+            .collect();
+        let q2: Vec<&str> = re_q2
+            .find_iter(text)
+            .map(|m| m.unwrap().as_str())
+            .collect();
+        // Qwen35: one token "café"
+        assert_eq!(q35, vec!["cafe\u{0301}"]);
+        // Qwen2: splits — at minimum the combining mark falls out of
+        // the letter run. Exact split shape depends on the regex
+        // engine; what matters is that Qwen35 ≠ Qwen2 here.
+        assert_ne!(q35, q2);
     }
 
     #[test]
