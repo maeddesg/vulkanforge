@@ -14,6 +14,12 @@
 
 pub(super) mod common;
 pub(super) mod gemma4;
+/// Sprint B (v0.4.6 prep) — Qwen3.5 / Qwen3.6 (`qwen35`) skeleton.
+/// Config + layer-kind routing + tensor-name helpers, no dispatch
+/// wiring yet. See `docs/qwen35_architecture_analysis.md` and
+/// `results/sprint_b_qwen35_prechecks.md`.
+#[allow(dead_code)]
+pub(super) mod qwen35;
 
 pub(super) use common::{
     GemmKind, compute_barrier, is_f32_layer_weight, is_fp8_layer_weight, layer_dims,
