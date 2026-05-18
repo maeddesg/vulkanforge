@@ -659,6 +659,46 @@ impl LoadedModel {
             gguf.tensors.keys().map(|s| s.as_str()).collect();
         tensor_names.sort_unstable();
 
+        // Sprint J — VRAM-Placement workaround for the ≥12 GB model
+        // lm_head BW cliff (Sprint I scaling finding, see
+        // `feedback_vf_vram_scaling_lmhead.md`). GGUF loads tensors
+        // alphabetically, which places `output.weight` /
+        // `token_embd.weight` (the lm_head) AFTER all `blk.*` tensors.
+        // On ≥12 GB models the AMD/RADV driver places these tensors'
+        // dedicated 500-1000 MB VkDeviceMemory blocks at high physical
+        // VRAM offsets, where GDDR6 bandwidth on the lm_head GEMV drops
+        // to ~50 GB/s (7.8 % peak; 8B models stay at 650 GB/s peak).
+        //
+        // `VF_LMHEAD_ALLOC_FIRST=1` hoists `output.weight` (or
+        // `token_embd.weight` if tied) to position 0 in the upload
+        // order so the driver places the dedicated block at a low
+        // physical offset. Measured impact (Sprint J):
+        //   Qwen3.6-27B Q3_K_S decode:  27.7 → 37.1 tok/s (+34 %)
+        //   Gemma-4-26B Q3_K_M decode:  27.2 → 36.5 tok/s (+34 %)
+        //   Qwen3-8B / Llama-3.1-8B:    ≤ 0.5 % delta (noise)
+        //
+        // Caveat: Qwen3.6 prefill drops -44 % (131 → 74 tok/s) under
+        // the env-gate. Likely an artifact of Sprint D's 49-layer
+        // Linear-Attn passthrough plan (untouched FFN weights now
+        // sit at higher offsets); Gemma-4-26B prefill stays within
+        // 5 % (59 → 56). Until Sprints F-G land real Linear-Attn
+        // dispatch and the trade-off can be re-evaluated, this is
+        // env-gated opt-in (not default).
+        if std::env::var("VF_LMHEAD_ALLOC_FIRST").is_ok() {
+            let lm_idx = tensor_names
+                .iter()
+                .position(|n| *n == "output.weight")
+                .or_else(|| tensor_names.iter().position(|n| *n == "token_embd.weight"));
+            if let Some(i) = lm_idx {
+                let lm = tensor_names.remove(i);
+                tensor_names.insert(0, lm);
+                eprintln!(
+                    "[VF_LMHEAD_ALLOC_FIRST] hoisted '{}' to position 0 ({}-th of {})",
+                    lm, i, tensor_names.len(),
+                );
+            }
+        }
+
         // Sprint 52A — Gemma-4 GGUFs use llama.cpp-style tensor suffixes
         // that don't all line up 1:1 with what `forward/` queries.
         // Build a name-translation closure that fires only for
