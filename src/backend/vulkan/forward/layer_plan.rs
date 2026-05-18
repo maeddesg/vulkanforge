@@ -145,6 +145,20 @@ pub enum LayerStep {
     /// fusion is internal to the executor, not a plan variant.
     AttnResidualAdd,
 
+    /// Sprint D (v0.4.6) — identity passthrough for the
+    /// attention sub-block. Emitted by the Qwen3.5/3.6 skeleton
+    /// plan in place of the full Q/K/V/Attention/OProj/ResidualAdd
+    /// sequence. Semantics: `res1 = input` (decode) / no-op (batch:
+    /// `batch_residual` already carries the layer input). Lets the
+    /// rest of the plan run unchanged (PreFfnNorm reads `res1`,
+    /// FFN dispatches, FfnResidualAdd writes `output = res1 +
+    /// ffn_out`). Output is `input + FFN(input)` — meaningless but
+    /// crash-free. Sprint D2-G replaces it on Full-Attention layers
+    /// with real Q-Gate-Split + Attention dispatches; the SSM/GDN
+    /// layers will keep this stub until the recurrent state +
+    /// `gated_delta_net.comp` lands.
+    ResidualIdentitySeed,
+
     /// `hidden_norm = rms_norm(res1) * (ffn_norm.weight | pre_ffn_norm.weight)`.
     /// Llama / Qwen3 use `ffn_norm.weight`; Gemma-4 uses the new
     /// `pre_ffn_norm.weight` introduced in Sprint 43B-1.
@@ -502,6 +516,51 @@ pub fn build_gemma4_layer(
     plan
 }
 
+/// Sprint D (v0.4.6) — Qwen3.5/3.6 skeleton plan builder.
+///
+/// Emits a passthrough plan for every layer regardless of kind
+/// (Full-Attention, Linear-Attention, MTP nextn). The attention
+/// sub-block is replaced by a single `ResidualIdentitySeed` step so
+/// the FFN sub-block can run unchanged. Output is `input +
+/// FFN(input)` per layer — meaningless but crash-free, satisfying
+/// the Sprint D gate ("token-generation flow works end-to-end").
+///
+/// Sprint D2-G replaces this on a per-kind basis:
+/// - Full-Attn (`is_full_attention_layer == true`): real Q-Gate-Split
+///   + Q/K-Norm + Partial-RoPE + Attention + Gated-Output + OProj
+///   chain. Sprint D2 brings the Q-Gate-Split + new shaders.
+/// - Linear-Attn (recurrent): SSM-Conv1d + Gated-Delta-Net +
+///   Norm-Gated chain. Sprints F-G bring the new shaders.
+/// - MTP nextn block (single layer at `n_main`): skipped on the
+///   trunk forward; spec-decoding wiring is Sprint J.
+pub fn build_qwen35_layer(
+    cfg: &ModelConfig,
+    _layer: u32,
+    _flags: &LayerWeightFlags,
+) -> LayerPlan {
+    debug_assert!(
+        cfg.qwen35.is_some(),
+        "build_qwen35_layer called on non-qwen35 cfg"
+    );
+    let mut plan: LayerPlan = Vec::with_capacity(10);
+    // Pre-attn RMSNorm. Reads `input`, writes `hidden_norm`. Even in
+    // passthrough we run this so the dispatch ordering matches the
+    // future Full-Attn plan and to keep at least one compute op per
+    // attention sub-block for telemetry.
+    plan.push(LayerStep::AttnNorm);
+    // Identity attention: decode does cmd_copy_buffer(input → res1);
+    // batch is a no-op (batch_residual already carries input).
+    plan.push(LayerStep::ResidualIdentitySeed);
+    // FFN is identical to Qwen3 (SwiGLU, no biases, no PostFfnNorm).
+    plan.push(LayerStep::PreFfnNorm);
+    plan.push(LayerStep::GateProj);
+    plan.push(LayerStep::UpProj);
+    plan.push(LayerStep::Activation { kind: ActivationKind::SwiGlu });
+    plan.push(LayerStep::DownProj);
+    plan.push(LayerStep::FfnResidualAdd);
+    plan
+}
+
 /// Production dispatcher: extracts `LayerWeightFlags` from
 /// `LoadedModel` and routes to the matching architecture builder.
 ///
@@ -524,6 +583,8 @@ pub fn build_layer_plan(
 
     if cfg.gemma4.is_some() {
         build_gemma4_layer(cfg, layer, &flags, rope_theta_scale_default)
+    } else if cfg.qwen35.is_some() {
+        build_qwen35_layer(cfg, layer, &flags)
     } else {
         build_qwen3_layer(cfg, layer, &flags, rope_theta_scale_default)
     }
@@ -551,6 +612,7 @@ mod tests {
             has_qk_norm,
             rms_norm_eps: 1e-6,
             gemma4: None,
+            qwen35: None,
         }
     }
 
@@ -643,6 +705,7 @@ mod tests {
             has_qk_norm: true,
             rms_norm_eps: 1e-6,
             gemma4: Some(gemma4_e2b_spec()),
+            qwen35: None,
         }
     }
 
@@ -939,6 +1002,7 @@ mod tests {
             has_qk_norm: true,
             rms_norm_eps: 1e-6,
             gemma4: Some(spec),
+            qwen35: None,
         };
         let flags = LayerWeightFlags::default();
         let plan = build_gemma4_layer(&cfg, 0, &flags, 1.0);
@@ -978,5 +1042,85 @@ mod tests {
             assert!(matches!(plan.first(), Some(LayerStep::AttnNorm)),
                     "Gemma-4 layer {layer} doesn't start with AttnNorm");
         }
+    }
+
+    fn qwen35_cfg() -> ModelConfig {
+        ModelConfig {
+            architecture: "qwen35".into(),
+            n_layers: 65,
+            n_heads: 24,
+            n_kv_heads: 4,
+            hidden_dim: 5120,
+            ffn_dim: 17408,
+            vocab_size: 248320,
+            head_dim: 256,
+            rope_freq_base: 1.0e7,
+            rope_dim: 64,
+            rope_variant: RopeVariant::Neox,
+            context_length: 262144,
+            has_qk_norm: true,
+            rms_norm_eps: 1.0e-6,
+            gemma4: None,
+            qwen35: Some(super::super::super::gguf::Qwen35Spec {
+                block_count: 65,
+                nextn_predict_layers: 1,
+                full_attention_interval: 4,
+                n_head_kv_full_attn: 4,
+                ssm_d_conv: 4,
+                ssm_d_state: 128,
+                ssm_n_group: 16,
+                ssm_dt_rank: 48,
+                ssm_d_inner: 6144,
+                rope_sections: [11, 11, 10, 0],
+            }),
+        }
+    }
+
+    /// Sprint D — skeleton plan covers every layer uniformly with
+    /// the FFN-only passthrough sequence. Output is intentionally
+    /// wrong but the dispatch graph is well-defined and crash-free.
+    #[test]
+    fn qwen35_skeleton_plan_is_passthrough_for_every_layer() {
+        let cfg = qwen35_cfg();
+        let flags = LayerWeightFlags::default();
+        // All 65 layers (including the MTP nextn block at index 64)
+        // get the same plan in Sprint D.
+        for layer in 0..cfg.n_layers {
+            let plan = build_qwen35_layer(&cfg, layer, &flags);
+            // Exactly 8 steps in the passthrough skeleton: 1 attn
+            // RMSNorm, 1 residual seed, 6 FFN steps (PreFfnNorm /
+            // GateProj / UpProj / Activation / DownProj /
+            // FfnResidualAdd).
+            assert_eq!(plan.len(), 8, "layer {layer} plan length");
+            assert!(matches!(plan[0], LayerStep::AttnNorm));
+            assert!(matches!(plan[1], LayerStep::ResidualIdentitySeed));
+            assert!(matches!(plan[2], LayerStep::PreFfnNorm));
+            assert!(matches!(plan[3], LayerStep::GateProj));
+            assert!(matches!(plan[4], LayerStep::UpProj));
+            assert!(matches!(
+                plan[5],
+                LayerStep::Activation { kind: ActivationKind::SwiGlu }
+            ));
+            assert!(matches!(plan[6], LayerStep::DownProj));
+            assert!(matches!(plan[7], LayerStep::FfnResidualAdd));
+        }
+    }
+
+    /// Confirm the dispatcher routes qwen35 cfgs to the qwen35
+    /// builder, even though `cfg.gemma4` is `None` (would otherwise
+    /// fall through to `build_qwen3_layer`, which would emit
+    /// `QProj`/`KProj` against weights that don't exist for the
+    /// Linear-Attention layers and panic at dispatch time).
+    #[test]
+    fn dispatcher_routes_qwen35_to_skeleton_builder() {
+        let cfg = qwen35_cfg();
+        // Layer plan for a Linear-Attn block (layer 0). The Qwen3
+        // builder would emit `QProj` here; the qwen35 builder must
+        // emit `ResidualIdentitySeed` instead.
+        let flags = LayerWeightFlags::default();
+        let plan = build_qwen35_layer(&cfg, 0, &flags);
+        assert!(plan.iter().any(|s| matches!(s, LayerStep::ResidualIdentitySeed)));
+        assert!(!plan.iter().any(|s| matches!(s, LayerStep::QProj)));
+        assert!(!plan.iter().any(|s| matches!(s, LayerStep::Attention { .. })));
     }
 }

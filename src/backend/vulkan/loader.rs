@@ -2670,6 +2670,9 @@ fn hf_to_model_config(hf: &HfConfig) -> Result<ModelConfig, LoaderError> {
         context_length: hf.max_position_embeddings.unwrap_or(2048),
         has_qk_norm,
         gemma4: gemma4_spec,
+        // Sprint D — qwen35 SafeTensors loader is not implemented;
+        // GGUF is the canonical source for Qwen3.5/3.6 weights.
+        qwen35: None,
     })
 }
 

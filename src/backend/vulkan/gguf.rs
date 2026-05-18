@@ -467,6 +467,12 @@ pub struct ModelConfig {
     /// the *maximum* across all layers (used for `Forward::new`
     /// buffer sizing); the per-layer values live inside `Gemma4Spec`.
     pub gemma4: Option<Gemma4Spec>,
+    /// Sprint D (v0.4.6) — Qwen3.5/3.6 hybrid (Mamba + Attention)
+    /// per-architecture spec. `None` for every other architecture.
+    /// When `Some`, the layer-plan builder branches on
+    /// `is_full_attention_layer` per layer; the Sprint D skeleton
+    /// emits passthrough plans (FFN-only) for every block.
+    pub qwen35: Option<Qwen35Spec>,
 }
 
 /// Sprint 43B-2 — per-Gemma-4 model state. Pulled into `ModelConfig`
@@ -565,6 +571,149 @@ pub struct Gemma4LayerSpec {
 pub enum Gemma4LayerKind {
     Sliding,
     Full,
+}
+
+/// Sprint D (v0.4.6) — per-Qwen3.5/3.6 routing state pulled from the
+/// `qwen35.*` GGUF metadata. Stored on `ModelConfig.qwen35` and
+/// consumed by `build_qwen35_layer` to decide per-layer step
+/// sequences. The fields cover both Full-Attention layout (head
+/// dims, full-attention interval) and the SSM/GDN linear-attention
+/// dims that Sprint D2-G will need.
+///
+/// Reference: `docs/qwen35_architecture_analysis.md` §1.
+#[derive(Debug, Clone, Copy)]
+pub struct Qwen35Spec {
+    /// `qwen35.block_count` — 65 for Qwen3.6-27B (64 trunk + 1 MTP).
+    pub block_count: u32,
+    /// `qwen35.nextn_predict_layers` — 1 for current Qwen3.6 release.
+    pub nextn_predict_layers: u32,
+    /// `qwen35.full_attention_interval` — 4 for Qwen3.6-27B
+    /// (layer `i` is full-attention iff `(i+1) % interval == 0`).
+    pub full_attention_interval: u32,
+    /// `qwen35.attention.head_count_kv` — KV-head count *on
+    /// full-attention layers*. Linear-attention layers consume their
+    /// own SSM state and have no KV cache, so per-layer `n_kv_heads`
+    /// returns 0 for them.
+    pub n_head_kv_full_attn: u32,
+
+    // SSM / Linear-Attention dims. Stored here for Sprint D2-G; the
+    // skeleton-passthrough plan in Sprint D ignores them.
+    /// `qwen35.ssm.conv_kernel` — 4 for Qwen3.6.
+    pub ssm_d_conv: u32,
+    /// `qwen35.ssm.state_size` — 128 for Qwen3.6.
+    pub ssm_d_state: u32,
+    /// `qwen35.ssm.group_count` — 16 for Qwen3.6.
+    pub ssm_n_group: u32,
+    /// `qwen35.ssm.time_step_rank` — 48 for Qwen3.6.
+    pub ssm_dt_rank: u32,
+    /// `qwen35.ssm.inner_size` — 6144 for Qwen3.6.
+    pub ssm_d_inner: u32,
+
+    /// `qwen35.rope.dimension_sections` — `[11, 11, 10, 0]` for
+    /// Qwen3.6 mRoPE. For text-only inference the effective
+    /// `n_rot = sections[0..3].sum() = 32`.
+    pub rope_sections: [u32; 4],
+}
+
+impl Qwen35Spec {
+    /// Number of trunk decoder blocks, excluding MTP `nextn` blocks.
+    pub fn n_main(&self) -> u32 {
+        self.block_count - self.nextn_predict_layers
+    }
+
+    /// True when layer `i` runs full attention (`(i+1) % interval ==
+    /// 0`) or sits in the MTP tail. Mirrors llama.cpp
+    /// `qwen35.cpp:25-28`.
+    pub fn is_full_attention_layer(&self, layer: u32) -> bool {
+        layer >= self.n_main()
+            || (layer + 1) % self.full_attention_interval == 0
+    }
+
+    /// True for layers that carry the `blk.N.nextn.*` MTP tensors.
+    /// With `nextn_predict_layers == 1` this is the single block at
+    /// index `n_main()`.
+    pub fn is_mtp_block(&self, layer: u32) -> bool {
+        layer >= self.n_main()
+    }
+
+    /// Effective per-head rotation dim for text-only inference: sum
+    /// of the three non-temporal mRoPE sections. For Qwen3.6-27B
+    /// `[11, 11, 10, 0]` this is 32.
+    pub fn n_rot_text_only(&self) -> u32 {
+        self.rope_sections[0] + self.rope_sections[1] + self.rope_sections[2]
+    }
+
+    /// Read the spec from `qwen35.*` GGUF metadata. Defaults that
+    /// don't appear in current Qwen3.6-27B unsloth GGUFs but might
+    /// appear in smaller variants are pulled with `unwrap_or` to
+    /// keep the loader robust.
+    pub fn from_gguf(gguf: &GgufFile) -> Result<Self, GgufError> {
+        let arch = gguf.metadata_str("general.architecture")?.to_string();
+        let key = |suffix: &str| format!("{arch}.{suffix}");
+        let block_count = gguf.metadata_u32(&key("block_count"))?;
+        let nextn_predict_layers = gguf
+            .metadata
+            .get(&key("nextn_predict_layers"))
+            .and_then(|v| v.as_u32())
+            .unwrap_or(0);
+        let full_attention_interval = gguf
+            .metadata
+            .get(&key("full_attention_interval"))
+            .and_then(|v| v.as_u32())
+            .unwrap_or(4);
+        let n_head_kv_full_attn = gguf
+            .metadata_u32_scalar_or_array_max(&key("attention.head_count_kv"))?;
+        let ssm_d_conv = gguf
+            .metadata
+            .get(&key("ssm.conv_kernel"))
+            .and_then(|v| v.as_u32())
+            .unwrap_or(4);
+        let ssm_d_state = gguf
+            .metadata
+            .get(&key("ssm.state_size"))
+            .and_then(|v| v.as_u32())
+            .unwrap_or(128);
+        let ssm_n_group = gguf
+            .metadata
+            .get(&key("ssm.group_count"))
+            .and_then(|v| v.as_u32())
+            .unwrap_or(16);
+        let ssm_dt_rank = gguf
+            .metadata
+            .get(&key("ssm.time_step_rank"))
+            .and_then(|v| v.as_u32())
+            .unwrap_or(48);
+        let ssm_d_inner = gguf
+            .metadata
+            .get(&key("ssm.inner_size"))
+            .and_then(|v| v.as_u32())
+            .unwrap_or(6144);
+        let rope_sections = gguf
+            .metadata
+            .get(&key("rope.dimension_sections"))
+            .and_then(|v| {
+                let arr = v.as_array()?;
+                let mut acc = [0u32; 4];
+                for (i, x) in arr.iter().take(4).enumerate() {
+                    acc[i] = x.as_u32()?;
+                }
+                Some(acc)
+            })
+            .unwrap_or([11, 11, 10, 0]);
+
+        Ok(Self {
+            block_count,
+            nextn_predict_layers,
+            full_attention_interval,
+            n_head_kv_full_attn,
+            ssm_d_conv,
+            ssm_d_state,
+            ssm_n_group,
+            ssm_dt_rank,
+            ssm_d_inner,
+            rope_sections,
+        })
+    }
 }
 
 /// Sprint 43B-2 — KV-cache routing for a single layer.
@@ -955,6 +1104,16 @@ impl ModelConfig {
             None
         };
 
+        // Sprint D (v0.4.6) — build Qwen3.5/3.6 spec when arch matches.
+        // The `qwen35moe` MoE variant (Sprint H) shares the metadata
+        // layout for the SSM/Full-Attn split; only the FFN execution
+        // path differs, so it pulls the same spec here.
+        let qwen35 = if matches!(arch, "qwen35" | "qwen35moe") {
+            Some(Qwen35Spec::from_gguf(gguf)?)
+        } else {
+            None
+        };
+
         Ok(Self {
             architecture,
             n_layers,
@@ -971,6 +1130,7 @@ impl ModelConfig {
             has_qk_norm,
             rms_norm_eps,
             gemma4,
+            qwen35,
         })
     }
 }

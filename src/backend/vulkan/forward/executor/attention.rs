@@ -417,6 +417,62 @@ impl DecodeExec {
         fwd.mark_written(&[gate_buf]);
     }
 
+    /// Sprint D (v0.4.6) — Qwen3.5/3.6 skeleton passthrough.
+    /// Decode path: `res1 = input` so the downstream PreFfnNorm
+    /// (which reads `res1`) and FfnResidualAdd (`output = res1 +
+    /// ffn_out`) collapse the attention sub-block to the identity.
+    /// Replaces the QProj→OProj→AttnResidualAdd chain emitted by
+    /// `build_qwen3_layer` / `build_gemma4_layer`. Sprint D2-G
+    /// replaces this on Full-Attention layers with the real
+    /// Q-Gate-Split + Attention dispatches.
+    pub(super) fn step_residual_identity_seed(
+        &self,
+        fwd: &mut Forward,
+        cfg: &ModelConfig,
+        ctx: &ExecCtx,
+    ) {
+        let (input, _) = decode_io(ctx);
+        let res1 = fwd.cur().res1.handle;
+        let bytes = (cfg.hidden_dim as u64) * 4;
+        let copy = vk::BufferCopy::default()
+            .src_offset(0)
+            .dst_offset(0)
+            .size(bytes);
+        // input arrives from the previous layer's FfnResidualAdd
+        // (compute-shader write). Flush before the transfer reads it.
+        let pre = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+        unsafe {
+            ctx.dev.device.cmd_pipeline_barrier(
+                ctx.cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                std::slice::from_ref(&pre), &[], &[],
+            );
+        }
+        fwd.profile("residual_identity_seed", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
+            dev.device.cmd_copy_buffer(cmd, input, res1, std::slice::from_ref(&copy));
+        });
+        // res1 is consumed by PreFfnNorm (compute read). TRANSFER_WRITE
+        // → SHADER_READ barrier so the subsequent dispatch sees the
+        // copied bytes.
+        let post = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ);
+        unsafe {
+            ctx.dev.device.cmd_pipeline_barrier(
+                ctx.cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                std::slice::from_ref(&post), &[], &[],
+            );
+        }
+        fwd.mark_written(&[res1]);
+    }
+
     pub(super) fn step_attn_residual_add(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
         // Gemma-4 path (PostAttnNorm just ran): res1 = input + gate_buf (the post-attn-normed o).
         // Llama path (handled by fused_attn_residual_norm) — should not reach here on Llama.
@@ -854,6 +910,23 @@ impl BatchExec {
             cfg.hidden_dim, seq_len, cfg.rms_norm_eps, "rms_norm_post_attn_b",
         );
         compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    /// Sprint D (v0.4.6) — Qwen3.5/3.6 skeleton passthrough.
+    /// Batch path: no-op. `batch_residual` already carries the
+    /// layer-input across layers (seeded by `record_prefill_seed`
+    /// for layer 0, then in-place updated by each layer's
+    /// AttnResidualAdd + FfnResidualAdd). Skipping the attention
+    /// sub-block means leaving `batch_residual` untouched — which is
+    /// exactly the identity passthrough we want. PreFfnNorm reads
+    /// `batch_residual` next, so the residual stream stays
+    /// well-defined without any transfer or compute work.
+    pub(super) fn b_step_residual_identity_seed(
+        &self,
+        _fwd: &mut Forward,
+        _cfg: &ModelConfig,
+        _ctx: &ExecCtx,
+    ) {
     }
 
     pub(super) fn b_step_attn_residual_add(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {

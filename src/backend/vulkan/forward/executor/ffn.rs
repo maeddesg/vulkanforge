@@ -26,9 +26,18 @@ impl DecodeExec {
     pub(super) fn step_pre_ffn_norm(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
         // Gemma-4 path: hidden_norm = rms_norm(res1) * pre_feedforward_layernorm.weight.
         // Llama path is fused via multi_add_rms with AttnResidualAdd in the loop driver.
+        // Sprint D — qwen35 carries the per-layer Pre-FFN norm as
+        // `post_attention_norm.weight` (named for its position in
+        // the layer rather than for the operation: it sits between
+        // the attention sub-block and the FFN sub-block).
         let res1 = fwd.cur().res1.handle;
         let hidden_norm = fwd.cur().hidden_norm.handle;
-        let pre_ffn_w = layer_weight(ctx.model, ctx.layer, "ffn_pre_norm.weight");
+        let suffix = if cfg.qwen35.is_some() {
+            "post_attention_norm.weight"
+        } else {
+            "ffn_pre_norm.weight"
+        };
+        let pre_ffn_w = layer_weight(ctx.model, ctx.layer, suffix);
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[res1]);
         fwd.run_rms_norm(
             ctx.dev, ctx.registry, ctx.cmd, res1, pre_ffn_w, hidden_norm,
@@ -182,7 +191,12 @@ impl BatchExec {
         // when batch path runs unfused). Use ffn_norm.weight for Llama,
         // ffn_pre_norm.weight for Gemma-4.
         let seq_len = batch_seq_len(ctx);
-        let suffix = if cfg.gemma4.is_some() {
+        // Sprint D — qwen35's per-layer Pre-FFN norm lives at
+        // `post_attention_norm.weight` (Gemma-4 calls it
+        // `ffn_pre_norm.weight`; Llama / Qwen3 use `ffn_norm.weight`).
+        let suffix = if cfg.qwen35.is_some() {
+            "post_attention_norm.weight"
+        } else if cfg.gemma4.is_some() {
             "ffn_pre_norm.weight"
         } else {
             "ffn_norm.weight"

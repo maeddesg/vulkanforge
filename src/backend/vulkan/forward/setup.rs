@@ -61,29 +61,22 @@ impl Forward {
         profiler: Option<ShaderProfiler>,
         max_prefill_tokens: u32,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // Sprint C (v0.4.6 prep): Qwen3.5/3.6 (qwen35, qwen35moe) is a
-        // hybrid Mamba+Attention model — the existing dispatch path
-        // would silently mis-execute the 48 linear-attention layers
-        // (SSM conv + Gated Delta Net are not yet implemented).
-        // Fail loudly here so a user who points VulkanForge at a
-        // qwen35 GGUF gets a clear "not yet supported" message rather
-        // than coherent-but-wrong output. Loader-level smoke (the
-        // 866-tensor upload) still runs successfully — this gate fires
-        // strictly between load and inference.
-        if matches!(config.architecture.as_str(), "qwen35" | "qwen35moe") {
-            return Err(format!(
-                "Qwen3.5/3.6 ({arch}) inference is not yet implemented \
-                 in VulkanForge. The architecture is a hybrid model \
-                 (~75 %% linear-attention / Gated Delta Net layers \
-                 + full-attention every 4th layer + 1 MTP head). \
-                 Tokenizer and GGUF loader work end-to-end as of Sprint C; \
-                 SSM conv1d + Gated Delta Net shaders are scheduled for \
-                 Sprints F-G. See docs/qwen35_architecture_analysis.md \
-                 for the implementation plan.",
-                arch = config.architecture
-            )
-            .into());
-        }
+        // Sprint D (v0.4.6 prep): Qwen3.5/3.6 (qwen35, qwen35moe) now
+        // enters Forward::new. The layer-plan builder emits a
+        // skeleton-passthrough plan for every block
+        // (`AttnNorm → ResidualIdentitySeed → FFN → FfnResidualAdd`),
+        // so the dispatch graph is well-defined but the math is
+        // intentionally wrong — output is `input + Σ FFN(input)`
+        // across layers without any attention contribution. The
+        // smoke gate is "no crash / no NaN"; coherent output for
+        // Qwen3.6-27B requires Sprint D2 (Full-Attn Q-Gate-Split)
+        // plus Sprints F-G (SSM conv1d + Gated Delta Net shaders).
+        //
+        // The architectural plumbing fields live on
+        // `ModelConfig.qwen35` (cf. `gguf.rs::Qwen35Spec`) and are
+        // populated by `Qwen35Spec::from_gguf` during ModelConfig
+        // construction. `build_qwen35_layer` (`layer_plan.rs`)
+        // branches on the presence of that field.
 
         // Sprint [vram-budget]: VRAM budget probe. Reads sysfs
         // mem_info_vram_used + mem_info_vram_total for the AMD GPU

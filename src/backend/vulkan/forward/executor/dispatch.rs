@@ -85,6 +85,7 @@ impl DecodeExec {
             LayerStep::OProj => self.step_o_proj(fwd, cfg, ctx),
             LayerStep::PostAttnNorm => self.step_post_attn_norm(fwd, cfg, ctx),
             LayerStep::AttnResidualAdd => self.step_attn_residual_add(fwd, cfg, ctx),
+            LayerStep::ResidualIdentitySeed => self.step_residual_identity_seed(fwd, cfg, ctx),
             LayerStep::PreFfnNorm => self.step_pre_ffn_norm(fwd, cfg, ctx),
             LayerStep::GateProj => self.step_gate_proj(fwd, cfg, ctx),
             LayerStep::UpProj => self.step_up_proj(fwd, cfg, ctx),
@@ -172,6 +173,9 @@ impl BatchExec {
             LayerStep::OProj => self.b_step_o_proj(fwd, cfg, ctx),
             LayerStep::PostAttnNorm => self.b_step_post_attn_norm(fwd, cfg, ctx),
             LayerStep::AttnResidualAdd => self.b_step_attn_residual_add(fwd, cfg, ctx),
+            LayerStep::ResidualIdentitySeed => {
+                self.b_step_residual_identity_seed(fwd, cfg, ctx)
+            }
             LayerStep::PreFfnNorm => self.b_step_pre_ffn_norm(fwd, cfg, ctx),
             LayerStep::GateProj => self.b_step_gate_proj(fwd, cfg, ctx),
             LayerStep::UpProj => self.b_step_up_proj(fwd, cfg, ctx),
