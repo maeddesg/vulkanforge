@@ -580,14 +580,21 @@ pub fn build_qwen35_layer(
     if spec.is_full_attention_layer(layer) && !spec.is_mtp_block(layer) {
         // Sprint D2 (v0.4.6) — real Full-Attention dispatch.
         let q_dim = cfg.n_heads * cfg.head_dim;
-        // Sprint D2 uses the full per-head rotation (head_dim=256 for
-        // Qwen3.6) instead of the partial-RoPE `n_rot=32` that the
-        // text-only mRoPE collapse calls for. Mathematically wrong but
-        // satisfies the no-crash gate; the real `n_rot=32` routing
-        // arrives in Sprint D3 along with the recurrent (Linear-Attn)
-        // dispatch (any coherence-test against llama.cpp is blocked
-        // by 48 passthrough layers anyway).
-        let rotary_dim = cfg.head_dim;
+        // Sprint E (v0.4.6) — partial mRoPE. `rope.dimension_sections =
+        // [11, 11, 10, 0]` ⇒ for text-only inference the first 32 of
+        // the 256 head-dim positions are rotated; the remaining 224
+        // are pass-through. The fused `rms_norm_mul_rope` shader honours
+        // `p.n_dims` natively (`rope_funcs.glsl:88` — when `i0 >=
+        // n_dims` the dim is copied unchanged), so passing
+        // `rotary_dim = 32` is sufficient. Mirrors the Gemma-4
+        // partial-RoPE path (`rope_partial_factor = 0.25`,
+        // `head_dim = 512 → rotary_dim = 128`).
+        //
+        // The base for `theta_scale` is the *rotary dim* (= 32), not
+        // the head dim, matching llama.cpp's `qwen35.cpp` and the
+        // standard RoPE-NeoX convention (`θ_i = freq_base^(-2 i /
+        // n_dims)`).
+        let rotary_dim = spec.n_rot_text_only();
         let freq_base = cfg.rope_freq_base;
         let theta_scale = (1.0_f32 / freq_base).powf(2.0 / rotary_dim as f32);
 
