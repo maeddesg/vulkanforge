@@ -173,10 +173,20 @@ fn load_gguf_session(args: &ServeArgs) -> Result<ServerSession, Box<dyn std::err
                 .gemma4
                 .as_ref()
                 .map(|g| g.layers.iter().map(|s| s.head_dim).collect()),
+            // Sprint D2 — Qwen3.6 per-layer KV-heads (0 for recurrent
+            // Linear-Attn layers, n_head_kv_full_attn for Full-Attn);
+            // drops the FP8 KV cache from 520 MB to ~136 MB.
             per_layer_n_kv_heads: cfg
                 .gemma4
                 .as_ref()
-                .map(|g| g.layers.iter().map(|s| s.n_kv_heads).collect()),
+                .map(|g| g.layers.iter().map(|s| s.n_kv_heads).collect::<Vec<_>>())
+                .or_else(|| cfg.qwen35.as_ref().map(|q| {
+                    (0..q.block_count)
+                        .map(|l| if q.is_full_attention_layer(l) {
+                            q.n_head_kv_full_attn
+                        } else { 0 })
+                        .collect::<Vec<_>>()
+                })),
         },
     )?;
     kv_cache.zero_fill(&dev)?;

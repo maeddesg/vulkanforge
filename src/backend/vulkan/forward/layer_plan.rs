@@ -74,6 +74,20 @@ pub enum LayerStep {
     /// Q linear projection. Always present.
     QProj,
 
+    /// Sprint D2 (v0.4.6) — Qwen3.6 Full-Attention fused Q+Gate
+    /// projection. Replaces `QProj` for qwen35 full-attention
+    /// layers. The `attn_q.weight` tensor is
+    /// `[hidden_dim, 2 × n_heads × head_dim]`; the GEMV/GEMM writes
+    /// `2 × q_dim` floats per token with Q in the first half and
+    /// Gate in the second half. Q is consumed by the downstream
+    /// `QNormRope`/`Attention` chain unchanged; Gate is consumed
+    /// later by `AttnGatedOutput`. Decode writes into `q_buf`
+    /// (resized to 2 × q_dim on qwen35); batch writes into
+    /// `batch_qgate` and a strided copy extracts Q into `batch_q`
+    /// so the existing Q-side dispatch chain operates on the same
+    /// per-token-contiguous layout as on every other architecture.
+    AttnQGateProj { q_dim: u32 },
+
     /// K linear projection. Skipped for Gemma-4 subscriber layers
     /// (they read K from a publisher's slab via `Attention.kv_layer`).
     KProj,
@@ -131,6 +145,15 @@ pub enum LayerStep {
     /// `[0, position+1)`; non-sliding layers and non-Gemma-4 stacks
     /// always pass `0`).
     Attention { kv_layer: u32, kv_start: u32 },
+
+    /// Sprint D2 (v0.4.6) — Qwen3.6 Full-Attention gated output.
+    /// In-place sigmoid-gate multiply on the post-attention buffer:
+    /// `attn = attn * sigmoid(gate)`. Sits between `Attention` and
+    /// `OProj` in the qwen35 Full-Attn plan. `q_dim` is the
+    /// elements-per-token of the post-attention buffer (= n_heads ×
+    /// head_dim); the gate lives in `q_buf` / `batch_qgate` at the
+    /// `q_dim..2 × q_dim` offset slice written by `AttnQGateProj`.
+    AttnGatedOutput { q_dim: u32 },
 
     /// Output projection (`attn_output.weight`).
     OProj,
@@ -516,41 +539,74 @@ pub fn build_gemma4_layer(
     plan
 }
 
-/// Sprint D (v0.4.6) — Qwen3.5/3.6 skeleton plan builder.
+/// Sprint D (v0.4.6) — Qwen3.5/3.6 plan builder. Per-layer kind
+/// routing (verified against Sprint A architecture analysis):
 ///
-/// Emits a passthrough plan for every layer regardless of kind
-/// (Full-Attention, Linear-Attention, MTP nextn). The attention
-/// sub-block is replaced by a single `ResidualIdentitySeed` step so
-/// the FFN sub-block can run unchanged. Output is `input +
-/// FFN(input)` per layer — meaningless but crash-free, satisfying
-/// the Sprint D gate ("token-generation flow works end-to-end").
+/// - **Full-Attention layers** (`is_full_attention_layer == true`,
+///   17 of 65 for Qwen3.6-27B = `{3, 7, …, 63, 64}`): real attention
+///   dispatch chain — `AttnNorm → AttnQGateProj → QNormRope → KProj
+///   → KNormRope → VProj → KvWrite → Attention → AttnGatedOutput →
+///   OProj → AttnResidualAdd` followed by the standard FFN. Q-Gate
+///   split lives in `q_buf` (Q in front half, Gate in back half);
+///   the gated output multiplies `attn_out *= sigmoid(gate)` before
+///   the O projection.
 ///
-/// Sprint D2-G replaces this on a per-kind basis:
-/// - Full-Attn (`is_full_attention_layer == true`): real Q-Gate-Split
-///   + Q/K-Norm + Partial-RoPE + Attention + Gated-Output + OProj
-///   chain. Sprint D2 brings the Q-Gate-Split + new shaders.
-/// - Linear-Attn (recurrent): SSM-Conv1d + Gated-Delta-Net +
-///   Norm-Gated chain. Sprints F-G bring the new shaders.
-/// - MTP nextn block (single layer at `n_main`): skipped on the
-///   trunk forward; spec-decoding wiring is Sprint J.
+/// - **Linear-Attention (recurrent) layers** (48 of 65, SSM + GDN):
+///   skeleton passthrough — `AttnNorm → ResidualIdentitySeed → FFN`.
+///   Real recurrent attention arrives in Sprints F-G with the new
+///   `ssm_conv1d.comp` + `gated_delta_net.comp` shaders.
+///
+/// - **MTP nextn block** (single layer at index `n_main`, =64 for
+///   Qwen3.6-27B): trunk-skipped passthrough; spec-decoding draft
+///   head wiring is Sprint J.
+///
+/// Output is still mathematically wrong while 48 layers passthrough,
+/// but the 17 Full-Attn layers now perform the real Q-Gate-Split,
+/// per-head Q/K norms, RoPE, GQA attention, and the sigmoid-gated
+/// output multiply.
 pub fn build_qwen35_layer(
     cfg: &ModelConfig,
-    _layer: u32,
+    layer: u32,
     _flags: &LayerWeightFlags,
 ) -> LayerPlan {
-    debug_assert!(
-        cfg.qwen35.is_some(),
-        "build_qwen35_layer called on non-qwen35 cfg"
-    );
-    let mut plan: LayerPlan = Vec::with_capacity(10);
-    // Pre-attn RMSNorm. Reads `input`, writes `hidden_norm`. Even in
-    // passthrough we run this so the dispatch ordering matches the
-    // future Full-Attn plan and to keep at least one compute op per
-    // attention sub-block for telemetry.
+    let spec = cfg
+        .qwen35
+        .as_ref()
+        .expect("build_qwen35_layer called on non-qwen35 cfg");
+    let mut plan: LayerPlan = Vec::with_capacity(16);
+
     plan.push(LayerStep::AttnNorm);
-    // Identity attention: decode does cmd_copy_buffer(input → res1);
-    // batch is a no-op (batch_residual already carries input).
-    plan.push(LayerStep::ResidualIdentitySeed);
+
+    if spec.is_full_attention_layer(layer) && !spec.is_mtp_block(layer) {
+        // Sprint D2 (v0.4.6) — real Full-Attention dispatch.
+        let q_dim = cfg.n_heads * cfg.head_dim;
+        // Sprint D2 uses the full per-head rotation (head_dim=256 for
+        // Qwen3.6) instead of the partial-RoPE `n_rot=32` that the
+        // text-only mRoPE collapse calls for. Mathematically wrong but
+        // satisfies the no-crash gate; the real `n_rot=32` routing
+        // arrives in Sprint D3 along with the recurrent (Linear-Attn)
+        // dispatch (any coherence-test against llama.cpp is blocked
+        // by 48 passthrough layers anyway).
+        let rotary_dim = cfg.head_dim;
+        let freq_base = cfg.rope_freq_base;
+        let theta_scale = (1.0_f32 / freq_base).powf(2.0 / rotary_dim as f32);
+
+        plan.push(LayerStep::AttnQGateProj { q_dim });
+        plan.push(LayerStep::QNormRope { rotary_dim, freq_base, theta_scale });
+        plan.push(LayerStep::KProj);
+        plan.push(LayerStep::KNormRope { rotary_dim, freq_base, theta_scale });
+        plan.push(LayerStep::VProj);
+        plan.push(LayerStep::KvWrite);
+        plan.push(LayerStep::Attention { kv_layer: layer, kv_start: 0 });
+        plan.push(LayerStep::AttnGatedOutput { q_dim });
+        plan.push(LayerStep::OProj);
+        plan.push(LayerStep::AttnResidualAdd);
+    } else {
+        // Recurrent / MTP block — keep the Sprint D passthrough so
+        // the FFN sub-block has a well-defined residual to consume.
+        plan.push(LayerStep::ResidualIdentitySeed);
+    }
+
     // FFN is identical to Qwen3 (SwiGLU, no biases, no PostFfnNorm).
     plan.push(LayerStep::PreFfnNorm);
     plan.push(LayerStep::GateProj);
@@ -1076,34 +1132,84 @@ mod tests {
         }
     }
 
-    /// Sprint D — skeleton plan covers every layer uniformly with
-    /// the FFN-only passthrough sequence. Output is intentionally
-    /// wrong but the dispatch graph is well-defined and crash-free.
+    /// Sprint D — recurrent (Linear-Attn) and MTP layers stay in
+    /// the passthrough skeleton. Layer 0 (recurrent) sees the
+    /// `AttnNorm → ResidualIdentitySeed → FFN` sequence.
     #[test]
-    fn qwen35_skeleton_plan_is_passthrough_for_every_layer() {
+    fn qwen35_recurrent_layers_are_passthrough() {
         let cfg = qwen35_cfg();
         let flags = LayerWeightFlags::default();
-        // All 65 layers (including the MTP nextn block at index 64)
-        // get the same plan in Sprint D.
+        // Layer 0 is recurrent (`(0+1) % 4 != 0`).
+        let plan = build_qwen35_layer(&cfg, 0, &flags);
+        assert_eq!(plan.len(), 8, "recurrent layer plan length");
+        assert!(matches!(plan[0], LayerStep::AttnNorm));
+        assert!(matches!(plan[1], LayerStep::ResidualIdentitySeed));
+        assert!(matches!(plan[2], LayerStep::PreFfnNorm));
+        assert!(matches!(plan[7], LayerStep::FfnResidualAdd));
+        // MTP block at index 64 (n_main = 64) — also passthrough.
+        let mtp = build_qwen35_layer(&cfg, 64, &flags);
+        assert_eq!(mtp.len(), 8, "mtp block plan length");
+        assert!(matches!(mtp[1], LayerStep::ResidualIdentitySeed));
+    }
+
+    /// Sprint D2 — Full-Attention layers dispatch the real chain.
+    /// Layer 3 (`(3+1) % 4 == 0`) is the first Full-Attn block.
+    #[test]
+    fn qwen35_full_attention_layers_emit_real_attention_chain() {
+        let cfg = qwen35_cfg();
+        let flags = LayerWeightFlags::default();
+        let plan = build_qwen35_layer(&cfg, 3, &flags);
+
+        // AttnNorm + 10 Full-Attn steps + 6 FFN steps = 17.
+        assert_eq!(plan.len(), 17, "full-attn layer plan length");
+        let q_dim = cfg.n_heads * cfg.head_dim;
+        assert!(matches!(plan[0], LayerStep::AttnNorm));
+        assert!(matches!(
+            plan[1],
+            LayerStep::AttnQGateProj { q_dim: d } if d == q_dim
+        ));
+        assert!(matches!(plan[2], LayerStep::QNormRope { .. }));
+        assert!(matches!(plan[3], LayerStep::KProj));
+        assert!(matches!(plan[4], LayerStep::KNormRope { .. }));
+        assert!(matches!(plan[5], LayerStep::VProj));
+        assert!(matches!(plan[6], LayerStep::KvWrite));
+        assert!(matches!(plan[7], LayerStep::Attention { kv_layer: 3, .. }));
+        assert!(matches!(
+            plan[8],
+            LayerStep::AttnGatedOutput { q_dim: d } if d == q_dim
+        ));
+        assert!(matches!(plan[9], LayerStep::OProj));
+        assert!(matches!(plan[10], LayerStep::AttnResidualAdd));
+        // FFN tail unchanged.
+        assert!(matches!(plan[11], LayerStep::PreFfnNorm));
+        assert!(matches!(plan[16], LayerStep::FfnResidualAdd));
+    }
+
+    /// Verify the 17-of-65 Full-Attention split matches the Sprint
+    /// A inventory (`{3, 7, 11, …, 59, 63, 64}` — every 4th block
+    /// in the trunk plus the MTP-adjacent block at index 64).
+    #[test]
+    fn qwen35_full_attention_layer_count() {
+        let cfg = qwen35_cfg();
+        let flags = LayerWeightFlags::default();
+        let mut full_count = 0;
+        let mut pass_count = 0;
         for layer in 0..cfg.n_layers {
             let plan = build_qwen35_layer(&cfg, layer, &flags);
-            // Exactly 8 steps in the passthrough skeleton: 1 attn
-            // RMSNorm, 1 residual seed, 6 FFN steps (PreFfnNorm /
-            // GateProj / UpProj / Activation / DownProj /
-            // FfnResidualAdd).
-            assert_eq!(plan.len(), 8, "layer {layer} plan length");
-            assert!(matches!(plan[0], LayerStep::AttnNorm));
-            assert!(matches!(plan[1], LayerStep::ResidualIdentitySeed));
-            assert!(matches!(plan[2], LayerStep::PreFfnNorm));
-            assert!(matches!(plan[3], LayerStep::GateProj));
-            assert!(matches!(plan[4], LayerStep::UpProj));
-            assert!(matches!(
-                plan[5],
-                LayerStep::Activation { kind: ActivationKind::SwiGlu }
-            ));
-            assert!(matches!(plan[6], LayerStep::DownProj));
-            assert!(matches!(plan[7], LayerStep::FfnResidualAdd));
+            // Full-Attn plans contain AttnQGateProj; passthrough plans
+            // contain ResidualIdentitySeed.
+            if plan.iter().any(|s| matches!(s, LayerStep::AttnQGateProj { .. })) {
+                full_count += 1;
+            }
+            if plan.iter().any(|s| matches!(s, LayerStep::ResidualIdentitySeed)) {
+                pass_count += 1;
+            }
         }
+        // Sprint A: full-attn layers = {3, 7, ..., 63} (16 trunk
+        // blocks); the MTP layer at index 64 stays passthrough until
+        // Sprint J wires the draft head. So 16 full + 49 passthrough.
+        assert_eq!(full_count, 16, "expected 16 trunk Full-Attn layers");
+        assert_eq!(pass_count, 49, "expected 49 passthrough layers (48 recurrent + 1 MTP)");
     }
 
     /// Confirm the dispatcher routes qwen35 cfgs to the qwen35

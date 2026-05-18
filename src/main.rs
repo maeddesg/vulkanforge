@@ -469,9 +469,23 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
             // we route through the per-layer Vec for consistency with
             // n_kv_heads_for(); architectures without `cfg.gemma4` use
             // the uniform `cfg.n_kv_heads` (None).
-            per_layer_n_kv_heads: cfg.gemma4.as_ref().map(|g| {
-                g.layers.iter().map(|s| s.n_kv_heads).collect()
-            }),
+            // Sprint D2 — Qwen3.6 trunks have 17 Full-Attn layers with
+            // 4 KV-heads and 48 recurrent (Linear-Attn) layers with no
+            // KV cache at all (per-layer KV-heads = 0 collapses the
+            // slab for those layers to zero bytes). Drops the FP8 KV
+            // cache from 520 MB (uniform 65 × 4 × 4096 × 256 × 1) to
+            // ~136 MB (17 × 4 × 4096 × 256 × 1).
+            per_layer_n_kv_heads: cfg
+                .gemma4
+                .as_ref()
+                .map(|g| g.layers.iter().map(|s| s.n_kv_heads).collect::<Vec<_>>())
+                .or_else(|| cfg.qwen35.as_ref().map(|q| {
+                    (0..q.block_count)
+                        .map(|l| if q.is_full_attention_layer(l) {
+                            q.n_head_kv_full_attn
+                        } else { 0 })
+                        .collect::<Vec<_>>()
+                })),
         },
     )?;
     // Sprint 43C — KV cache one-shot zero-fill. Required for Gemma-4
@@ -850,9 +864,23 @@ fn run_chat_safetensors(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>
             // we route through the per-layer Vec for consistency with
             // n_kv_heads_for(); architectures without `cfg.gemma4` use
             // the uniform `cfg.n_kv_heads` (None).
-            per_layer_n_kv_heads: cfg.gemma4.as_ref().map(|g| {
-                g.layers.iter().map(|s| s.n_kv_heads).collect()
-            }),
+            // Sprint D2 — Qwen3.6 trunks have 17 Full-Attn layers with
+            // 4 KV-heads and 48 recurrent (Linear-Attn) layers with no
+            // KV cache at all (per-layer KV-heads = 0 collapses the
+            // slab for those layers to zero bytes). Drops the FP8 KV
+            // cache from 520 MB (uniform 65 × 4 × 4096 × 256 × 1) to
+            // ~136 MB (17 × 4 × 4096 × 256 × 1).
+            per_layer_n_kv_heads: cfg
+                .gemma4
+                .as_ref()
+                .map(|g| g.layers.iter().map(|s| s.n_kv_heads).collect::<Vec<_>>())
+                .or_else(|| cfg.qwen35.as_ref().map(|q| {
+                    (0..q.block_count)
+                        .map(|l| if q.is_full_attention_layer(l) {
+                            q.n_head_kv_full_attn
+                        } else { 0 })
+                        .collect::<Vec<_>>()
+                })),
         },
     )?;
     // Sprint 43C — KV cache one-shot zero-fill. Required for Gemma-4
@@ -1500,9 +1528,23 @@ fn run_bench(
             // we route through the per-layer Vec for consistency with
             // n_kv_heads_for(); architectures without `cfg.gemma4` use
             // the uniform `cfg.n_kv_heads` (None).
-            per_layer_n_kv_heads: cfg.gemma4.as_ref().map(|g| {
-                g.layers.iter().map(|s| s.n_kv_heads).collect()
-            }),
+            // Sprint D2 — Qwen3.6 trunks have 17 Full-Attn layers with
+            // 4 KV-heads and 48 recurrent (Linear-Attn) layers with no
+            // KV cache at all (per-layer KV-heads = 0 collapses the
+            // slab for those layers to zero bytes). Drops the FP8 KV
+            // cache from 520 MB (uniform 65 × 4 × 4096 × 256 × 1) to
+            // ~136 MB (17 × 4 × 4096 × 256 × 1).
+            per_layer_n_kv_heads: cfg
+                .gemma4
+                .as_ref()
+                .map(|g| g.layers.iter().map(|s| s.n_kv_heads).collect::<Vec<_>>())
+                .or_else(|| cfg.qwen35.as_ref().map(|q| {
+                    (0..q.block_count)
+                        .map(|l| if q.is_full_attention_layer(l) {
+                            q.n_head_kv_full_attn
+                        } else { 0 })
+                        .collect::<Vec<_>>()
+                })),
         },
     )?;
     let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;
@@ -1691,9 +1733,23 @@ fn run_bench_safetensors(
             // we route through the per-layer Vec for consistency with
             // n_kv_heads_for(); architectures without `cfg.gemma4` use
             // the uniform `cfg.n_kv_heads` (None).
-            per_layer_n_kv_heads: cfg.gemma4.as_ref().map(|g| {
-                g.layers.iter().map(|s| s.n_kv_heads).collect()
-            }),
+            // Sprint D2 — Qwen3.6 trunks have 17 Full-Attn layers with
+            // 4 KV-heads and 48 recurrent (Linear-Attn) layers with no
+            // KV cache at all (per-layer KV-heads = 0 collapses the
+            // slab for those layers to zero bytes). Drops the FP8 KV
+            // cache from 520 MB (uniform 65 × 4 × 4096 × 256 × 1) to
+            // ~136 MB (17 × 4 × 4096 × 256 × 1).
+            per_layer_n_kv_heads: cfg
+                .gemma4
+                .as_ref()
+                .map(|g| g.layers.iter().map(|s| s.n_kv_heads).collect::<Vec<_>>())
+                .or_else(|| cfg.qwen35.as_ref().map(|q| {
+                    (0..q.block_count)
+                        .map(|l| if q.is_full_attention_layer(l) {
+                            q.n_head_kv_full_attn
+                        } else { 0 })
+                        .collect::<Vec<_>>()
+                })),
         },
     )?;
     let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;

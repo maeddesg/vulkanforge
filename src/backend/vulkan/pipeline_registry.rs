@@ -221,6 +221,7 @@ impl PipelineRegistry {
                 ShaderId::Silu
                 | ShaderId::SwiGLU
                 | ShaderId::GeluPytorchTanhGlu
+                | ShaderId::SigmoidMul
                 | ShaderId::MultiAddRms
                 | ShaderId::Copy
                 | ShaderId::RopeNorm

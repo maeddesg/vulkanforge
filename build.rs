@@ -537,6 +537,18 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "gelu_pytorch_tanh.comp",
         defines: &[],
     },
+    // Sprint D2 (v0.4.6) — strided in-place sigmoid-gate multiply
+    // for Qwen3.6 Full-Attention gated output (`attn = attn *
+    // sigmoid(gate)`). 2 SSBOs (gate readonly, inout in-place), 4
+    // u32 push consts (ne / chunk / stride / gate_offset). The
+    // strided form serves both decode (seq=1, stride=chunk) and
+    // batch prefill (seq>1, stride=2*chunk for the fused [Q|G]
+    // layout) from one shader.
+    ShaderJob {
+        out_name: "sigmoid_mul_f32.spv",
+        entry_source: "sigmoid_mul.comp",
+        defines: &[],
+    },
     // v0.2 Sprint 9b — fused residual-add + RMSNorm-mul. 5 SSBOs
     // (a, b, weight, sum, norm_out); 1 WG per row, BLOCK_SIZE=512.
     // Replaces (add → barrier → rms_norm) at Stelle 1 (add_res1 +

@@ -570,6 +570,15 @@ pub struct Forward {
     pub(super) batch_up: GpuBuffer,
     pub(super) batch_ffn_hidden: GpuBuffer,
     pub(super) batch_ffn_out: GpuBuffer,
+    /// Sprint D2 (v0.4.6) — Qwen3.6 Full-Attention fused Q+Gate
+    /// batch output: `[max_pp × 2 × n_heads × head_dim]` f32, laid
+    /// out as N×M row-major (per-token slice is contiguous, Q at
+    /// offset 0 and Gate at offset `n_heads × head_dim`).
+    /// `Some` only when `cfg.qwen35.is_some()`. The only dispatch
+    /// sites that read it are the Qwen3.6-specific
+    /// `AttnQGateProj` / `AttnGatedOutput` step bodies which gate
+    /// on the same cfg flag.
+    pub(super) batch_qgate: Option<GpuBuffer>,
 
     /// Sprint 12D — barrier elision via dirty-flag tracking. The set
     /// holds `vk::Buffer` raw handles that have been written since the

@@ -59,6 +59,12 @@ impl DecodeExec {
         match step {
             LayerStep::AttnNorm => self.step_attn_norm(fwd, cfg, ctx),
             LayerStep::QProj => self.step_q_proj(fwd, cfg, ctx),
+            LayerStep::AttnQGateProj { q_dim } => {
+                self.step_attn_q_gate_proj(fwd, cfg, ctx, *q_dim)
+            }
+            LayerStep::AttnGatedOutput { q_dim } => {
+                self.step_attn_gated_output(fwd, cfg, ctx, *q_dim)
+            }
             LayerStep::KProj => self.step_k_proj(fwd, cfg, ctx),
             LayerStep::VProj => self.step_v_proj(fwd, cfg, ctx),
             LayerStep::VFromKRaw => self.step_v_from_k_raw(fwd, cfg, ctx),
@@ -147,6 +153,12 @@ impl BatchExec {
         match step {
             LayerStep::AttnNorm => self.b_step_attn_norm(fwd, cfg, ctx),
             LayerStep::QProj => self.b_step_q_proj(fwd, cfg, ctx),
+            LayerStep::AttnQGateProj { q_dim } => {
+                self.b_step_attn_q_gate_proj(fwd, cfg, ctx, *q_dim)
+            }
+            LayerStep::AttnGatedOutput { q_dim } => {
+                self.b_step_attn_gated_output(fwd, cfg, ctx, *q_dim)
+            }
             LayerStep::KProj => self.b_step_k_proj(fwd, cfg, ctx),
             LayerStep::VProj => self.b_step_v_proj(fwd, cfg, ctx),
             LayerStep::VFromKRaw => self.b_step_v_from_k_raw(fwd, cfg, ctx),

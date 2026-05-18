@@ -34,7 +34,8 @@ use super::super::pipeline::{
     MmqIdPushConstants, MmqPushConstants,
     MoeRouterNormGemvPushConstants, MoeRouterSoftmaxTopkPushConstants,
     MultiAddRmsPushConstants, Q8_1QuantizePushConstants, RmsNormMulRopePushConstants,
-    RopePushConstants, ScalarAttnPushConstants, SwigluPushConstants,
+    RopePushConstants, ScalarAttnPushConstants, SigmoidMulPushConstants,
+    SwigluPushConstants,
 };
 use super::super::pipeline_registry::PipelineRegistry;
 use super::super::shaders::ShaderId;
@@ -2167,6 +2168,47 @@ impl Forward {
         let pc = SwigluPushConstants { n };
         // local_size_x = 256 in swiglu.comp, 1 element per thread.
         let dispatch_x = (n + 255) / 256;
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
+        });
+    }
+
+    /// Sprint D2 (v0.4.6) — strided in-place sigmoid-gate multiply
+    /// for Qwen3.6 Full-Attention's gated output. 2 SSBOs (gate
+    /// readonly, inout in-place); 4 u32 push consts. Handles decode
+    /// (seq=1) and batch (seq>1, gate stride=2*chunk over fused
+    /// [Q|G]) from the same shader — the strided form collapses to
+    /// the trivial single-token sigmoid-mul when stride = chunk.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_sigmoid_mul(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        gate: vk::Buffer,
+        inout: vk::Buffer,
+        ne: u32,
+        chunk: u32,
+        stride: u32,
+        gate_offset: u32,
+        label: &str,
+    ) {
+        let kernel = registry.get(ShaderId::SigmoidMul);
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[(0, gate, 0, 0), (1, inout, 0, 0)],
+        );
+        let pc = SigmoidMulPushConstants { ne, chunk, stride, gate_offset };
+        let dispatch_x = (ne + 255) / 256;
         let layout = kernel.pipeline_layout;
         let pipeline = kernel.pipeline;
         self.profile(label, dev, cmd, |dev, cmd| unsafe {

@@ -263,7 +263,16 @@ impl DecodeExec {
             // contains PostAttnNorm before AttnResidualAdd, so the
             // residual add reads a different scratch buffer and the
             // fusion can't apply).
+            // Sprint D2 — Qwen3.6 carries the Pre-FFN norm as
+            // `post_attention_norm.weight`, not `ffn_norm.weight`. The
+            // fused multi_add_rms helper hard-codes the Llama/Qwen3
+            // tensor name (Sprint 9b.2), so disable fusion on qwen35
+            // and let the executor emit AttnResidualAdd + PreFfnNorm
+            // as two separate dispatches. PreFfnNorm's tensor-name
+            // branch (executor/ffn.rs) already picks the right
+            // `post_attention_norm.weight` for qwen35.
             if cfg.gemma4.is_none()
+                && cfg.qwen35.is_none()
                 && matches!(plan.get(i), Some(LayerStep::AttnResidualAdd))
                 && matches!(plan.get(i + 1), Some(LayerStep::PreFfnNorm))
             {
@@ -343,7 +352,9 @@ impl BatchExec {
             // (the plan has PostAttnNorm preceding AttnResidualAdd, so
             // the residual reads scratch instead of batch_o, and the
             // fusion shader can't model that).
+            // Sprint D2 — same qwen35 carve-out as the DEC path above.
             if cfg.gemma4.is_none()
+                && cfg.qwen35.is_none()
                 && matches!(plan.get(i), Some(LayerStep::AttnResidualAdd))
                 && matches!(plan.get(i + 1), Some(LayerStep::PreFfnNorm))
             {

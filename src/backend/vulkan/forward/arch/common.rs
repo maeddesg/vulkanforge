@@ -283,6 +283,20 @@ pub(crate) fn layer_dims(cfg: &ModelConfig, layer: u32) -> (u32, u32, f32, u32) 
 pub(crate) fn n_kv_heads_for(cfg: &ModelConfig, layer: u32) -> u32 {
     if let Some(g) = cfg.gemma4.as_ref() {
         g.layers[layer as usize].n_kv_heads
+    } else if let Some(q) = cfg.qwen35.as_ref() {
+        // Sprint D2 (v0.4.6) — Qwen3.6 Full-Attention layers carry
+        // standard GQA K/V; recurrent (Linear-Attn) layers run a
+        // Gated Delta Net and have no KV-cache. Sprint D-skeleton
+        // emits no Attention/KvWrite for recurrent layers, so the
+        // returned 0 is only consulted for sizing decisions in code
+        // paths the recurrent layers don't traverse. Sprint F/G
+        // (SSM dispatch) will replace this with the real recurrent
+        // state lookup.
+        if q.is_full_attention_layer(layer) {
+            q.n_head_kv_full_attn
+        } else {
+            0
+        }
     } else {
         cfg.n_kv_heads
     }

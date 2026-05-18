@@ -213,6 +213,27 @@ pub struct SwigluPushConstants {
 }
 const _: () = assert!(std::mem::size_of::<SwigluPushConstants>() == 4);
 
+/// Sprint D2 (v0.4.6) — strided in-place sigmoid-gate multiply
+/// push block. Field order matches `sigmoid_mul.comp`'s `parameter`
+/// block exactly.
+///
+/// - `ne` — total in-out element count (= seq_len × chunk).
+/// - `chunk` — elements per token in the in-out buffer (= n_heads ×
+///   head_dim for Qwen3.6).
+/// - `stride` — elements per token in the gate buffer (≥ chunk;
+///   = 2 × chunk for Qwen3.6's fused [Q|G] layout).
+/// - `gate_offset` — gate position within each token's stride
+///   (= chunk when Q sits before Gate, as in Qwen3.6).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SigmoidMulPushConstants {
+    pub ne: u32,
+    pub chunk: u32,
+    pub stride: u32,
+    pub gate_offset: u32,
+}
+const _: () = assert!(std::mem::size_of::<SigmoidMulPushConstants>() == 16);
+
 /// v0.2 Sprint 9b — fused residual-add + RMSNorm-mul push block.
 /// 2 × u32 + 1 × f32 = 12 B. Field order matches `multi_add_rms.comp`'s
 /// `parameter` block exactly.

@@ -1,0 +1,49 @@
+#version 450
+
+// Sprint D2 (v0.4.6) — strided in-place sigmoid-gate multiply.
+//
+//   inout[i] *= sigmoid(gate[token(i) * stride + gate_offset + within(i)])
+//
+// where:
+//   chunk        = elements per token in `inout`
+//   stride       = elements per token in `gate` (≥ chunk; gate carries
+//                  fused [Q|G] for Qwen3.6 → stride = 2 * chunk)
+//   gate_offset  = position of the gate slice within each token's stride
+//                  (= chunk when Q sits before Gate in the fused layout)
+//   ne           = total elements in `inout` (= seq_len × chunk)
+//
+// For decode (seq_len = 1): token = 0, within = i, gate_idx =
+// gate_offset + i. The strided form collapses to the trivial single-
+// token sigmoid-mul with no extra cost — the divide/modulo become
+// no-ops the compiler can fold when chunk = ne.
+//
+// Reference: Qwen3.6 Full-Attn `attn = attn * sigmoid(gate)` in
+// llama.cpp's `qwen35.cpp:graph_attn_pre_output` and HF's
+// `Qwen35FullAttention.forward` (gate-multiplicative output).
+// Mirrors the SwiGLU shader's bindings (`gate_data` → readonly,
+// `data` → in-out) and dispatch shape (local_size_x = 256).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer Gate { float gate_data[]; };
+layout (binding = 1)         buffer InOut { float data[];      };
+
+layout (push_constant) uniform parameter {
+    uint ne;            // total in-out element count
+    uint chunk;         // elements per token in in-out
+    uint stride;        // elements per token in gate (≥ chunk)
+    uint gate_offset;   // gate position within stride
+} p;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= p.ne) return;
+
+    const uint token  = i / p.chunk;
+    const uint within = i - token * p.chunk;
+    const uint gate_idx = token * p.stride + p.gate_offset + within;
+
+    const float g = gate_data[gate_idx];
+    const float s = 1.0f / (1.0f + exp(-g));
+    data[i] *= s;
+}

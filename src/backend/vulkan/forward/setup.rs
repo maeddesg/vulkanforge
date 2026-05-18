@@ -107,7 +107,15 @@ impl Forward {
         };
 
         let hidden_bytes = (config.hidden_dim as u64) * 4;
-        let q_bytes = (config.n_heads as u64) * (config.head_dim as u64) * 4;
+        // Sprint D2 (v0.4.6) — Qwen3.6 Full-Attention fuses Q with a
+        // sigmoid gate into a single 2 × q_dim-wide projection
+        // (`attn_q.weight` is `[hidden, 2 × n_heads × head_dim]`).
+        // Grow `q_buf` so the GEMV result fits with Q at offset 0
+        // and Gate at offset `q_dim`. Other architectures keep the
+        // single-Q layout.
+        let q_factor: u64 = if config.qwen35.is_some() { 2 } else { 1 };
+        let q_bytes =
+            q_factor * (config.n_heads as u64) * (config.head_dim as u64) * 4;
         let kv_bytes = (config.n_kv_heads as u64) * (config.head_dim as u64) * 4;
         let ffn_bytes = (config.ffn_dim as u64) * 4;
         let logits_bytes = (config.vocab_size as u64) * 4;
@@ -130,7 +138,13 @@ impl Forward {
             let q_buf = mk_storage(q_bytes, MemoryLocation::GpuOnly, &format!("q_buf{suf}"))?;
             let k_buf = mk_storage(kv_bytes, MemoryLocation::GpuOnly, &format!("k_buf{suf}"))?;
             let v_buf = mk_storage(kv_bytes, MemoryLocation::GpuOnly, &format!("v_buf{suf}"))?;
-            let attn_out = mk_storage(q_bytes, MemoryLocation::GpuOnly, &format!("attn_out{suf}"))?;
+            // attn_out always holds the post-attention Q-shaped result
+            // (n_heads × head_dim × 4 floats). For qwen35 the gate
+            // multiply is in-place on attn_out, so the Gate-doubled
+            // q_bytes would over-allocate here without buying anything.
+            let attn_out_bytes =
+                (config.n_heads as u64) * (config.head_dim as u64) * 4;
+            let attn_out = mk_storage(attn_out_bytes, MemoryLocation::GpuOnly, &format!("attn_out{suf}"))?;
             let o_buf = mk_storage(hidden_bytes, MemoryLocation::GpuOnly, &format!("o_buf{suf}"))?;
             let res1 = mk_storage(hidden_bytes, MemoryLocation::GpuOnly, &format!("res1{suf}"))?;
             // Sprint 51D-R — `gate_buf` is reused as the post-attn-norm
@@ -347,6 +361,16 @@ impl Forward {
         let batch_ffn_hidden_bytes = pp_ffn.max(pp_hidden);
         let batch_ffn_hidden = mk_storage(batch_ffn_hidden_bytes, MemoryLocation::GpuOnly,  "batch_ffn_hidden")?;
         let batch_ffn_out    = mk_storage(pp_hidden, MemoryLocation::GpuOnly,  "batch_ffn_out")?;
+        // Sprint D2 (v0.4.6) — Qwen3.6 Full-Attention fused Q+Gate
+        // batch projection target. Sized for the full 2 × q_dim
+        // GEMM output per token (Q at offset 0, Gate at offset
+        // q_dim). Allocated only on qwen35 stacks; other arches get
+        // `None` and never touch the field.
+        let batch_qgate = if config.qwen35.is_some() {
+            Some(mk_storage(pp_q * 2, MemoryLocation::GpuOnly, "batch_qgate")?)
+        } else {
+            None
+        };
 
         // Sprint 51D-D — host-readable staging for MoE router input.
         // Sized for the worst case: full prefill batch × hidden × 4 B.
@@ -746,6 +770,7 @@ impl Forward {
             batch_input, batch_residual, batch_norm, batch_q8,
             batch_q, batch_k, batch_v, batch_attn_out, batch_o,
             batch_gate, batch_up, batch_ffn_hidden, batch_ffn_out,
+            batch_qgate,
             // Sprint 12D — barrier elision tracker.
             pending_writes: std::collections::HashSet::with_capacity(32),
             elision_disabled: std::env::var("VULKANFORGE_DISABLE_BARRIER_ELISION")
@@ -1093,6 +1118,10 @@ impl Forward {
         self.batch_up.destroy(device, allocator);
         self.batch_ffn_hidden.destroy(device, allocator);
         self.batch_ffn_out.destroy(device, allocator);
+        // Sprint D2 — optional Qwen3.6 batch fused Q+Gate target.
+        if let Some(b) = self.batch_qgate {
+            b.destroy(device, allocator);
+        }
         // Sprint 51D-D — MoE router staging.
         self.moe_route_staging.destroy(device, allocator);
         // Sprint 56B — GPU-side MoE router buffers.

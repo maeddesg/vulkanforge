@@ -61,6 +61,42 @@ impl DecodeExec {
         fwd.mark_written(&[q_buf]);
     }
 
+    /// Sprint D2 (v0.4.6) — Qwen3.6 Full-Attention fused Q+Gate
+    /// projection. GEMV writes `2 × q_dim` floats into `q_buf`
+    /// (resized in setup.rs on qwen35 stacks). Q occupies the
+    /// first `q_dim` floats; Gate the second `q_dim`. Downstream
+    /// QNormRope reads the first half unchanged.
+    pub(super) fn step_attn_q_gate_proj(
+        &self,
+        fwd: &mut Forward,
+        cfg: &ModelConfig,
+        ctx: &ExecCtx,
+        q_dim: u32,
+    ) {
+        let out_dim = q_dim * 2;
+        let hidden_norm = fwd.cur().hidden_norm.handle;
+        let q_buf = fwd.cur().q_buf.handle;
+        let wq = layer_weight(ctx.model, ctx.layer, "attn_q.weight");
+        let sq = layer_weight_shader(
+            ctx.model, ctx.layer, "attn_q.weight", fwd.mul_mat_vec_subgroup_enabled,
+        );
+        let scale_q = layer_weight_scale_scalar(ctx.model, ctx.layer, "attn_q.weight");
+        let sb_q = layer_weight_scale_buf(ctx.model, ctx.layer, "attn_q.weight");
+        if let Some(s) = sb_q {
+            let blk = layer_weight_scale_block(ctx.model, ctx.layer, "attn_q.weight");
+            fwd.run_gemv_fp8_dispatch(
+                ctx.dev, ctx.cmd, wq, s, hidden_norm, q_buf,
+                cfg.hidden_dim, out_dim, blk, "gemv_q_gate",
+            );
+        } else {
+            fwd.run_gemv(
+                ctx.dev, ctx.registry, ctx.cmd, sq, wq, hidden_norm, q_buf,
+                cfg.hidden_dim, out_dim, scale_q, "gemv_q_gate",
+            );
+        }
+        fwd.mark_written(&[q_buf]);
+    }
+
     pub(super) fn step_k_proj(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
         let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
         let kv_dim = n_kv_heads_for(cfg, ctx.layer) * head_dim;
@@ -376,6 +412,35 @@ impl DecodeExec {
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[attn_out]);
     }
 
+    /// Sprint D2 (v0.4.6) — Qwen3.6 Full-Attention gated output.
+    /// `attn_out[i] *= sigmoid(q_buf[q_dim + i])`. Decode path:
+    /// single-token, gate sits contiguously at `q_buf[q_dim..2*q_dim]`
+    /// so the shader's strided form collapses to `stride = q_dim`.
+    pub(super) fn step_attn_gated_output(
+        &self,
+        fwd: &mut Forward,
+        _cfg: &ModelConfig,
+        ctx: &ExecCtx,
+        q_dim: u32,
+    ) {
+        let attn_out = fwd.cur().attn_out.handle;
+        let q_buf = fwd.cur().q_buf.handle;
+        // Both buffers were written by earlier dispatches (attention
+        // → attn_out, Q-Gate proj → q_buf). Flush both before the
+        // sigmoid-mul reads the gate and writes the in-place result.
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[attn_out, q_buf]);
+        fwd.run_sigmoid_mul(
+            ctx.dev, ctx.registry, ctx.cmd,
+            q_buf, attn_out,
+            q_dim,        // ne
+            q_dim,        // chunk
+            q_dim,        // stride (single token: 1 chunk per stride)
+            q_dim,        // gate_offset (Gate starts after Q in q_buf)
+            "sigmoid_mul_gated_out",
+        );
+        fwd.mark_written(&[attn_out]);
+    }
+
     pub(super) fn step_o_proj(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
         let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
         let q_dim = cfg.n_heads * head_dim;
@@ -554,6 +619,85 @@ impl BatchExec {
             kv_dim, cfg.hidden_dim, seq_len, "gemm_k",
             quantize_input_after_q(ctx.model, ctx.layer),
         );
+    }
+
+    /// Sprint D2 (v0.4.6) — Qwen3.6 Full-Attention fused Q+Gate
+    /// batched projection. One GEMM writes `2 × q_dim` floats per
+    /// token into `batch_qgate`; a strided `cmd_copy_buffer` then
+    /// extracts the Q half into `batch_q` so downstream
+    /// QNormRope/KvWrite/Attention dispatches see the same
+    /// per-token-contiguous Q layout as on every other architecture.
+    /// Gate stays in `batch_qgate` for `AttnGatedOutput` to consume.
+    pub(super) fn b_step_attn_q_gate_proj(
+        &self,
+        fwd: &mut Forward,
+        cfg: &ModelConfig,
+        ctx: &ExecCtx,
+        q_dim: u32,
+    ) {
+        let seq_len = batch_seq_len(ctx);
+        let total_dim = q_dim * 2;
+        let qgate = fwd
+            .batch_qgate
+            .as_ref()
+            .expect("AttnQGateProj emitted but batch_qgate not allocated (cfg.qwen35 is None)")
+            .handle;
+        // Single fused GEMM: 12288 outputs per token, Q in front
+        // half, Gate in back half (per-token contiguous).
+        self.b_run_proj(
+            fwd, cfg, ctx,
+            "attn_q.weight",
+            fwd.batch_norm.handle,
+            qgate,
+            total_dim, cfg.hidden_dim, seq_len, "gemm_q_gate",
+            /* quantize_input = */ true,
+        );
+        self.b_subscriber_q_barrier(cfg, ctx);
+
+        // Strided copy: batch_qgate[t, 0..q_dim] → batch_q[t, 0..q_dim]
+        // for each of `seq_len` tokens. cmd_copy_buffer accepts a
+        // multi-region array so the whole extraction is one transfer
+        // submission. Compute → transfer barrier flushes the GEMM
+        // writes; transfer → compute barrier covers the downstream
+        // QNormRope read on batch_q.
+        let q_bytes_per_token = (q_dim as u64) * 4;
+        let qgate_stride = (total_dim as u64) * 4;
+        let mut regions = Vec::with_capacity(seq_len as usize);
+        for t in 0..seq_len as u64 {
+            regions.push(
+                vk::BufferCopy::default()
+                    .src_offset(t * qgate_stride)
+                    .dst_offset(t * q_bytes_per_token)
+                    .size(q_bytes_per_token),
+            );
+        }
+        let pre = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+        unsafe {
+            ctx.dev.device.cmd_pipeline_barrier(
+                ctx.cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                std::slice::from_ref(&pre), &[], &[],
+            );
+            ctx.dev.device.cmd_copy_buffer(
+                ctx.cmd, qgate, fwd.batch_q.handle, &regions,
+            );
+        }
+        let post = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ);
+        unsafe {
+            ctx.dev.device.cmd_pipeline_barrier(
+                ctx.cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                std::slice::from_ref(&post), &[], &[],
+            );
+        }
     }
 
     pub(super) fn b_step_v_proj(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
@@ -879,6 +1023,38 @@ impl BatchExec {
                 kv_layer, kv_start,
             );
         }
+        compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    /// Sprint D2 (v0.4.6) — Qwen3.6 Full-Attention gated output,
+    /// batch path. Reads Gate from `batch_qgate` with per-token
+    /// stride `2 × q_dim` (Gate offset within stride = `q_dim`,
+    /// since Q sits in the front half) and applies an in-place
+    /// sigmoid multiply on `batch_attn_out`.
+    pub(super) fn b_step_attn_gated_output(
+        &self,
+        fwd: &mut Forward,
+        _cfg: &ModelConfig,
+        ctx: &ExecCtx,
+        q_dim: u32,
+    ) {
+        let seq_len = batch_seq_len(ctx);
+        let qgate = fwd
+            .batch_qgate
+            .as_ref()
+            .expect("AttnGatedOutput emitted but batch_qgate not allocated (cfg.qwen35 is None)")
+            .handle;
+        let ne = seq_len * q_dim;
+        let stride = q_dim * 2;
+        fwd.run_sigmoid_mul(
+            ctx.dev, ctx.registry, ctx.cmd,
+            qgate, fwd.batch_attn_out.handle,
+            ne,         // total elements in attn_out (seq × q_dim)
+            q_dim,      // chunk: elements per token in attn_out
+            stride,     // stride: elements per token in batch_qgate
+            q_dim,      // gate_offset within stride (Gate after Q)
+            "sigmoid_mul_gated_out_b",
+        );
         compute_barrier(ctx.dev, ctx.cmd);
     }
 
