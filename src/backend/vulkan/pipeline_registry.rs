@@ -237,7 +237,10 @@ impl PipelineRegistry {
                 // 4 u32 push consts (head_dim / n_src / n_dst / n_tokens).
                 // Neither uses spec constants.
                 | ShaderId::SoftplusF32
-                | ShaderId::RepeatInterleaveF32 => {
+                | ShaderId::RepeatInterleaveF32
+                // Sprint G-2d (v0.4.6) — pure in-place sigmoid. 1 SSBO,
+                // 1 u32 push const (ne). No spec constants.
+                | ShaderId::SigmoidF32 => {
                     ComputeKernel::from_spv(device, &words, cache)
                 }
                 ShaderId::SsmConvF32 => {

@@ -30,11 +30,12 @@ use super::super::pipeline::{
     CoopmatPushConstants, FlashAttnBatchPushConstants, FlashAttnReducePushConstants,
     FlashAttnSplitPushConstants, Fp8BlockwiseGemmPushConstants,
     Fp8BlockwiseGemvPushConstants, Fp8GemmPushConstants, GenericBinaryPushConstants,
-    GenericHeadPushConstants, KvCopyFp16PushConstants, L2NormPushConstants,
-    MatVecIdPushConstants, MatVecPushConstants,
+    ElementwiseInplacePushConstants, GenericHeadPushConstants, KvCopyFp16PushConstants,
+    L2NormPushConstants, MatVecIdPushConstants, MatVecPushConstants,
     MmqIdPushConstants, MmqPushConstants,
     MoeRouterNormGemvPushConstants, MoeRouterSoftmaxTopkPushConstants,
-    MultiAddRmsPushConstants, Q8_1QuantizePushConstants, RmsNormMulRopePushConstants,
+    MultiAddRmsPushConstants, Q8_1QuantizePushConstants, RepeatInterleavePushConstants,
+    RmsNormMulRopePushConstants,
     RopePushConstants, ScalarAttnPushConstants, SigmoidMulPushConstants,
     SsmConvPushConstants, SsmConvSetupPushConstants, SwigluPushConstants,
 };
@@ -2881,6 +2882,115 @@ impl Forward {
         };
         // local_size_x = 512 inside silu.comp.
         let dispatch_x = (n + 511) / 512;
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
+        });
+    }
+
+    /// Sprint G-2a + G-2d (v0.4.6) — In-place softplus / sigmoid via a
+    /// single 1-SSBO 1-u32-push-const shader. Both shaders share the
+    /// same dispatch shape (local_size_x = 256, no spec consts).
+    fn run_inplace_elementwise(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        shader: ShaderId,
+        data: vk::Buffer,
+        n: u32,
+        label: &str,
+    ) {
+        let kernel = registry.get(shader);
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[(0, data, 0, 0)],
+        );
+        let pc = ElementwiseInplacePushConstants { ne: n };
+        let dispatch_x = (n + 255) / 256;
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
+        });
+    }
+
+    /// Sprint G-2a (v0.4.6) — In-place softplus (`x ← log(1 + exp(x))`,
+    /// numerically stable `x > 20 → x`). Used in the Qwen3.6 Linear-Attn
+    /// gate path on `ssm_alpha_buf` between `add(ssm_dt.bias)` and
+    /// `mul(ssm_a)`.
+    pub(super) fn run_softplus(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        data: vk::Buffer,
+        n: u32,
+        label: &str,
+    ) {
+        self.run_inplace_elementwise(dev, registry, cmd, ShaderId::SoftplusF32, data, n, label);
+    }
+
+    /// Sprint G-2d (v0.4.6) — Pure in-place sigmoid. Distinct from
+    /// `run_sigmoid_mul` (which folds in a multiplicative gate input).
+    pub(super) fn run_sigmoid(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        data: vk::Buffer,
+        n: u32,
+        label: &str,
+    ) {
+        self.run_inplace_elementwise(dev, registry, cmd, ShaderId::SigmoidF32, data, n, label);
+    }
+
+    /// Sprint G-2a + G-2d (v0.4.6) — Head-axis modulo repeat:
+    /// `dst[s, t, h_dst, d] = src[s, t, h_dst % n_src_heads, d]`. The
+    /// `src` binding can be offset (in bytes) so a 3-way split tensor
+    /// (Q | K | V in `conv_output`) can feed Q-only or K-only repeats
+    /// off the same buffer without a separate copy.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_repeat_interleave(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        src: vk::Buffer,
+        src_offset_bytes: u64,
+        src_bytes: u64,
+        dst: vk::Buffer,
+        head_dim: u32,
+        n_src_heads: u32,
+        n_dst_heads: u32,
+        n_tokens: u32,
+        label: &str,
+    ) {
+        let kernel = registry.get(ShaderId::RepeatInterleaveF32);
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[(0, src, src_offset_bytes, src_bytes), (1, dst, 0, 0)],
+        );
+        let pc = RepeatInterleavePushConstants {
+            head_dim, n_src_heads, n_dst_heads, n_tokens,
+        };
+        let total = head_dim * n_dst_heads * n_tokens;
+        let dispatch_x = (total + 255) / 256;
         let layout = kernel.pipeline_layout;
         let pipeline = kernel.pipeline;
         self.profile(label, dev, cmd, |dev, cmd| unsafe {

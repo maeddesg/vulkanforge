@@ -571,6 +571,14 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "ssm_conv_setup.comp",
         defines: &[],
     },
+    // Sprint G-2d (v0.4.6) — Pure in-place sigmoid (`data[i] ←
+    // sigmoid(data[i])`) for Qwen3.6 Linear-Attn SsmBetaProj output.
+    // 1 in-out SSBO, 1 u32 push const (ne).
+    ShaderJob {
+        out_name: "sigmoid_f32.spv",
+        entry_source: "sigmoid.comp",
+        defines: &[],
+    },
     // Sprint G-2c (v0.4.6) — In-place L2-norm for Q/K slices in
     // Linear-Attn. 2 SSBOs (input readonly, output buffer — same
     // buffer in callers for in-place), 3 push consts (ncols,

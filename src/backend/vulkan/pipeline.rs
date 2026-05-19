@@ -615,6 +615,28 @@ pub struct L2NormPushConstants {
 }
 const _: () = assert!(std::mem::size_of::<L2NormPushConstants>() == 12);
 
+/// Sprint G-2a + G-2d (v0.4.6) — single-u32 `ne` push block shared by
+/// the in-place elementwise activations (`softplus.comp`, `sigmoid.comp`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ElementwiseInplacePushConstants {
+    pub ne: u32,
+}
+const _: () = assert!(std::mem::size_of::<ElementwiseInplacePushConstants>() == 4);
+
+/// Sprint G-2a (v0.4.6) — `repeat_interleave.comp` push block. 4 × u32 = 16 B.
+/// Field order matches `vk_shaders/repeat_interleave.comp`'s parameter
+/// block exactly.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct RepeatInterleavePushConstants {
+    pub head_dim: u32,
+    pub n_src_heads: u32,
+    pub n_dst_heads: u32,
+    pub n_tokens: u32,
+}
+const _: () = assert!(std::mem::size_of::<RepeatInterleavePushConstants>() == 16);
+
 /// llama.cpp's `init_fastdiv_values`. Used by [`GenericUnaryPushConstants`]
 /// to populate the `ne*_*mp/L` fields — without these, `copy`'s SPIR-V
 /// fastdiv path divides by a magic-of-zero and produces garbage indices.

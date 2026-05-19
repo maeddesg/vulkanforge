@@ -164,6 +164,13 @@ pub enum ShaderId {
     /// reduction. Drop-in simplification of llama.cpp's rms_norm.comp
     /// with the weight-mul branch removed.
     L2NormF32,
+    /// Sprint G-2d (v0.4.6) — Pure in-place sigmoid (`data[i] ←
+    /// 1/(1+exp(-data[i]))`). 1 in-out SSBO, push const `ne` (u32).
+    /// local_size_x = 256. Distinct from `SigmoidMul` (which fuses
+    /// `data *= sigmoid(gate)` for Full-Attn gated output). Used by
+    /// the Qwen3.6 Linear-Attn `beta = sigmoid(ssm_beta @ hidden)`
+    /// path that feeds GDN's β binding directly.
+    SigmoidF32,
     /// Sprint G-2a (v0.4.6) — Softplus in-place activation (`x ← log(1+exp(x))`,
     /// numerically stable branch at x>20). 1 in-out SSBO, push const
     /// `ne` (u32). local_size_x = 256. Used in the Qwen3.6 Linear-Attn
@@ -531,6 +538,7 @@ impl ShaderId {
             ShaderId::SsmConvF32 => "ssm_conv_f32",
             ShaderId::SsmConvSetupF32 => "ssm_conv_setup_f32",
             ShaderId::L2NormF32 => "l2_norm_f32",
+            ShaderId::SigmoidF32 => "sigmoid_f32",
             ShaderId::SoftplusF32 => "softplus_f32",
             ShaderId::RepeatInterleaveF32 => "repeat_interleave_f32",
             ShaderId::GatedDeltaNetF32 => "gated_delta_net_f32",
@@ -686,6 +694,7 @@ impl ShaderId {
             ShaderId::SsmConvF32 => SSM_CONV_F32,
             ShaderId::SsmConvSetupF32 => SSM_CONV_SETUP_F32,
             ShaderId::L2NormF32 => L2_NORM_F32,
+            ShaderId::SigmoidF32 => SIGMOID_F32,
             ShaderId::SoftplusF32 => SOFTPLUS_F32,
             ShaderId::RepeatInterleaveF32 => REPEAT_INTERLEAVE_F32,
             ShaderId::GatedDeltaNetF32 => GATED_DELTA_NET_F32,
@@ -848,6 +857,7 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::SsmConvF32,
     ShaderId::SsmConvSetupF32,
     ShaderId::L2NormF32,
+    ShaderId::SigmoidF32,
     ShaderId::SoftplusF32,
     ShaderId::RepeatInterleaveF32,
     ShaderId::GatedDeltaNetF32,
@@ -1056,6 +1066,8 @@ pub const SSM_CONV_SETUP_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ssm_conv_setup_f32.spv"));
 pub const L2_NORM_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/l2_norm_f32.spv"));
+pub const SIGMOID_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/sigmoid_f32.spv"));
 pub const SOFTPLUS_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/softplus_f32.spv"));
 pub const REPEAT_INTERLEAVE_F32: &[u8] =

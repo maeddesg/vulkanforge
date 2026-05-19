@@ -667,29 +667,155 @@ impl DecodeExec {
     //   G-2e → step_gated_delta_net, step_norm_gated
     // ──────────────────────────────────────────────────────────
 
+    /// Sprint G-2d (v0.4.6) — `attn_qkv.weight` GEMV
+    /// (`[hidden_dim → conv_channels]`). For Qwen3.6-27B: Q3_K
+    /// `[5120, 10240]`. Writes the per-token mixed QKV slab into
+    /// `ssm_qkv_buf` which `step_ssm_conv1d` then consumes as the
+    /// current-token slot of the rolling conv window.
     pub(super) fn step_attn_qkv_proj(
-        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
     ) {
-        // No-op until Sprint G-2d (attn_qkv.weight GEMV).
+        let spec = cfg.qwen35.as_ref().expect(
+            "step_attn_qkv_proj emitted for non-qwen35 config",
+        );
+        let hidden_norm = fwd.cur().hidden_norm.handle;
+        let qkv_buf = fwd.ssm_qkv_buf.as_ref().unwrap().handle;
+        let w = layer_weight(ctx.model, layer, "attn_qkv.weight");
+        let s = layer_weight_shader(
+            ctx.model, layer, "attn_qkv.weight",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
+        let scale = layer_weight_scale_scalar(ctx.model, layer, "attn_qkv.weight");
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[hidden_norm]);
+        fwd.run_gemv(
+            ctx.dev, ctx.registry, ctx.cmd, s, w, hidden_norm, qkv_buf,
+            cfg.hidden_dim, spec.conv_channels(), scale, "gemv_ssm_qkv",
+        );
+        fwd.mark_written(&[qkv_buf]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[qkv_buf]);
     }
 
+    /// Sprint G-2d (v0.4.6) — `attn_gate.weight` GEMV
+    /// (`[hidden_dim → ssm_d_inner]`). Q3_K `[5120, 6144]`. Output
+    /// `ssm_z_buf` is the multiplicative gate `z` for the later
+    /// NormGated step. Reads the same `hidden_norm` as AttnQkvProj
+    /// (both readonly — no barrier needed between).
     pub(super) fn step_attn_gate_z_proj(
-        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
     ) {
-        // No-op until Sprint G-2d (attn_gate.weight GEMV).
+        let spec = cfg.qwen35.as_ref().expect(
+            "step_attn_gate_z_proj emitted for non-qwen35 config",
+        );
+        let hidden_norm = fwd.cur().hidden_norm.handle;
+        let z_buf = fwd.ssm_z_buf.as_ref().unwrap().handle;
+        let w = layer_weight(ctx.model, layer, "attn_gate.weight");
+        let s = layer_weight_shader(
+            ctx.model, layer, "attn_gate.weight",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
+        let scale = layer_weight_scale_scalar(ctx.model, layer, "attn_gate.weight");
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[hidden_norm]);
+        fwd.run_gemv(
+            ctx.dev, ctx.registry, ctx.cmd, s, w, hidden_norm, z_buf,
+            cfg.hidden_dim, spec.ssm_d_inner, scale, "gemv_ssm_z",
+        );
+        fwd.mark_written(&[z_buf]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[z_buf]);
     }
 
+    /// Sprint G-2d (v0.4.6) — `ssm_beta.weight` GEMV `[5120, 48]` F32 +
+    /// in-place sigmoid. Mirrors `qwen35.cpp:397
+    /// ggml_sigmoid(beta_cur)`. Output feeds GDN's β binding directly.
     pub(super) fn step_ssm_beta_proj(
-        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
     ) {
-        // No-op until Sprint G-2d (ssm_beta.weight GEMV + sigmoid).
+        let spec = cfg.qwen35.as_ref().expect(
+            "step_ssm_beta_proj emitted for non-qwen35 config",
+        );
+        let hidden_norm = fwd.cur().hidden_norm.handle;
+        let beta_buf = fwd.ssm_beta_buf.as_ref().unwrap().handle;
+        let w = layer_weight(ctx.model, layer, "ssm_beta.weight");
+        let s = layer_weight_shader(
+            ctx.model, layer, "ssm_beta.weight",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
+        let scale = layer_weight_scale_scalar(ctx.model, layer, "ssm_beta.weight");
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[hidden_norm]);
+        fwd.run_gemv(
+            ctx.dev, ctx.registry, ctx.cmd, s, w, hidden_norm, beta_buf,
+            cfg.hidden_dim, spec.num_v_heads(), scale, "gemv_ssm_beta",
+        );
+        fwd.mark_written(&[beta_buf]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[beta_buf]);
+        fwd.run_sigmoid(
+            ctx.dev, ctx.registry, ctx.cmd,
+            beta_buf, spec.num_v_heads(), "ssm_beta_sigmoid",
+        );
+        fwd.mark_written(&[beta_buf]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[beta_buf]);
     }
 
+    /// Sprint G-2d (v0.4.6) — fused alpha-gate compose (Ops 6-9 of
+    /// `build_layer_attn_linear`):
+    ///   1. `alpha = ssm_alpha.weight @ hidden_norm`         (F32 GEMV)
+    ///   2. `alpha += ssm_dt.bias`                            (elementwise)
+    ///   3. `alpha = softplus(alpha)`                          (in-place)
+    ///   4. `gate  = alpha * ssm_a`                            (elementwise)
+    /// Output `ssm_gate_buf` is GDN's log-domain decay term (g
+    /// binding).
     pub(super) fn step_ssm_alpha_gate(
-        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
     ) {
-        // No-op until Sprint G-2d (ssm_alpha GEMV + ssm_dt bias add +
-        // softplus + × ssm_a → ssm_gate_buf).
+        let spec = cfg.qwen35.as_ref().expect(
+            "step_ssm_alpha_gate emitted for non-qwen35 config",
+        );
+        let hidden_norm = fwd.cur().hidden_norm.handle;
+        let alpha_buf = fwd.ssm_alpha_buf.as_ref().unwrap().handle;
+        let gate_buf  = fwd.ssm_gate_buf.as_ref().unwrap().handle;
+        let n_heads   = spec.num_v_heads();
+
+        // 1. alpha = ssm_alpha.weight @ hidden_norm
+        let w_alpha = layer_weight(ctx.model, layer, "ssm_alpha.weight");
+        let s_alpha = layer_weight_shader(
+            ctx.model, layer, "ssm_alpha.weight",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
+        let scale = layer_weight_scale_scalar(ctx.model, layer, "ssm_alpha.weight");
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[hidden_norm]);
+        fwd.run_gemv(
+            ctx.dev, ctx.registry, ctx.cmd, s_alpha, w_alpha, hidden_norm, alpha_buf,
+            cfg.hidden_dim, n_heads, scale, "gemv_ssm_alpha",
+        );
+        fwd.mark_written(&[alpha_buf]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[alpha_buf]);
+
+        // 2. alpha += ssm_dt.bias
+        let dt_bias = layer_weight(ctx.model, layer, "ssm_dt.bias");
+        fwd.run_binary(
+            ctx.dev, ctx.registry, ctx.cmd, ShaderId::Add,
+            alpha_buf, dt_bias, alpha_buf,
+            n_heads, "ssm_alpha_add_dt",
+        );
+        fwd.mark_written(&[alpha_buf]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[alpha_buf]);
+
+        // 3. alpha = softplus(alpha) in-place
+        fwd.run_softplus(
+            ctx.dev, ctx.registry, ctx.cmd,
+            alpha_buf, n_heads, "ssm_alpha_softplus",
+        );
+        fwd.mark_written(&[alpha_buf]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[alpha_buf]);
+
+        // 4. gate = alpha * ssm_a (note: ssm_a has NO .weight suffix in GGUF).
+        let ssm_a = layer_weight(ctx.model, layer, "ssm_a");
+        fwd.run_binary(
+            ctx.dev, ctx.registry, ctx.cmd, ShaderId::Mul,
+            alpha_buf, ssm_a, gate_buf,
+            n_heads, "ssm_alpha_mul_a",
+        );
+        fwd.mark_written(&[gate_buf]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[gate_buf]);
     }
 
     /// Sprint G-2c (v0.4.6) — in-place SiLU on `ssm_conv_output_buf`
@@ -754,10 +880,42 @@ impl DecodeExec {
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_output]);
     }
 
+    /// Sprint G-2d (v0.4.6) — Head-axis 16 → 48 repeat for Q + K
+    /// post-L2-norm (Op 14 of `build_layer_attn_linear`). Reads two
+    /// slices of `ssm_conv_output_buf`:
+    ///   Q: bytes `[0, 2048×4)`  → `ssm_qrep_buf` `[48 × 128]`
+    ///   K: bytes `[2048×4, 4096×4)` → `ssm_krep_buf` `[48 × 128]`
+    /// Bound at offset via descriptor set, so no extra copy step.
     pub(super) fn step_ssm_repeat_qk(
-        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, _layer: u32,
     ) {
-        // No-op until Sprint G-2d (repeat_interleave 16→48 for Q/K).
+        let spec = cfg.qwen35.as_ref().expect(
+            "step_ssm_repeat_qk emitted for non-qwen35 config",
+        );
+        let conv_output = fwd.ssm_conv_output_buf.as_ref().unwrap().handle;
+        let qrep = fwd.ssm_qrep_buf.as_ref().unwrap().handle;
+        let krep = fwd.ssm_krep_buf.as_ref().unwrap().handle;
+        let head_dim    = spec.head_k_dim();        // 128
+        let n_src_heads = spec.num_k_heads();       // 16
+        let n_dst_heads = spec.num_v_heads();       // 48
+        let n_tokens    = 1u32;                     // decode
+        let slice_bytes = head_dim as u64 * n_src_heads as u64 * 4; // 2048 floats × 4 = 8192 B
+
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_output]);
+        // Q at offset 0.
+        fwd.run_repeat_interleave(
+            ctx.dev, ctx.registry, ctx.cmd,
+            conv_output, /* src_offset_bytes = */ 0, slice_bytes, qrep,
+            head_dim, n_src_heads, n_dst_heads, n_tokens, "ssm_repeat_q",
+        );
+        // K at offset 2048 floats = 8192 bytes.
+        fwd.run_repeat_interleave(
+            ctx.dev, ctx.registry, ctx.cmd,
+            conv_output, slice_bytes, slice_bytes, krep,
+            head_dim, n_src_heads, n_dst_heads, n_tokens, "ssm_repeat_k",
+        );
+        fwd.mark_written(&[qrep, krep]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[qrep, krep]);
     }
 
     pub(super) fn step_gated_delta_net(
@@ -772,10 +930,33 @@ impl DecodeExec {
         // No-op until Sprint G-2e (RMSNorm(gdn_out) × Silu(z)).
     }
 
+    /// Sprint G-2d (v0.4.6) — `ssm_out.weight` GEMV `[6144, 5120]` Q4_K
+    /// (Op 17 of `build_layer_attn_linear`). Reads `ssm_norm_out_buf`
+    /// (NormGated output, still no-op-zero until G-2e ships), writes
+    /// the per-layer hidden-dim attention output into `o_buf` where
+    /// `step_attn_residual_add` consumes it (`addend = o_buf` on the
+    /// non-Gemma path).
     pub(super) fn step_ssm_out_proj(
-        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
     ) {
-        // No-op until Sprint G-2d (ssm_out.weight GEMV 6144→5120).
+        let spec = cfg.qwen35.as_ref().expect(
+            "step_ssm_out_proj emitted for non-qwen35 config",
+        );
+        let norm_out = fwd.ssm_norm_out_buf.as_ref().unwrap().handle;
+        let o_buf    = fwd.cur().o_buf.handle;
+        let w = layer_weight(ctx.model, layer, "ssm_out.weight");
+        let s = layer_weight_shader(
+            ctx.model, layer, "ssm_out.weight",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
+        let scale = layer_weight_scale_scalar(ctx.model, layer, "ssm_out.weight");
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[norm_out]);
+        fwd.run_gemv(
+            ctx.dev, ctx.registry, ctx.cmd, s, w, norm_out, o_buf,
+            spec.ssm_d_inner, cfg.hidden_dim, scale, "gemv_ssm_out",
+        );
+        fwd.mark_written(&[o_buf]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[o_buf]);
     }
 }
 
@@ -1410,28 +1591,142 @@ impl BatchExec {
     // BAT delta on a per-step basis.
     // ──────────────────────────────────────────────────────────
 
+    /// Sprint G-2d (v0.4.6) — batch counterpart of
+    /// [`DecodeExec::step_attn_qkv_proj`]. Recurrent layers run
+    /// per-token in prefill so the GEMV is dispatched in place of a
+    /// batched mul_mm. With G-2b's decode-sized scratch the body
+    /// processes token 0 only — multi-token correctness lands when
+    /// scratch grows to seq_len.
     pub(super) fn b_step_attn_qkv_proj(
-        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
     ) {
-        // No-op until Sprint G-2d.
+        let spec = cfg.qwen35.as_ref().expect(
+            "b_step_attn_qkv_proj emitted for non-qwen35 config",
+        );
+        let input = fwd.batch_norm.handle;
+        let qkv_buf = fwd.ssm_qkv_buf.as_ref().unwrap().handle;
+        let w = layer_weight(ctx.model, layer, "attn_qkv.weight");
+        let s = layer_weight_shader(
+            ctx.model, layer, "attn_qkv.weight",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
+        let scale = layer_weight_scale_scalar(ctx.model, layer, "attn_qkv.weight");
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[input]);
+        fwd.run_gemv(
+            ctx.dev, ctx.registry, ctx.cmd, s, w, input, qkv_buf,
+            cfg.hidden_dim, spec.conv_channels(), scale, "b_gemv_ssm_qkv",
+        );
+        fwd.mark_written(&[qkv_buf]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[qkv_buf]);
     }
 
+    /// Sprint G-2d (v0.4.6) — batch counterpart of
+    /// [`DecodeExec::step_attn_gate_z_proj`].
     pub(super) fn b_step_attn_gate_z_proj(
-        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
     ) {
-        // No-op until Sprint G-2d.
+        let spec = cfg.qwen35.as_ref().expect(
+            "b_step_attn_gate_z_proj emitted for non-qwen35 config",
+        );
+        let input = fwd.batch_norm.handle;
+        let z_buf = fwd.ssm_z_buf.as_ref().unwrap().handle;
+        let w = layer_weight(ctx.model, layer, "attn_gate.weight");
+        let s = layer_weight_shader(
+            ctx.model, layer, "attn_gate.weight",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
+        let scale = layer_weight_scale_scalar(ctx.model, layer, "attn_gate.weight");
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[input]);
+        fwd.run_gemv(
+            ctx.dev, ctx.registry, ctx.cmd, s, w, input, z_buf,
+            cfg.hidden_dim, spec.ssm_d_inner, scale, "b_gemv_ssm_z",
+        );
+        fwd.mark_written(&[z_buf]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[z_buf]);
     }
 
+    /// Sprint G-2d (v0.4.6) — batch counterpart of
+    /// [`DecodeExec::step_ssm_beta_proj`].
     pub(super) fn b_step_ssm_beta_proj(
-        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
     ) {
-        // No-op until Sprint G-2d.
+        let spec = cfg.qwen35.as_ref().expect(
+            "b_step_ssm_beta_proj emitted for non-qwen35 config",
+        );
+        let input = fwd.batch_norm.handle;
+        let beta_buf = fwd.ssm_beta_buf.as_ref().unwrap().handle;
+        let w = layer_weight(ctx.model, layer, "ssm_beta.weight");
+        let s = layer_weight_shader(
+            ctx.model, layer, "ssm_beta.weight",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
+        let scale = layer_weight_scale_scalar(ctx.model, layer, "ssm_beta.weight");
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[input]);
+        fwd.run_gemv(
+            ctx.dev, ctx.registry, ctx.cmd, s, w, input, beta_buf,
+            cfg.hidden_dim, spec.num_v_heads(), scale, "b_gemv_ssm_beta",
+        );
+        fwd.mark_written(&[beta_buf]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[beta_buf]);
+        fwd.run_sigmoid(
+            ctx.dev, ctx.registry, ctx.cmd,
+            beta_buf, spec.num_v_heads(), "b_ssm_beta_sigmoid",
+        );
+        fwd.mark_written(&[beta_buf]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[beta_buf]);
     }
 
+    /// Sprint G-2d (v0.4.6) — batch counterpart of
+    /// [`DecodeExec::step_ssm_alpha_gate`].
     pub(super) fn b_step_ssm_alpha_gate(
-        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
     ) {
-        // No-op until Sprint G-2d.
+        let spec = cfg.qwen35.as_ref().expect(
+            "b_step_ssm_alpha_gate emitted for non-qwen35 config",
+        );
+        let input = fwd.batch_norm.handle;
+        let alpha_buf = fwd.ssm_alpha_buf.as_ref().unwrap().handle;
+        let gate_buf  = fwd.ssm_gate_buf.as_ref().unwrap().handle;
+        let n_heads   = spec.num_v_heads();
+
+        let w_alpha = layer_weight(ctx.model, layer, "ssm_alpha.weight");
+        let s_alpha = layer_weight_shader(
+            ctx.model, layer, "ssm_alpha.weight",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
+        let scale = layer_weight_scale_scalar(ctx.model, layer, "ssm_alpha.weight");
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[input]);
+        fwd.run_gemv(
+            ctx.dev, ctx.registry, ctx.cmd, s_alpha, w_alpha, input, alpha_buf,
+            cfg.hidden_dim, n_heads, scale, "b_gemv_ssm_alpha",
+        );
+        fwd.mark_written(&[alpha_buf]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[alpha_buf]);
+
+        let dt_bias = layer_weight(ctx.model, layer, "ssm_dt.bias");
+        fwd.run_binary(
+            ctx.dev, ctx.registry, ctx.cmd, ShaderId::Add,
+            alpha_buf, dt_bias, alpha_buf,
+            n_heads, "b_ssm_alpha_add_dt",
+        );
+        fwd.mark_written(&[alpha_buf]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[alpha_buf]);
+
+        fwd.run_softplus(
+            ctx.dev, ctx.registry, ctx.cmd,
+            alpha_buf, n_heads, "b_ssm_alpha_softplus",
+        );
+        fwd.mark_written(&[alpha_buf]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[alpha_buf]);
+
+        let ssm_a = layer_weight(ctx.model, layer, "ssm_a");
+        fwd.run_binary(
+            ctx.dev, ctx.registry, ctx.cmd, ShaderId::Mul,
+            alpha_buf, ssm_a, gate_buf,
+            n_heads, "b_ssm_alpha_mul_a",
+        );
+        fwd.mark_written(&[gate_buf]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[gate_buf]);
     }
 
     /// Sprint G-2c (v0.4.6) — batch counterpart of
@@ -1485,10 +1780,35 @@ impl BatchExec {
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_output]);
     }
 
+    /// Sprint G-2d (v0.4.6) — batch counterpart of
+    /// [`DecodeExec::step_ssm_repeat_qk`].
     pub(super) fn b_step_ssm_repeat_qk(
-        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, _layer: u32,
     ) {
-        // No-op until Sprint G-2d.
+        let spec = cfg.qwen35.as_ref().expect(
+            "b_step_ssm_repeat_qk emitted for non-qwen35 config",
+        );
+        let conv_output = fwd.ssm_conv_output_buf.as_ref().unwrap().handle;
+        let qrep = fwd.ssm_qrep_buf.as_ref().unwrap().handle;
+        let krep = fwd.ssm_krep_buf.as_ref().unwrap().handle;
+        let head_dim    = spec.head_k_dim();
+        let n_src_heads = spec.num_k_heads();
+        let n_dst_heads = spec.num_v_heads();
+        let slice_bytes = head_dim as u64 * n_src_heads as u64 * 4;
+
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_output]);
+        fwd.run_repeat_interleave(
+            ctx.dev, ctx.registry, ctx.cmd,
+            conv_output, 0, slice_bytes, qrep,
+            head_dim, n_src_heads, n_dst_heads, 1, "b_ssm_repeat_q",
+        );
+        fwd.run_repeat_interleave(
+            ctx.dev, ctx.registry, ctx.cmd,
+            conv_output, slice_bytes, slice_bytes, krep,
+            head_dim, n_src_heads, n_dst_heads, 1, "b_ssm_repeat_k",
+        );
+        fwd.mark_written(&[qrep, krep]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[qrep, krep]);
     }
 
     pub(super) fn b_step_gated_delta_net(
@@ -1503,9 +1823,31 @@ impl BatchExec {
         // No-op until Sprint G-2e.
     }
 
+    /// Sprint G-2d (v0.4.6) — batch counterpart of
+    /// [`DecodeExec::step_ssm_out_proj`]. Writes only token 0's worth
+    /// into `batch_o[0..hidden_dim]`; subsequent residual-add on
+    /// tokens 1..N consumes stale/zero data (smoke-only correctness,
+    /// matches the G-2b plan's decode-sized scratch).
     pub(super) fn b_step_ssm_out_proj(
-        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
     ) {
-        // No-op until Sprint G-2d.
+        let spec = cfg.qwen35.as_ref().expect(
+            "b_step_ssm_out_proj emitted for non-qwen35 config",
+        );
+        let norm_out = fwd.ssm_norm_out_buf.as_ref().unwrap().handle;
+        let batch_o  = fwd.batch_o.handle;
+        let w = layer_weight(ctx.model, layer, "ssm_out.weight");
+        let s = layer_weight_shader(
+            ctx.model, layer, "ssm_out.weight",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
+        let scale = layer_weight_scale_scalar(ctx.model, layer, "ssm_out.weight");
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[norm_out]);
+        fwd.run_gemv(
+            ctx.dev, ctx.registry, ctx.cmd, s, w, norm_out, batch_o,
+            spec.ssm_d_inner, cfg.hidden_dim, scale, "b_gemv_ssm_out",
+        );
+        fwd.mark_written(&[batch_o]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[batch_o]);
     }
 }
