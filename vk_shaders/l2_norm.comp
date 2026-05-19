@@ -1,0 +1,54 @@
+#version 450
+
+// Sprint G-2c (v0.4.6) — In-place L2 / RMS-norm (no weight).
+//
+//   out[row, col] = in[row, col] / sqrt(mean(in[row, *]²) + eps)
+//
+// Drop-in simplification of llama.cpp's `rms_norm.comp` with the
+// weight-multiplication branch removed. Q and K slices of the conv
+// output are L2-normalised per (16-head, 128-dim) row — one workgroup
+// per row, shared-memory tree reduction. Bindings 0/1 may alias the
+// same buffer for in-place operation (the shader reads then writes,
+// no race).
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 128;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer A { float data_a[]; };
+layout(binding = 1)         buffer  D { float data_d[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint  ncols;
+    uint  base_offset;    // in floats — start of slice within bound buffer
+    float eps;
+};
+
+shared float sumsh[BLOCK_SIZE];
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint row_base = base_offset + row * ncols;
+
+    float sum = 0.0;
+    for (uint col = tid; col < ncols; col += BLOCK_SIZE) {
+        float xi = data_a[row_base + col];
+        sum += xi * xi;
+    }
+    sumsh[tid] = sum;
+    barrier();
+    for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sumsh[tid] += sumsh[tid + s];
+        }
+        barrier();
+    }
+    const float mean = sumsh[0] / float(ncols);
+    const float scale = inversesqrt(mean + eps);
+    for (uint col = tid; col < ncols; col += BLOCK_SIZE) {
+        data_d[row_base + col] = data_a[row_base + col] * scale;
+    }
+}

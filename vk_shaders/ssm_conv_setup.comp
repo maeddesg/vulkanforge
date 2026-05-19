@@ -1,0 +1,67 @@
+#version 450
+
+// Sprint G-2c (v0.4.6) — fused SSM-Conv input-build + state-shift.
+//
+// Runs immediately before `ssm_conv.comp` for each Qwen3.6 Linear-Attn
+// layer. Builds the channel-major-time-inner `conv_input` buffer that
+// the ssm_conv shader expects and slides the persistent
+// `conv_state` window one position to the left in the same dispatch
+// (one thread per channel — no cross-thread aliasing).
+//
+// Layout (channel-outer-time-inner, matches ssm_conv.comp strides):
+//   conv_state   : [conv_channels × (d_conv-1)]   per-layer slice
+//   ssm_qkv      : [conv_channels]                current-token QKV
+//   conv_input   : [conv_channels × d_conv]       (output)
+//
+// Per channel `ch`, the thread:
+//   1. Reads `state[ch, 0..d_conv-1]` and `qkv[ch]` into registers.
+//   2. Writes `conv_input[ch, 0..d_conv-1] = state`, `conv_input[ch, d_conv-1] = qkv`.
+//   3. Writes `state[ch, 0..d_conv-2] = state[ch, 1..d_conv-1]`,
+//      `state[ch, d_conv-2] = qkv`  (slide window left).
+//
+// The state alias (binding 0 is both read & written) is safe: each
+// thread reads its OWN channel's slice into registers first, then
+// writes its own slice — no cross-thread overlap.
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+layout(constant_id = 1) const uint D_CONV     = 4;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0)          buffer State    { float state[]; };
+layout(binding = 1) readonly buffer Qkv      { float qkv[]; };
+layout(binding = 2) writeonly buffer Input   { float conv_input[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint conv_channels;   // nr (10240 for Qwen3.6-27B)
+};
+
+void main() {
+    const uint ch = gl_GlobalInvocationID.x;
+    if (ch >= conv_channels) {
+        return;
+    }
+
+    const uint d_state = D_CONV - 1;           // 3 for Qwen3.6
+    const uint state_base = ch * d_state;       // binding-bound at the per-layer offset
+    const uint input_base = ch * D_CONV;
+
+    // Load past state (3 floats for Qwen3.6) + current QKV into registers.
+    float s[D_CONV];
+    [[unroll]] for (uint t = 0; t < d_state; t++) {
+        s[t] = state[state_base + t];
+    }
+    s[d_state] = qkv[ch];
+
+    // Emit conv_input = [s0, s1, s2, qkv]  (channel-outer-time-inner).
+    [[unroll]] for (uint t = 0; t < D_CONV; t++) {
+        conv_input[input_base + t] = s[t];
+    }
+
+    // Slide state left: new_state = [s1, s2, qkv].
+    [[unroll]] for (uint t = 0; t < d_state; t++) {
+        state[state_base + t] = s[t + 1];
+    }
+}

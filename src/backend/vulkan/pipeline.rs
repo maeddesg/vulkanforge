@@ -576,6 +576,45 @@ pub struct FlashAttnBatchPushConstants {
 }
 const _: () = assert!(std::mem::size_of::<FlashAttnBatchPushConstants>() == 32);
 
+/// Sprint F (v0.4.6) — `ssm_conv.comp` push block. 11 × u32 = 44 B.
+/// All strides are in **bytes** (the shader divides by 4 to convert
+/// to float indices). Field order matches `vk_shaders/ssm_conv.comp`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SsmConvPushConstants {
+    pub nb01: u32,
+    pub nb02: u32,
+    pub nb11: u32,
+    pub dst_nb0: u32,
+    pub dst_nb1: u32,
+    pub dst_nb2: u32,
+    pub nc: u32,
+    pub ncs: u32,
+    pub nr: u32,
+    pub n_t: u32,
+    pub n_s: u32,
+}
+const _: () = assert!(std::mem::size_of::<SsmConvPushConstants>() == 44);
+
+/// Sprint G-2c (v0.4.6) — `ssm_conv_setup.comp` push block.
+/// Single u32 = conv_channel count (`nr` in ssm_conv terminology).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SsmConvSetupPushConstants {
+    pub conv_channels: u32,
+}
+const _: () = assert!(std::mem::size_of::<SsmConvSetupPushConstants>() == 4);
+
+/// Sprint G-2c (v0.4.6) — `l2_norm.comp` push block. 8 B + 4 B = 12 B.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct L2NormPushConstants {
+    pub ncols: u32,
+    pub base_offset: u32,   // in floats — slice start within bound buffer
+    pub eps: f32,
+}
+const _: () = assert!(std::mem::size_of::<L2NormPushConstants>() == 12);
+
 /// llama.cpp's `init_fastdiv_values`. Used by [`GenericUnaryPushConstants`]
 /// to populate the `ne*_*mp/L` fields — without these, `copy`'s SPIR-V
 /// fastdiv path divides by a magic-of-zero and produces garbage indices.

@@ -30,12 +30,13 @@ use super::super::pipeline::{
     CoopmatPushConstants, FlashAttnBatchPushConstants, FlashAttnReducePushConstants,
     FlashAttnSplitPushConstants, Fp8BlockwiseGemmPushConstants,
     Fp8BlockwiseGemvPushConstants, Fp8GemmPushConstants, GenericBinaryPushConstants,
-    KvCopyFp16PushConstants, MatVecIdPushConstants, MatVecPushConstants,
+    GenericHeadPushConstants, KvCopyFp16PushConstants, L2NormPushConstants,
+    MatVecIdPushConstants, MatVecPushConstants,
     MmqIdPushConstants, MmqPushConstants,
     MoeRouterNormGemvPushConstants, MoeRouterSoftmaxTopkPushConstants,
     MultiAddRmsPushConstants, Q8_1QuantizePushConstants, RmsNormMulRopePushConstants,
     RopePushConstants, ScalarAttnPushConstants, SigmoidMulPushConstants,
-    SwigluPushConstants,
+    SsmConvPushConstants, SsmConvSetupPushConstants, SwigluPushConstants,
 };
 use super::super::pipeline_registry::PipelineRegistry;
 use super::super::shaders::ShaderId;
@@ -2752,6 +2753,189 @@ impl Forward {
                 cmd, layout2, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc2),
             );
             dev.device.cmd_dispatch(cmd, seq_len, 1, 1);
+        });
+    }
+
+    /// Sprint G-2c (v0.4.6) — fused conv-input build + state-shift for
+    /// the Qwen3.6 Linear-Attn block. `state` is bound at the per-layer
+    /// byte offset (`recurrent_index × (d_conv-1) × conv_channels × 4`);
+    /// `qkv` is the current-token AttnQkvProj output;
+    /// `conv_input` is the fresh `[conv_channels × d_conv]` window the
+    /// next `run_ssm_conv` reads.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_ssm_conv_setup(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        state: vk::Buffer,
+        state_offset_bytes: u64,
+        state_bytes: u64,
+        qkv: vk::Buffer,
+        conv_input: vk::Buffer,
+        conv_channels: u32,
+        label: &str,
+    ) {
+        let kernel = registry.get(ShaderId::SsmConvSetupF32);
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[
+                (0, state, state_offset_bytes, state_bytes),
+                (1, qkv, 0, 0),
+                (2, conv_input, 0, 0),
+            ],
+        );
+        let pc = SsmConvSetupPushConstants { conv_channels };
+        // local_size_x = BLOCK_SIZE (256, spec const).
+        let dispatch_x = (conv_channels + 255) / 256;
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
+        });
+    }
+
+    /// Sprint F + G-2c (v0.4.6) — dispatch llama.cpp's `ssm_conv.comp`
+    /// over a single-sequence decode (`n_s=1`) with `n_t` output time
+    /// slots. For Qwen3.6-27B decode: `nr=10240, nc=4, ncs=4, n_t=1`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_ssm_conv(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        conv_input: vk::Buffer,
+        conv_weight: vk::Buffer,
+        dst: vk::Buffer,
+        nc: u32,            // ssm_d_conv (4)
+        ncs: u32,           // conv-input time slots (= nc-1+n_t)
+        nr: u32,            // conv_channels (10240)
+        n_t: u32,           // output time slots (1 for decode)
+        n_s: u32,           // sequences (1)
+        label: &str,
+    ) {
+        let kernel = registry.get(ShaderId::SsmConvF32);
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[(0, conv_input, 0, 0), (1, conv_weight, 0, 0), (2, dst, 0, 0)],
+        );
+        // Strides in BYTES (shader divides by 4 to convert to float idx).
+        let nb01 = ncs * 4;             // per channel row in conv_input
+        let nb02 = nr * ncs * 4;        // per sequence in conv_input
+        let nb11 = nc * 4;              // per channel row in conv_weight
+        let dst_nb0 = 4;
+        let dst_nb1 = nr * 4;           // per output time slot in dst
+        let dst_nb2 = nr * n_t * 4;     // per sequence in dst
+        let pc = SsmConvPushConstants {
+            nb01, nb02, nb11, dst_nb0, dst_nb1, dst_nb2,
+            nc, ncs, nr, n_t, n_s,
+        };
+        // local_size_x_id = BLOCK_SIZE (32); local_size_y_id = TOKENS_PER_WG (16).
+        let dispatch_x = (nr + 31) / 32;
+        let dispatch_y = (n_t + 15) / 16;
+        let dispatch_z = n_s;
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, dispatch_x, dispatch_y, dispatch_z);
+        });
+    }
+
+    /// Sprint G-2c (v0.4.6) — In-place SiLU on `n` FP32 elements via the
+    /// long-registered `silu_f32` pipeline. Caller passes the same
+    /// buffer for `src` and `dst` for the in-place pattern (shader
+    /// reads into a register before writing; no aliasing hazard
+    /// within a single thread).
+    pub(super) fn run_silu(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        src: vk::Buffer,
+        dst: vk::Buffer,
+        n: u32,
+        label: &str,
+    ) {
+        let kernel = registry.get(ShaderId::Silu);
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[(0, src, 0, 0), (1, dst, 0, 0)],
+        );
+        let pc = GenericHeadPushConstants {
+            kx: n, ky: 1,
+            param1: 0.0, param2: 0.0, param3: 0.0, param4: 0.0,
+        };
+        // local_size_x = 512 inside silu.comp.
+        let dispatch_x = (n + 511) / 512;
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
+        });
+    }
+
+    /// Sprint G-2c (v0.4.6) — In-place L2-norm over `nrows` rows of
+    /// `ncols` FP32 elements each. `base_offset_floats` is added to
+    /// both src and dst indices in the shader so the same buffer can
+    /// be used for in-place ops on a sub-slice (Q at offset 0, K at
+    /// offset `n_k_heads * head_k_dim` floats in the conv output).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_l2_norm(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        src: vk::Buffer,
+        dst: vk::Buffer,
+        ncols: u32,
+        nrows: u32,
+        base_offset_floats: u32,
+        eps: f32,
+        label: &str,
+    ) {
+        let kernel = registry.get(ShaderId::L2NormF32);
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[(0, src, 0, 0), (1, dst, 0, 0)],
+        );
+        let pc = L2NormPushConstants {
+            ncols,
+            base_offset: base_offset_floats,
+            eps,
+        };
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            // One workgroup per row.
+            dev.device.cmd_dispatch(cmd, nrows, 1, 1);
         });
     }
 }

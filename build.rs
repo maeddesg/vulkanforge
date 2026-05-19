@@ -559,6 +559,29 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "ssm_conv.comp",
         defines: &[],
     },
+    // Sprint G-2c (v0.4.6) — fused SSM-Conv input-build + state-shift.
+    // 3 SSBOs (state inout, qkv readonly, conv_input writeonly), 1 u32
+    // push const (conv_channels). Spec consts: BLOCK_SIZE=256 (x),
+    // D_CONV=4. One thread per channel reads its own 3-slot state + qkv
+    // into registers, writes the 4-slot conv_input row and the
+    // shifted 3-slot state. Eliminates the alternative of 10240
+    // per-channel cmd_copy_buffer regions per layer.
+    ShaderJob {
+        out_name: "ssm_conv_setup_f32.spv",
+        entry_source: "ssm_conv_setup.comp",
+        defines: &[],
+    },
+    // Sprint G-2c (v0.4.6) — In-place L2-norm for Q/K slices in
+    // Linear-Attn. 2 SSBOs (input readonly, output buffer — same
+    // buffer in callers for in-place), 3 push consts (ncols,
+    // base_offset, eps). One workgroup per row, shared-memory tree
+    // reduction. Drop-in simplification of llama.cpp's rms_norm.comp
+    // with weight-multiplication removed.
+    ShaderJob {
+        out_name: "l2_norm_f32.spv",
+        entry_source: "l2_norm.comp",
+        defines: &[],
+    },
     // Sprint G-2a (v0.4.6) — Softplus elementwise for Qwen3.6
     // Linear-Attn alpha gate. 1 in-out SSBO, 1 u32 push const (ne).
     ShaderJob {

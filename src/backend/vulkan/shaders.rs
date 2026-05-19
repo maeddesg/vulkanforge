@@ -150,6 +150,20 @@ pub enum ShaderId {
     /// consts: BLOCK_SIZE=32 (local_size_x), TOKENS_PER_WG=16 (local_size_y).
     /// Port of llama.cpp's `ssm_conv.comp`.
     SsmConvF32,
+    /// Sprint G-2c (v0.4.6) — fused SSM-Conv input-build + state-shift.
+    /// 3 SSBOs (state inout per-layer slice, qkv readonly, conv_input
+    /// writeonly); 1 u32 push const (conv_channels). Spec consts:
+    /// BLOCK_SIZE=256, D_CONV=4. One thread per channel reads its own
+    /// 3-slot state + qkv into registers, emits the 4-slot conv_input
+    /// row and slides the state window left.
+    SsmConvSetupF32,
+    /// Sprint G-2c (v0.4.6) — In-place L2-norm (no weight). 2 SSBOs
+    /// (input readonly, output buffer — same buffer for in-place);
+    /// push consts (ncols, base_offset_floats, eps). Spec const
+    /// BLOCK_SIZE=128. One workgroup per row, shared-memory tree
+    /// reduction. Drop-in simplification of llama.cpp's rms_norm.comp
+    /// with the weight-mul branch removed.
+    L2NormF32,
     /// Sprint G-2a (v0.4.6) — Softplus in-place activation (`x ← log(1+exp(x))`,
     /// numerically stable branch at x>20). 1 in-out SSBO, push const
     /// `ne` (u32). local_size_x = 256. Used in the Qwen3.6 Linear-Attn
@@ -515,6 +529,8 @@ impl ShaderId {
             ShaderId::GeluPytorchTanhGlu => "gelu_pytorch_tanh_f32",
             ShaderId::SigmoidMul => "sigmoid_mul_f32",
             ShaderId::SsmConvF32 => "ssm_conv_f32",
+            ShaderId::SsmConvSetupF32 => "ssm_conv_setup_f32",
+            ShaderId::L2NormF32 => "l2_norm_f32",
             ShaderId::SoftplusF32 => "softplus_f32",
             ShaderId::RepeatInterleaveF32 => "repeat_interleave_f32",
             ShaderId::GatedDeltaNetF32 => "gated_delta_net_f32",
@@ -668,6 +684,8 @@ impl ShaderId {
             ShaderId::GeluPytorchTanhGlu => GELU_PYTORCH_TANH_F32,
             ShaderId::SigmoidMul => SIGMOID_MUL_F32,
             ShaderId::SsmConvF32 => SSM_CONV_F32,
+            ShaderId::SsmConvSetupF32 => SSM_CONV_SETUP_F32,
+            ShaderId::L2NormF32 => L2_NORM_F32,
             ShaderId::SoftplusF32 => SOFTPLUS_F32,
             ShaderId::RepeatInterleaveF32 => REPEAT_INTERLEAVE_F32,
             ShaderId::GatedDeltaNetF32 => GATED_DELTA_NET_F32,
@@ -828,6 +846,8 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::GeluPytorchTanhGlu,
     ShaderId::SigmoidMul,
     ShaderId::SsmConvF32,
+    ShaderId::SsmConvSetupF32,
+    ShaderId::L2NormF32,
     ShaderId::SoftplusF32,
     ShaderId::RepeatInterleaveF32,
     ShaderId::GatedDeltaNetF32,
@@ -1032,6 +1052,10 @@ pub const SIGMOID_MUL_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/sigmoid_mul_f32.spv"));
 pub const SSM_CONV_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ssm_conv_f32.spv"));
+pub const SSM_CONV_SETUP_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/ssm_conv_setup_f32.spv"));
+pub const L2_NORM_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/l2_norm_f32.spv"));
 pub const SOFTPLUS_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/softplus_f32.spv"));
 pub const REPEAT_INTERLEAVE_F32: &[u8] =

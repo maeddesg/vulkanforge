@@ -15,12 +15,40 @@ use super::super::arch::{
     compute_barrier, layer_weight,
     layer_weight_opt, layer_weight_scale_block, layer_weight_scale_buf,
     layer_weight_scale_scalar, layer_weight_shader,
+    transfer_to_compute_barrier,
 };
 use super::super::state::Forward;
 use super::super::super::gguf::ModelConfig;
 use super::super::super::shaders::ShaderId;
 
 use ash::vk;
+
+/// Sprint G-2c (v0.4.6) — Lazy zero-init for the persistent SSM
+/// buffers (`conv_state_buf` + `ssm_state_buf`). Fires once per
+/// `Forward` instance; subsequent calls observe the flag and bail out
+/// without enqueuing transfers. Without this the very first decode /
+/// prefill token reads whatever uninitialised GPU memory the
+/// allocator handed us, which can produce NaN that propagates
+/// forever via the recurrent state. Called from both the DEC and
+/// BAT conv-step bodies so any entry path covers init. The
+/// flag flips back to `false` on `/reset` in Sprint G-2e.
+fn ensure_ssm_persistent_initialized(fwd: &mut Forward, ctx: &ExecCtx) {
+    if fwd.ssm_persistent_initialized {
+        return;
+    }
+    let conv_state = fwd.conv_state_buf.as_ref().expect(
+        "ssm_persistent_initialized called without conv_state_buf",
+    ).handle;
+    let ssm_state = fwd.ssm_state_buf.as_ref().expect(
+        "ssm_persistent_initialized called without ssm_state_buf",
+    ).handle;
+    unsafe {
+        ctx.dev.device.cmd_fill_buffer(ctx.cmd, conv_state, 0, vk::WHOLE_SIZE, 0);
+        ctx.dev.device.cmd_fill_buffer(ctx.cmd, ssm_state,  0, vk::WHOLE_SIZE, 0);
+    }
+    transfer_to_compute_barrier(ctx.dev, ctx.cmd);
+    fwd.ssm_persistent_initialized = true;
+}
 
 impl DecodeExec {
     pub(super) fn step_attn_norm(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
@@ -561,22 +589,69 @@ impl DecodeExec {
         fwd.mark_written(&[res1]);
     }
 
-    /// Sprint F (v0.4.6) — SSM 1D convolution step. **Staging-only
-    /// implementation:** plumbing for the persistent `conv_state`
-    /// buffer + `ssm_conv_f32` pipeline is wired into `Forward`; the
-    /// real dispatch (conv + state-shift `cmd_copy_buffer` chain) lands
-    /// in Sprint G-2c alongside `GatedDeltaNet`. The conv output is not
-    /// consumed by any downstream step in the current passthrough plan,
-    /// so dispatching it here would only burn cycles without enabling
-    /// the gate ("kein Crash, kein NaN" holds either way).
+    /// Sprint G-2c (v0.4.6) — real SSM 1D convolution dispatch with
+    /// persistent state-shift.
+    ///
+    /// Three dispatches per call:
+    ///   1. **`ssm_conv_setup`** — one thread per channel builds the
+    ///      4-slot `conv_input` window from `conv_state[..]` + the
+    ///      current-token `ssm_qkv_buf`, AND slides the state window
+    ///      one position left (new state = `[s1, s2, qkv]`). Fused so
+    ///      we only read the per-channel state into registers once.
+    ///   2. **`ssm_conv`** — Sprint F shader, channel-major-time-inner
+    ///      layout, `n_t = n_s = 1` for decode.
+    ///   3. Implicit barrier so downstream `SsmSilu` / `SsmQkL2Norm`
+    ///      observe `conv_output`'s writes.
+    ///
+    /// First call lazily zero-fills the persistent `conv_state` +
+    /// `ssm_state` buffers (so the first token doesn't read whatever
+    /// uninitialised GPU memory the allocator handed us). The flag
+    /// resets on `/reset` in Sprint G-2e.
     pub(super) fn step_ssm_conv1d(
         &self,
-        _fwd: &mut Forward,
-        _cfg: &ModelConfig,
-        _ctx: &ExecCtx,
-        _layer: u32,
+        fwd: &mut Forward,
+        cfg: &ModelConfig,
+        ctx: &ExecCtx,
+        layer: u32,
     ) {
-        // No-op until Sprint G-2c fills in the body.
+        let spec = cfg.qwen35.as_ref().expect(
+            "step_ssm_conv1d emitted for non-qwen35 config",
+        );
+        let conv_channels = spec.conv_channels();
+        let d_conv = spec.ssm_d_conv;
+        let slots = d_conv - 1;
+        let recurrent_idx = spec.recurrent_index(layer);
+
+        ensure_ssm_persistent_initialized(fwd, ctx);
+
+        let conv_state_buf = fwd.conv_state_buf.as_ref().unwrap().handle;
+        let qkv_buf       = fwd.ssm_qkv_buf.as_ref().unwrap().handle;
+        let conv_input    = fwd.ssm_conv_input_buf.as_ref().unwrap().handle;
+        let conv_output   = fwd.ssm_conv_output_buf.as_ref().unwrap().handle;
+
+        let state_bytes_per_layer = slots as u64 * conv_channels as u64 * 4;
+        let state_offset_bytes    = recurrent_idx as u64 * state_bytes_per_layer;
+
+        // Build conv_input + slide state window.
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[qkv_buf]);
+        fwd.run_ssm_conv_setup(
+            ctx.dev, ctx.registry, ctx.cmd,
+            conv_state_buf, state_offset_bytes, state_bytes_per_layer,
+            qkv_buf, conv_input,
+            conv_channels, "ssm_conv_setup",
+        );
+        fwd.mark_written(&[conv_input, conv_state_buf]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_input]);
+
+        // Real conv dispatch (decode: n_t = 1, n_s = 1, ncs = d_conv).
+        let conv_weight = layer_weight(ctx.model, layer, "ssm_conv1d.weight");
+        fwd.run_ssm_conv(
+            ctx.dev, ctx.registry, ctx.cmd,
+            conv_input, conv_weight, conv_output,
+            d_conv, d_conv, conv_channels, 1, 1, "ssm_conv",
+        );
+        fwd.mark_written(&[conv_output]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_output]);
     }
 
     // ──────────────────────────────────────────────────────────
@@ -617,16 +692,66 @@ impl DecodeExec {
         // softplus + × ssm_a → ssm_gate_buf).
     }
 
+    /// Sprint G-2c (v0.4.6) — in-place SiLU on `ssm_conv_output_buf`
+    /// (Op 11 of `build_layer_attn_linear`). The silu pipeline reads
+    /// binding 0 once into a register before writing binding 1, so the
+    /// in-place aliasing (same buffer in both slots) is hazard-free.
     pub(super) fn step_ssm_silu(
-        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, _layer: u32,
     ) {
-        // No-op until Sprint G-2c (Silu on ssm_conv_output_buf).
+        let spec = cfg.qwen35.as_ref().expect(
+            "step_ssm_silu emitted for non-qwen35 config",
+        );
+        let conv_output = fwd.ssm_conv_output_buf.as_ref().unwrap().handle;
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_output]);
+        fwd.run_silu(
+            ctx.dev, ctx.registry, ctx.cmd,
+            conv_output, conv_output,
+            spec.conv_channels(), "ssm_silu",
+        );
+        fwd.mark_written(&[conv_output]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_output]);
     }
 
+    /// Sprint G-2c (v0.4.6) — in-place L2-norm on the Q and K slices
+    /// of `ssm_conv_output_buf` (Op 13 of `build_layer_attn_linear`).
+    ///
+    /// Conv-output layout (channel-major, `conv_channels=10240` floats):
+    ///   `[0..2048)`  → Q  (16 heads × 128 dim)
+    ///   `[2048..4096)` → K  (16 heads × 128 dim)
+    ///   `[4096..10240)` → V  (NOT normalised here — repeats unchanged)
+    ///
+    /// One dispatch per slice; the workgroup-per-row tree reduction
+    /// inside `l2_norm.comp` handles the head-axis (16 rows × 128 cols).
     pub(super) fn step_ssm_qk_l2_norm(
-        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, _layer: u32,
     ) {
-        // No-op until Sprint G-2c (L2-Norm via RMSNorm-trick on Q/K).
+        let spec = cfg.qwen35.as_ref().expect(
+            "step_ssm_qk_l2_norm emitted for non-qwen35 config",
+        );
+        let conv_output = fwd.ssm_conv_output_buf.as_ref().unwrap().handle;
+        let head_dim = spec.head_k_dim();          // 128
+        let n_heads  = spec.num_k_heads();         // 16
+        let qk_floats = head_dim * n_heads;        // 2048 per slice
+        let eps = cfg.rms_norm_eps;
+
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_output]);
+        // Q-slice: rows 0..n_heads at base_offset = 0.
+        fwd.run_l2_norm(
+            ctx.dev, ctx.registry, ctx.cmd,
+            conv_output, conv_output,
+            head_dim, n_heads, /* base_offset_floats = */ 0,
+            eps, "ssm_l2_norm_q",
+        );
+        // K-slice: rows 0..n_heads at base_offset = qk_floats (2048).
+        fwd.run_l2_norm(
+            ctx.dev, ctx.registry, ctx.cmd,
+            conv_output, conv_output,
+            head_dim, n_heads, /* base_offset_floats = */ qk_floats,
+            eps, "ssm_l2_norm_k",
+        );
+        fwd.mark_written(&[conv_output]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_output]);
     }
 
     pub(super) fn step_ssm_repeat_qk(
@@ -1216,18 +1341,62 @@ impl BatchExec {
         compute_barrier(ctx.dev, ctx.cmd);
     }
 
-    /// Sprint F (v0.4.6) — batch counterpart of [`DecodeExec::step_ssm_conv1d`].
-    /// Staging-only no-op; see DEC sibling for the rationale. Lives in
-    /// the same file (`executor/attention.rs`) so the DEC + BAT pair
-    /// stays co-located per coding-standards §4.2.
+    /// Sprint G-2c (v0.4.6) — batch counterpart of
+    /// [`DecodeExec::step_ssm_conv1d`].
+    ///
+    /// Recurrent layers MUST process tokens sequentially because
+    /// `conv_state` and `ssm_state` update token-by-token (this is the
+    /// `keep_rs()` branch in `delta-net-base.cpp:build_conv_state`).
+    /// With the per-token scratch sized for `seq=1` (G-2b plan), the
+    /// BAT body collapses to the same dispatch sequence as DEC — the
+    /// upstream `b_step_attn_qkv_proj` (G-2d) will land per-token-aware
+    /// writes into `ssm_qkv_buf` so this body just consumes whatever
+    /// slot the executor has already produced. For G-2c the body
+    /// matches DEC, exercising the conv pipeline at prefill smoke-test
+    /// level without claiming multi-token correctness.
     pub(super) fn b_step_ssm_conv1d(
         &self,
-        _fwd: &mut Forward,
-        _cfg: &ModelConfig,
-        _ctx: &ExecCtx,
-        _layer: u32,
+        fwd: &mut Forward,
+        cfg: &ModelConfig,
+        ctx: &ExecCtx,
+        layer: u32,
     ) {
-        // No-op until Sprint G-2c fills in the body.
+        let spec = cfg.qwen35.as_ref().expect(
+            "b_step_ssm_conv1d emitted for non-qwen35 config",
+        );
+        let conv_channels = spec.conv_channels();
+        let d_conv = spec.ssm_d_conv;
+        let slots = d_conv - 1;
+        let recurrent_idx = spec.recurrent_index(layer);
+
+        ensure_ssm_persistent_initialized(fwd, ctx);
+
+        let conv_state_buf = fwd.conv_state_buf.as_ref().unwrap().handle;
+        let qkv_buf       = fwd.ssm_qkv_buf.as_ref().unwrap().handle;
+        let conv_input    = fwd.ssm_conv_input_buf.as_ref().unwrap().handle;
+        let conv_output   = fwd.ssm_conv_output_buf.as_ref().unwrap().handle;
+
+        let state_bytes_per_layer = slots as u64 * conv_channels as u64 * 4;
+        let state_offset_bytes    = recurrent_idx as u64 * state_bytes_per_layer;
+
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[qkv_buf]);
+        fwd.run_ssm_conv_setup(
+            ctx.dev, ctx.registry, ctx.cmd,
+            conv_state_buf, state_offset_bytes, state_bytes_per_layer,
+            qkv_buf, conv_input,
+            conv_channels, "b_ssm_conv_setup",
+        );
+        fwd.mark_written(&[conv_input, conv_state_buf]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_input]);
+
+        let conv_weight = layer_weight(ctx.model, layer, "ssm_conv1d.weight");
+        fwd.run_ssm_conv(
+            ctx.dev, ctx.registry, ctx.cmd,
+            conv_input, conv_weight, conv_output,
+            d_conv, d_conv, conv_channels, 1, 1, "b_ssm_conv",
+        );
+        fwd.mark_written(&[conv_output]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_output]);
     }
 
     // ──────────────────────────────────────────────────────────
@@ -1265,16 +1434,55 @@ impl BatchExec {
         // No-op until Sprint G-2d.
     }
 
+    /// Sprint G-2c (v0.4.6) — batch counterpart of
+    /// [`DecodeExec::step_ssm_silu`]. Pointwise, so identical to DEC.
     pub(super) fn b_step_ssm_silu(
-        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, _layer: u32,
     ) {
-        // No-op until Sprint G-2c.
+        let spec = cfg.qwen35.as_ref().expect(
+            "b_step_ssm_silu emitted for non-qwen35 config",
+        );
+        let conv_output = fwd.ssm_conv_output_buf.as_ref().unwrap().handle;
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_output]);
+        fwd.run_silu(
+            ctx.dev, ctx.registry, ctx.cmd,
+            conv_output, conv_output,
+            spec.conv_channels(), "b_ssm_silu",
+        );
+        fwd.mark_written(&[conv_output]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_output]);
     }
 
+    /// Sprint G-2c (v0.4.6) — batch counterpart of
+    /// [`DecodeExec::step_ssm_qk_l2_norm`]. Per-row reduction, so
+    /// identical to DEC for `seq=1`-sized scratch (G-2b).
     pub(super) fn b_step_ssm_qk_l2_norm(
-        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, _layer: u32,
     ) {
-        // No-op until Sprint G-2c.
+        let spec = cfg.qwen35.as_ref().expect(
+            "b_step_ssm_qk_l2_norm emitted for non-qwen35 config",
+        );
+        let conv_output = fwd.ssm_conv_output_buf.as_ref().unwrap().handle;
+        let head_dim = spec.head_k_dim();
+        let n_heads  = spec.num_k_heads();
+        let qk_floats = head_dim * n_heads;
+        let eps = cfg.rms_norm_eps;
+
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_output]);
+        fwd.run_l2_norm(
+            ctx.dev, ctx.registry, ctx.cmd,
+            conv_output, conv_output,
+            head_dim, n_heads, 0,
+            eps, "b_ssm_l2_norm_q",
+        );
+        fwd.run_l2_norm(
+            ctx.dev, ctx.registry, ctx.cmd,
+            conv_output, conv_output,
+            head_dim, n_heads, qk_floats,
+            eps, "b_ssm_l2_norm_k",
+        );
+        fwd.mark_written(&[conv_output]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_output]);
     }
 
     pub(super) fn b_step_ssm_repeat_qk(

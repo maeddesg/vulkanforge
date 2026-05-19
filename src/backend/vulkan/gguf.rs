@@ -645,6 +645,54 @@ impl Qwen35Spec {
             && (layer + 1) % self.full_attention_interval != 0
     }
 
+    /// Sprint G-2c — 0-based index of a recurrent layer among the
+    /// recurrent layers (skipping full-attention ones). Used to address
+    /// each layer's slice in the persistent `conv_state` / `ssm_state`
+    /// buffers.
+    ///
+    /// `recurrent_index(L) = L - floor(L / full_attention_interval)`
+    /// counts the full-attention layers in `0..L` (one per `interval`
+    /// stride at indices 3, 7, 11, ...). Caller must guarantee
+    /// `is_recurrent_layer(layer)`; result is meaningless otherwise.
+    pub fn recurrent_index(&self, layer: u32) -> u32 {
+        layer - (layer / self.full_attention_interval)
+    }
+
+    /// Sprint G-2c — total count of trunk Linear-Attn layers.
+    /// `n_main - n_main/interval` (= 48 for Qwen3.6-27B: 64 trunk
+    /// layers, every 4th is Full-Attention).
+    pub fn n_recurrent(&self) -> u32 {
+        self.n_main() - self.n_main() / self.full_attention_interval
+    }
+
+    /// Sprint G-2c — Conv channel count from llama.cpp `qwen35.cpp:385`:
+    /// `conv_channels = ssm_d_inner + 2 * ssm_n_group * ssm_d_state`.
+    /// For Qwen3.6-27B: 6144 + 2×16×128 = 10240.
+    pub fn conv_channels(&self) -> u32 {
+        self.ssm_d_inner + 2 * self.ssm_n_group * self.ssm_d_state
+    }
+
+    /// Sprint G-2c — V-head count (48 for Qwen3.6-27B).
+    pub fn num_v_heads(&self) -> u32 {
+        self.ssm_dt_rank
+    }
+
+    /// Sprint G-2c — V-head dim (`ssm_d_inner / num_v_heads`,
+    /// 128 for Qwen3.6-27B).
+    pub fn head_v_dim(&self) -> u32 {
+        self.ssm_d_inner / self.num_v_heads()
+    }
+
+    /// Sprint G-2c — K-head count (`ssm_n_group`, 16 for Qwen3.6-27B).
+    pub fn num_k_heads(&self) -> u32 {
+        self.ssm_n_group
+    }
+
+    /// Sprint G-2c — K-head dim (`ssm_d_state`, 128 for Qwen3.6).
+    pub fn head_k_dim(&self) -> u32 {
+        self.ssm_d_state
+    }
+
     /// Effective per-head rotation dim for text-only inference: sum
     /// of the three non-temporal mRoPE sections. For Qwen3.6-27B
     /// `[11, 11, 10, 0]` this is 32.

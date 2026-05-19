@@ -871,6 +871,7 @@ impl Forward {
             ssm_krep_buf,
             ssm_gdn_out_buf,
             ssm_norm_out_buf,
+            ssm_persistent_initialized: false,
             // Sprint 12D — barrier elision tracker.
             pending_writes: std::collections::HashSet::with_capacity(32),
             elision_disabled: std::env::var("VULKANFORGE_DISABLE_BARRIER_ELISION")

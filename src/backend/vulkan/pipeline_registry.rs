@@ -250,6 +250,23 @@ impl PipelineRegistry {
                     let bytes = bytemuck::bytes_of(&data);
                     ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes, None)
                 }
+                ShaderId::SsmConvSetupF32 => {
+                    // Sprint G-2c (v0.4.6) — Conv-input build + state-shift.
+                    //   id 0  BLOCK_SIZE = 256  (local_size_x)
+                    //   id 1  D_CONV     = 4    (ssm_d_conv; pinned for Qwen3.6)
+                    let data: [u32; 2] = [256, 4];
+                    let entries = [entry(0, 0, 4), entry(1, 4, 4)];
+                    let bytes = bytemuck::bytes_of(&data);
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes, None)
+                }
+                ShaderId::L2NormF32 => {
+                    // Sprint G-2c (v0.4.6) — In-place L2-norm.
+                    //   id 0  BLOCK_SIZE = 128 (local_size_x, tree-reduction width)
+                    let data: [u32; 1] = [128];
+                    let entries = [entry(0, 0, 4)];
+                    let bytes = bytemuck::bytes_of(&data);
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes, None)
+                }
                 ShaderId::GatedDeltaNetF32 | ShaderId::GatedDeltaNetF32Shmem => {
                     // Sprint G-2a (v0.4.6) — Gated-Delta-Net. Four spec
                     // constants tuned for Qwen3.6-27B on RDNA4 (gfx1201):

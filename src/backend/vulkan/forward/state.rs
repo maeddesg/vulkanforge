@@ -662,6 +662,13 @@ pub struct Forward {
     /// Final SSM activation feeding `step_ssm_out_proj`.
     pub(super) ssm_norm_out_buf: Option<GpuBuffer>,
 
+    /// Sprint G-2c — lazy zero-init guard for the persistent SSM
+    /// buffers. Flipped on the first conv-setup dispatch; resets to
+    /// `false` only on `/reset` (G-2e). Cleared at construction so
+    /// the first decode (or prefill) sees a clean state regardless
+    /// of GPU memory-pool reuse. Gated on `cfg.qwen35.is_some()`.
+    pub(super) ssm_persistent_initialized: bool,
+
     /// Sprint 12D — barrier elision via dirty-flag tracking. The set
     /// holds `vk::Buffer` raw handles that have been written since the
     /// last `compute_barrier`. `maybe_compute_barrier(reads)` skips the
