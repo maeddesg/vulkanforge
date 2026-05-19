@@ -116,7 +116,21 @@ impl DecodeExec {
             }
             LayerStep::PostMoeNorm => self.step_post_moe_norm(fwd, cfg, ctx),
             LayerStep::MoeBranchAdd => self.step_moe_branch_add(fwd, cfg, ctx),
-            LayerStep::SsmConv1d { layer } => self.step_ssm_conv1d(fwd, cfg, ctx, *layer),
+            LayerStep::SsmConv1d      { layer } => self.step_ssm_conv1d(fwd, cfg, ctx, *layer),
+            // Sprint G-2b — Qwen3.6 Linear-Attn. All bodies are no-op
+            // staging stubs in `executor/attention.rs`; Sprints G-2c
+            // (conv body), G-2d (GEMVs + alpha-gate + repeat), G-2e
+            // (GDN + NormGated) fill them.
+            LayerStep::AttnQkvProj    { layer } => self.step_attn_qkv_proj(fwd, cfg, ctx, *layer),
+            LayerStep::AttnGateZProj  { layer } => self.step_attn_gate_z_proj(fwd, cfg, ctx, *layer),
+            LayerStep::SsmBetaProj    { layer } => self.step_ssm_beta_proj(fwd, cfg, ctx, *layer),
+            LayerStep::SsmAlphaGate   { layer } => self.step_ssm_alpha_gate(fwd, cfg, ctx, *layer),
+            LayerStep::SsmSilu        { layer } => self.step_ssm_silu(fwd, cfg, ctx, *layer),
+            LayerStep::SsmQkL2Norm    { layer } => self.step_ssm_qk_l2_norm(fwd, cfg, ctx, *layer),
+            LayerStep::SsmRepeatQK    { layer } => self.step_ssm_repeat_qk(fwd, cfg, ctx, *layer),
+            LayerStep::GatedDeltaNet  { layer } => self.step_gated_delta_net(fwd, cfg, ctx, *layer),
+            LayerStep::NormGated      { layer } => self.step_norm_gated(fwd, cfg, ctx, *layer),
+            LayerStep::SsmOutProj     { layer } => self.step_ssm_out_proj(fwd, cfg, ctx, *layer),
         }
     }
 }
@@ -212,7 +226,18 @@ impl BatchExec {
             }
             LayerStep::PostMoeNorm => self.b_step_post_moe_norm(fwd, cfg, ctx),
             LayerStep::MoeBranchAdd => self.b_step_moe_branch_add(fwd, cfg, ctx),
-            LayerStep::SsmConv1d { layer } => self.b_step_ssm_conv1d(fwd, cfg, ctx, *layer),
+            LayerStep::SsmConv1d      { layer } => self.b_step_ssm_conv1d(fwd, cfg, ctx, *layer),
+            // Sprint G-2b — BAT counterparts (no-op staging).
+            LayerStep::AttnQkvProj    { layer } => self.b_step_attn_qkv_proj(fwd, cfg, ctx, *layer),
+            LayerStep::AttnGateZProj  { layer } => self.b_step_attn_gate_z_proj(fwd, cfg, ctx, *layer),
+            LayerStep::SsmBetaProj    { layer } => self.b_step_ssm_beta_proj(fwd, cfg, ctx, *layer),
+            LayerStep::SsmAlphaGate   { layer } => self.b_step_ssm_alpha_gate(fwd, cfg, ctx, *layer),
+            LayerStep::SsmSilu        { layer } => self.b_step_ssm_silu(fwd, cfg, ctx, *layer),
+            LayerStep::SsmQkL2Norm    { layer } => self.b_step_ssm_qk_l2_norm(fwd, cfg, ctx, *layer),
+            LayerStep::SsmRepeatQK    { layer } => self.b_step_ssm_repeat_qk(fwd, cfg, ctx, *layer),
+            LayerStep::GatedDeltaNet  { layer } => self.b_step_gated_delta_net(fwd, cfg, ctx, *layer),
+            LayerStep::NormGated      { layer } => self.b_step_norm_gated(fwd, cfg, ctx, *layer),
+            LayerStep::SsmOutProj     { layer } => self.b_step_ssm_out_proj(fwd, cfg, ctx, *layer),
         }
     }
 }

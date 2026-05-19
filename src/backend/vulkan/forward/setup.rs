@@ -378,28 +378,85 @@ impl Forward {
         // layers. Allocated uninitialised here; the Sprint G dispatch
         // will lazily zero-fill on first use (no SSM-Conv shader reads
         // this buffer in Sprint F's no-op step body).
-        let conv_state_buf = if let Some(spec) = config.qwen35.as_ref() {
-            // n_main / interval = #full-attention trunk layers; trunk
-            // size minus that gives recurrent count (MTP block is
-            // excluded — it's full-attention).
+        //
+        // Sprint G-2b extends this block with the persistent
+        // ssm_state_buf (144 MB) plus 11 scratch buffers for the
+        // Linear-Attn pipeline. All gated on `cfg.qwen35.is_some()`
+        // so non-qwen35 stacks allocate nothing.
+        let (
+            conv_state_buf,
+            ssm_state_buf,
+            ssm_qkv_buf,
+            ssm_z_buf,
+            ssm_beta_buf,
+            ssm_alpha_buf,
+            ssm_gate_buf,
+            ssm_conv_input_buf,
+            ssm_conv_output_buf,
+            ssm_qrep_buf,
+            ssm_krep_buf,
+            ssm_gdn_out_buf,
+            ssm_norm_out_buf,
+        ) = if let Some(spec) = config.qwen35.as_ref() {
             let n_main = spec.n_main();
-            let n_recurrent = n_main - n_main / spec.full_attention_interval;
+            let n_recurrent = (n_main - n_main / spec.full_attention_interval) as u64;
             let conv_channels =
-                2 * spec.ssm_d_state * spec.ssm_n_group + spec.ssm_d_inner;
-            let slots_per_layer = spec.ssm_d_conv.saturating_sub(1);
-            let bytes = (n_recurrent as u64)
-                * (slots_per_layer as u64)
-                * (conv_channels as u64)
-                * 4;
-            // Defensive: skip allocation if the spec degenerates (e.g.
-            // a future variant with ssm_d_conv == 1).
-            if bytes > 0 {
-                Some(mk_storage(bytes, MemoryLocation::GpuOnly, "conv_state_buf")?)
+                (2 * spec.ssm_d_state * spec.ssm_n_group + spec.ssm_d_inner) as u64;
+            let conv_slots = spec.ssm_d_conv.saturating_sub(1) as u64;
+            let head_v_dim = (spec.ssm_d_inner / spec.ssm_dt_rank) as u64;
+            let num_v_heads = spec.ssm_dt_rank as u64;
+
+            // Persistent conv state: 5.6 MB for Qwen3.6-27B.
+            let conv_state_bytes = n_recurrent * conv_slots * conv_channels * 4;
+            // Persistent ssm state: 144 MB for Qwen3.6-27B
+            // (48 layers × 48 heads × 128² × 4 B).
+            let ssm_state_bytes =
+                n_recurrent * num_v_heads * head_v_dim * head_v_dim * 4;
+
+            let conv_state = if conv_state_bytes > 0 {
+                Some(mk_storage(conv_state_bytes, MemoryLocation::GpuOnly, "conv_state_buf")?)
             } else {
                 None
-            }
+            };
+            let ssm_state = if ssm_state_bytes > 0 {
+                Some(mk_storage(ssm_state_bytes, MemoryLocation::GpuOnly, "ssm_state_buf")?)
+            } else {
+                None
+            };
+
+            // Per-token scratch (decode-sized). Recurrent layers are
+            // dispatched per-token even in prefill (delta-net state
+            // updates sequentially), so the same scratch is reused
+            // across tokens — no need to scale with seq_len.
+            let qkv_bytes        = conv_channels * 4;            // 10240 * 4 = 40 KB
+            let z_bytes          = (spec.ssm_d_inner as u64) * 4; // 6144 * 4 = 24 KB
+            let beta_bytes       = num_v_heads * 4;              // 48 * 4 = 192 B
+            let alpha_bytes      = num_v_heads * 4;              // 48 * 4 = 192 B
+            let gate_bytes       = num_v_heads * 4;              // 48 * 4 = 192 B
+            let conv_in_bytes    = (spec.ssm_d_conv as u64) * conv_channels * 4; // 4*10240*4 = 160 KB
+            let conv_out_bytes   = conv_channels * 4;            // 10240 * 4 = 40 KB
+            let qrep_bytes       = head_v_dim * num_v_heads * 4; // 128*48*4 = 24 KB
+            let krep_bytes       = head_v_dim * num_v_heads * 4; // 24 KB
+            let gdn_out_bytes    = head_v_dim * num_v_heads * 4; // 24 KB
+            let norm_out_bytes   = head_v_dim * num_v_heads * 4; // 24 KB
+
+            let qkv      = Some(mk_storage(qkv_bytes,      MemoryLocation::GpuOnly, "ssm_qkv_buf")?);
+            let z        = Some(mk_storage(z_bytes,        MemoryLocation::GpuOnly, "ssm_z_buf")?);
+            let beta     = Some(mk_storage(beta_bytes,     MemoryLocation::GpuOnly, "ssm_beta_buf")?);
+            let alpha    = Some(mk_storage(alpha_bytes,    MemoryLocation::GpuOnly, "ssm_alpha_buf")?);
+            let gate     = Some(mk_storage(gate_bytes,     MemoryLocation::GpuOnly, "ssm_gate_buf")?);
+            let conv_in  = Some(mk_storage(conv_in_bytes,  MemoryLocation::GpuOnly, "ssm_conv_input_buf")?);
+            let conv_out = Some(mk_storage(conv_out_bytes, MemoryLocation::GpuOnly, "ssm_conv_output_buf")?);
+            let qrep     = Some(mk_storage(qrep_bytes,     MemoryLocation::GpuOnly, "ssm_qrep_buf")?);
+            let krep     = Some(mk_storage(krep_bytes,     MemoryLocation::GpuOnly, "ssm_krep_buf")?);
+            let gdn_out  = Some(mk_storage(gdn_out_bytes,  MemoryLocation::GpuOnly, "ssm_gdn_out_buf")?);
+            let norm_out = Some(mk_storage(norm_out_bytes, MemoryLocation::GpuOnly, "ssm_norm_out_buf")?);
+
+            (conv_state, ssm_state, qkv, z, beta, alpha, gate,
+             conv_in, conv_out, qrep, krep, gdn_out, norm_out)
         } else {
-            None
+            (None, None, None, None, None, None, None,
+             None, None, None, None, None, None)
         };
 
         // Sprint 51D-D — host-readable staging for MoE router input.
@@ -802,6 +859,18 @@ impl Forward {
             batch_gate, batch_up, batch_ffn_hidden, batch_ffn_out,
             batch_qgate,
             conv_state_buf,
+            ssm_state_buf,
+            ssm_qkv_buf,
+            ssm_z_buf,
+            ssm_beta_buf,
+            ssm_alpha_buf,
+            ssm_gate_buf,
+            ssm_conv_input_buf,
+            ssm_conv_output_buf,
+            ssm_qrep_buf,
+            ssm_krep_buf,
+            ssm_gdn_out_buf,
+            ssm_norm_out_buf,
             // Sprint 12D — barrier elision tracker.
             pending_writes: std::collections::HashSet::with_capacity(32),
             elision_disabled: std::env::var("VULKANFORGE_DISABLE_BARRIER_ELISION")
@@ -1157,6 +1226,21 @@ impl Forward {
         if let Some(b) = self.conv_state_buf {
             b.destroy(device, allocator);
         }
+        // Sprint G-2b — optional Qwen3.6 Linear-Attn persistent ssm state
+        // + 11 per-token scratch buffers. All `Option` so `take()` on
+        // non-qwen35 stacks is a no-op pattern compile-fold.
+        if let Some(b) = self.ssm_state_buf        { b.destroy(device, allocator); }
+        if let Some(b) = self.ssm_qkv_buf          { b.destroy(device, allocator); }
+        if let Some(b) = self.ssm_z_buf            { b.destroy(device, allocator); }
+        if let Some(b) = self.ssm_beta_buf         { b.destroy(device, allocator); }
+        if let Some(b) = self.ssm_alpha_buf        { b.destroy(device, allocator); }
+        if let Some(b) = self.ssm_gate_buf         { b.destroy(device, allocator); }
+        if let Some(b) = self.ssm_conv_input_buf   { b.destroy(device, allocator); }
+        if let Some(b) = self.ssm_conv_output_buf  { b.destroy(device, allocator); }
+        if let Some(b) = self.ssm_qrep_buf         { b.destroy(device, allocator); }
+        if let Some(b) = self.ssm_krep_buf         { b.destroy(device, allocator); }
+        if let Some(b) = self.ssm_gdn_out_buf      { b.destroy(device, allocator); }
+        if let Some(b) = self.ssm_norm_out_buf     { b.destroy(device, allocator); }
         // Sprint 51D-D — MoE router staging.
         self.moe_route_staging.destroy(device, allocator);
         // Sprint 56B — GPU-side MoE router buffers.

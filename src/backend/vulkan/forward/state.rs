@@ -590,6 +590,78 @@ pub struct Forward {
     /// dispatch reads it.
     pub(super) conv_state_buf: Option<GpuBuffer>,
 
+    // ────────────────────────────────────────────────────────────
+    // Sprint G-2b (v0.4.6) — Qwen3.6 Linear-Attention buffers.
+    //
+    // All `Some` only when `cfg.qwen35.is_some()` so non-qwen35
+    // models pay only the `Option` discriminant. Sized for the
+    // decode (single-token) hot path; recurrent layers are
+    // dispatched per-token so prefill reuses these same buffers
+    // sequentially across tokens (llama.cpp's `keep_rs()` path).
+    // ────────────────────────────────────────────────────────────
+
+    /// `[head_v_dim², num_v_heads, n_recurrent_layers]` FP32 = 144 MB
+    /// for Qwen3.6-27B (48 × 48 × 128 × 128 × 4). Persistent across
+    /// decode tokens; per-layer offset is `recurrent_idx(layer) ×
+    /// (S_V² × num_v_heads × 4)`. Zero-init lazy on first dispatch
+    /// (Sprint G-2e). Reset on `/reset` REPL command.
+    pub(super) ssm_state_buf: Option<GpuBuffer>,
+
+    /// AttnQkvProj output, `[conv_channels=10240]` FP32 = 40 KB.
+    /// Lives one full layer cycle: written by `step_attn_qkv_proj`,
+    /// consumed by `step_ssm_conv1d` as the current-token slot.
+    pub(super) ssm_qkv_buf: Option<GpuBuffer>,
+
+    /// AttnGateZProj output, `[ssm_d_inner=6144]` FP32 = 24 KB. The
+    /// `z` gate for NormGated. Written by `step_attn_gate_z_proj`,
+    /// consumed by `step_norm_gated`.
+    pub(super) ssm_z_buf: Option<GpuBuffer>,
+
+    /// SsmBetaProj output (post-sigmoid), `[num_v_heads=48]` FP32 =
+    /// 192 B. Consumed by GDN's binding 4.
+    pub(super) ssm_beta_buf: Option<GpuBuffer>,
+
+    /// SsmAlphaGate intermediate (raw alpha GEMV output, then
+    /// alpha + dt_bias, then softplus-in-place), `[48]` FP32 = 192 B.
+    /// Internal to `step_ssm_alpha_gate`; not read by other steps
+    /// directly.
+    pub(super) ssm_alpha_buf: Option<GpuBuffer>,
+
+    /// SsmAlphaGate final output (`alpha_softplus × ssm_a`), `[48]`
+    /// FP32 = 192 B. The log-domain decay term consumed by GDN's
+    /// binding 3.
+    pub(super) ssm_gate_buf: Option<GpuBuffer>,
+
+    /// Rolling window built for `step_ssm_conv1d`, `[ssm_d_conv ×
+    /// conv_channels] = [4 × 10240]` FP32 = 160 KB. Channel-major-
+    /// time-inner (per channel: 3 history floats + 1 current).
+    /// Sprint G-2c builds it from `conv_state_buf` + `ssm_qkv_buf`.
+    pub(super) ssm_conv_input_buf: Option<GpuBuffer>,
+
+    /// SSM-Conv output (post-shader, post-SiLU), `[conv_channels=10240]`
+    /// FP32 = 40 KB. Layout matches the conv weight: Q, K halves
+    /// each `head_k_dim × num_k_heads = 2048` floats followed by V
+    /// `head_v_dim × num_v_heads = 6144` floats.
+    pub(super) ssm_conv_output_buf: Option<GpuBuffer>,
+
+    /// Q after L2Norm and head-repeat 16 → 48, `[head_k_dim ×
+    /// num_v_heads = 128 × 48 = 6144]` FP32 = 24 KB. Written by
+    /// `step_ssm_repeat_qk`, consumed by GDN's binding 0.
+    pub(super) ssm_qrep_buf: Option<GpuBuffer>,
+
+    /// K after L2Norm and head-repeat 16 → 48, `[6144]` FP32 = 24 KB.
+    /// Written by `step_ssm_repeat_qk`, consumed by GDN's binding 1.
+    pub(super) ssm_krep_buf: Option<GpuBuffer>,
+
+    /// Gated-Delta-Net output, `[head_v_dim × num_v_heads = 6144]`
+    /// FP32 = 24 KB. Written by `step_gated_delta_net`, consumed
+    /// by `step_norm_gated`.
+    pub(super) ssm_gdn_out_buf: Option<GpuBuffer>,
+
+    /// NormGated output (RMSNorm × SiLU(z)), `[6144]` FP32 = 24 KB.
+    /// Final SSM activation feeding `step_ssm_out_proj`.
+    pub(super) ssm_norm_out_buf: Option<GpuBuffer>,
+
     /// Sprint 12D — barrier elision via dirty-flag tracking. The set
     /// holds `vk::Buffer` raw handles that have been written since the
     /// last `compute_barrier`. `maybe_compute_barrier(reads)` skips the

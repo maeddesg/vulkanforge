@@ -302,6 +302,109 @@ pub enum LayerStep {
     /// conv alone would be wasted work and risk barrier-tuning
     /// regressions on Qwen3-8B / Gemma-4-26B).
     SsmConv1d { layer: u32 },
+
+    // ────────────────────────────────────────────────────────────
+    // Sprint G-2b (v0.4.6) — Qwen3.6 Linear-Attention pipeline
+    //
+    // All 10 variants below are emitted by `build_qwen35_layer` on
+    // recurrent trunk layers (48 of 65 for Qwen3.6-27B). Step bodies
+    // in `executor/attention.rs` are no-op until Sprints G-2c/d/e
+    // fill them with real dispatches. The variants exist now so the
+    // exhaustive-match enforcement (coding-standards §3.2) catches
+    // missing executor implementations at compile time.
+    // ────────────────────────────────────────────────────────────
+
+    /// QKV fused projection (`attn_qkv.weight`, `[5120, 10240]` GEMV).
+    /// Sources `hidden_norm` (the AttnNorm output) and writes
+    /// `Forward::ssm_qkv_buf`. Output is `qkv_mixed = 2*k_dim + v_dim
+    /// = 4096 + 6144 = 10240` floats (channel-major within token).
+    /// Consumed by `SsmConv1d` as the current input slot of the
+    /// rolling conv window. Sprint G-2d fills the body.
+    AttnQkvProj { layer: u32 },
+
+    /// Gate (z) projection (`attn_gate.weight`, `[5120, 6144]` GEMV).
+    /// Sources `hidden_norm` and writes `Forward::ssm_z_buf`. The
+    /// `z` output is consumed by `NormGated` as the gate signal
+    /// (`silu(z)` modulates the post-GDN RMSNorm output).
+    /// Sprint G-2d fills the body.
+    AttnGateZProj { layer: u32 },
+
+    /// Beta projection (`ssm_beta.weight`, `[5120, 48]` GEMV) +
+    /// in-place sigmoid. Sources `hidden_norm` and writes
+    /// `Forward::ssm_beta_buf`. `beta` carries the per-v-head delta-
+    /// rule strength (sigmoid-bounded into [0, 1]) consumed by GDN.
+    /// Sprint G-2d fills the body (GEMV + Sigmoid).
+    SsmBetaProj { layer: u32 },
+
+    /// Alpha gate composition (5 fused operations):
+    ///   * `ssm_alpha.weight` GEMV `[5120, 48]` → `ssm_alpha_buf`
+    ///   * + `ssm_dt.bias` (additive bias `[48]`)
+    ///   * softplus in-place (`x ← log(1+exp(x))`)
+    ///   * × `ssm_a` (per-v-head scalar `[48]`, negative)
+    ///   * result → `ssm_gate_buf`
+    ///
+    /// `gate` is the log-domain decay term consumed by GDN's
+    /// `g_exp[r] = exp(data_g[gb_off])` path (KDA=0). Sprint G-2d
+    /// fills the body using the existing `Add`/`Mul` runs + the
+    /// new `SoftplusF32` shader.
+    SsmAlphaGate { layer: u32 },
+
+    /// SiLU in-place on the SSM-Conv output. Sources and writes
+    /// `Forward::ssm_conv_output_buf`. Mirrors llama.cpp
+    /// `qwen35.cpp:396 ggml_silu(conv_output_proper)` which sits
+    /// between the conv and the Q/K/V split. Reuses the existing
+    /// `Silu` shader. Sprint G-2c fills the body.
+    SsmSilu { layer: u32 },
+
+    /// L2-Norm on the Q and K halves of the conv-output (per-head,
+    /// `head_k_dim = 128`). Two in-place dispatches via the existing
+    /// `RmsNorm` shader with a synthetic weight=1.0 buffer (plan §5
+    /// "L2Norm via RMSNorm-Trick"). Sources `ssm_conv_output_buf`
+    /// at offsets `0` and `2048` respectively, writes back in-place.
+    /// Mirrors llama.cpp `qwen35.cpp:430-431 ggml_l2_norm(q_conv)`
+    /// / `ggml_l2_norm(k_conv)`. Sprint G-2c fills the body.
+    SsmQkL2Norm { layer: u32 },
+
+    /// Head-repeat 16 → 48 for Q and K. Two dispatches of the
+    /// `RepeatInterleaveF32` shader (modulo repeat along the head
+    /// axis). Source `ssm_conv_output_buf[0..4096]` for Q+K,
+    /// destinations `ssm_qrep_buf` and `ssm_krep_buf`. Mirrors
+    /// llama.cpp `qwen35.cpp:441-443 ggml_repeat_4d(q_conv, …,
+    /// num_v_heads, …)` — only fired when `num_k_heads !=
+    /// num_v_heads` (the conditional in upstream); always true for
+    /// Qwen3.6-27B (16 vs 48). Sprint G-2d fills the body.
+    SsmRepeatQK { layer: u32 },
+
+    /// Gated-Delta-Net dispatch + persistent ssm_state update.
+    /// Inputs:
+    ///   * Q  ← `ssm_qrep_buf` (post-l2-norm, post-repeat)
+    ///   * K  ← `ssm_krep_buf`
+    ///   * V  ← `ssm_conv_output_buf` at offset 4096 (`v_dim = 6144`)
+    ///   * G  ← `ssm_gate_buf` (alpha-gate, log-domain)
+    ///   * B  ← `ssm_beta_buf` (sigmoid)
+    ///   * State ← `Forward::ssm_state_buf` at per-layer offset
+    /// Output: `ssm_gdn_out_buf` `[6144]` + updated state slot.
+    /// Uses the `GatedDeltaNetF32` shader from Sprint G-2a.
+    /// Sprint G-2e fills the body (the highest-risk slice — coherence
+    /// gate hinges on correct state layout + push-const strides).
+    GatedDeltaNet { layer: u32 },
+
+    /// Norm-gated activation: `RMSNorm(gdn_out, ssm_norm) * SiLU(z)`.
+    /// Sources `ssm_gdn_out_buf` + `ssm_z_buf` + `ssm_norm.weight`,
+    /// writes `ssm_norm_out_buf`. Naive 3-dispatch impl (RMSNorm →
+    /// Silu → Mul); the optional fused `norm_gated.comp` shader is
+    /// a Sprint G3 optimisation. Mirrors llama.cpp
+    /// `qwen35.cpp:455 build_norm_gated(output, ssm_norm, z_2d)`.
+    /// Sprint G-2e fills the body.
+    NormGated { layer: u32 },
+
+    /// SSM output projection (`ssm_out.weight`, `[6144, 5120]` GEMV).
+    /// Sources `ssm_norm_out_buf` (`[6144]`) and writes the layer's
+    /// `linear_attn_out` slot (`Forward::cur().attn_out`, `[5120]`)
+    /// so that the existing `AttnResidualAdd` can consume it
+    /// unchanged. Mirrors llama.cpp `qwen35.cpp:462`. Sprint G-2d
+    /// fills the body.
+    SsmOutProj { layer: u32 },
 }
 
 /// Activation flavour for the FFN gated-linear-unit shader.
@@ -630,16 +733,29 @@ pub fn build_qwen35_layer(
         plan.push(LayerStep::OProj);
         plan.push(LayerStep::AttnResidualAdd);
     } else if spec.is_recurrent_layer(layer) {
-        // Sprint F (v0.4.6) — Linear-Attn block. The SSM-Conv variant is
-        // emitted on every recurrent layer so the layer plan already
-        // matches the Sprint G shape and the executor's exhaustive
-        // match enforces both DEC + BAT implementations. The step
-        // body is a no-op for now (real conv dispatch + state shift
-        // arrives in Sprint G alongside Gated-Delta-Net); the
-        // `ResidualIdentitySeed` keeps the FFN sub-block fed with a
-        // well-defined residual.
-        plan.push(LayerStep::SsmConv1d { layer });
-        plan.push(LayerStep::ResidualIdentitySeed);
+        // Sprint G-2b (v0.4.6) — Linear-Attn block. Full 13-step
+        // attention sub-block matching llama.cpp's
+        // `build_layer_attn_linear` (qwen35.cpp:337-469); see
+        // `docs/qwen35_sprint_g_plan.md` §3 for the source-line
+        // mapping. Order is verified against upstream — do NOT
+        // reorder without re-reading qwen35.cpp.
+        //
+        // All 10 SSM-step bodies are still no-op in Sprint G-2b
+        // (real dispatches land in G-2c/d/e). The plan emits them
+        // now so the exhaustive-match enforces both DEC + BAT
+        // implementations before any real work starts.
+        plan.push(LayerStep::AttnQkvProj    { layer });    // Op 2: 5120 → 10240
+        plan.push(LayerStep::AttnGateZProj  { layer });    // Op 3: 5120 → 6144 (z)
+        plan.push(LayerStep::SsmBetaProj    { layer });    // Op 4-5: 5120 → 48 + sigmoid
+        plan.push(LayerStep::SsmAlphaGate   { layer });    // Op 6-9: alpha + dt + softplus × ssm_a
+        plan.push(LayerStep::SsmConv1d      { layer });    // Op 10: conv dispatch
+        plan.push(LayerStep::SsmSilu        { layer });    // Op 11: silu(conv_out)
+        plan.push(LayerStep::SsmQkL2Norm    { layer });    // Op 13: l2_norm Q, K
+        plan.push(LayerStep::SsmRepeatQK    { layer });    // Op 14: 16 → 48 heads
+        plan.push(LayerStep::GatedDeltaNet  { layer });    // Op 15: GDN + state update
+        plan.push(LayerStep::NormGated      { layer });    // Op 16: rms_norm × silu(z)
+        plan.push(LayerStep::SsmOutProj     { layer });    // Op 17: 6144 → 5120
+        plan.push(LayerStep::AttnResidualAdd);             // Op 18 (existing): res1 += attn_out
     } else {
         // MTP nextn block (layer == n_main). Trunk-skipped passthrough
         // until the spec-decoding draft head lands.
@@ -1171,56 +1287,127 @@ mod tests {
         }
     }
 
-    /// Sprint F — recurrent (Linear-Attn) layers emit the new
-    /// `SsmConv1d { layer }` variant ahead of the
-    /// `ResidualIdentitySeed → FFN` passthrough. The step body is a
-    /// no-op in both executors (Sprint G fills it in), but the
-    /// variant must be present so Sprint G can replace it without
-    /// touching the plan builder again. MTP block stays in the
-    /// older 8-step passthrough — Linear-Attn semantics don't apply
-    /// to the draft head.
+    /// Sprint G-2b — recurrent (Linear-Attn) layers emit the full
+    /// 12-step SSM attention sub-block + 6-step FFN = 19 steps total
+    /// (incl. the prefix `AttnNorm`). Mirrors llama.cpp's
+    /// `build_layer_attn_linear` (qwen35.cpp:337-469). Step bodies in
+    /// both executors are no-op staging stubs in G-2b; Sprint G-2c/d/e
+    /// fills them. The test pins the EXACT order — any reorder must
+    /// re-read qwen35.cpp.
     #[test]
-    fn qwen35_recurrent_layers_emit_ssm_conv1d() {
+    fn qwen35_recurrent_layer_emits_full_ssm_sequence() {
         let cfg = qwen35_cfg();
         let flags = LayerWeightFlags::default();
         // Layer 0 is recurrent (`(0+1) % 4 != 0`).
         let plan = build_qwen35_layer(&cfg, 0, &flags);
-        assert_eq!(plan.len(), 9, "recurrent layer plan length (Sprint F)");
-        assert!(matches!(plan[0], LayerStep::AttnNorm));
-        assert!(matches!(plan[1], LayerStep::SsmConv1d { layer: 0 }));
-        assert!(matches!(plan[2], LayerStep::ResidualIdentitySeed));
-        assert!(matches!(plan[3], LayerStep::PreFfnNorm));
-        assert!(matches!(plan[8], LayerStep::FfnResidualAdd));
-        // A second recurrent layer carries its own layer index.
-        let plan_layer62 = build_qwen35_layer(&cfg, 62, &flags);
-        assert!(matches!(plan_layer62[1], LayerStep::SsmConv1d { layer: 62 }));
-        // MTP block at index 64 (n_main = 64) does NOT emit SsmConv1d.
-        let mtp = build_qwen35_layer(&cfg, 64, &flags);
-        assert_eq!(mtp.len(), 8, "mtp block plan length unchanged");
-        assert!(matches!(mtp[1], LayerStep::ResidualIdentitySeed));
-        for step in &mtp {
-            assert!(
-                !matches!(step, LayerStep::SsmConv1d { .. }),
-                "MTP block must not emit SsmConv1d"
-            );
-        }
+        // 1 AttnNorm + 12 SSM steps + 6 FFN = 19.
+        assert_eq!(plan.len(), 19, "recurrent layer plan length (Sprint G-2b)");
+
+        assert!(matches!(plan[0],  LayerStep::AttnNorm));
+        assert!(matches!(plan[1],  LayerStep::AttnQkvProj   { layer: 0 }));
+        assert!(matches!(plan[2],  LayerStep::AttnGateZProj { layer: 0 }));
+        assert!(matches!(plan[3],  LayerStep::SsmBetaProj   { layer: 0 }));
+        assert!(matches!(plan[4],  LayerStep::SsmAlphaGate  { layer: 0 }));
+        assert!(matches!(plan[5],  LayerStep::SsmConv1d     { layer: 0 }));
+        assert!(matches!(plan[6],  LayerStep::SsmSilu       { layer: 0 }));
+        assert!(matches!(plan[7],  LayerStep::SsmQkL2Norm   { layer: 0 }));
+        assert!(matches!(plan[8],  LayerStep::SsmRepeatQK   { layer: 0 }));
+        assert!(matches!(plan[9],  LayerStep::GatedDeltaNet { layer: 0 }));
+        assert!(matches!(plan[10], LayerStep::NormGated     { layer: 0 }));
+        assert!(matches!(plan[11], LayerStep::SsmOutProj    { layer: 0 }));
+        assert!(matches!(plan[12], LayerStep::AttnResidualAdd));
+
+        // FFN unchanged.
+        assert!(matches!(plan[13], LayerStep::PreFfnNorm));
+        assert!(matches!(plan[18], LayerStep::FfnResidualAdd));
+
+        // A different recurrent layer carries its own index.
+        let plan62 = build_qwen35_layer(&cfg, 62, &flags);
+        assert!(matches!(plan62[1], LayerStep::AttnQkvProj { layer: 62 }));
+        assert!(matches!(plan62[9], LayerStep::GatedDeltaNet { layer: 62 }));
     }
 
-    /// Full-attention layers must NOT receive a SsmConv1d step — the
-    /// 17 Full-Attn trunk layers + the MTP block run conventional
-    /// Q-Gate-Split + GQA-attention (Sprint D2) and never touch the
-    /// SSM path.
+    /// Sprint G-2b — `ResidualIdentitySeed` must no longer appear on
+    /// any recurrent layer (Sprint F's placeholder is replaced by
+    /// the real `AttnResidualAdd` at position 12). MTP block keeps
+    /// the seed as its passthrough sentinel.
     #[test]
-    fn qwen35_full_attention_layers_do_not_emit_ssm_conv1d() {
+    fn qwen35_recurrent_layers_drop_residual_identity_seed() {
         let cfg = qwen35_cfg();
         let flags = LayerWeightFlags::default();
-        for layer in [3u32, 7, 11, 27, 63] {
+        for &layer in &[0u32, 1, 2, 4, 5, 6, 62] {
+            let plan = build_qwen35_layer(&cfg, layer, &flags);
+            for (i, step) in plan.iter().enumerate() {
+                assert!(
+                    !matches!(step, LayerStep::ResidualIdentitySeed),
+                    "recurrent layer {layer} step {i} still emits ResidualIdentitySeed"
+                );
+            }
+        }
+        // MTP block (layer 64) still uses the seed (no SSM semantics).
+        let mtp = build_qwen35_layer(&cfg, 64, &flags);
+        assert!(mtp.iter().any(|s| matches!(s, LayerStep::ResidualIdentitySeed)));
+    }
+
+    /// Sprint G-2b — Full-attention layers must NOT emit any SSM
+    /// step. The 17 Full-Attn trunk layers + the MTP block run
+    /// conventional Q-Gate-Split + GQA-attention (Sprint D2).
+    #[test]
+    fn qwen35_full_attention_layers_do_not_emit_ssm_steps() {
+        let cfg = qwen35_cfg();
+        let flags = LayerWeightFlags::default();
+        for layer in [3u32, 7, 11, 27, 63, 64] {
             let plan = build_qwen35_layer(&cfg, layer, &flags);
             for step in &plan {
                 assert!(
-                    !matches!(step, LayerStep::SsmConv1d { .. }),
-                    "full-attn layer {layer} must not emit SsmConv1d"
+                    !matches!(
+                        step,
+                        LayerStep::SsmConv1d     { .. } |
+                        LayerStep::AttnQkvProj   { .. } |
+                        LayerStep::AttnGateZProj { .. } |
+                        LayerStep::SsmBetaProj   { .. } |
+                        LayerStep::SsmAlphaGate  { .. } |
+                        LayerStep::SsmSilu       { .. } |
+                        LayerStep::SsmQkL2Norm   { .. } |
+                        LayerStep::SsmRepeatQK   { .. } |
+                        LayerStep::GatedDeltaNet { .. } |
+                        LayerStep::NormGated     { .. } |
+                        LayerStep::SsmOutProj    { .. }
+                    ),
+                    "non-recurrent layer {layer} must not emit SSM steps"
                 );
+            }
+        }
+    }
+
+    /// Sprint G-2b — each new SsmConv1d-family step variant carries
+    /// the right layer index, end-to-end through the builder. Pin
+    /// the layer-field invariant so a future loop-counter bug
+    /// (e.g. emitting all steps with `layer: 0`) is caught here.
+    #[test]
+    fn qwen35_ssm_steps_carry_correct_layer_index() {
+        let cfg = qwen35_cfg();
+        let flags = LayerWeightFlags::default();
+        for &target in &[0u32, 1, 2, 4, 5, 62] {
+            let plan = build_qwen35_layer(&cfg, target, &flags);
+            for step in &plan {
+                match step {
+                    LayerStep::AttnQkvProj   { layer } |
+                    LayerStep::AttnGateZProj { layer } |
+                    LayerStep::SsmBetaProj   { layer } |
+                    LayerStep::SsmAlphaGate  { layer } |
+                    LayerStep::SsmConv1d     { layer } |
+                    LayerStep::SsmSilu       { layer } |
+                    LayerStep::SsmQkL2Norm   { layer } |
+                    LayerStep::SsmRepeatQK   { layer } |
+                    LayerStep::GatedDeltaNet { layer } |
+                    LayerStep::NormGated     { layer } |
+                    LayerStep::SsmOutProj    { layer } => {
+                        assert_eq!(*layer, target,
+                            "SSM step on layer {target} carried layer={layer}");
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -1261,28 +1448,39 @@ mod tests {
     /// Verify the 17-of-65 Full-Attention split matches the Sprint
     /// A inventory (`{3, 7, 11, …, 59, 63, 64}` — every 4th block
     /// in the trunk plus the MTP-adjacent block at index 64).
+    /// Sprint G-2b: recurrent layers no longer carry
+    /// `ResidualIdentitySeed` (replaced by the full SSM pipeline),
+    /// so passthrough count drops from 49 → 1 (MTP block only).
+    /// Recurrent layers are now identified by `SsmConv1d`.
     #[test]
     fn qwen35_full_attention_layer_count() {
         let cfg = qwen35_cfg();
         let flags = LayerWeightFlags::default();
         let mut full_count = 0;
-        let mut pass_count = 0;
+        let mut recurrent_count = 0;
+        let mut mtp_pass_count = 0;
         for layer in 0..cfg.n_layers {
             let plan = build_qwen35_layer(&cfg, layer, &flags);
-            // Full-Attn plans contain AttnQGateProj; passthrough plans
-            // contain ResidualIdentitySeed.
             if plan.iter().any(|s| matches!(s, LayerStep::AttnQGateProj { .. })) {
                 full_count += 1;
             }
+            if plan.iter().any(|s| matches!(s, LayerStep::SsmConv1d { .. })) {
+                recurrent_count += 1;
+            }
             if plan.iter().any(|s| matches!(s, LayerStep::ResidualIdentitySeed)) {
-                pass_count += 1;
+                mtp_pass_count += 1;
             }
         }
-        // Sprint A: full-attn layers = {3, 7, ..., 63} (16 trunk
-        // blocks); the MTP layer at index 64 stays passthrough until
-        // Sprint J wires the draft head. So 16 full + 49 passthrough.
-        assert_eq!(full_count, 16, "expected 16 trunk Full-Attn layers");
-        assert_eq!(pass_count, 49, "expected 49 passthrough layers (48 recurrent + 1 MTP)");
+        // Full-attn trunk layers = {3, 7, ..., 63} (16 blocks) carry
+        // AttnQGateProj; the MTP block at layer 64 hits the `else`
+        // branch in build_qwen35_layer and carries ResidualIdentitySeed
+        // (its draft-head wiring is Sprint J). Recurrent layers = 48
+        // trunk (carry SsmConv1d). 16 + 48 + 1 = 65 = n_layers ✓
+        assert_eq!(full_count, 16, "expected 16 trunk Full-Attn layers (AttnQGateProj)");
+        assert_eq!(recurrent_count, 48, "expected 48 recurrent (Linear-Attn) layers");
+        assert_eq!(mtp_pass_count, 1, "expected 1 MTP-block passthrough");
+        assert_eq!(full_count + recurrent_count + mtp_pass_count, cfg.n_layers as usize,
+            "every layer must be classified");
     }
 
     /// Confirm the dispatcher routes qwen35 cfgs to the qwen35
@@ -1290,16 +1488,18 @@ mod tests {
     /// fall through to `build_qwen3_layer`, which would emit
     /// `QProj`/`KProj` against weights that don't exist for the
     /// Linear-Attention layers and panic at dispatch time).
+    /// Sprint G-2b: layer 0 is recurrent and carries the SSM
+    /// pipeline (not `QProj` / `Attention` / `ResidualIdentitySeed`).
     #[test]
     fn dispatcher_routes_qwen35_to_skeleton_builder() {
         let cfg = qwen35_cfg();
-        // Layer plan for a Linear-Attn block (layer 0). The Qwen3
-        // builder would emit `QProj` here; the qwen35 builder must
-        // emit `ResidualIdentitySeed` instead.
         let flags = LayerWeightFlags::default();
         let plan = build_qwen35_layer(&cfg, 0, &flags);
-        assert!(plan.iter().any(|s| matches!(s, LayerStep::ResidualIdentitySeed)));
+        // Recurrent layer must use the SSM path, NOT vanilla GQA-attention.
+        assert!(plan.iter().any(|s| matches!(s, LayerStep::SsmConv1d { .. })));
+        assert!(plan.iter().any(|s| matches!(s, LayerStep::AttnQkvProj { .. })));
         assert!(!plan.iter().any(|s| matches!(s, LayerStep::QProj)));
         assert!(!plan.iter().any(|s| matches!(s, LayerStep::Attention { .. })));
+        assert!(!plan.iter().any(|s| matches!(s, LayerStep::ResidualIdentitySeed)));
     }
 }

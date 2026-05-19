@@ -565,7 +565,7 @@ impl DecodeExec {
     /// implementation:** plumbing for the persistent `conv_state`
     /// buffer + `ssm_conv_f32` pipeline is wired into `Forward`; the
     /// real dispatch (conv + state-shift `cmd_copy_buffer` chain) lands
-    /// in Sprint G alongside `GatedDeltaNet`. The conv output is not
+    /// in Sprint G-2c alongside `GatedDeltaNet`. The conv output is not
     /// consumed by any downstream step in the current passthrough plan,
     /// so dispatching it here would only burn cycles without enabling
     /// the gate ("kein Crash, kein NaN" holds either way).
@@ -576,7 +576,81 @@ impl DecodeExec {
         _ctx: &ExecCtx,
         _layer: u32,
     ) {
-        // No-op until Sprint G fills in the body.
+        // No-op until Sprint G-2c fills in the body.
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // Sprint G-2b (v0.4.6) — Qwen3.6 Linear-Attn step stubs (DEC).
+    //
+    // All 10 are no-op staging bodies. Match-arms in
+    // `executor/dispatch.rs` route to them so the exhaustive-match
+    // gate stays satisfied; real bodies arrive in:
+    //   G-2c → step_ssm_conv1d body, step_ssm_silu, step_ssm_qk_l2_norm
+    //   G-2d → step_attn_qkv_proj, step_attn_gate_z_proj,
+    //          step_ssm_beta_proj, step_ssm_alpha_gate,
+    //          step_ssm_repeat_qk, step_ssm_out_proj
+    //   G-2e → step_gated_delta_net, step_norm_gated
+    // ──────────────────────────────────────────────────────────
+
+    pub(super) fn step_attn_qkv_proj(
+        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+    ) {
+        // No-op until Sprint G-2d (attn_qkv.weight GEMV).
+    }
+
+    pub(super) fn step_attn_gate_z_proj(
+        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+    ) {
+        // No-op until Sprint G-2d (attn_gate.weight GEMV).
+    }
+
+    pub(super) fn step_ssm_beta_proj(
+        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+    ) {
+        // No-op until Sprint G-2d (ssm_beta.weight GEMV + sigmoid).
+    }
+
+    pub(super) fn step_ssm_alpha_gate(
+        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+    ) {
+        // No-op until Sprint G-2d (ssm_alpha GEMV + ssm_dt bias add +
+        // softplus + × ssm_a → ssm_gate_buf).
+    }
+
+    pub(super) fn step_ssm_silu(
+        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+    ) {
+        // No-op until Sprint G-2c (Silu on ssm_conv_output_buf).
+    }
+
+    pub(super) fn step_ssm_qk_l2_norm(
+        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+    ) {
+        // No-op until Sprint G-2c (L2-Norm via RMSNorm-trick on Q/K).
+    }
+
+    pub(super) fn step_ssm_repeat_qk(
+        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+    ) {
+        // No-op until Sprint G-2d (repeat_interleave 16→48 for Q/K).
+    }
+
+    pub(super) fn step_gated_delta_net(
+        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+    ) {
+        // No-op until Sprint G-2e (GDN shader dispatch + ssm_state update).
+    }
+
+    pub(super) fn step_norm_gated(
+        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+    ) {
+        // No-op until Sprint G-2e (RMSNorm(gdn_out) × Silu(z)).
+    }
+
+    pub(super) fn step_ssm_out_proj(
+        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+    ) {
+        // No-op until Sprint G-2d (ssm_out.weight GEMV 6144→5120).
     }
 }
 
@@ -1153,6 +1227,77 @@ impl BatchExec {
         _ctx: &ExecCtx,
         _layer: u32,
     ) {
-        // No-op until Sprint G fills in the body.
+        // No-op until Sprint G-2c fills in the body.
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // Sprint G-2b (v0.4.6) — Qwen3.6 Linear-Attn BAT step stubs.
+    // Each one mirrors its DEC sibling above; bodies fill in tandem
+    // (G-2c/d/e) so the two paths stay in sync per
+    // `feedback_layer_dispatch_paths` (§4.2 same-file co-location).
+    // Recurrent layers in qwen35.cpp run per-token in prefill via
+    // `keep_rs()` too, so most of these will share the DEC body
+    // verbatim once written. Sprint G-2c/d/e decides the exact
+    // BAT delta on a per-step basis.
+    // ──────────────────────────────────────────────────────────
+
+    pub(super) fn b_step_attn_qkv_proj(
+        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+    ) {
+        // No-op until Sprint G-2d.
+    }
+
+    pub(super) fn b_step_attn_gate_z_proj(
+        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+    ) {
+        // No-op until Sprint G-2d.
+    }
+
+    pub(super) fn b_step_ssm_beta_proj(
+        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+    ) {
+        // No-op until Sprint G-2d.
+    }
+
+    pub(super) fn b_step_ssm_alpha_gate(
+        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+    ) {
+        // No-op until Sprint G-2d.
+    }
+
+    pub(super) fn b_step_ssm_silu(
+        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+    ) {
+        // No-op until Sprint G-2c.
+    }
+
+    pub(super) fn b_step_ssm_qk_l2_norm(
+        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+    ) {
+        // No-op until Sprint G-2c.
+    }
+
+    pub(super) fn b_step_ssm_repeat_qk(
+        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+    ) {
+        // No-op until Sprint G-2d.
+    }
+
+    pub(super) fn b_step_gated_delta_net(
+        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+    ) {
+        // No-op until Sprint G-2e.
+    }
+
+    pub(super) fn b_step_norm_gated(
+        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+    ) {
+        // No-op until Sprint G-2e.
+    }
+
+    pub(super) fn b_step_ssm_out_proj(
+        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+    ) {
+        // No-op until Sprint G-2d.
     }
 }
