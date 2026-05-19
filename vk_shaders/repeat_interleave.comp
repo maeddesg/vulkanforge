@@ -1,0 +1,51 @@
+#version 450
+
+// Sprint G-2a (v0.4.6) — Head-repeat shader for Qwen3.6 Linear-Attn
+// `ggml_repeat_4d(t, head_dim, num_v_heads, n_tokens, n_seqs)` along the
+// head axis. Used to expand q_conv / k_conv from `num_k_heads = 16` to
+// `num_v_heads = 48` so the GDN shader sees Q, K, V at the same head
+// count (qwen35.cpp:441-443).
+//
+// llama.cpp's upstream `repeat.comp` is generic 4D and pulls in
+// `generic_unary_head.glsl` (ne00..ne13, nb00..nb13 push consts). This
+// VF variant is specialised to the head-axis modulo case:
+//
+//   dst[s, t, h_dst, d] = src[s, t, h_dst % n_src_heads, d]
+//
+// which is exactly what `ggml_repeat_4d` produces along ne[1] when the
+// other dims match. Saves us from porting `get_idx`/`get_aoffset`/
+// `dst_idx` + 16 stride push consts.
+//
+// Layout (head-major within token): both src and dst are contiguous
+// `[head_dim, n_heads, n_tokens, n_seqs]` row-major (head_dim inner).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer Src { float src_data[]; };
+layout(binding = 1) writeonly buffer Dst { float dst_data[]; };
+
+layout(push_constant) uniform parameter {
+    uint head_dim;     // 128 (= ssm_d_state for Qwen3.6)
+    uint n_src_heads;  // 16 (= num_k_heads)
+    uint n_dst_heads;  // 48 (= num_v_heads)
+    uint n_tokens;     // 1 (decode) or seq_len (batch)
+} p;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    const uint dst_per_token = p.head_dim * p.n_dst_heads;
+    const uint total = dst_per_token * p.n_tokens;
+    if (i >= total) return;
+
+    const uint token    = i / dst_per_token;
+    const uint rem      = i - token * dst_per_token;
+    const uint dst_head = rem / p.head_dim;
+    const uint dim      = rem - dst_head * p.head_dim;
+
+    const uint src_head = dst_head % p.n_src_heads;
+    const uint src_idx  = token * p.head_dim * p.n_src_heads
+                        + src_head * p.head_dim
+                        + dim;
+
+    dst_data[i] = src_data[src_idx];
+}

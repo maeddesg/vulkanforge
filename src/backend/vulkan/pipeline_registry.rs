@@ -230,7 +230,14 @@ impl PipelineRegistry {
                 // Sprint 56C-1 — Indexed FMA accumulator. Same shader
                 // shape as FmaAdd (local_size_x = 256, no spec constants);
                 // adds a 3rd SSBO for the per-expert weights buffer.
-                | ShaderId::FmaAddIndexed => {
+                | ShaderId::FmaAddIndexed
+                // Sprint G-2a (v0.4.6) — Qwen3.6 Linear-Attn helpers.
+                // Softplus is in-place elementwise (`x ← log(1+exp(x))`)
+                // with one u32 push const (ne). Repeat-interleave has
+                // 4 u32 push consts (head_dim / n_src / n_dst / n_tokens).
+                // Neither uses spec constants.
+                | ShaderId::SoftplusF32
+                | ShaderId::RepeatInterleaveF32 => {
                     ComputeKernel::from_spv(device, &words, cache)
                 }
                 ShaderId::SsmConvF32 => {
@@ -240,6 +247,28 @@ impl PipelineRegistry {
                     //   id 1  TOKENS_PER_WG  = 16  (drives local_size_y)
                     let data: [u32; 2] = [32, 16];
                     let entries = [entry(0, 0, 4), entry(1, 4, 4)];
+                    let bytes = bytemuck::bytes_of(&data);
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes, None)
+                }
+                ShaderId::GatedDeltaNetF32 | ShaderId::GatedDeltaNetF32Shmem => {
+                    // Sprint G-2a (v0.4.6) — Gated-Delta-Net. Four spec
+                    // constants tuned for Qwen3.6-27B on RDNA4 (gfx1201):
+                    //   id 0  S_V               = 128  (= ssm_d_state)
+                    //   id 1  KDA               = 0    (scalar gate path)
+                    //   id 2  SUBGROUP_SIZE     = 64   (RDNA4 compute SG; drives local_size_x_id=2)
+                    //   id 3  LANES_PER_COLUMN  = 32   (S_V/4 → 4 rows per lane)
+                    //
+                    // The shader requires `SUBGROUP_SIZE % LANES_PER_COLUMN == 0`
+                    // (yields COLS_PER_WG = 2) and `S_V % LANES_PER_COLUMN == 0`
+                    // (yields ROWS_PER_LANE = 4). Both invariants hold for
+                    // (64, 32, 128).
+                    let data: [u32; 4] = [128, 0, 64, 32];
+                    let entries = [
+                        entry(0, 0, 4),
+                        entry(1, 4, 4),
+                        entry(2, 8, 4),
+                        entry(3, 12, 4),
+                    ];
                     let bytes = bytemuck::bytes_of(&data);
                     ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes, None)
                 }

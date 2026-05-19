@@ -150,6 +150,32 @@ pub enum ShaderId {
     /// consts: BLOCK_SIZE=32 (local_size_x), TOKENS_PER_WG=16 (local_size_y).
     /// Port of llama.cpp's `ssm_conv.comp`.
     SsmConvF32,
+    /// Sprint G-2a (v0.4.6) — Softplus in-place activation (`x ← log(1+exp(x))`,
+    /// numerically stable branch at x>20). 1 in-out SSBO, push const
+    /// `ne` (u32). local_size_x = 256. Used in the Qwen3.6 Linear-Attn
+    /// gate path: `alpha_softplus = softplus(alpha + ssm_dt.bias)`.
+    SoftplusF32,
+    /// Sprint G-2a (v0.4.6) — Head-axis modulo repeat. 2 SSBOs (src
+    /// readonly, dst writeonly), 4 u32 push consts (head_dim,
+    /// n_src_heads, n_dst_heads, n_tokens). local_size_x = 256.
+    /// Used for Qwen3.6 Q/K head expansion 16 → 48 (= num_v_heads /
+    /// num_k_heads = 3× modulo-repeat).
+    RepeatInterleaveF32,
+    /// Sprint G-2a (v0.4.6) — Gated-Delta-Net recurrence (clustered
+    /// subgroup variant). 7 SSBOs (Q, K, V, G, beta, state, dst);
+    /// 80 B push consts (H, n_tokens, n_seqs, s_off, sq1..3, sv1..3,
+    /// sb1..3, neq1, rq3, scale, K). Spec consts: S_V=128, KDA=0,
+    /// SUBGROUP_SIZE=64 (RDNA4), LANES_PER_COLUMN=32. Direct port
+    /// of llama.cpp's `gated_delta_net.comp` with
+    /// `USE_SUBGROUP_CLUSTERED=1` + `USE_SUBGROUP_ADD=1` build defines.
+    GatedDeltaNetF32,
+    /// Sprint G-2a (v0.4.6) — Gated-Delta-Net shared-memory fallback.
+    /// Same bindings + push consts + spec consts as `GatedDeltaNetF32`;
+    /// the only delta is the `USE_SUBGROUP_*` build defines (both 0)
+    /// which switches the reduction to a `shared FLOAT_TYPE temp[]`
+    /// barrier-based path. Kept in-binary as a drop-in alternative;
+    /// not selected by runtime dispatch yet.
+    GatedDeltaNetF32Shmem,
     /// v0.2 Sprint 9b — fused residual-add + RMSNorm-mul. Combines
     /// `add_res1` (a + b → sum) with `rms_norm_ffn` (rms_norm(sum) *
     /// weight → norm_out) into a single dispatch. Saves one dispatch
@@ -489,6 +515,10 @@ impl ShaderId {
             ShaderId::GeluPytorchTanhGlu => "gelu_pytorch_tanh_f32",
             ShaderId::SigmoidMul => "sigmoid_mul_f32",
             ShaderId::SsmConvF32 => "ssm_conv_f32",
+            ShaderId::SoftplusF32 => "softplus_f32",
+            ShaderId::RepeatInterleaveF32 => "repeat_interleave_f32",
+            ShaderId::GatedDeltaNetF32 => "gated_delta_net_f32",
+            ShaderId::GatedDeltaNetF32Shmem => "gated_delta_net_f32_shmem",
             ShaderId::MultiAddRms => "multi_add_rms_f32",
             ShaderId::RmsNormMulRope => "rms_norm_mul_rope_f32",
             ShaderId::KvCopyFp16 => "kv_copy_fp16",
@@ -638,6 +668,10 @@ impl ShaderId {
             ShaderId::GeluPytorchTanhGlu => GELU_PYTORCH_TANH_F32,
             ShaderId::SigmoidMul => SIGMOID_MUL_F32,
             ShaderId::SsmConvF32 => SSM_CONV_F32,
+            ShaderId::SoftplusF32 => SOFTPLUS_F32,
+            ShaderId::RepeatInterleaveF32 => REPEAT_INTERLEAVE_F32,
+            ShaderId::GatedDeltaNetF32 => GATED_DELTA_NET_F32,
+            ShaderId::GatedDeltaNetF32Shmem => GATED_DELTA_NET_F32_SHMEM,
             ShaderId::MultiAddRms => MULTI_ADD_RMS_F32,
             ShaderId::RmsNormMulRope => RMS_NORM_MUL_ROPE_F32,
             ShaderId::KvCopyFp16 => KV_COPY_FP16,
@@ -794,6 +828,10 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::GeluPytorchTanhGlu,
     ShaderId::SigmoidMul,
     ShaderId::SsmConvF32,
+    ShaderId::SoftplusF32,
+    ShaderId::RepeatInterleaveF32,
+    ShaderId::GatedDeltaNetF32,
+    ShaderId::GatedDeltaNetF32Shmem,
     ShaderId::MultiAddRms,
     ShaderId::RmsNormMulRope,
     ShaderId::KvCopyFp16,
@@ -994,6 +1032,14 @@ pub const SIGMOID_MUL_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/sigmoid_mul_f32.spv"));
 pub const SSM_CONV_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ssm_conv_f32.spv"));
+pub const SOFTPLUS_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/softplus_f32.spv"));
+pub const REPEAT_INTERLEAVE_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/repeat_interleave_f32.spv"));
+pub const GATED_DELTA_NET_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gated_delta_net_f32.spv"));
+pub const GATED_DELTA_NET_F32_SHMEM: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gated_delta_net_f32_shmem.spv"));
 pub const GELU_PYTORCH_TANH_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gelu_pytorch_tanh_f32.spv"));
 pub const MULTI_ADD_RMS_F32: &[u8] =

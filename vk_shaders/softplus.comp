@@ -1,0 +1,35 @@
+#version 450
+
+// Sprint G-2a (v0.4.6) — Softplus elementwise activation for Qwen3.6
+// Linear-Attention's gate path (`alpha_softplus = softplus(alpha + dt)`).
+//
+// Adapted from llama.cpp's `ggml/src/ggml-vulkan/vulkan-shaders/softplus.comp`.
+// Two deltas vs upstream:
+//   1. Drops `#include "types.glsl"` + `#include "generic_head.glsl"` — VF
+//      uses plain `float` here and carries its own minimal push-const
+//      block instead of upstream's generic `KX/ne0/ne1/...` family.
+//   2. In-place (single binding) instead of upstream's two-binding
+//      readonly→writeonly pair. The gate path always wants
+//      `alpha = softplus(alpha)` so the extra allocation is wasted.
+//
+// Numerically stable form:
+//   x > 20  → softplus(x) ≈ x        (exp(x) overflows beyond ~88)
+//   else    → log(1 + exp(x))
+//
+// Mirrors the upstream branch cut at `x > 20.0f`.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) buffer InOut { float data[]; };
+
+layout(push_constant) uniform parameter {
+    uint ne;  // total element count
+} p;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= p.ne) return;
+
+    const float x = data[i];
+    data[i] = (x > 20.0) ? x : log(1.0 + exp(x));
+}

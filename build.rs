@@ -559,6 +559,51 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "ssm_conv.comp",
         defines: &[],
     },
+    // Sprint G-2a (v0.4.6) — Softplus elementwise for Qwen3.6
+    // Linear-Attn alpha gate. 1 in-out SSBO, 1 u32 push const (ne).
+    ShaderJob {
+        out_name: "softplus_f32.spv",
+        entry_source: "softplus.comp",
+        defines: &[],
+    },
+    // Sprint G-2a (v0.4.6) — Head-interleave repeat shader. Modulo
+    // repeat along the head axis (`dst[h_out] = src[h_out % n_src_heads]`)
+    // for Qwen3.6 Q/K expansion from num_k_heads=16 to num_v_heads=48.
+    // 2 SSBOs (src readonly, dst writeonly), 4 u32 push consts
+    // (head_dim, n_src_heads, n_dst_heads, n_tokens).
+    ShaderJob {
+        out_name: "repeat_interleave_f32.spv",
+        entry_source: "repeat_interleave.comp",
+        defines: &[],
+    },
+    // Sprint G-2a (v0.4.6) — Gated-Delta-Net recurrence kernel.
+    // Direct port of llama.cpp's `gated_delta_net.comp` (190 LOC).
+    // Two build variants:
+    //   * clustered + subgroup-add (preferred on RDNA4/gfx1201 where
+    //     both subgroup_clustered and subgroup_arithmetic are
+    //     available with SUBGROUP_SIZE=64)
+    //   * pure shared-memory fallback (for completeness)
+    // FLOAT_TYPE is plain `float`; the FP16 path would need
+    // FLOAT_TYPE=float16_t and the f16 storage extension — out of
+    // scope for Sprint G.
+    ShaderJob {
+        out_name: "gated_delta_net_f32.spv",
+        entry_source: "gated_delta_net.comp",
+        defines: &[
+            ("FLOAT_TYPE", "float"),
+            ("USE_SUBGROUP_ADD", "1"),
+            ("USE_SUBGROUP_CLUSTERED", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "gated_delta_net_f32_shmem.spv",
+        entry_source: "gated_delta_net.comp",
+        defines: &[
+            ("FLOAT_TYPE", "float"),
+            ("USE_SUBGROUP_ADD", "0"),
+            ("USE_SUBGROUP_CLUSTERED", "0"),
+        ],
+    },
     // v0.2 Sprint 9b — fused residual-add + RMSNorm-mul. 5 SSBOs
     // (a, b, weight, sum, norm_out); 1 WG per row, BLOCK_SIZE=512.
     // Replaces (add → barrier → rms_norm) at Stelle 1 (add_res1 +
