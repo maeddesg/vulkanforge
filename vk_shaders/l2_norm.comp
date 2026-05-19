@@ -46,8 +46,12 @@ void main() {
         }
         barrier();
     }
-    const float mean = sumsh[0] / float(ncols);
-    const float scale = inversesqrt(mean + eps);
+    // Match ggml_l2_norm semantics exactly (ggml-cpu/ops.cpp):
+    //   scale = 1.0 / max(sqrt(sum(x²)), eps)
+    // NOT `x / sqrt(mean(x²) + eps)` — that would be RMSNorm with weight=1
+    // (different magnitude by sqrt(ncols)).
+    const float norm  = sqrt(sumsh[0]);
+    const float scale = 1.0 / max(norm, eps);
     for (uint col = tid; col < ncols; col += BLOCK_SIZE) {
         data_d[row_base + col] = data_a[row_base + col] * scale;
     }

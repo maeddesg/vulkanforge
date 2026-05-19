@@ -637,6 +637,32 @@ pub struct RepeatInterleavePushConstants {
 }
 const _: () = assert!(std::mem::size_of::<RepeatInterleavePushConstants>() == 16);
 
+/// Sprint G-2e (v0.4.6) — `gated_delta_net.comp` push block. 17 × 4 B = 68 B.
+/// Field order matches the upstream `vk_op_gated_delta_net_push_constants`
+/// struct in `ggml-vulkan.cpp` exactly (shader header's "80 bytes"
+/// comment is out-of-date — the actual layout is 17 scalars).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GatedDeltaNetPushConstants {
+    pub h: u32,
+    pub n_tokens: u32,
+    pub n_seqs: u32,
+    /// Offset within the `dst` binding (in **elements**, not bytes)
+    /// where the new state's slot 0 starts. With output and state
+    /// co-located in dst, this is `S_v * H * n_tokens * n_seqs`.
+    pub s_off: u32,
+    pub sq1: u32, pub sq2: u32, pub sq3: u32,
+    pub sv1: u32, pub sv2: u32, pub sv3: u32,
+    pub sb1: u32, pub sb2: u32, pub sb3: u32,
+    pub neq1: u32, pub rq3: u32,
+    /// Decay scale, typically `1.0 / sqrt(S_v)` (Qwen3.6: 1/√128 ≈ 0.0884).
+    pub scale: f32,
+    /// Snapshot slot count. `1` for decode (final state only) and
+    /// prefill in autoregressive mode.
+    pub k: u32,
+}
+const _: () = assert!(std::mem::size_of::<GatedDeltaNetPushConstants>() == 68);
+
 /// llama.cpp's `init_fastdiv_values`. Used by [`GenericUnaryPushConstants`]
 /// to populate the `ne*_*mp/L` fields — without these, `copy`'s SPIR-V
 /// fastdiv path divides by a magic-of-zero and produces garbage indices.

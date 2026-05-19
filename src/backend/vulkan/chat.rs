@@ -115,6 +115,12 @@ impl ChatSession {
     /// Discard KV state + history. Next `send()` is treated as Turn 1.
     pub fn reset(&mut self) {
         self.forward.kv_cache.reset();
+        // Sprint G-2e — flip the persistent-SSM init flag. Next decode
+        // token re-zeros `conv_state` + `ssm_state` via
+        // `ensure_ssm_persistent_initialized` so the new conversation
+        // doesn't inherit the previous Linear-Attn recurrence. No-op
+        // on non-qwen35 stacks.
+        self.forward.reset_ssm_state();
         self.history.clear();
         self.current_pos = 0;
         self.turn_count = 0;

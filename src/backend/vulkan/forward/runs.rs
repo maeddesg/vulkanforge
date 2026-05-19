@@ -30,7 +30,8 @@ use super::super::pipeline::{
     CoopmatPushConstants, FlashAttnBatchPushConstants, FlashAttnReducePushConstants,
     FlashAttnSplitPushConstants, Fp8BlockwiseGemmPushConstants,
     Fp8BlockwiseGemvPushConstants, Fp8GemmPushConstants, GenericBinaryPushConstants,
-    ElementwiseInplacePushConstants, GenericHeadPushConstants, KvCopyFp16PushConstants,
+    ElementwiseInplacePushConstants, GatedDeltaNetPushConstants,
+    GenericHeadPushConstants, KvCopyFp16PushConstants,
     L2NormPushConstants, MatVecIdPushConstants, MatVecPushConstants,
     MmqIdPushConstants, MmqPushConstants,
     MoeRouterNormGemvPushConstants, MoeRouterSoftmaxTopkPushConstants,
@@ -3002,6 +3003,81 @@ impl Forward {
                 cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
             );
             dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
+        });
+    }
+
+    /// Sprint G-2e (v0.4.6) — Dispatch the Gated-Delta-Net recurrence.
+    ///
+    /// The shader writes both the attention output and the new
+    /// persistent state into the same `dst` buffer at distinct
+    /// offsets (output at `[0, s_off)`, new state at `[s_off, end)`).
+    /// Caller is responsible for copying the state portion back into
+    /// `ssm_state_buf` after this dispatch — the GDN shader cannot
+    /// do that itself because the state input binding is read-only
+    /// in the same dispatch.
+    ///
+    /// State binding (binding 5) is bound starting at the per-layer
+    /// byte offset so the shader's per-head indexing (`head_id *
+    /// state_size`) lines up. V binding (binding 2) is bound at the
+    /// V-slice offset within `conv_output`.
+    ///
+    /// Dispatch grid follows llama.cpp's vulkan backend: `{H, n_seqs,
+    /// S_v}`. With S_v=128 and COLS_PER_WG=2 spec-derived, the Z axis
+    /// gets each pair of cols.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_gated_delta_net(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        q: vk::Buffer,
+        k: vk::Buffer,
+        v: vk::Buffer,
+        v_offset_bytes: u64,
+        v_bytes: u64,
+        g: vk::Buffer,
+        beta: vk::Buffer,
+        state: vk::Buffer,
+        state_offset_bytes: u64,
+        state_bytes: u64,
+        dst: vk::Buffer,
+        s_v: u32,           // ssm_d_state (128 for Qwen3.6) — pinned by spec const
+        cols_per_wg: u32,   // SUBGROUP_SIZE / LANES_PER_COLUMN (2 for our spec)
+        push: &GatedDeltaNetPushConstants,
+        label: &str,
+    ) {
+        let kernel = registry.get(ShaderId::GatedDeltaNetF32);
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[
+                (0, q, 0, 0),
+                (1, k, 0, 0),
+                (2, v, v_offset_bytes, v_bytes),
+                (3, g, 0, 0),
+                (4, beta, 0, 0),
+                (5, state, state_offset_bytes, state_bytes),
+                (6, dst, 0, 0),
+            ],
+        );
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        // Dispatch grid: {H, n_seqs, ceil(S_v / cols_per_wg)} — mirrors
+        // llama.cpp's `wg_denoms = {1, 1, cols_per_wg}` divisor pattern.
+        // Each workgroup processes `cols_per_wg` cols of the S_v axis
+        // via its `SUBGROUP_SIZE / LANES_PER_COLUMN` parallel-column
+        // shards.
+        let dispatch_x = push.h;
+        let dispatch_y = push.n_seqs;
+        let dispatch_z = (s_v + cols_per_wg - 1) / cols_per_wg;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(push),
+            );
+            dev.device.cmd_dispatch(cmd, dispatch_x, dispatch_y, dispatch_z);
         });
     }
 

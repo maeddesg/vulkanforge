@@ -203,6 +203,18 @@ impl Forward {
         Ok(())
     }
 
+    /// Sprint G-2e — Reset the lazy-init guard for the persistent
+    /// SSM buffers (`conv_state_buf` + `ssm_state_buf`). The next
+    /// decode/prefill token that enters a recurrent layer's
+    /// `step_ssm_conv1d` will re-zero them via
+    /// `ensure_ssm_persistent_initialized`, ensuring the new
+    /// conversation doesn't inherit the previous Linear-Attn
+    /// recurrence. No-op on non-qwen35 stacks (where the field is
+    /// also `false` after construction but never read).
+    pub fn reset_ssm_state(&mut self) {
+        self.ssm_persistent_initialized = false;
+    }
+
     /// Sprint 12D — mark `bufs` as pending-write so the next
     /// `maybe_compute_barrier` that reads any of them will fire a
     /// barrier. No-op when elision is disabled (legacy unconditional

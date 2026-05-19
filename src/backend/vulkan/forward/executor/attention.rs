@@ -8,7 +8,8 @@
 //! See `executor/mod.rs` for shared types + helpers.
 
 use super::{
-    batch_seq_len, batch_seq_pos, decode_io, decode_position, layer_dims_local,
+    batch_seq_len, batch_seq_pos, compute_to_transfer_barrier,
+    decode_io, decode_position, layer_dims_local,
     n_kv_heads_for, quantize_input_after_q, BatchExec, DecodeExec, ExecCtx,
 };
 use super::super::arch::{
@@ -17,6 +18,7 @@ use super::super::arch::{
     layer_weight_scale_scalar, layer_weight_shader,
     transfer_to_compute_barrier,
 };
+use super::super::super::pipeline::GatedDeltaNetPushConstants;
 use super::super::state::Forward;
 use super::super::super::gguf::ModelConfig;
 use super::super::super::shaders::ShaderId;
@@ -918,16 +920,160 @@ impl DecodeExec {
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[qrep, krep]);
     }
 
+    /// Sprint G-2e (v0.4.6) — The recurrence at the heart of Qwen3.6
+    /// Linear-Attention.
+    ///
+    /// Dispatches the 190-LOC `gated_delta_net.comp` (Sprint G-2a) with:
+    ///   binding 0  Q      `ssm_qrep_buf`         [H × K]
+    ///   binding 1  K      `ssm_krep_buf`         [H × K]
+    ///   binding 2  V      `ssm_conv_output_buf`  V-slice at offset
+    ///                                              `2 × head_k × num_k_heads`
+    ///                                              floats (skip Q + K)
+    ///   binding 3  G      `ssm_gate_buf`         [H]      log-decay
+    ///   binding 4  Beta   `ssm_beta_buf`         [H]      post-sigmoid
+    ///   binding 5  State  `ssm_state_buf`        per-layer slice (RO)
+    ///   binding 6  Dst    `ssm_gdn_out_buf`      output [H × S_v]
+    ///                                            + new state [H × S_v²]
+    ///                                            co-located at `s_off`
+    ///
+    /// After the dispatch a `cmd_copy_buffer` copies the new state
+    /// portion of dst back into `ssm_state_buf` at the per-layer
+    /// offset for the next token to read. The GDN shader cannot
+    /// overwrite State binding-5 in the same dispatch because it's
+    /// declared `readonly` (Vulkan validation enforces this).
+    ///
+    /// Push consts mirror llama.cpp `vk_op_gated_delta_net_push_constants`
+    /// 1:1 (17 scalars, 68 B). Strides are in **elements**.
     pub(super) fn step_gated_delta_net(
-        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
     ) {
-        // No-op until Sprint G-2e (GDN shader dispatch + ssm_state update).
+        let spec = cfg.qwen35.as_ref().expect(
+            "step_gated_delta_net emitted for non-qwen35 config",
+        );
+        let h           = spec.num_v_heads();        // 48
+        let s_v         = spec.ssm_d_state;          // 128
+        let head_k      = spec.head_k_dim();         // 128
+        let num_k_heads = spec.num_k_heads();        // 16
+        let recurrent_idx = spec.recurrent_index(layer);
+
+        let q     = fwd.ssm_qrep_buf.as_ref().unwrap().handle;
+        let k     = fwd.ssm_krep_buf.as_ref().unwrap().handle;
+        let v     = fwd.ssm_conv_output_buf.as_ref().unwrap().handle;
+        let g     = fwd.ssm_gate_buf.as_ref().unwrap().handle;
+        let beta  = fwd.ssm_beta_buf.as_ref().unwrap().handle;
+        let state = fwd.ssm_state_buf.as_ref().unwrap().handle;
+        let dst   = fwd.ssm_gdn_out_buf.as_ref().unwrap().handle;
+
+        // V-slice in conv_output: per qwen35.cpp:406-422 V sits at
+        // offset `head_k_dim × num_k_heads × 2` floats (= Q + K halves).
+        // For Qwen3.6: (128 × 16 × 2) = 4096 floats = 16 384 bytes.
+        let v_offset_bytes = (head_k as u64) * (num_k_heads as u64) * 2 * 4;
+        let v_bytes        = (s_v as u64) * (h as u64) * 4;     // 6144 × 4 = 24 576 B
+
+        // Per-layer state slice (input + ultimate output destination).
+        let state_bytes_per_layer = (h as u64) * (s_v as u64) * (s_v as u64) * 4;
+        let state_offset_bytes    = recurrent_idx as u64 * state_bytes_per_layer;
+
+        // s_off (elements within dst) — where new state begins:
+        //   output occupies dst[0 .. S_v × H × n_tokens × n_seqs)
+        let s_off = s_v * h;
+
+        let push = GatedDeltaNetPushConstants {
+            h,
+            n_tokens: 1,
+            n_seqs:   1,
+            s_off,
+            // Q strides (elements). Layout [K, H, n_tokens=1, n_seqs=1].
+            sq1: head_k, sq2: head_k * h, sq3: head_k * h,
+            // V strides — same shape but inner = S_v (= K for square-state Qwen3.6).
+            sv1: s_v,    sv2: s_v * h,    sv3: s_v * h,
+            // Beta / g strides — [H, n_tokens, n_seqs], head-inner.
+            sb1: 1, sb2: h, sb3: h,
+            neq1: h,
+            rq3:  1,
+            scale: 1.0 / (s_v as f32).sqrt(),
+            k: 1,
+        };
+
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[q, k, v, g, beta]);
+        fwd.run_gated_delta_net(
+            ctx.dev, ctx.registry, ctx.cmd,
+            q, k,
+            v, v_offset_bytes, v_bytes,
+            g, beta,
+            state, state_offset_bytes, state_bytes_per_layer,
+            dst,
+            s_v, /* cols_per_wg = SUBGROUP_SIZE/LANES_PER_COLUMN */ 2,
+            &push, "gdn",
+        );
+        fwd.mark_written(&[dst]);
+
+        // Copy the new state portion of `dst` back into `ssm_state_buf`
+        // at the per-layer offset so the next token's GDN dispatch
+        // reads it via binding 5.
+        compute_to_transfer_barrier(ctx.dev, ctx.cmd);
+        let region = vk::BufferCopy {
+            src_offset: (s_off as u64) * 4,
+            dst_offset: state_offset_bytes,
+            size:       state_bytes_per_layer,
+        };
+        unsafe {
+            ctx.dev.device.cmd_copy_buffer(
+                ctx.cmd, dst, state, std::slice::from_ref(&region),
+            );
+        }
+        transfer_to_compute_barrier(ctx.dev, ctx.cmd);
+        fwd.mark_written(&[state]);
     }
 
+    /// Sprint G-2e (v0.4.6) — `RMSNorm(ssm_norm.weight) × SiLU(z)`,
+    /// Op 16 of `build_layer_attn_linear`. Three dispatches (safe
+    /// path per G-2d §11.2 recommendation):
+    ///   1. RMSNorm: gdn_out [H × S_v] → norm_out, weight=`ssm_norm.weight`
+    ///      (per-head, S_v cols × H rows).
+    ///   2. SiLU on `z` in-place.
+    ///   3. norm_out *= silu(z) elementwise.
     pub(super) fn step_norm_gated(
-        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
     ) {
-        // No-op until Sprint G-2e (RMSNorm(gdn_out) × Silu(z)).
+        let spec = cfg.qwen35.as_ref().expect(
+            "step_norm_gated emitted for non-qwen35 config",
+        );
+        let h   = spec.num_v_heads();
+        let s_v = spec.ssm_d_state;
+        let ne  = h * s_v;
+
+        let gdn_out  = fwd.ssm_gdn_out_buf.as_ref().unwrap().handle;
+        let z        = fwd.ssm_z_buf.as_ref().unwrap().handle;
+        let norm_out = fwd.ssm_norm_out_buf.as_ref().unwrap().handle;
+        let norm_w   = layer_weight(ctx.model, layer, "ssm_norm.weight");
+
+        // 1. RMSNorm per head.
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[gdn_out]);
+        fwd.run_rms_norm(
+            ctx.dev, ctx.registry, ctx.cmd,
+            gdn_out, norm_w, norm_out,
+            s_v, h, cfg.rms_norm_eps, "ssm_norm_gated_rms",
+        );
+        fwd.mark_written(&[norm_out]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[z]);
+
+        // 2. SiLU on z in-place.
+        fwd.run_silu(
+            ctx.dev, ctx.registry, ctx.cmd,
+            z, z, ne, "ssm_z_silu",
+        );
+        fwd.mark_written(&[z]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[norm_out, z]);
+
+        // 3. norm_out *= silu(z) (elementwise).
+        fwd.run_binary(
+            ctx.dev, ctx.registry, ctx.cmd, ShaderId::Mul,
+            norm_out, z, norm_out,
+            ne, "ssm_norm_gated_mul",
+        );
+        fwd.mark_written(&[norm_out]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[norm_out]);
     }
 
     /// Sprint G-2d (v0.4.6) — `ssm_out.weight` GEMV `[6144, 5120]` Q4_K
@@ -1811,16 +1957,113 @@ impl BatchExec {
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[qrep, krep]);
     }
 
+    /// Sprint G-2e (v0.4.6) — batch counterpart of
+    /// [`DecodeExec::step_gated_delta_net`]. Recurrent state updates
+    /// per-token; with decode-sized scratch the BAT body matches DEC
+    /// for token 0 only (multi-token correctness lands when scratch
+    /// grows to seq_len — out of scope for G-2e).
     pub(super) fn b_step_gated_delta_net(
-        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
     ) {
-        // No-op until Sprint G-2e.
+        let spec = cfg.qwen35.as_ref().expect(
+            "b_step_gated_delta_net emitted for non-qwen35 config",
+        );
+        let h           = spec.num_v_heads();
+        let s_v         = spec.ssm_d_state;
+        let head_k      = spec.head_k_dim();
+        let num_k_heads = spec.num_k_heads();
+        let recurrent_idx = spec.recurrent_index(layer);
+
+        let q     = fwd.ssm_qrep_buf.as_ref().unwrap().handle;
+        let k     = fwd.ssm_krep_buf.as_ref().unwrap().handle;
+        let v     = fwd.ssm_conv_output_buf.as_ref().unwrap().handle;
+        let g     = fwd.ssm_gate_buf.as_ref().unwrap().handle;
+        let beta  = fwd.ssm_beta_buf.as_ref().unwrap().handle;
+        let state = fwd.ssm_state_buf.as_ref().unwrap().handle;
+        let dst   = fwd.ssm_gdn_out_buf.as_ref().unwrap().handle;
+
+        let v_offset_bytes = (head_k as u64) * (num_k_heads as u64) * 2 * 4;
+        let v_bytes        = (s_v as u64) * (h as u64) * 4;
+        let state_bytes_per_layer = (h as u64) * (s_v as u64) * (s_v as u64) * 4;
+        let state_offset_bytes    = recurrent_idx as u64 * state_bytes_per_layer;
+        let s_off = s_v * h;
+
+        let push = GatedDeltaNetPushConstants {
+            h, n_tokens: 1, n_seqs: 1, s_off,
+            sq1: head_k, sq2: head_k * h, sq3: head_k * h,
+            sv1: s_v,    sv2: s_v * h,    sv3: s_v * h,
+            sb1: 1, sb2: h, sb3: h,
+            neq1: h, rq3: 1,
+            scale: 1.0 / (s_v as f32).sqrt(),
+            k: 1,
+        };
+
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[q, k, v, g, beta]);
+        fwd.run_gated_delta_net(
+            ctx.dev, ctx.registry, ctx.cmd,
+            q, k,
+            v, v_offset_bytes, v_bytes,
+            g, beta,
+            state, state_offset_bytes, state_bytes_per_layer,
+            dst,
+            s_v, 2,
+            &push, "b_gdn",
+        );
+        fwd.mark_written(&[dst]);
+
+        compute_to_transfer_barrier(ctx.dev, ctx.cmd);
+        let region = vk::BufferCopy {
+            src_offset: (s_off as u64) * 4,
+            dst_offset: state_offset_bytes,
+            size:       state_bytes_per_layer,
+        };
+        unsafe {
+            ctx.dev.device.cmd_copy_buffer(
+                ctx.cmd, dst, state, std::slice::from_ref(&region),
+            );
+        }
+        transfer_to_compute_barrier(ctx.dev, ctx.cmd);
+        fwd.mark_written(&[state]);
     }
 
+    /// Sprint G-2e (v0.4.6) — batch counterpart of
+    /// [`DecodeExec::step_norm_gated`].
     pub(super) fn b_step_norm_gated(
-        &self, _fwd: &mut Forward, _cfg: &ModelConfig, _ctx: &ExecCtx, _layer: u32,
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
     ) {
-        // No-op until Sprint G-2e.
+        let spec = cfg.qwen35.as_ref().expect(
+            "b_step_norm_gated emitted for non-qwen35 config",
+        );
+        let h   = spec.num_v_heads();
+        let s_v = spec.ssm_d_state;
+        let ne  = h * s_v;
+
+        let gdn_out  = fwd.ssm_gdn_out_buf.as_ref().unwrap().handle;
+        let z        = fwd.ssm_z_buf.as_ref().unwrap().handle;
+        let norm_out = fwd.ssm_norm_out_buf.as_ref().unwrap().handle;
+        let norm_w   = layer_weight(ctx.model, layer, "ssm_norm.weight");
+
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[gdn_out]);
+        fwd.run_rms_norm(
+            ctx.dev, ctx.registry, ctx.cmd,
+            gdn_out, norm_w, norm_out,
+            s_v, h, cfg.rms_norm_eps, "b_ssm_norm_gated_rms",
+        );
+        fwd.mark_written(&[norm_out]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[z]);
+        fwd.run_silu(
+            ctx.dev, ctx.registry, ctx.cmd,
+            z, z, ne, "b_ssm_z_silu",
+        );
+        fwd.mark_written(&[z]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[norm_out, z]);
+        fwd.run_binary(
+            ctx.dev, ctx.registry, ctx.cmd, ShaderId::Mul,
+            norm_out, z, norm_out,
+            ne, "b_ssm_norm_gated_mul",
+        );
+        fwd.mark_written(&[norm_out]);
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[norm_out]);
     }
 
     /// Sprint G-2d (v0.4.6) — batch counterpart of

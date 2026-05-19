@@ -437,7 +437,20 @@ impl Forward {
             let conv_out_bytes   = conv_channels * 4;            // 10240 * 4 = 40 KB
             let qrep_bytes       = head_v_dim * num_v_heads * 4; // 128*48*4 = 24 KB
             let krep_bytes       = head_v_dim * num_v_heads * 4; // 24 KB
-            let gdn_out_bytes    = head_v_dim * num_v_heads * 4; // 24 KB
+            // Sprint G-2e — `ssm_gdn_out_buf` holds BOTH the GDN output
+            // `[H × S_v × n_tokens × n_seqs]` AND the new persistent
+            // state `[H × S_v × S_v × n_seqs]` co-located in a single
+            // VkBuffer (the GDN shader writes both at distinct offsets
+            // within binding 6). For Qwen3.6-27B decode (n_tokens=1,
+            // n_seqs=1, H=48, S_v=128):
+            //   output: 48 × 128 = 6144 floats           (24 KB)
+            //   state : 48 × 128 × 128 = 786432 floats   (~3.0 MB)
+            //   total : 792576 floats                     (~3.02 MB)
+            // The executor copies the state portion back into
+            // `ssm_state_buf` after each dispatch.
+            let gdn_out_bytes    =
+                (head_v_dim * num_v_heads                          // output 6144
+                 + num_v_heads * head_v_dim * head_v_dim) * 4;     // state  786432
             let norm_out_bytes   = head_v_dim * num_v_heads * 4; // 24 KB
 
             let qkv      = Some(mk_storage(qkv_bytes,      MemoryLocation::GpuOnly, "ssm_qkv_buf")?);
