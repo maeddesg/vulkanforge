@@ -143,6 +143,13 @@ pub enum ShaderId {
     /// gate_offset). Serves both decode (seq=1) and batch prefill
     /// (seq>1, stride=2*chunk for fused [Q|G] layout) from one shader.
     SigmoidMul,
+    /// Sprint F (v0.4.6) — Qwen3.6 SSM 1D causal convolution. 3 SSBOs
+    /// (src0 rolling-window input, src1 conv kernel `[nc, nr]` per-channel,
+    /// dst output `[nr, n_t, n_s]`); 11 u32 push consts (nb01, nb02,
+    /// nb11, dst_nb0, dst_nb1, dst_nb2, nc, ncs, nr, n_t, n_s). Spec
+    /// consts: BLOCK_SIZE=32 (local_size_x), TOKENS_PER_WG=16 (local_size_y).
+    /// Port of llama.cpp's `ssm_conv.comp`.
+    SsmConvF32,
     /// v0.2 Sprint 9b — fused residual-add + RMSNorm-mul. Combines
     /// `add_res1` (a + b → sum) with `rms_norm_ffn` (rms_norm(sum) *
     /// weight → norm_out) into a single dispatch. Saves one dispatch
@@ -481,6 +488,7 @@ impl ShaderId {
             ShaderId::SwiGLU => "swiglu_f32",
             ShaderId::GeluPytorchTanhGlu => "gelu_pytorch_tanh_f32",
             ShaderId::SigmoidMul => "sigmoid_mul_f32",
+            ShaderId::SsmConvF32 => "ssm_conv_f32",
             ShaderId::MultiAddRms => "multi_add_rms_f32",
             ShaderId::RmsNormMulRope => "rms_norm_mul_rope_f32",
             ShaderId::KvCopyFp16 => "kv_copy_fp16",
@@ -629,6 +637,7 @@ impl ShaderId {
             ShaderId::SwiGLU => SWIGLU_F32,
             ShaderId::GeluPytorchTanhGlu => GELU_PYTORCH_TANH_F32,
             ShaderId::SigmoidMul => SIGMOID_MUL_F32,
+            ShaderId::SsmConvF32 => SSM_CONV_F32,
             ShaderId::MultiAddRms => MULTI_ADD_RMS_F32,
             ShaderId::RmsNormMulRope => RMS_NORM_MUL_ROPE_F32,
             ShaderId::KvCopyFp16 => KV_COPY_FP16,
@@ -784,6 +793,7 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::SwiGLU,
     ShaderId::GeluPytorchTanhGlu,
     ShaderId::SigmoidMul,
+    ShaderId::SsmConvF32,
     ShaderId::MultiAddRms,
     ShaderId::RmsNormMulRope,
     ShaderId::KvCopyFp16,
@@ -982,6 +992,8 @@ pub const SILU_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silu_f32.s
 pub const SWIGLU_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/swiglu_f32.spv"));
 pub const SIGMOID_MUL_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/sigmoid_mul_f32.spv"));
+pub const SSM_CONV_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/ssm_conv_f32.spv"));
 pub const GELU_PYTORCH_TANH_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gelu_pytorch_tanh_f32.spv"));
 pub const MULTI_ADD_RMS_F32: &[u8] =

@@ -233,6 +233,16 @@ impl PipelineRegistry {
                 | ShaderId::FmaAddIndexed => {
                     ComputeKernel::from_spv(device, &words, cache)
                 }
+                ShaderId::SsmConvF32 => {
+                    // Sprint F (v0.4.6) — SSM 1D convolution. Two spec
+                    // constants pinned to llama.cpp's defaults:
+                    //   id 0  BLOCK_SIZE     = 32  (drives local_size_x)
+                    //   id 1  TOKENS_PER_WG  = 16  (drives local_size_y)
+                    let data: [u32; 2] = [32, 16];
+                    let entries = [entry(0, 0, 4), entry(1, 4, 4)];
+                    let bytes = bytemuck::bytes_of(&data);
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes, None)
+                }
                 ShaderId::ScalarAttn => {
                     // SpecId 0 = MAX_SEQ — sets the size of the
                     // shared `scores[]` buffer. Sprint 22 — wired

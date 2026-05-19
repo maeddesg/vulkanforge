@@ -549,6 +549,16 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "sigmoid_mul.comp",
         defines: &[],
     },
+    // Sprint F (v0.4.6) — Qwen3.6 SSM 1D causal convolution. 3 SSBOs
+    // (src0 rolling-window input, src1 conv kernel, dst output), 11
+    // u32 push consts (byte strides + nc/ncs/nr/n_t/n_s). Port of
+    // llama.cpp's ssm_conv.comp. Spec consts: BLOCK_SIZE=32 (x),
+    // TOKENS_PER_WG=16 (y).
+    ShaderJob {
+        out_name: "ssm_conv_f32.spv",
+        entry_source: "ssm_conv.comp",
+        defines: &[],
+    },
     // v0.2 Sprint 9b — fused residual-add + RMSNorm-mul. 5 SSBOs
     // (a, b, weight, sum, norm_out); 1 WG per row, BLOCK_SIZE=512.
     // Replaces (add → barrier → rms_norm) at Stelle 1 (add_res1 +

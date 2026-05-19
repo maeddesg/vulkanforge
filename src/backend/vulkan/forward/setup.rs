@@ -372,6 +372,36 @@ impl Forward {
             None
         };
 
+        // Sprint F (v0.4.6) — Qwen3.6 Linear-Attn persistent conv state.
+        // Sized for `n_recurrent_layers * (ssm_d_conv - 1) * conv_channels`
+        // FP32; for Qwen3.6-27B this is ~5.6 MB across all 48 recurrent
+        // layers. Allocated uninitialised here; the Sprint G dispatch
+        // will lazily zero-fill on first use (no SSM-Conv shader reads
+        // this buffer in Sprint F's no-op step body).
+        let conv_state_buf = if let Some(spec) = config.qwen35.as_ref() {
+            // n_main / interval = #full-attention trunk layers; trunk
+            // size minus that gives recurrent count (MTP block is
+            // excluded — it's full-attention).
+            let n_main = spec.n_main();
+            let n_recurrent = n_main - n_main / spec.full_attention_interval;
+            let conv_channels =
+                2 * spec.ssm_d_state * spec.ssm_n_group + spec.ssm_d_inner;
+            let slots_per_layer = spec.ssm_d_conv.saturating_sub(1);
+            let bytes = (n_recurrent as u64)
+                * (slots_per_layer as u64)
+                * (conv_channels as u64)
+                * 4;
+            // Defensive: skip allocation if the spec degenerates (e.g.
+            // a future variant with ssm_d_conv == 1).
+            if bytes > 0 {
+                Some(mk_storage(bytes, MemoryLocation::GpuOnly, "conv_state_buf")?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Sprint 51D-D — host-readable staging for MoE router input.
         // Sized for the worst case: full prefill batch × hidden × 4 B.
         // Cheap (~1.4 MB on 26B at pp=128); always allocated so the
@@ -771,6 +801,7 @@ impl Forward {
             batch_q, batch_k, batch_v, batch_attn_out, batch_o,
             batch_gate, batch_up, batch_ffn_hidden, batch_ffn_out,
             batch_qgate,
+            conv_state_buf,
             // Sprint 12D — barrier elision tracker.
             pending_writes: std::collections::HashSet::with_capacity(32),
             elision_disabled: std::env::var("VULKANFORGE_DISABLE_BARRIER_ELISION")
@@ -1120,6 +1151,10 @@ impl Forward {
         self.batch_ffn_out.destroy(device, allocator);
         // Sprint D2 — optional Qwen3.6 batch fused Q+Gate target.
         if let Some(b) = self.batch_qgate {
+            b.destroy(device, allocator);
+        }
+        // Sprint F — optional Qwen3.6 Linear-Attn persistent conv state.
+        if let Some(b) = self.conv_state_buf {
             b.destroy(device, allocator);
         }
         // Sprint 51D-D — MoE router staging.

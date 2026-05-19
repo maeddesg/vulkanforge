@@ -116,6 +116,7 @@ impl DecodeExec {
             }
             LayerStep::PostMoeNorm => self.step_post_moe_norm(fwd, cfg, ctx),
             LayerStep::MoeBranchAdd => self.step_moe_branch_add(fwd, cfg, ctx),
+            LayerStep::SsmConv1d { layer } => self.step_ssm_conv1d(fwd, cfg, ctx, *layer),
         }
     }
 }
@@ -211,6 +212,7 @@ impl BatchExec {
             }
             LayerStep::PostMoeNorm => self.b_step_post_moe_norm(fwd, cfg, ctx),
             LayerStep::MoeBranchAdd => self.b_step_moe_branch_add(fwd, cfg, ctx),
+            LayerStep::SsmConv1d { layer } => self.b_step_ssm_conv1d(fwd, cfg, ctx, *layer),
         }
     }
 }

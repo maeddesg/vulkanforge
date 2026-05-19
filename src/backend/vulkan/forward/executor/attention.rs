@@ -560,6 +560,24 @@ impl DecodeExec {
         );
         fwd.mark_written(&[res1]);
     }
+
+    /// Sprint F (v0.4.6) — SSM 1D convolution step. **Staging-only
+    /// implementation:** plumbing for the persistent `conv_state`
+    /// buffer + `ssm_conv_f32` pipeline is wired into `Forward`; the
+    /// real dispatch (conv + state-shift `cmd_copy_buffer` chain) lands
+    /// in Sprint G alongside `GatedDeltaNet`. The conv output is not
+    /// consumed by any downstream step in the current passthrough plan,
+    /// so dispatching it here would only burn cycles without enabling
+    /// the gate ("kein Crash, kein NaN" holds either way).
+    pub(super) fn step_ssm_conv1d(
+        &self,
+        _fwd: &mut Forward,
+        _cfg: &ModelConfig,
+        _ctx: &ExecCtx,
+        _layer: u32,
+    ) {
+        // No-op until Sprint G fills in the body.
+    }
 }
 
 impl BatchExec {
@@ -1122,5 +1140,19 @@ impl BatchExec {
             seq_len * cfg.hidden_dim, "add_res1_b",
         );
         compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    /// Sprint F (v0.4.6) — batch counterpart of [`DecodeExec::step_ssm_conv1d`].
+    /// Staging-only no-op; see DEC sibling for the rationale. Lives in
+    /// the same file (`executor/attention.rs`) so the DEC + BAT pair
+    /// stays co-located per coding-standards §4.2.
+    pub(super) fn b_step_ssm_conv1d(
+        &self,
+        _fwd: &mut Forward,
+        _cfg: &ModelConfig,
+        _ctx: &ExecCtx,
+        _layer: u32,
+    ) {
+        // No-op until Sprint G fills in the body.
     }
 }

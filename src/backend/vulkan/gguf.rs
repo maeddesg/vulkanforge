@@ -636,6 +636,15 @@ impl Qwen35Spec {
         layer >= self.n_main()
     }
 
+    /// True for trunk Linear-Attention (SSM + Gated-Delta-Net) layers.
+    /// Inverse of `is_full_attention_layer` on the trunk, with the MTP
+    /// block (`layer >= n_main`) explicitly excluded. Mirrors
+    /// llama.cpp `qwen35.cpp:25-28` `recurrent_layer_arr[i]`.
+    pub fn is_recurrent_layer(&self, layer: u32) -> bool {
+        layer < self.n_main()
+            && (layer + 1) % self.full_attention_interval != 0
+    }
+
     /// Effective per-head rotation dim for text-only inference: sum
     /// of the three non-temporal mRoPE sections. For Qwen3.6-27B
     /// `[11, 11, 10, 0]` this is 32.

@@ -580,6 +580,16 @@ pub struct Forward {
     /// on the same cfg flag.
     pub(super) batch_qgate: Option<GpuBuffer>,
 
+    /// Sprint F (v0.4.6) — Qwen3.6 Linear-Attn persistent conv state.
+    /// `[n_recurrent_layers, ssm_d_conv - 1, conv_channels]` FP32
+    /// rolling window of the last `ssm_d_conv - 1` channel-wise inputs
+    /// to each recurrent layer's SSM-Conv1d. For Qwen3.6-27B this is
+    /// `48 × 3 × 10240 × 4 ≈ 5.6 MB`. `Some` only when
+    /// `cfg.qwen35.is_some()`. Allocated GpuOnly (uninit) here; Sprint G
+    /// adds the once-per-process zero-fill before the first conv
+    /// dispatch reads it.
+    pub(super) conv_state_buf: Option<GpuBuffer>,
+
     /// Sprint 12D — barrier elision via dirty-flag tracking. The set
     /// holds `vk::Buffer` raw handles that have been written since the
     /// last `compute_barrier`. `maybe_compute_barrier(reads)` skips the
