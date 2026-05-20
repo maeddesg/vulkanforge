@@ -145,8 +145,11 @@ impl DecodeExec {
         //
         // Gated behind `VF_QGATE_DEINTERLEAVE=1` so the bisect-active
         // branch can be flipped without rebuilding for ablation runs.
+        // Sprint G-2i — promoted to default-on for Qwen3.6 after
+        // coherence-verified via the bisect chain G-2g→G-2h→G-2i.
+        // The env var stays as an OFF-switch for ablation runs.
         if cfg.qwen35.is_some()
-            && std::env::var("VF_QGATE_DEINTERLEAVE").is_ok()
+            && std::env::var("VF_QGATE_DEINTERLEAVE_OFF").is_err()
         {
             let head_dim = cfg.head_dim;
             let n_heads = cfg.n_heads;
@@ -410,8 +413,12 @@ impl DecodeExec {
         // intermediate is dumpable. Toggled with VF_QWEN35_SPLIT_RNR=1
         // for bisect-active runs. Production gate (post-coherence) will
         // promote this to default for cfg.qwen35.is_some().
+        // Sprint G-2i — split-RNR + post-norm drain default-on for
+        // Qwen3.6. The fused rms_norm_mul_rope shader produces
+        // numerically wrong RoPE outputs on RADV/gfx1201 unless the
+        // intermediate is drained via mid_frame_submit_and_wait.
         let split = cfg.qwen35.is_some()
-            && std::env::var("VF_QWEN35_SPLIT_RNR").is_ok();
+            && std::env::var("VF_QWEN35_SPLIT_RNR_OFF").is_err();
         if split {
             fwd.run_rms_norm(
                 ctx.dev, ctx.registry, ctx.cmd,
@@ -421,15 +428,33 @@ impl DecodeExec {
             );
             fwd.mark_written(&[q_buf]);
             super::super::arch::compute_barrier(ctx.dev, ctx.cmd);
-            // Sprint G-2h diag — force a CB-submit drain between split
-            // rms_norm and rope_neox when VF_QWEN35_FORCE_DRAIN=1. A
-            // simple `compute_barrier` was empirically insufficient on
-            // RADV/gfx1201 — only a full pipeline drain flipped the
-            // output from "( ( (" to "Paris". Possibly a driver/barrier
-            // visibility issue. Keep gated for diag while we
-            // investigate. Performance: ~1 ms per call × 16 full-attn
-            // layers × per-token = 16-20 % decode regression.
-            if std::env::var("VF_QWEN35_FORCE_DRAIN").is_ok() {
+            // Sprint G-2i — drain at L3. The G-2h "Paris" config
+            // achieved this via the postnorm dump which did a
+            // cmd_copy_buffer (TRANSFER) into staging + a barrier
+            // SHADER_WRITE→TRANSFER_READ before the
+            // mid_frame_submit_and_wait. Mid-frame submit alone
+            // (without the TRANSFER op) doesn't reproduce coherence —
+            // the cmd_copy_buffer appears to force some additional
+            // cache flush that pure submit-and-wait doesn't. Replicate
+            // by doing a no-op cmd_copy_buffer (q_buf → staging) under
+            // a SHADER_WRITE→TRANSFER_READ barrier.
+            if ctx.layer == 3 && std::env::var("VF_QWEN35_FORCE_DRAIN_OFF").is_err() {
+                let stage = fwd.hidden_staging.handle;
+                let pre = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+                unsafe {
+                    ctx.dev.device.cmd_pipeline_barrier(
+                        ctx.cmd,
+                        vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        std::slice::from_ref(&pre), &[], &[],
+                    );
+                    let copy = vk::BufferCopy::default()
+                        .src_offset(0).dst_offset(0).size(64); // 16 floats
+                    ctx.dev.device.cmd_copy_buffer(ctx.cmd, q_buf, stage, std::slice::from_ref(&copy));
+                }
                 let _ = fwd.mid_frame_submit_and_wait(ctx.dev, ctx.cmd);
             }
             fwd.run_rope_neox_with_pos_offset(
@@ -441,7 +466,19 @@ impl DecodeExec {
                 "rope_neox_q_split",
             );
             fwd.mark_written(&[q_buf]);
+            // Sprint G-2i — second drain at L3 (matches the
+            // dump_after_step mid-frame-submit that worked in G-2h).
+            if ctx.layer == 3 && std::env::var("VF_QWEN35_FORCE_DRAIN_OFF").is_err() {
+                let _ = fwd.mid_frame_submit_and_wait(ctx.dev, ctx.cmd);
+            }
         } else {
+            // Sprint G-2i Test 6 — fused path + DRAIN, to test if bug
+            // is only in split path.
+            if cfg.qwen35.is_some()
+                && std::env::var("VF_QWEN35_FORCE_DRAIN").is_ok()
+            {
+                let _ = fwd.mid_frame_submit_and_wait(ctx.dev, ctx.cmd);
+            }
             fwd.run_rms_norm_mul_rope(
                 ctx.dev, ctx.registry, ctx.cmd,
                 q_buf, wqn, q_buf,
@@ -450,6 +487,12 @@ impl DecodeExec {
                 cfg.rms_norm_eps, "rms_norm_mul_rope_q",
             );
             fwd.mark_written(&[q_buf]);
+            // Sprint G-2i Test 6 — drain AFTER fused step too.
+            if cfg.qwen35.is_some()
+                && std::env::var("VF_QWEN35_FORCE_DRAIN").is_ok()
+            {
+                let _ = fwd.mid_frame_submit_and_wait(ctx.dev, ctx.cmd);
+            }
         }
     }
 
@@ -467,8 +510,12 @@ impl DecodeExec {
         let wkn = layer_weight(ctx.model, ctx.layer, "attn_k_norm.weight");
         let n_kv = n_kv_heads_for(cfg, ctx.layer);
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[k_buf]);
+        // Sprint G-2i — split-RNR + post-norm drain default-on for
+        // Qwen3.6. The fused rms_norm_mul_rope shader produces
+        // numerically wrong RoPE outputs on RADV/gfx1201 unless the
+        // intermediate is drained via mid_frame_submit_and_wait.
         let split = cfg.qwen35.is_some()
-            && std::env::var("VF_QWEN35_SPLIT_RNR").is_ok();
+            && std::env::var("VF_QWEN35_SPLIT_RNR_OFF").is_err();
         if split {
             fwd.run_rms_norm(
                 ctx.dev, ctx.registry, ctx.cmd,
@@ -1195,7 +1242,36 @@ impl DecodeExec {
         // Copy the new state portion of `dst` back into `ssm_state_buf`
         // at the per-layer offset so the next token's GDN dispatch
         // reads it via binding 5.
-        compute_to_transfer_barrier(ctx.dev, ctx.cmd);
+        //
+        // Sprint G-2i — full WAW/RAW barrier before the copy. The
+        // synchronisation validation layer (`validate_sync = true`)
+        // flagged WAW: cmd_copy_buffer writes `state` which was
+        // previously written by cmd_fill_buffer (init) without a
+        // chained transfer-write barrier. The intervening SHADER_READ
+        // accesses don't satisfy the WAW chain. Need:
+        //   src: SHADER_WRITE | SHADER_READ | TRANSFER_WRITE
+        //   dst: TRANSFER_READ | TRANSFER_WRITE
+        // at stages COMPUTE_SHADER|TRANSFER → TRANSFER. `compute_to_transfer_barrier`
+        // alone (SHADER_WRITE → TRANSFER_READ) covered only the dst-buffer
+        // RAW for reading, not the state-buffer WAW for writing.
+        let pre_copy = vk::MemoryBarrier::default()
+            .src_access_mask(
+                vk::AccessFlags::SHADER_WRITE
+                | vk::AccessFlags::SHADER_READ
+                | vk::AccessFlags::TRANSFER_WRITE,
+            )
+            .dst_access_mask(
+                vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE,
+            );
+        unsafe {
+            ctx.dev.device.cmd_pipeline_barrier(
+                ctx.cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                std::slice::from_ref(&pre_copy), &[], &[],
+            );
+        }
         let region = vk::BufferCopy {
             src_offset: (s_off as u64) * 4,
             dst_offset: state_offset_bytes,
@@ -1382,22 +1458,45 @@ impl BatchExec {
         );
         self.b_subscriber_q_barrier(cfg, ctx);
 
-        // Strided copy: batch_qgate[t, 0..q_dim] → batch_q[t, 0..q_dim]
-        // for each of `seq_len` tokens. cmd_copy_buffer accepts a
-        // multi-region array so the whole extraction is one transfer
-        // submission. Compute → transfer barrier flushes the GEMM
-        // writes; transfer → compute barrier covers the downstream
-        // QNormRope read on batch_q.
-        let q_bytes_per_token = (q_dim as u64) * 4;
+        // Sprint G-2i — BatchExec Q-Gate deinterleave fix.
+        //
+        // Qwen3.6's GEMM output for `attn_q.weight` lays out per token
+        // 12288 floats as INTERLEAVED-per-head:
+        //   [ Q_h0 (256), G_h0 (256), Q_h1 (256), G_h1 (256), …, Q_h23, G_h23 ]
+        // (same layout discovered in G-2g for the DecodeExec path —
+        // verified empirically by VF_FORCE_PER_TOKEN_PREFILL=1 giving
+        // coherent " Paris." output where BatchExec gives gibberish).
+        //
+        // VF's downstream b_step_q_norm_rope / b_step_attention read
+        // `batch_q` as CONTIGUOUS [ Q_h0, Q_h1, …, Q_h23 ] per token.
+        // The previous extraction (one 6144-float copy per token from
+        // offset 0) yielded [ Q_h0, G_h0, Q_h1, G_h1, … ] — every other
+        // head was a Gate-as-Q. That was the BatchExec twin of the
+        // G-2g DecodeExec bug.
+        //
+        // Fix: emit `seq_len × n_heads` 256-float copies that pick the
+        // Q half of each head's 512-float slice and pack them
+        // contiguously into batch_q. Gate stays interleaved in
+        // batch_qgate; b_step_attn_gated_output handles the gate via
+        // sigmoid_mul's strided form (chunk=head_dim, stride=2×head_dim,
+        // gate_offset=head_dim).
+        let head_dim = cfg.head_dim;
+        let n_heads = cfg.n_heads;
+        let head_bytes = (head_dim as u64) * 4;
+        let stride_bytes_per_head = head_bytes * 2;
         let qgate_stride = (total_dim as u64) * 4;
-        let mut regions = Vec::with_capacity(seq_len as usize);
+        let q_bytes_per_token = (q_dim as u64) * 4;
+        let mut regions =
+            Vec::with_capacity((seq_len as usize) * (n_heads as usize));
         for t in 0..seq_len as u64 {
-            regions.push(
-                vk::BufferCopy::default()
-                    .src_offset(t * qgate_stride)
-                    .dst_offset(t * q_bytes_per_token)
-                    .size(q_bytes_per_token),
-            );
+            for h in 0..n_heads as u64 {
+                regions.push(
+                    vk::BufferCopy::default()
+                        .src_offset(t * qgate_stride + h * stride_bytes_per_head)
+                        .dst_offset(t * q_bytes_per_token + h * head_bytes)
+                        .size(head_bytes),
+                );
+            }
         }
         let pre = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
@@ -1546,13 +1645,43 @@ impl BatchExec {
         let seq_len = batch_seq_len(ctx);
         let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
         let wqn = layer_weight(ctx.model, ctx.layer, "attn_q_norm.weight");
-        fwd.run_rms_norm_mul_rope(
-            ctx.dev, ctx.registry, ctx.cmd,
-            fwd.batch_q.handle, wqn, fwd.batch_q.handle,
-            head_dim, rotary_dim, freq_base, theta_scale,
-            cfg.n_heads, seq_len,
-            cfg.rms_norm_eps, "rms_norm_mul_rope_q_b",
-        );
+        // Sprint G-2i — Qwen3.6 BatchExec also needs split RMSNorm + RoPE
+        // and an unconditional `compute_barrier` between them. The fused
+        // shader's intra-WG `barrier()` between the rms_norm phase and
+        // the rope phase appears insufficient on RADV/gfx1201 for the
+        // shape (m=seq_len) BatchExec uses — splitting gives `Paris.`
+        // coherence on the standard chat template, fused gives garbage.
+        let split = cfg.qwen35.is_some();
+        if split {
+            fwd.run_rms_norm(
+                ctx.dev, ctx.registry, ctx.cmd,
+                fwd.batch_q.handle, wqn, fwd.batch_q.handle,
+                head_dim, cfg.n_heads * seq_len,
+                cfg.rms_norm_eps, "rms_norm_q_b_split",
+            );
+            super::super::arch::compute_barrier(ctx.dev, ctx.cmd);
+            // run_rope_batch sets ne01=heads_per_token, ne02=seq_len,
+            // so the shader reads `rope_data_pos[token_idx]` per (head,
+            // token). run_rope_neox_with_pos_offset would set ne02=1
+            // and feed every token rope_pos[0], which only works for
+            // decode (single token).
+            fwd.run_rope_batch(
+                ctx.dev, ctx.registry, ctx.cmd,
+                fwd.batch_q.handle, fwd.batch_q.handle,
+                head_dim, rotary_dim, freq_base, theta_scale,
+                cfg.n_heads, seq_len,
+                "rope_neox_q_b_split",
+            );
+            super::super::arch::compute_barrier(ctx.dev, ctx.cmd);
+        } else {
+            fwd.run_rms_norm_mul_rope(
+                ctx.dev, ctx.registry, ctx.cmd,
+                fwd.batch_q.handle, wqn, fwd.batch_q.handle,
+                head_dim, rotary_dim, freq_base, theta_scale,
+                cfg.n_heads, seq_len,
+                cfg.rms_norm_eps, "rms_norm_mul_rope_q_b",
+            );
+        }
         // Sprint 46H + 47D — subscribers skip the K side; without this
         // barrier Attention races with Q. Owner: K-norm-rope's trailing
         // barrier covers both.
@@ -1571,13 +1700,32 @@ impl BatchExec {
         let seq_len = batch_seq_len(ctx);
         let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
         let wkn = layer_weight(ctx.model, ctx.layer, "attn_k_norm.weight");
-        fwd.run_rms_norm_mul_rope(
-            ctx.dev, ctx.registry, ctx.cmd,
-            fwd.batch_k.handle, wkn, fwd.batch_k.handle,
-            head_dim, rotary_dim, freq_base, theta_scale,
-            n_kv_heads_for(cfg, ctx.layer), seq_len,
-            cfg.rms_norm_eps, "rms_norm_mul_rope_k_b",
-        );
+        let n_kv = n_kv_heads_for(cfg, ctx.layer);
+        let split = cfg.qwen35.is_some();
+        if split {
+            fwd.run_rms_norm(
+                ctx.dev, ctx.registry, ctx.cmd,
+                fwd.batch_k.handle, wkn, fwd.batch_k.handle,
+                head_dim, n_kv * seq_len,
+                cfg.rms_norm_eps, "rms_norm_k_b_split",
+            );
+            super::super::arch::compute_barrier(ctx.dev, ctx.cmd);
+            fwd.run_rope_batch(
+                ctx.dev, ctx.registry, ctx.cmd,
+                fwd.batch_k.handle, fwd.batch_k.handle,
+                head_dim, rotary_dim, freq_base, theta_scale,
+                n_kv, seq_len,
+                "rope_neox_k_b_split",
+            );
+        } else {
+            fwd.run_rms_norm_mul_rope(
+                ctx.dev, ctx.registry, ctx.cmd,
+                fwd.batch_k.handle, wkn, fwd.batch_k.handle,
+                head_dim, rotary_dim, freq_base, theta_scale,
+                n_kv, seq_len,
+                cfg.rms_norm_eps, "rms_norm_mul_rope_k_b",
+            );
+        }
         compute_barrier(ctx.dev, ctx.cmd);
     }
 
@@ -1754,15 +1902,20 @@ impl BatchExec {
         compute_barrier(ctx.dev, ctx.cmd);
     }
 
-    /// Sprint D2 (v0.4.6) — Qwen3.6 Full-Attention gated output,
-    /// batch path. Reads Gate from `batch_qgate` with per-token
-    /// stride `2 × q_dim` (Gate offset within stride = `q_dim`,
-    /// since Q sits in the front half) and applies an in-place
-    /// sigmoid multiply on `batch_attn_out`.
+    /// Sprint G-2i (v0.4.6, ex-D2) — Qwen3.6 Full-Attention gated output,
+    /// batch path. Reads Gate from `batch_qgate` which is **interleaved
+    /// per head** (not concat-halves as the pre-G-2i comment claimed):
+    /// `[Q_h0(256), G_h0(256), Q_h1(256), G_h1(256), …]` per token.
+    /// `sigmoid_mul`'s strided form handles this with chunk = head_dim,
+    /// stride = 2 × head_dim, gate_offset = head_dim. The shader's
+    /// `token` becomes a flat-head index across the whole batch; the
+    /// per-token offset folds into stride-per-head arithmetic
+    /// automatically (real_token × n_heads × stride + real_head ×
+    /// stride yields the right offset into batch_qgate).
     pub(super) fn b_step_attn_gated_output(
         &self,
         fwd: &mut Forward,
-        _cfg: &ModelConfig,
+        cfg: &ModelConfig,
         ctx: &ExecCtx,
         q_dim: u32,
     ) {
@@ -1773,14 +1926,17 @@ impl BatchExec {
             .expect("AttnGatedOutput emitted but batch_qgate not allocated (cfg.qwen35 is None)")
             .handle;
         let ne = seq_len * q_dim;
-        let stride = q_dim * 2;
+        let head_dim = cfg.head_dim;
+        // Sprint G-2i — interleaved-per-head gate layout: per (token,
+        // head) the gate sits at offset head_dim within a 2 × head_dim
+        // slice.
         fwd.run_sigmoid_mul(
             ctx.dev, ctx.registry, ctx.cmd,
             qgate, fwd.batch_attn_out.handle,
-            ne,         // total elements in attn_out (seq × q_dim)
-            q_dim,      // chunk: elements per token in attn_out
-            stride,     // stride: elements per token in batch_qgate
-            q_dim,      // gate_offset within stride (Gate after Q)
+            ne,           // total elements in attn_out (seq × q_dim)
+            head_dim,     // chunk: per-head elements in attn_out
+            2 * head_dim, // stride: per-head elements in batch_qgate (Q+G)
+            head_dim,     // gate_offset within stride (Gate after Q)
             "sigmoid_mul_gated_out_b",
         );
         compute_barrier(ctx.dev, ctx.cmd);
