@@ -30,6 +30,8 @@ use super::arch::{
     layer_weight_scale_buf, layer_weight_scale_scalar, layer_weight_shader,
     n_kv_heads_for,
 };
+use super::executor::ExecCtx;
+use super::layer_plan::LayerStep;
 use super::state::{DebugTarget, Forward};
 
 impl Forward {
@@ -408,6 +410,215 @@ impl Forward {
             &bytes_slice[..(self.config.hidden_dim as usize) * 4],
         )
         .to_vec())
+    }
+}
+
+// ── Sprint G-2f throwaway: per-step dump for Qwen3.6 coherence bisect ──
+//
+// `VF_DUMP_LAYER_0=1` activates `dump_after_step` after every LayerStep on
+// layer 0 of the DECODE path. Each dump stages a slice of the relevant SSM
+// scratch buffer into `cur().scratch_a` (host-visible, 5120 floats wide),
+// then mid-frame-submits + waits + reads + prints first-10 floats and
+// min/max/mean stats.
+//
+// REQUIREMENTS for callers:
+// - Set `VULKANFORGE_DISABLE_ASYNC_DECODE=1` to avoid the async-decode
+//   hazard (see `memory/feedback_async_decode_dump_hazard.md`).
+// - Caps dump width at 5120 floats (scratch_a size at hidden_dim=5120);
+//   stats are computed over the sampled subset, not the whole buffer.
+// - Throwaway: REMOVE THIS BLOCK + the `dump_after_step` call in
+//   `executor/mod.rs` once the bisect lands a coherent Qwen3.6 fix.
+
+/// Sprint G-2f — copy `[src_buf @ off_floats .. off_floats + n_floats)` to
+/// host, print first 10 floats + min/max/mean over the read region.
+///
+/// `n_floats` is clamped to `scratch_a` capacity (`hidden_dim`, currently
+/// 5120 on Qwen3.6). Mid-frame-submits + waits — expensive, do not call
+/// outside `VF_DUMP_LAYER_0` gate.
+pub(super) fn dump_buffer_layer0(
+    fwd: &mut Forward,
+    dev: &VulkanDevice,
+    cmd: vk::CommandBuffer,
+    src_buf: vk::Buffer,
+    off_floats: u64,
+    n_floats: usize,
+    label: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Cap to first hidden_dim floats — Sprint G-2f bisect prints first 10
+    // + small magnitude stats; full-buffer stats aren't needed and we'd
+    // need a much larger staging anyway. `hidden_staging` is 64 ×
+    // hidden_dim × 4 (= 1.28 MB on Qwen3.6) so we have plenty of room.
+    let cap = fwd.config.hidden_dim as usize;
+    let n = n_floats.min(cap);
+    let bytes = (n as u64) * 4;
+    let off_bytes = off_floats * 4;
+
+    // CRITICAL: do NOT use `cur().scratch_a` as the staging here — it's
+    // the layer's input buffer at layer 0 and overwriting it corrupts
+    // AttnResidualAdd's `input` operand (Sprint G-2f false-positive trap).
+    // Use `hidden_staging` (separate, GpuToCpu, only written by
+    // dispatch_final which hasn't run yet for layer 0).
+    let stage = fwd.hidden_staging.handle;
+    unsafe {
+        let pre = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(src_buf)
+            .offset(0)
+            .size(vk::WHOLE_SIZE);
+        dev.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[], std::slice::from_ref(&pre), &[],
+        );
+        let copy = vk::BufferCopy::default()
+            .src_offset(off_bytes).dst_offset(0).size(bytes);
+        dev.device.cmd_copy_buffer(cmd, src_buf, stage, std::slice::from_ref(&copy));
+        let post = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(stage)
+            .offset(0)
+            .size(vk::WHOLE_SIZE);
+        dev.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            &[], std::slice::from_ref(&post), &[],
+        );
+    }
+
+    fwd.mid_frame_submit_and_wait(dev, cmd)?;
+
+    let raw = fwd.hidden_staging.read_bytes()?;
+    let floats: &[f32] = bytemuck::cast_slice(&raw[..n * 4]);
+
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    let mut sum = 0.0_f64;
+    let mut nan = 0u32;
+    for &v in floats {
+        if v.is_nan() { nan += 1; continue; }
+        if v < min { min = v; }
+        if v > max { max = v; }
+        sum += v as f64;
+    }
+    let valid = (n as u32).saturating_sub(nan).max(1) as f64;
+    let mean = sum / valid;
+    let head: Vec<f32> = floats.iter().take(10).copied().collect();
+    eprintln!(
+        "[DUMP] {:<28} n={:>7} min={:>11.5} max={:>11.5} mean={:>11.5} nan={:>3}  first10={:?}",
+        label, n, min, max, mean, nan, head,
+    );
+    Ok(())
+}
+
+/// Sprint G-2f — per-step dump dispatcher. Reads the relevant scratch
+/// buffer for `step`, writes it to stderr. No-op when:
+/// - `ctx.layer != 0` (caller already gates, but defensive)
+/// - `step` is not in the Qwen3.6 Linear-Attn sequence (only SSM steps + AttnNorm)
+/// - `cfg.qwen35.is_none()` (other architectures don't have the SSM buffers)
+pub(super) fn dump_after_step(fwd: &mut Forward, ctx: &ExecCtx, step: &LayerStep) {
+    // Caller (executor/mod.rs) gates layer + position; here we just dump.
+    let pos_tag = match ctx.mode {
+        super::executor::ExecMode::Decode { position, .. } => position,
+        _ => 0,
+    };
+    let layer_tag = format!("L{}p{}", ctx.layer, pos_tag);
+    let cfg = fwd.config.clone();
+    let Some(spec) = cfg.qwen35.as_ref() else { return; };
+    let head_k = spec.head_k_dim() as u64;          // 128
+    let n_k    = spec.num_k_heads() as u64;          // 16
+    let head_v = spec.head_v_dim() as u64;          // 128
+    let n_v    = spec.num_v_heads() as u64;          // 48
+    let inner  = spec.ssm_d_inner as u64;            // 6144 = head_v × n_v
+    let conv_c = spec.conv_channels() as u64;        // 10240 = 2·head_k·n_k + head_v·n_v
+    let qk_slice = (head_k * n_k) as usize;          // 2048
+
+    // Helper to print after running an attempt; ignore Err to avoid
+    // killing the run on a single dump failure.
+    let dev = ctx.dev;
+    let cmd = ctx.cmd;
+
+    match step {
+        LayerStep::AttnNorm => {
+            let h = fwd.cur().hidden_norm.handle;
+            let _ = dump_buffer_layer0(fwd, dev, cmd, h, 0, cfg.hidden_dim as usize, &format!("{layer_tag} attn_norm"));
+        }
+        LayerStep::AttnQkvProj { .. } => {
+            let h = fwd.ssm_qkv_buf.as_ref().unwrap().handle;
+            let _ = dump_buffer_layer0(fwd, dev, cmd, h, 0, conv_c as usize, &format!("{layer_tag} ssm_qkv_proj"));
+        }
+        LayerStep::AttnGateZProj { .. } => {
+            let h = fwd.ssm_z_buf.as_ref().unwrap().handle;
+            let _ = dump_buffer_layer0(fwd, dev, cmd, h, 0, inner as usize, &format!("{layer_tag} ssm_gate_z_proj"));
+        }
+        LayerStep::SsmBetaProj { .. } => {
+            let h = fwd.ssm_beta_buf.as_ref().unwrap().handle;
+            let _ = dump_buffer_layer0(fwd, dev, cmd, h, 0, n_v as usize, &format!("{layer_tag} ssm_beta_proj"));
+        }
+        LayerStep::SsmAlphaGate { .. } => {
+            let h = fwd.ssm_gate_buf.as_ref().unwrap().handle;
+            let _ = dump_buffer_layer0(fwd, dev, cmd, h, 0, n_v as usize, &format!("{layer_tag} ssm_alpha_gate"));
+        }
+        LayerStep::SsmConv1d { .. } => {
+            let h = fwd.ssm_conv_output_buf.as_ref().unwrap().handle;
+            let _ = dump_buffer_layer0(fwd, dev, cmd, h, 0, conv_c as usize, &format!("{layer_tag} ssm_conv1d"));
+        }
+        LayerStep::SsmSilu { .. } => {
+            let h = fwd.ssm_conv_output_buf.as_ref().unwrap().handle;
+            let _ = dump_buffer_layer0(fwd, dev, cmd, h, 0, conv_c as usize, &format!("{layer_tag} ssm_silu"));
+        }
+        LayerStep::SsmQkL2Norm { .. } => {
+            let h = fwd.ssm_conv_output_buf.as_ref().unwrap().handle;
+            let _ = dump_buffer_layer0(fwd, dev, cmd, h, 0, qk_slice, &format!("{layer_tag} ssm_qk_l2_norm_Q"));
+            let _ = dump_buffer_layer0(fwd, dev, cmd, h, qk_slice as u64, qk_slice, &format!("{layer_tag} ssm_qk_l2_norm_K"));
+        }
+        LayerStep::SsmRepeatQK { .. } => {
+            let q = fwd.ssm_qrep_buf.as_ref().unwrap().handle;
+            let k = fwd.ssm_krep_buf.as_ref().unwrap().handle;
+            let _ = dump_buffer_layer0(fwd, dev, cmd, q, 0, inner as usize, &format!("{layer_tag} ssm_repeat_Q"));
+            let _ = dump_buffer_layer0(fwd, dev, cmd, k, 0, inner as usize, &format!("{layer_tag} ssm_repeat_K"));
+        }
+        LayerStep::GatedDeltaNet { .. } => {
+            let dst = fwd.ssm_gdn_out_buf.as_ref().unwrap().handle;
+            // GDN output (first H × S_v = 6144 floats) + sample of new state.
+            let _ = dump_buffer_layer0(fwd, dev, cmd, dst, 0, inner as usize, &format!("{layer_tag} gdn_output"));
+            // The next slot is the new state — sample first 512 floats only.
+            let s_off = inner; // floats
+            let _ = dump_buffer_layer0(fwd, dev, cmd, dst, s_off, 512, &format!("{layer_tag} gdn_new_state"));
+        }
+        LayerStep::NormGated { .. } => {
+            let h = fwd.ssm_norm_out_buf.as_ref().unwrap().handle;
+            let _ = dump_buffer_layer0(fwd, dev, cmd, h, 0, inner as usize, &format!("{layer_tag} norm_gated"));
+        }
+        LayerStep::SsmOutProj { .. } => {
+            let h = fwd.cur().o_buf.handle;
+            let _ = dump_buffer_layer0(fwd, dev, cmd, h, 0, cfg.hidden_dim as usize, &format!("{layer_tag} ssm_out_proj"));
+        }
+        LayerStep::AttnResidualAdd => {
+            let r = fwd.cur().res1.handle;
+            let _ = dump_buffer_layer0(fwd, dev, cmd, r, 0, cfg.hidden_dim as usize, &format!("{layer_tag} attn_residual"));
+        }
+        LayerStep::PreFfnNorm => {
+            let h = fwd.cur().hidden_norm.handle;
+            let _ = dump_buffer_layer0(fwd, dev, cmd, h, 0, cfg.hidden_dim as usize, &format!("{layer_tag} post_attn_norm"));
+        }
+        LayerStep::FfnResidualAdd => {
+            // Output buffer for this layer = decode_io's `output`. Read it
+            // via the executor's ExecMode::Decode { output, .. }.
+            if let super::executor::ExecMode::Decode { output, .. } = ctx.mode {
+                let _ = dump_buffer_layer0(fwd, dev, cmd, output, 0, cfg.hidden_dim as usize, &format!("{layer_tag} ffn_residual"));
+            }
+        }
+        _ => {}
     }
 }
 

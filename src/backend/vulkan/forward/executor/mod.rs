@@ -281,6 +281,31 @@ impl DecodeExec {
                 continue;
             }
             self.execute_step(fwd, &plan[i], &cfg, ctx);
+            // Sprint G-2f throwaway — per-step dump on layer 0 (and
+            // optionally layer 1 via `VF_DUMP_LAYER_1=1`) for the
+            // Qwen3.6 Linear-Attn coherence bisect. Gated to position 0
+            // (first token) to keep the output compact and aligned with
+            // llama-eval-callback's per-batch column-0 tensors. Remove
+            // once the bug is found + fixed (see debug.rs).
+            if std::env::var("VF_DUMP_LAYER_0").is_ok() {
+                // Layers: default {0}, override via VF_DUMP_LAYERS=0,1,30
+                // Positions: default {0}, override via VF_DUMP_POSITIONS=0,1,4
+                let dump_layers: Vec<u32> = std::env::var("VF_DUMP_LAYERS")
+                    .unwrap_or_else(|_| "0".to_string())
+                    .split(',')
+                    .filter_map(|s| s.trim().parse().ok())
+                    .collect();
+                let dump_positions: Vec<u32> = std::env::var("VF_DUMP_POSITIONS")
+                    .unwrap_or_else(|_| "0".to_string())
+                    .split(',')
+                    .filter_map(|s| s.trim().parse().ok())
+                    .collect();
+                let layer_match = dump_layers.contains(&ctx.layer);
+                let pos_match = matches!(ctx.mode, ExecMode::Decode { position, .. } if dump_positions.contains(&position));
+                if layer_match && pos_match {
+                    super::debug::dump_after_step(fwd, ctx, &plan[i]);
+                }
+            }
             i += 1;
         }
     }

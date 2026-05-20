@@ -571,8 +571,14 @@ fn render_mistral_continuation(tokenizer: &Tokenizer, user: &str) -> Vec<u32> {
 
 fn render_raw_first(tokenizer: &Tokenizer, system: &str, user: &str) -> Vec<u32> {
     let mut tokens = Vec::new();
-    if let Some(bos) = tokenizer.bos_id {
-        tokens.push(bos);
+    // Sprint G-2f throwaway — `VF_RAW_NOBOS=1` skips BOS so we match
+    // llama-eval-callback's default-no-BOS tokenization for Qwen3.6
+    // during the layer-0 bisect. Remove with the dump infra.
+    let skip_bos = std::env::var("VF_RAW_NOBOS").is_ok();
+    if !skip_bos {
+        if let Some(bos) = tokenizer.bos_id {
+            tokens.push(bos);
+        }
     }
     if !system.is_empty() {
         tokens.extend(tokenizer.encode(system));

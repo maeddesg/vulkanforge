@@ -200,12 +200,17 @@ impl ChatSession {
             }
         };
 
+        // Sprint G-2f throwaway — env-gate to force per-token prefill so
+        // `VF_DUMP_LAYER_0` can dump every prompt token through the
+        // DecodeExec path (BatchExec is not hooked). Remove with the
+        // dump infra once the Qwen3.6 coherence bug is fixed.
+        let force_pt_prefill = std::env::var("VF_FORCE_PER_TOKEN_PREFILL").is_ok();
         let result = generate_from_tokens(
             &mut self.forward,
             dev, registry, cmd_ctx, model,
             super::decode::EmbeddingSource::Gguf(gguf),
             cfg, tokenizer,
-            &prefill, self.current_pos, config, false, &mut on_token,
+            &prefill, self.current_pos, config, force_pt_prefill, &mut on_token,
         )
         .map_err(ChatError::Generation)?;
 
