@@ -125,6 +125,105 @@ impl DecodeExec {
             );
         }
         fwd.mark_written(&[q_buf]);
+
+        // Sprint G-2g — Qwen3.6 Q-Gate deinterleave hypothesis.
+        //
+        // llama.cpp `qwen35.cpp::build_qkvz` (lines 268-296) views Qcur_full
+        // as interleaved-per-head with `nb1 = 2 × head_dim` (stride 512
+        // floats per head): each head's 512 floats are `[Q_h (256), G_h
+        // (256)]`. VF's downstream shaders (QNormRope, flash_attn,
+        // sigmoid_mul) assume CONTIGUOUS layout `[Q_0 ... Q_23, G_0 ... G_23]`.
+        // This block physically deinterleaves via two `cmd_copy_buffer`
+        // passes using `up_buf` as scratch.
+        //
+        // Empirical result: applying this fix changes L4 attn_norm[0] from
+        // -0.0934 (drift -60% vs llama -0.2318) to +0.2299 (drift +200%).
+        // The fix moves the values significantly but does NOT restore
+        // coherence — needs G-2h to bisect L3's internal stages (Q/K/V,
+        // Attention, gated_output) against llama's `Qcur_normed`,
+        // `attn_pregate`, `attn_output`, etc. to find why.
+        //
+        // Gated behind `VF_QGATE_DEINTERLEAVE=1` so the bisect-active
+        // branch can be flipped without rebuilding for ablation runs.
+        if cfg.qwen35.is_some()
+            && std::env::var("VF_QGATE_DEINTERLEAVE").is_ok()
+        {
+            let head_dim = cfg.head_dim;
+            let n_heads = cfg.n_heads;
+            let head_bytes = (head_dim as u64) * 4;
+            let stride_bytes = head_bytes * 2;
+            let q_total_bytes = (q_dim as u64) * 4;
+            let scratch = fwd.cur().up_buf.handle;
+
+            let pre = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            unsafe {
+                ctx.dev.device.cmd_pipeline_barrier(
+                    ctx.cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&pre), &[], &[],
+                );
+            }
+
+            let mut regions: Vec<vk::BufferCopy> =
+                Vec::with_capacity(2 * n_heads as usize);
+            for h in 0..n_heads as u64 {
+                regions.push(
+                    vk::BufferCopy::default()
+                        .src_offset(h * stride_bytes)
+                        .dst_offset(h * head_bytes)
+                        .size(head_bytes),
+                );
+                regions.push(
+                    vk::BufferCopy::default()
+                        .src_offset(h * stride_bytes + head_bytes)
+                        .dst_offset(q_total_bytes + h * head_bytes)
+                        .size(head_bytes),
+                );
+            }
+            fwd.profile("q_gate_deinterleave", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
+                dev.device.cmd_copy_buffer(cmd, q_buf, scratch, &regions);
+            });
+
+            let mid = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            unsafe {
+                ctx.dev.device.cmd_pipeline_barrier(
+                    ctx.cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&mid), &[], &[],
+                );
+            }
+
+            let total_bytes = (out_dim as u64) * 4;
+            let copy_back = vk::BufferCopy::default()
+                .src_offset(0)
+                .dst_offset(0)
+                .size(total_bytes);
+            fwd.profile("q_gate_copy_back", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
+                dev.device.cmd_copy_buffer(cmd, scratch, q_buf, std::slice::from_ref(&copy_back));
+            });
+
+            let post = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            unsafe {
+                ctx.dev.device.cmd_pipeline_barrier(
+                    ctx.cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&post), &[], &[],
+                );
+            }
+            fwd.mark_written(&[q_buf]);
+        }
     }
 
     pub(super) fn step_k_proj(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
