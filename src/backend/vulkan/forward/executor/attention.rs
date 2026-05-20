@@ -406,9 +406,11 @@ impl DecodeExec {
             );
             fwd.mark_written(&[q_buf]);
             super::super::arch::compute_barrier(ctx.dev, ctx.cmd);
-            if ctx.layer == 3 {
-                let _ = fwd.mid_frame_submit_and_wait(ctx.dev, ctx.cmd);
-            }
+            // Sprint G-3 — L3 mid_frame_submit_and_wait (added in G-2j)
+            // was phantom: only required as a proxy for the async-decode
+            // race. With sync-decode default-on for qwen35 (see
+            // decode.rs:570) the L3 drain produces no behavioural
+            // change. Removed.
             fwd.run_rope_neox_with_pos_offset(
                 ctx.dev, ctx.registry, ctx.cmd, q_buf, q_buf,
                 head_dim, rotary_dim, freq_base, theta_scale,

@@ -201,12 +201,12 @@ impl ChatSession {
         };
 
         // Sprint G-2i — Qwen3.6 BatchExec prefill has unidentified
-        // barrier/layout bugs that DecodeExec path doesn't share. Until
-        // a future sprint locates the BatchExec divergence, route the
-        // prefill through DecodeExec per-token. Slow on long prompts
-        // (~22 tok/s vs ~67 for BatchExec), but COHERENT. Other archs
-        // (Qwen3, Gemma-4, Llama) unaffected — they keep BatchExec.
-        // Sprint G-2f throwaway env-var stays as escape hatch.
+        // barrier/layout bugs that DecodeExec path doesn't share.
+        // Sprint G-3 Phase 4 re-confirmed: BatchExec emits empty/single-
+        // token gibberish for default chat prompts even after the G-2i
+        // deinterleave fix. Per-token-prefill stays default for Qwen3.6
+        // until G-4+ locates the divergence (deferred — speed work
+        // focuses on decode where the win is bigger).
         let force_pt_prefill = cfg.qwen35.is_some()
             || std::env::var("VF_FORCE_PER_TOKEN_PREFILL").is_ok();
         let result = generate_from_tokens(
