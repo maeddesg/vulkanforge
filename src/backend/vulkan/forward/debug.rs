@@ -618,6 +618,78 @@ pub(super) fn dump_after_step(fwd: &mut Forward, ctx: &ExecCtx, step: &LayerStep
                 let _ = dump_buffer_layer0(fwd, dev, cmd, output, 0, cfg.hidden_dim as usize, &format!("{layer_tag} ffn_residual"));
             }
         }
+        // ── Sprint G-2h Full-Attn dump points (L3 / L7 / … bisect) ──
+        LayerStep::AttnQGateProj { q_dim } => {
+            let q = fwd.cur().q_buf.handle;
+            let q_dim_u = *q_dim as usize;
+            // First Q-only slice (post-deinterleave when env-gate on; raw
+            // interleaved otherwise).
+            let _ = dump_buffer_layer0(fwd, dev, cmd, q, 0, q_dim_u, &format!("{layer_tag} qgate_proj_Q"));
+            // Gate slice (post-deinterleave: contiguous at offset q_dim;
+            // pre-deinterleave: actually 2nd dim of head 0).
+            let _ = dump_buffer_layer0(fwd, dev, cmd, q, q_dim_u as u64, q_dim_u, &format!("{layer_tag} qgate_proj_G"));
+            // Probe positions 0, 256, 512 for layout verification:
+            let head_dim = cfg.head_dim as u64;
+            let _ = dump_buffer_layer0(fwd, dev, cmd, q, 0, 16, &format!("{layer_tag} qgate_first16"));
+            let _ = dump_buffer_layer0(fwd, dev, cmd, q, head_dim, 16, &format!("{layer_tag} qgate_at_head_dim"));
+            let _ = dump_buffer_layer0(fwd, dev, cmd, q, 2 * head_dim, 16, &format!("{layer_tag} qgate_at_2x_head_dim"));
+        }
+        LayerStep::QNormRope { .. } | LayerStep::QRope { .. } => {
+            let q = fwd.cur().q_buf.handle;
+            let q_dim = (cfg.n_heads * cfg.head_dim) as usize;
+            let _ = dump_buffer_layer0(fwd, dev, cmd, q, 0, q_dim, &format!("{layer_tag} q_post_normrope"));
+            // Dump head 0 first 16 floats specifically.
+            let _ = dump_buffer_layer0(fwd, dev, cmd, q, 0, 16, &format!("{layer_tag} q_h0_first16"));
+        }
+        LayerStep::KProj => {
+            let k = fwd.cur().k_buf.handle;
+            // Determine kv_dim via metadata (n_kv_heads for FA layer).
+            let kv_dim = if let Some(spec) = cfg.qwen35.as_ref() {
+                if spec.is_full_attention_layer(ctx.layer) {
+                    (spec.n_head_kv_full_attn * cfg.head_dim) as usize
+                } else { 0 }
+            } else { (cfg.n_kv_heads * cfg.head_dim) as usize };
+            if kv_dim > 0 {
+                let _ = dump_buffer_layer0(fwd, dev, cmd, k, 0, kv_dim, &format!("{layer_tag} k_proj"));
+            }
+        }
+        LayerStep::KNormRope { .. } | LayerStep::KRope { .. } => {
+            let k = fwd.cur().k_buf.handle;
+            let kv_dim = if let Some(spec) = cfg.qwen35.as_ref() {
+                if spec.is_full_attention_layer(ctx.layer) {
+                    (spec.n_head_kv_full_attn * cfg.head_dim) as usize
+                } else { 0 }
+            } else { (cfg.n_kv_heads * cfg.head_dim) as usize };
+            if kv_dim > 0 {
+                let _ = dump_buffer_layer0(fwd, dev, cmd, k, 0, kv_dim, &format!("{layer_tag} k_post_normrope"));
+                let _ = dump_buffer_layer0(fwd, dev, cmd, k, 0, 16, &format!("{layer_tag} k_h0_first16"));
+            }
+        }
+        LayerStep::VProj => {
+            let v = fwd.cur().v_buf.handle;
+            let kv_dim = if let Some(spec) = cfg.qwen35.as_ref() {
+                if spec.is_full_attention_layer(ctx.layer) {
+                    (spec.n_head_kv_full_attn * cfg.head_dim) as usize
+                } else { 0 }
+            } else { (cfg.n_kv_heads * cfg.head_dim) as usize };
+            if kv_dim > 0 {
+                let _ = dump_buffer_layer0(fwd, dev, cmd, v, 0, kv_dim, &format!("{layer_tag} v_proj"));
+            }
+        }
+        LayerStep::Attention { .. } => {
+            let a = fwd.cur().attn_out.handle;
+            let q_dim = (cfg.n_heads * cfg.head_dim) as usize;
+            let _ = dump_buffer_layer0(fwd, dev, cmd, a, 0, q_dim, &format!("{layer_tag} attn_pregate"));
+        }
+        LayerStep::AttnGatedOutput { .. } => {
+            let a = fwd.cur().attn_out.handle;
+            let q_dim = (cfg.n_heads * cfg.head_dim) as usize;
+            let _ = dump_buffer_layer0(fwd, dev, cmd, a, 0, q_dim, &format!("{layer_tag} attn_gated"));
+        }
+        LayerStep::OProj => {
+            let o = fwd.cur().o_buf.handle;
+            let _ = dump_buffer_layer0(fwd, dev, cmd, o, 0, cfg.hidden_dim as usize, &format!("{layer_tag} o_proj"));
+        }
         _ => {}
     }
 }

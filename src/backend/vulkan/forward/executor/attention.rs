@@ -381,15 +381,76 @@ impl DecodeExec {
         let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
         let q_buf = fwd.cur().q_buf.handle;
         let wqn = layer_weight(ctx.model, ctx.layer, "attn_q_norm.weight");
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[q_buf]);
-        fwd.run_rms_norm_mul_rope(
-            ctx.dev, ctx.registry, ctx.cmd,
-            q_buf, wqn, q_buf,
-            head_dim, rotary_dim, freq_base, theta_scale,
-            cfg.n_heads, 1,
-            cfg.rms_norm_eps, "rms_norm_mul_rope_q",
-        );
-        fwd.mark_written(&[q_buf]);
+        // Sprint G-2h — UNCONDITIONAL transfer-to-compute barrier on
+        // q_buf at step entry. The Q-Gate-deinterleave path (above)
+        // writes q_buf via TRANSFER (cmd_copy_buffer). The fused-path
+        // shader reads q_buf via SHADER_READ. The deinterleave emits a
+        // TRANSFER_WRITE→SHADER_READ post-barrier, but
+        // `maybe_compute_barrier` (next-step protocol) issues
+        // COMPUTE→COMPUTE which doesn't cover the TRANSFER source. Add
+        // an explicit barrier here on Qwen3.6 to be safe.
+        if cfg.qwen35.is_some() {
+            let mb = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            unsafe {
+                ctx.dev.device.cmd_pipeline_barrier(
+                    ctx.cmd,
+                    vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&mb), &[], &[],
+                );
+            }
+        } else {
+            fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[q_buf]);
+        }
+        // Sprint G-2h — Qwen3.6 split path: separate RMSNorm + RoPE
+        // dispatches (instead of fused `rms_norm_mul_rope`) so each
+        // intermediate is dumpable. Toggled with VF_QWEN35_SPLIT_RNR=1
+        // for bisect-active runs. Production gate (post-coherence) will
+        // promote this to default for cfg.qwen35.is_some().
+        let split = cfg.qwen35.is_some()
+            && std::env::var("VF_QWEN35_SPLIT_RNR").is_ok();
+        if split {
+            fwd.run_rms_norm(
+                ctx.dev, ctx.registry, ctx.cmd,
+                q_buf, wqn, q_buf,
+                head_dim, cfg.n_heads,
+                cfg.rms_norm_eps, "rms_norm_q_split",
+            );
+            fwd.mark_written(&[q_buf]);
+            super::super::arch::compute_barrier(ctx.dev, ctx.cmd);
+            // Sprint G-2h diag — force a CB-submit drain between split
+            // rms_norm and rope_neox when VF_QWEN35_FORCE_DRAIN=1. A
+            // simple `compute_barrier` was empirically insufficient on
+            // RADV/gfx1201 — only a full pipeline drain flipped the
+            // output from "( ( (" to "Paris". Possibly a driver/barrier
+            // visibility issue. Keep gated for diag while we
+            // investigate. Performance: ~1 ms per call × 16 full-attn
+            // layers × per-token = 16-20 % decode regression.
+            if std::env::var("VF_QWEN35_FORCE_DRAIN").is_ok() {
+                let _ = fwd.mid_frame_submit_and_wait(ctx.dev, ctx.cmd);
+            }
+            fwd.run_rope_neox_with_pos_offset(
+                ctx.dev, ctx.registry, ctx.cmd, q_buf, q_buf,
+                head_dim, rotary_dim, freq_base, theta_scale,
+                cfg.n_heads,
+                /* position = */ 0, // unused; pos is read from rope_pos_buf
+                /* pos_buf_offset = */ 0,
+                "rope_neox_q_split",
+            );
+            fwd.mark_written(&[q_buf]);
+        } else {
+            fwd.run_rms_norm_mul_rope(
+                ctx.dev, ctx.registry, ctx.cmd,
+                q_buf, wqn, q_buf,
+                head_dim, rotary_dim, freq_base, theta_scale,
+                cfg.n_heads, 1,
+                cfg.rms_norm_eps, "rms_norm_mul_rope_q",
+            );
+            fwd.mark_written(&[q_buf]);
+        }
     }
 
     pub(super) fn step_k_norm_rope(
@@ -404,15 +465,39 @@ impl DecodeExec {
         let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
         let k_buf = fwd.cur().k_buf.handle;
         let wkn = layer_weight(ctx.model, ctx.layer, "attn_k_norm.weight");
+        let n_kv = n_kv_heads_for(cfg, ctx.layer);
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[k_buf]);
-        fwd.run_rms_norm_mul_rope(
-            ctx.dev, ctx.registry, ctx.cmd,
-            k_buf, wkn, k_buf,
-            head_dim, rotary_dim, freq_base, theta_scale,
-            n_kv_heads_for(cfg, ctx.layer), 1,
-            cfg.rms_norm_eps, "rms_norm_mul_rope_k",
-        );
-        fwd.mark_written(&[k_buf]);
+        let split = cfg.qwen35.is_some()
+            && std::env::var("VF_QWEN35_SPLIT_RNR").is_ok();
+        if split {
+            fwd.run_rms_norm(
+                ctx.dev, ctx.registry, ctx.cmd,
+                k_buf, wkn, k_buf,
+                head_dim, n_kv,
+                cfg.rms_norm_eps, "rms_norm_k_split",
+            );
+            fwd.mark_written(&[k_buf]);
+            // Sprint G-2h — same unconditional barrier as Q-path.
+            super::super::arch::compute_barrier(ctx.dev, ctx.cmd);
+            fwd.run_rope_neox_with_pos_offset(
+                ctx.dev, ctx.registry, ctx.cmd, k_buf, k_buf,
+                head_dim, rotary_dim, freq_base, theta_scale,
+                n_kv,
+                /* position = */ 0,
+                /* pos_buf_offset = */ 0,
+                "rope_neox_k_split",
+            );
+            fwd.mark_written(&[k_buf]);
+        } else {
+            fwd.run_rms_norm_mul_rope(
+                ctx.dev, ctx.registry, ctx.cmd,
+                k_buf, wkn, k_buf,
+                head_dim, rotary_dim, freq_base, theta_scale,
+                n_kv, 1,
+                cfg.rms_norm_eps, "rms_norm_mul_rope_k",
+            );
+            fwd.mark_written(&[k_buf]);
+        }
     }
 
     pub(super) fn step_q_rope(
