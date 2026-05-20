@@ -126,31 +126,16 @@ impl DecodeExec {
         }
         fwd.mark_written(&[q_buf]);
 
-        // Sprint G-2g — Qwen3.6 Q-Gate deinterleave hypothesis.
+        // Sprint G-2g — Qwen3.6 Q-Gate deinterleave (default-on for
+        // qwen35 since G-2j coherence pass).
         //
-        // llama.cpp `qwen35.cpp::build_qkvz` (lines 268-296) views Qcur_full
-        // as interleaved-per-head with `nb1 = 2 × head_dim` (stride 512
-        // floats per head): each head's 512 floats are `[Q_h (256), G_h
-        // (256)]`. VF's downstream shaders (QNormRope, flash_attn,
-        // sigmoid_mul) assume CONTIGUOUS layout `[Q_0 ... Q_23, G_0 ... G_23]`.
-        // This block physically deinterleaves via two `cmd_copy_buffer`
-        // passes using `up_buf` as scratch.
-        //
-        // Empirical result: applying this fix changes L4 attn_norm[0] from
-        // -0.0934 (drift -60% vs llama -0.2318) to +0.2299 (drift +200%).
-        // The fix moves the values significantly but does NOT restore
-        // coherence — needs G-2h to bisect L3's internal stages (Q/K/V,
-        // Attention, gated_output) against llama's `Qcur_normed`,
-        // `attn_pregate`, `attn_output`, etc. to find why.
-        //
-        // Gated behind `VF_QGATE_DEINTERLEAVE=1` so the bisect-active
-        // branch can be flipped without rebuilding for ablation runs.
-        // Sprint G-2i — promoted to default-on for Qwen3.6 after
-        // coherence-verified via the bisect chain G-2g→G-2h→G-2i.
-        // The env var stays as an OFF-switch for ablation runs.
-        if cfg.qwen35.is_some()
-            && std::env::var("VF_QGATE_DEINTERLEAVE_OFF").is_err()
-        {
+        // llama.cpp `qwen35.cpp::build_qkvz` (268-296) views Qcur_full
+        // as interleaved-per-head with `nb1 = 2 × head_dim`: each head's
+        // 512 floats are `[Q_h (256), G_h (256)]`. VF's downstream
+        // shaders (QNormRope, flash_attn, sigmoid_mul) read CONTIGUOUS
+        // layout `[Q_0 ... Q_23, G_0 ... G_23]`. Deinterleave via two
+        // `cmd_copy_buffer` passes using `up_buf` as scratch.
+        if cfg.qwen35.is_some() {
             let head_dim = cfg.head_dim;
             let n_heads = cfg.n_heads;
             let head_bytes = (head_dim as u64) * 4;
@@ -384,14 +369,12 @@ impl DecodeExec {
         let (head_dim, _, _, _) = layer_dims_local(cfg, ctx.layer);
         let q_buf = fwd.cur().q_buf.handle;
         let wqn = layer_weight(ctx.model, ctx.layer, "attn_q_norm.weight");
-        // Sprint G-2h — UNCONDITIONAL transfer-to-compute barrier on
-        // q_buf at step entry. The Q-Gate-deinterleave path (above)
-        // writes q_buf via TRANSFER (cmd_copy_buffer). The fused-path
-        // shader reads q_buf via SHADER_READ. The deinterleave emits a
-        // TRANSFER_WRITE→SHADER_READ post-barrier, but
-        // `maybe_compute_barrier` (next-step protocol) issues
-        // COMPUTE→COMPUTE which doesn't cover the TRANSFER source. Add
-        // an explicit barrier here on Qwen3.6 to be safe.
+        // Sprint G-2h — Qwen3.6 needs a TRANSFER→COMPUTE barrier on
+        // q_buf at QNormRope entry: the upstream Q-Gate-deinterleave
+        // writes q_buf via cmd_copy_buffer (TRANSFER stage), and the
+        // generic `maybe_compute_barrier` only issues SHADER→SHADER.
+        // Other archs hit a plain COMPUTE write of q_buf (GEMV) so
+        // SHADER→SHADER suffices.
         if cfg.qwen35.is_some() {
             let mb = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)
@@ -408,18 +391,13 @@ impl DecodeExec {
         } else {
             fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[q_buf]);
         }
-        // Sprint G-2h — Qwen3.6 split path: separate RMSNorm + RoPE
-        // dispatches (instead of fused `rms_norm_mul_rope`) so each
-        // intermediate is dumpable. Toggled with VF_QWEN35_SPLIT_RNR=1
-        // for bisect-active runs. Production gate (post-coherence) will
-        // promote this to default for cfg.qwen35.is_some().
-        // Sprint G-2i — split-RNR + post-norm drain default-on for
-        // Qwen3.6. The fused rms_norm_mul_rope shader produces
-        // numerically wrong RoPE outputs on RADV/gfx1201 unless the
-        // intermediate is drained via mid_frame_submit_and_wait.
-        let split = cfg.qwen35.is_some()
-            && std::env::var("VF_QWEN35_SPLIT_RNR_OFF").is_err();
-        if split {
+        // Sprint G-2j — Qwen3.6 uses split RMSNorm + RoPE dispatches
+        // (fused `rms_norm_mul_rope` is numerically wrong on
+        // RADV/gfx1201 even after G-2i barrier fixes). Plus a
+        // mid-frame-submit drain at L3 (first Full-Attention layer)
+        // between the two dispatches to defuse a Heisenberg sync bug.
+        // Other archs keep the fused path.
+        if cfg.qwen35.is_some() {
             fwd.run_rms_norm(
                 ctx.dev, ctx.registry, ctx.cmd,
                 q_buf, wqn, q_buf,
@@ -428,33 +406,7 @@ impl DecodeExec {
             );
             fwd.mark_written(&[q_buf]);
             super::super::arch::compute_barrier(ctx.dev, ctx.cmd);
-            // Sprint G-2i — drain at L3. The G-2h "Paris" config
-            // achieved this via the postnorm dump which did a
-            // cmd_copy_buffer (TRANSFER) into staging + a barrier
-            // SHADER_WRITE→TRANSFER_READ before the
-            // mid_frame_submit_and_wait. Mid-frame submit alone
-            // (without the TRANSFER op) doesn't reproduce coherence —
-            // the cmd_copy_buffer appears to force some additional
-            // cache flush that pure submit-and-wait doesn't. Replicate
-            // by doing a no-op cmd_copy_buffer (q_buf → staging) under
-            // a SHADER_WRITE→TRANSFER_READ barrier.
-            if ctx.layer == 3 && std::env::var("VF_QWEN35_FORCE_DRAIN_OFF").is_err() {
-                let stage = fwd.hidden_staging.handle;
-                let pre = vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-                unsafe {
-                    ctx.dev.device.cmd_pipeline_barrier(
-                        ctx.cmd,
-                        vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::DependencyFlags::empty(),
-                        std::slice::from_ref(&pre), &[], &[],
-                    );
-                    let copy = vk::BufferCopy::default()
-                        .src_offset(0).dst_offset(0).size(64); // 16 floats
-                    ctx.dev.device.cmd_copy_buffer(ctx.cmd, q_buf, stage, std::slice::from_ref(&copy));
-                }
+            if ctx.layer == 3 {
                 let _ = fwd.mid_frame_submit_and_wait(ctx.dev, ctx.cmd);
             }
             fwd.run_rope_neox_with_pos_offset(
@@ -466,19 +418,7 @@ impl DecodeExec {
                 "rope_neox_q_split",
             );
             fwd.mark_written(&[q_buf]);
-            // Sprint G-2i — second drain at L3 (matches the
-            // dump_after_step mid-frame-submit that worked in G-2h).
-            if ctx.layer == 3 && std::env::var("VF_QWEN35_FORCE_DRAIN_OFF").is_err() {
-                let _ = fwd.mid_frame_submit_and_wait(ctx.dev, ctx.cmd);
-            }
         } else {
-            // Sprint G-2i Test 6 — fused path + DRAIN, to test if bug
-            // is only in split path.
-            if cfg.qwen35.is_some()
-                && std::env::var("VF_QWEN35_FORCE_DRAIN").is_ok()
-            {
-                let _ = fwd.mid_frame_submit_and_wait(ctx.dev, ctx.cmd);
-            }
             fwd.run_rms_norm_mul_rope(
                 ctx.dev, ctx.registry, ctx.cmd,
                 q_buf, wqn, q_buf,
@@ -487,12 +427,6 @@ impl DecodeExec {
                 cfg.rms_norm_eps, "rms_norm_mul_rope_q",
             );
             fwd.mark_written(&[q_buf]);
-            // Sprint G-2i Test 6 — drain AFTER fused step too.
-            if cfg.qwen35.is_some()
-                && std::env::var("VF_QWEN35_FORCE_DRAIN").is_ok()
-            {
-                let _ = fwd.mid_frame_submit_and_wait(ctx.dev, ctx.cmd);
-            }
         }
     }
 
@@ -510,13 +444,9 @@ impl DecodeExec {
         let wkn = layer_weight(ctx.model, ctx.layer, "attn_k_norm.weight");
         let n_kv = n_kv_heads_for(cfg, ctx.layer);
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[k_buf]);
-        // Sprint G-2i — split-RNR + post-norm drain default-on for
-        // Qwen3.6. The fused rms_norm_mul_rope shader produces
-        // numerically wrong RoPE outputs on RADV/gfx1201 unless the
-        // intermediate is drained via mid_frame_submit_and_wait.
-        let split = cfg.qwen35.is_some()
-            && std::env::var("VF_QWEN35_SPLIT_RNR_OFF").is_err();
-        if split {
+        // Sprint G-2j — Qwen3.6 uses split RMSNorm + RoPE dispatches
+        // (see step_q_norm_rope for rationale).
+        if cfg.qwen35.is_some() {
             fwd.run_rms_norm(
                 ctx.dev, ctx.registry, ctx.cmd,
                 k_buf, wkn, k_buf,
@@ -524,7 +454,6 @@ impl DecodeExec {
                 cfg.rms_norm_eps, "rms_norm_k_split",
             );
             fwd.mark_written(&[k_buf]);
-            // Sprint G-2h — same unconditional barrier as Q-path.
             super::super::arch::compute_barrier(ctx.dev, ctx.cmd);
             fwd.run_rope_neox_with_pos_offset(
                 ctx.dev, ctx.registry, ctx.cmd, k_buf, k_buf,

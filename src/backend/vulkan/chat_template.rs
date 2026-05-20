@@ -52,6 +52,23 @@ pub enum ChatTemplate {
     /// `<|channel>` (id 100). E2B's chat_template.jinja does NOT emit
     /// the block; 26B's does.
     Gemma4WithThoughtChannel,
+    /// Sprint G-2j — Qwen3.6 ChatML variant that appends
+    /// `<think>\n</think>\n\n` after the assistant header to disable
+    /// thinking mode. Equivalent to the upstream Jinja
+    /// `enable_thinking=false` path:
+    ///
+    /// ```jinja
+    /// {%- if add_generation_prompt %}
+    ///     {{- '<|im_start|>assistant\n' }}
+    ///     {%- if enable_thinking is defined and enable_thinking is false %}
+    ///         {{- '<think>\n</think>\n\n' }}
+    /// ```
+    ///
+    /// Without the skip block Qwen3.6 emits empty `<think></think>`,
+    /// then `<|im_end|>` (= EOS, token id 248046 maps to the chat
+    /// turn-end), and stops after 2 generated tokens. Same fix shape
+    /// as `Gemma4WithThoughtChannel`.
+    ChatMLNoThink,
     /// Plain text — system + user concatenated, no role markers.
     Raw,
 }
@@ -80,8 +97,21 @@ impl ChatTemplate {
         }
         // Qwen3 (and any other ChatML model) drops `<|im_start|>` /
         // `<|im_end|>` literals into the template.
+        //
+        // Sprint G-2j — Qwen3.6 ships ChatML pattern too, but its
+        // upstream Jinja default is `enable_thinking=true`, which emits
+        // an empty `<think></think>` + `<|im_end|>` on the first decode
+        // tokens and stops generation. The fix is to inject the
+        // `<think>\n</think>\n\n` skip block after the assistant header
+        // (= the `enable_thinking=false` upstream path). Route Qwen35
+        // here based on flavour even when the template_str matches
+        // ChatML literals.
         if template_str.contains("<|im_start|>") || template_str.contains("<|im_end|>") {
-            return ChatTemplate::ChatML;
+            return if matches!(tokenizer.flavour(), Some(TokenizerFlavour::Qwen35)) {
+                ChatTemplate::ChatMLNoThink
+            } else {
+                ChatTemplate::ChatML
+            };
         }
         // Mistral Instruct: `[INST]` + `[/INST]` brackets in the
         // template. Mistral is the canonical SPM template, so any
@@ -96,9 +126,13 @@ impl ChatTemplate {
         // those to the Mistral [INST] template, which is the only
         // SPM-style template we currently render.
         match tokenizer.flavour() {
-            // Qwen3.5/3.6 share the ChatML special-token layout with
-            // Qwen2 (`<|im_start|>` / `<|im_end|>` / `<|endoftext|>`).
-            Some(TokenizerFlavour::Qwen2 | TokenizerFlavour::Qwen35) => ChatTemplate::ChatML,
+            // Sprint G-2j — Qwen3.5/3.6 default to ChatMLNoThink (the
+            // upstream-default `enable_thinking=false` path) to skip
+            // the thinking-mode that otherwise emits empty
+            // `<think></think>` + EOS at decode-token-2. Qwen2 stays on
+            // plain ChatML (no thinking model).
+            Some(TokenizerFlavour::Qwen35) => ChatTemplate::ChatMLNoThink,
+            Some(TokenizerFlavour::Qwen2) => ChatTemplate::ChatML,
             Some(TokenizerFlavour::Llama3) => ChatTemplate::Llama3,
             Some(TokenizerFlavour::Gemma2) => ChatTemplate::Gemma4,
             None => ChatTemplate::Mistral,
@@ -170,9 +204,13 @@ impl ChatTemplate {
             return ChatTemplate::Gemma4;
         }
         match tokenizer.flavour() {
-            // Qwen3.5/3.6 share the ChatML special-token layout with
-            // Qwen2 (`<|im_start|>` / `<|im_end|>` / `<|endoftext|>`).
-            Some(TokenizerFlavour::Qwen2 | TokenizerFlavour::Qwen35) => ChatTemplate::ChatML,
+            // Sprint G-2j — Qwen3.5/3.6 default to ChatMLNoThink (the
+            // upstream-default `enable_thinking=false` path) to skip
+            // the thinking-mode that otherwise emits empty
+            // `<think></think>` + EOS at decode-token-2. Qwen2 stays on
+            // plain ChatML (no thinking model).
+            Some(TokenizerFlavour::Qwen35) => ChatTemplate::ChatMLNoThink,
+            Some(TokenizerFlavour::Qwen2) => ChatTemplate::ChatML,
             Some(TokenizerFlavour::Llama3) => ChatTemplate::Llama3,
             Some(TokenizerFlavour::Gemma2) => ChatTemplate::Gemma4,
             None => ChatTemplate::Mistral,
@@ -189,7 +227,8 @@ impl ChatTemplate {
         user: &str,
     ) -> Vec<u32> {
         match self {
-            ChatTemplate::ChatML => render_chatml_first(tokenizer, system, user),
+            ChatTemplate::ChatML => render_chatml_first(tokenizer, system, user, false),
+            ChatTemplate::ChatMLNoThink => render_chatml_first(tokenizer, system, user, true),
             ChatTemplate::Llama3 => render_llama3_first(tokenizer, system, user),
             ChatTemplate::DeepSeekR1 => render_deepseek_first(tokenizer, system, user),
             ChatTemplate::Mistral => render_mistral_first(tokenizer, system, user),
@@ -205,7 +244,8 @@ impl ChatTemplate {
     /// (but not including) the previous assistant-turn terminator.
     pub fn render_continuation(self, tokenizer: &Tokenizer, user: &str) -> Vec<u32> {
         match self {
-            ChatTemplate::ChatML => render_chatml_continuation(tokenizer, user),
+            ChatTemplate::ChatML => render_chatml_continuation(tokenizer, user, false),
+            ChatTemplate::ChatMLNoThink => render_chatml_continuation(tokenizer, user, true),
             ChatTemplate::Llama3 => render_llama3_continuation(tokenizer, user),
             ChatTemplate::DeepSeekR1 => render_deepseek_continuation(tokenizer, user),
             ChatTemplate::Mistral => render_mistral_continuation(tokenizer, user),
@@ -231,7 +271,8 @@ impl ChatTemplate {
         messages: &[RenderMessage<'_>],
     ) -> Vec<u32> {
         match self {
-            ChatTemplate::ChatML => render_chatml_full(tokenizer, messages),
+            ChatTemplate::ChatML => render_chatml_full(tokenizer, messages, false),
+            ChatTemplate::ChatMLNoThink => render_chatml_full(tokenizer, messages, true),
             ChatTemplate::Llama3 => render_llama3_full(tokenizer, messages),
             ChatTemplate::DeepSeekR1 => render_deepseek_full(tokenizer, messages),
             ChatTemplate::Mistral => render_mistral_full(tokenizer, messages),
@@ -352,7 +393,12 @@ fn render_gemma4_continuation(
 
 // ---------- ChatML (Qwen3) ----------
 
-fn render_chatml_first(tokenizer: &Tokenizer, system: &str, user: &str) -> Vec<u32> {
+fn render_chatml_first(
+    tokenizer: &Tokenizer,
+    system: &str,
+    user: &str,
+    no_think: bool,
+) -> Vec<u32> {
     let im_start = tokenizer
         .im_start_id
         .expect("ChatML render needs <|im_start|>");
@@ -373,10 +419,13 @@ fn render_chatml_first(tokenizer: &Tokenizer, system: &str, user: &str) -> Vec<u
     tokens.extend(tokenizer.encode("\n"));
     tokens.push(im_start);
     tokens.extend(tokenizer.encode("assistant\n"));
+    if no_think {
+        chatml_push_think_skip(tokenizer, &mut tokens);
+    }
     tokens
 }
 
-fn render_chatml_continuation(tokenizer: &Tokenizer, user: &str) -> Vec<u32> {
+fn render_chatml_continuation(tokenizer: &Tokenizer, user: &str, no_think: bool) -> Vec<u32> {
     let im_start = tokenizer.im_start_id.expect("ChatML render needs <|im_start|>");
     let im_end = tokenizer.im_end_id.expect("ChatML render needs <|im_end|>");
 
@@ -392,6 +441,9 @@ fn render_chatml_continuation(tokenizer: &Tokenizer, user: &str) -> Vec<u32> {
     tokens.extend(tokenizer.encode("\n"));
     tokens.push(im_start);
     tokens.extend(tokenizer.encode("assistant\n"));
+    if no_think {
+        chatml_push_think_skip(tokenizer, &mut tokens);
+    }
     tokens
 }
 
@@ -571,14 +623,8 @@ fn render_mistral_continuation(tokenizer: &Tokenizer, user: &str) -> Vec<u32> {
 
 fn render_raw_first(tokenizer: &Tokenizer, system: &str, user: &str) -> Vec<u32> {
     let mut tokens = Vec::new();
-    // Sprint G-2f throwaway — `VF_RAW_NOBOS=1` skips BOS so we match
-    // llama-eval-callback's default-no-BOS tokenization for Qwen3.6
-    // during the layer-0 bisect. Remove with the dump infra.
-    let skip_bos = std::env::var("VF_RAW_NOBOS").is_ok();
-    if !skip_bos {
-        if let Some(bos) = tokenizer.bos_id {
-            tokens.push(bos);
-        }
+    if let Some(bos) = tokenizer.bos_id {
+        tokens.push(bos);
     }
     if !system.is_empty() {
         tokens.extend(tokenizer.encode(system));
@@ -619,7 +665,11 @@ fn split_system<'a>(messages: &'a [RenderMessage<'a>]) -> (Option<&'a str>, &'a 
 
 // ---------- ChatML (Qwen3 / generic) full ----------
 
-fn render_chatml_full(tokenizer: &Tokenizer, messages: &[RenderMessage<'_>]) -> Vec<u32> {
+fn render_chatml_full(
+    tokenizer: &Tokenizer,
+    messages: &[RenderMessage<'_>],
+    no_think: bool,
+) -> Vec<u32> {
     let im_start = tokenizer.im_start_id.expect("ChatML render needs <|im_start|>");
     let im_end = tokenizer.im_end_id.expect("ChatML render needs <|im_end|>");
 
@@ -647,7 +697,30 @@ fn render_chatml_full(tokenizer: &Tokenizer, messages: &[RenderMessage<'_>]) -> 
     // Generation prompt: assistant header without content.
     tokens.push(im_start);
     tokens.extend(tokenizer.encode("assistant\n"));
+    if no_think {
+        chatml_push_think_skip(tokenizer, &mut tokens);
+    }
     tokens
+}
+
+/// Sprint G-2j — emit the Qwen3.6 `enable_thinking=false` skip block
+/// `<think>\n</think>\n\n` using the special-token ids where available.
+///
+/// `<think>` and `</think>` ARE registered in Qwen3.6's vocab as single
+/// special tokens (ids 248068 and 248046 in the Q3_K_S GGUF). Plain
+/// `tokenizer.encode("<think>")` would NOT produce those single tokens
+/// because the BPE pre-split splits on `<`+letters+`>` boundaries and
+/// merges character-by-character through the merge table. Use
+/// `special_id` to pull the integer ids directly.
+fn chatml_push_think_skip(tokenizer: &Tokenizer, tokens: &mut Vec<u32>) {
+    if let Some(o) = tokenizer.special_id("<think>") {
+        tokens.push(o);
+    }
+    tokens.extend(tokenizer.encode("\n"));
+    if let Some(c) = tokenizer.special_id("</think>") {
+        tokens.push(c);
+    }
+    tokens.extend(tokenizer.encode("\n\n"));
 }
 
 // ---------- Llama-3 full ----------

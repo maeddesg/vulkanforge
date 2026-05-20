@@ -564,13 +564,26 @@ pub fn generate_from_tokens(
     // race condition cannot fire. The legacy CPU-readback path is
     // still selectable via `VF_GPU_DIRECT_MOE=0` — in that case async
     // remains disabled for MoE to preserve the 54I workaround.
+    // Sprint G-2j — Qwen3.6 has a Heisenberg sync bug between async
+    // decode pipeline stages: async path produces gibberish even with
+    // all G-2g→G-2i barrier fixes, but the serial path (single CB,
+    // record+submit+wait per token) is fully coherent. Without this
+    // env-default the model emits `,` or `<think><think>` instead of
+    // the actual answer. Default OFF on cfg.qwen35.is_some() until the
+    // underlying race is found.
     let async_decode = match std::env::var("VULKANFORGE_DISABLE_ASYNC_DECODE") {
         Ok(v) => v != "1" && !v.eq_ignore_ascii_case("true"),
-        Err(_) => cfg
-            .gemma4
-            .as_ref()
-            .map(|g| !g.enable_moe_block || gpu_direct_moe_enabled())
-            .unwrap_or(true),
+        Err(_) => {
+            if cfg.qwen35.is_some() {
+                false
+            } else {
+                cfg
+                    .gemma4
+                    .as_ref()
+                    .map(|g| !g.enable_moe_block || gpu_direct_moe_enabled())
+                    .unwrap_or(true)
+            }
+        }
     };
 
     if async_decode {

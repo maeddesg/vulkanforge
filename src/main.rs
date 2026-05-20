@@ -443,14 +443,6 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
             (tok, tpl)
         }
     };
-    // Sprint G-2f throwaway — env-gate to force the Raw (no-template)
-    // chat renderer so VF's tokenized prompt matches llama-eval-callback's
-    // raw `--prompt` for the coherence bisect. Remove with the dump infra.
-    let template = if std::env::var("VF_RAW_TEMPLATE").is_ok() {
-        vulkanforge::backend::vulkan::chat_template::ChatTemplate::Raw
-    } else {
-        template
-    };
     if max_context > cfg.context_length {
         eprintln!(
             "VulkanForge: --max-context {} exceeds model's reported context_length {} — \
