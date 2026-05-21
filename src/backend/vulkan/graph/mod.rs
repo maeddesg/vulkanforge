@@ -44,6 +44,7 @@
 //! decode path in `forward/decode.rs` is untouched; `VF_USE_GRAPH=1`
 //! will be wired in SG-1.3.
 
+pub mod builder;
 pub mod edge;
 pub mod node;
 
@@ -119,22 +120,102 @@ impl VulkanGraph {
         self.nodes.is_empty()
     }
 
-    /// **STUB (SG-1.2 will implement).** Walk every node in build
-    /// order and emit a [`Dependency`] for every byte-range overlap
-    /// between a later node's read/write and an earlier node's write.
-    /// The byte-range check is the central novelty over VF's
-    /// whole-buffer-dirty `pending_writes: HashSet<u64>`. See
-    /// `results/vulkan_graph_analysis_part4.md` §2.
+    /// O(N²) byte-range overlap sweep. For every pair `(i, j)` with
+    /// `i < j`, emits a [`Dependency`] whenever any of
+    ///   * RAW: `i.writes` overlaps `j.reads` on the same buffer
+    ///   * WAW: `i.writes` overlaps `j.writes`
+    ///   * WAR: `i.reads`  overlaps `j.writes`
+    ///
+    /// Implements the analysis-Teil-4-§2 lever: byte-range tracking
+    /// replaces VF's whole-buffer-dirty `pending_writes: HashSet<u64>`
+    /// and lets the future SG-1.3 Recorder emit only the barriers
+    /// implied by actual memory dependencies. Insertion order is the
+    /// build order — `from < to` always holds, so a topological order
+    /// exists for the resulting DAG.
     pub fn resolve_dependencies(&mut self) {
-        // Empty placeholder. Real implementation lands in SG-1.2.
+        self.edges.clear();
+        let n = self.nodes.len();
+        for i in 0..n {
+            // Snapshot i's accesses to avoid the borrow conflict with
+            // `&mut self.edges.push` below.
+            let writes_i: Vec<_> = self.nodes[i].writes().to_vec();
+            let reads_i: Vec<_>  = self.nodes[i].reads().to_vec();
+            for j in (i + 1)..n {
+                let writes_j = self.nodes[j].writes();
+                let reads_j  = self.nodes[j].reads();
+
+                // RAW: i writes, j reads
+                for w in &writes_i {
+                    for r in reads_j {
+                        if w.buffer == r.buffer && w.range.overlaps(r.range) {
+                            self.edges.push(Dependency::raw(
+                                i as NodeId, j as NodeId,
+                                w.buffer, w.range, r.range,
+                            ));
+                            break; // one edge per (i, j, kind) is enough
+                        }
+                    }
+                }
+                // WAW: i writes, j writes
+                'waw: for wi in &writes_i {
+                    for wj in writes_j {
+                        if wi.buffer == wj.buffer && wi.range.overlaps(wj.range) {
+                            self.edges.push(Dependency::waw(
+                                i as NodeId, j as NodeId,
+                                wi.buffer, wi.range, wj.range,
+                            ));
+                            break 'waw;
+                        }
+                    }
+                }
+                // WAR: i reads, j writes (mostly matters for
+                // compute→transfer ordering; cheap to compute either way)
+                'war: for ri in &reads_i {
+                    for wj in writes_j {
+                        if ri.buffer == wj.buffer && ri.range.overlaps(wj.range) {
+                            self.edges.push(Dependency::war(
+                                i as NodeId, j as NodeId,
+                                ri.buffer, ri.range, wj.range,
+                            ));
+                            break 'war;
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    /// **STUB (SG-1.2).** Topological sort respecting all edges.
-    /// Default `execution_order` mirrors insertion order, which is a
-    /// valid topological order while edges go strictly forward (the
-    /// Builder enforces that contract).
+    /// Kahn's topological sort respecting [`edges`]. Output goes into
+    /// [`execution_order`]. Panics on cycle — cycles in a compute graph
+    /// would indicate a Builder bug (forward-only edges by construction).
     pub fn sort(&mut self) {
-        self.execution_order = (0..self.nodes.len() as NodeId).collect();
+        use std::collections::VecDeque;
+        let n = self.nodes.len();
+        let mut in_degree: Vec<u32> = vec![0; n];
+        let mut adj: Vec<Vec<NodeId>> = vec![Vec::new(); n];
+        for e in &self.edges {
+            adj[e.from as usize].push(e.to);
+            in_degree[e.to as usize] += 1;
+        }
+        let mut queue: VecDeque<NodeId> = (0..n as NodeId)
+            .filter(|&i| in_degree[i as usize] == 0)
+            .collect();
+        self.execution_order.clear();
+        self.execution_order.reserve(n);
+        while let Some(v) = queue.pop_front() {
+            self.execution_order.push(v);
+            for &w in &adj[v as usize] {
+                in_degree[w as usize] -= 1;
+                if in_degree[w as usize] == 0 {
+                    queue.push_back(w);
+                }
+            }
+        }
+        assert_eq!(
+            self.execution_order.len(), n,
+            "cycle detected in graph: only {} of {} nodes sorted (Builder bug)",
+            self.execution_order.len(), n
+        );
     }
 
     /// **STUB (SG-1.2+).** Run optimization passes (fusion, dead-node

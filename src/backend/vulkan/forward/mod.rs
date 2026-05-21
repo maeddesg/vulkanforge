@@ -65,7 +65,7 @@ mod debug;
 mod decode;
 mod executor;
 mod harness;
-mod layer_plan;
+pub(crate) mod layer_plan;
 mod mid_frame;
 mod prefill;
 mod runs;
