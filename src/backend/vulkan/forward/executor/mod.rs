@@ -330,8 +330,24 @@ impl DecodeExec {
         // Per-layer Builder. BufferMap carries real `vk::Buffer`
         // handles so byte-range dependency resolution distinguishes
         // distinct buffers correctly (not all-null poison).
+        //
+        // SG-1.4-f — input/output alternate per layer in `decode.rs:104`
+        // (`std::mem::swap(&mut input, &mut output)`). L0 reads scratch_a +
+        // writes scratch_b, L1 reads scratch_b + writes scratch_a, …
+        // Earlier sprints used `fwd.cur().scratch_a.handle` for both
+        // `scratch_a` and `layer_output`, which silently mis-modelled
+        // the per-layer flow: the graph thought FfnResidualAdd wrote
+        // scratch_a but the imperative `execute_step` actually wrote
+        // scratch_b. Under `BarrierMode::GraphDriven` this meant
+        // pending_writes was seeded with the wrong handle at the
+        // layer boundary, so subsequent imperative reads of the real
+        // output buffer fired NO barrier — silent race.
+        //
+        // Fix: thread the real `(input, output)` pair from
+        // `decode_io(ctx)` into the BufferMap.
+        let (layer_input, layer_output_handle) = decode_io(ctx);
         let bufs = BufferMap {
-            scratch_a:    fwd.cur().scratch_a.handle,
+            scratch_a:    layer_input,
             hidden_norm:  fwd.cur().hidden_norm.handle,
             q_buf:        fwd.cur().q_buf.handle,
             k_buf:        fwd.cur().k_buf.handle,
@@ -343,11 +359,9 @@ impl DecodeExec {
             up_buf:       fwd.cur().up_buf.handle,
             ffn_hidden:   fwd.cur().ffn_hidden.handle,
             ffn_out:      fwd.cur().ffn_out.handle,
-            // For SG-1.3 the layer output equals scratch_a (cur slot
-            // recycles; the next layer reads its own scratch_a). The
-            // graph only uses this for byte-range tracking, not actual
-            // dispatching.
-            layer_output: fwd.cur().scratch_a.handle,
+            // SG-1.4-f — use the actual layer-output handle from
+            // ExecCtx (alternates scratch_a/scratch_b per layer).
+            layer_output: layer_output_handle,
             kv_cache:     fwd.kv_cache.k_buffer.handle,
 
             // Sprint SG-1.4 — Qwen3.6 SSM buffers (`Option<GpuBuffer>` on
@@ -435,13 +449,29 @@ impl DecodeExec {
         // one more missing edge or barrier site. Documented in
         // `results/sprint_sg1_4c_edge_audit.md`. Gemma-4 also stays
         // imperative.
-        // SG-1.4-d — VF_GRAPH_BARRIERS_ALL=1 is a diagnostic env that
-        // forces graph-driven barriers on every architecture (incl.
-        // qwen35 / gemma4). Use with VF_BARRIER_TRACE=1 to find the
-        // remaining missing-edge bug on Qwen3.6.
+        // SG-1.4-d / SG-1.4-f — diagnostic env gates for graph-driven
+        // barrier scope. Used to bisect remaining qwen35 enable bug.
+        //
+        //  VF_GRAPH_BARRIERS_ALL=1 — force graph-driven on every arch
+        //  VF_GRAPH_BARRIERS_LAYERS=N-M — only layers N..=M (incl)
         let force_all = std::env::var("VF_GRAPH_BARRIERS_ALL").as_deref() == Ok("1");
-        let use_graph_barriers = force_all
-            || (cfg.gemma4.is_none() && cfg.qwen35.is_none());
+        let layer_range: Option<(u32, u32)> = std::env::var("VF_GRAPH_BARRIERS_LAYERS")
+            .ok()
+            .and_then(|v| {
+                let parts: Vec<&str> = v.split('-').collect();
+                if parts.len() == 2 {
+                    Some((parts[0].parse().ok()?, parts[1].parse().ok()?))
+                } else {
+                    None
+                }
+            });
+        let use_graph_barriers = if force_all {
+            true
+        } else if let Some((lo, hi)) = layer_range {
+            ctx.layer >= lo && ctx.layer <= hi
+        } else {
+            cfg.gemma4.is_none() && cfg.qwen35.is_none()
+        };
         let trace = std::env::var("VF_BARRIER_TRACE").as_deref() == Ok("1");
         if use_graph_barriers {
             fwd.barrier_mode = BarrierMode::GraphDriven;
