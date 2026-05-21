@@ -493,6 +493,15 @@ pub fn generate_from_tokens(
     let mut acc_wait = Duration::ZERO;
     let mut acc_readback = Duration::ZERO;
     let mut acc_other = Duration::ZERO;
+    // Graph-analysis Teil 3 — barrier-count delta per decode token.
+    // VF emits 361 (Qwen3-8B) → 1840 (Gemma-4-26B-A4B) barriers/tok,
+    // versus llama.cpp's ~50-70/tok (byte-range memory-overlap tracking).
+    // Surfacing the delta in VF_CPU_TIMER's printout lets future sprints
+    // verify barrier-reduction work (e.g. G-8 byte-range tracking) by
+    // re-running this bench.
+    let barrier_baseline = if cpu_timer { Some(forward.barrier_stats()) } else { None };
+    let mut acc_barriers_issued: u64 = 0;
+    let mut acc_barriers_checked: u64 = 0;
 
     // ---- Prefill ----
     let prefill_start = Instant::now();
@@ -848,6 +857,12 @@ pub fn generate_from_tokens(
 
     // Sprint G-7 — CPU-side per-stage breakdown printout.
     if cpu_timer && decode_tokens_profiled > 0 {
+        // Snapshot barrier-stats delta over the whole decode loop.
+        if let Some((checked0, issued0)) = barrier_baseline {
+            let (checked1, issued1) = forward.barrier_stats();
+            acc_barriers_checked = checked1.saturating_sub(checked0);
+            acc_barriers_issued = issued1.saturating_sub(issued0);
+        }
         let n = decode_tokens_profiled as f64;
         let ms = |d: Duration| d.as_secs_f64() * 1000.0;
         let total = acc_reset + acc_begin + acc_record + acc_end
@@ -874,6 +889,14 @@ pub fn generate_from_tokens(
         eprintln!("  Async-decode potential overlap:");
         eprintln!("    - GPU wait ({:.2} ms/tok) hides record+submit+end of next token", ms(acc_wait) / n);
         eprintln!("    - readback ({:.2} ms/tok) is post-wait CPU work; could hide if N+1 pre-records", ms(acc_readback) / n);
+        eprintln!();
+        eprintln!("  Barrier-elision counters (delta over decode loop):");
+        eprintln!("    - checked: {:>8}  ({:>7.1} /tok)",
+            acc_barriers_checked, acc_barriers_checked as f64 / n);
+        eprintln!("    - issued : {:>8}  ({:>7.1} /tok)  ({:.1}% elided)",
+            acc_barriers_issued, acc_barriers_issued as f64 / n,
+            100.0 * (acc_barriers_checked.saturating_sub(acc_barriers_issued)) as f64
+                / acc_barriers_checked.max(1) as f64);
         eprintln!();
     }
 
