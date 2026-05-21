@@ -50,8 +50,61 @@ use super::shaders::{self, ShaderId};
 //   Sprint 12G-D / 12H), and per-WG VGPR / register pressure
 //   grows with NUM_ROWS=2 in ways that hurt occupancy. Reverted.
 //   See results/v024_sprint14c_numrows2_redux.md.
+// Sprint G-5 — NUM_ROWS for K-quant GEMVs is runtime-overridable via
+// VF_GEMV_NUM_ROWS_K. **Default 1 — opt-in only.** llama.cpp uses
+// NUM_ROWS=2 for K-quants on AMD RDNA. Sprint 14C tested NUM_ROWS=2
+// on Qwen2.5/Llama and reverted (perf wash). G-5 retest specifically
+// for Qwen3.6 found NUM_ROWS=2 also produces **incoherent output**
+// on the SSM (Linear-Attn) layers — Qwen3-8B with NUM_ROWS=2 stays
+// coherent at 108 tok/s, but Qwen3.6 echoes the prompt with garbage.
+// Likely an odd-M dispatch in one of the SSM-side GEMVs that the
+// 2-row guard `first_row + NUM_ROWS <= p.stride_d` silently drops.
+// Kept env-gated for future diagnosis; not a production lever yet.
+pub fn mmv_num_rows_k() -> u32 {
+    std::env::var("VF_GEMV_NUM_ROWS_K")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&v| v >= 1 && v <= 4)
+        .unwrap_or(1)
+}
+
+/// Legacy alias for callers that still pre-dated the env override.
+/// Always returns the canonical value picked by [`mmv_num_rows_k`].
 pub const MMV_NUM_ROWS: u32 = 1;
-const MMV_SPEC_DATA: [u32; 3] = [64, MMV_NUM_ROWS, 1];
+
+/// True when `shader` is one of the K-quant (Q2K..Q6K) GEMV pipelines
+/// whose specialization was overridden by [`mmv_num_rows_k`]. Callers
+/// dispatching through such a pipeline must scale their workgroup
+/// count by the same factor or risk over/under-dispatching rows.
+pub fn shader_is_k_quant_gemv(id: ShaderId) -> bool {
+    matches!(
+        id,
+        ShaderId::MulMatVecQ3K | ShaderId::MulMatVecQ3KSubgroup
+        | ShaderId::MulMatVecQ4K | ShaderId::MulMatVecQ4KSubgroup
+        | ShaderId::MulMatVecQ5K | ShaderId::MulMatVecQ5KSubgroup
+        | ShaderId::MulMatVecQ6K | ShaderId::MulMatVecQ6KSubgroup
+        | ShaderId::MulMatVecQ3KSubgroupNoShmem
+        | ShaderId::MulMatVecQ4KSubgroupNoShmem
+        | ShaderId::MulMatVecQ5KSubgroupNoShmem
+        | ShaderId::MulMatVecQ6KSubgroupNoShmem
+        | ShaderId::MulMatVecQ3KId | ShaderId::MulMatVecQ3KIdSubgroup
+        | ShaderId::MulMatVecQ4KId | ShaderId::MulMatVecQ4KIdSubgroup
+    )
+}
+
+/// Sprint G-5 — when `VF_GEMV_NO_SHMEM=1`, callers want the Path C
+/// (`_subgroup_no_shmem`) variant for K-quant GEMVs. Default false.
+/// llama.cpp's runtime picks this variant by default on AMD non-GCN.
+/// Empirically on gfx1201 with BLOCK_SIZE=64 = subgroup_size=64 the
+/// Path A shmem reduction is already trivial (1 subgroup per WG → the
+/// cross-subgroup loop runs once), so Path C is **coherent but
+/// produces no measurable wall speedup** (verified Sprint G-5 60-token
+/// decode bench, +0.1 tok/s on 16.1 tok/s baseline = noise).
+pub fn gemv_no_shmem_enabled() -> bool {
+    std::env::var("VF_GEMV_NO_SHMEM")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
 
 fn entry(constant_id: u32, offset: u32, size: usize) -> vk::SpecializationMapEntry {
     vk::SpecializationMapEntry {
@@ -166,6 +219,13 @@ impl PipelineRegistry {
                 | ShaderId::MulMatVecQ4KSubgroup | ShaderId::MulMatVecQ6KSubgroup
                 | ShaderId::MulMatVecQ3K | ShaderId::MulMatVecQ3KSubgroup
                 | ShaderId::MulMatVecQ5K | ShaderId::MulMatVecQ5KSubgroup
+                // Sprint G-5 — Path C K-quant GEMVs share the same
+                // 3-spec-constant surface (BLOCK_SIZE / NUM_ROWS /
+                // NUM_COLS).
+                | ShaderId::MulMatVecQ3KSubgroupNoShmem
+                | ShaderId::MulMatVecQ4KSubgroupNoShmem
+                | ShaderId::MulMatVecQ5KSubgroupNoShmem
+                | ShaderId::MulMatVecQ6KSubgroupNoShmem
                 | ShaderId::MulMatVecQ4_0 | ShaderId::MulMatVecQ4_0Subgroup
                 // Sprint 52J — Q5_0 / Q5_1 / Q8_0 GEMVs share the same
                 // generic mul_mat_vec.comp surface as Q4_0 (spec consts
@@ -184,7 +244,12 @@ impl PipelineRegistry {
                 | ShaderId::MulMatVecQ5_0Id | ShaderId::MulMatVecQ5_0IdSubgroup
                 | ShaderId::MulMatVecQ4_0Id | ShaderId::MulMatVecQ4_0IdSubgroup => {
                     let entries = [entry(0, 0, 4), entry(1, 4, 4), entry(2, 8, 4)];
-                    let bytes = bytemuck::bytes_of(&MMV_SPEC_DATA);
+                    // Sprint G-5 — NUM_ROWS_K env-overridable for the
+                    // K-quant (Q2K..Q6K) GEMVs; legacy quants keep the
+                    // pre-G-5 row-per-WG layout via the const.
+                    let num_rows = if shader_is_k_quant_gemv(id) { mmv_num_rows_k() } else { MMV_NUM_ROWS };
+                    let spec_data: [u32; 3] = [64, num_rows, 1];
+                    let bytes = bytemuck::bytes_of(&spec_data);
                     // Sprint 14A — pin requiredSubgroupSize=64 for the GEMV
                     // pipelines. Sprint 14B — same pin applies to the
                     // _subgroup variants; without it, ACO could pick Wave32,

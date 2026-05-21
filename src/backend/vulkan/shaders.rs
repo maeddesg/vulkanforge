@@ -20,6 +20,17 @@ pub enum ShaderId {
     // K-quant decode; opt-out via VULKANFORGE_DISABLE_SUBGROUP_GEMV=1.
     MulMatVecQ4KSubgroup,
     MulMatVecQ6KSubgroup,
+    /// Sprint G-5 — Path C variants of the K-quant GEMVs (Q3K/Q4K/Q5K/Q6K).
+    /// Defines `USE_SUBGROUP_ADD_NO_SHMEM=1` instead of `USE_SUBGROUP_ADD`,
+    /// which removes the inter-subgroup LDS reduction entirely. On RDNA4
+    /// with required_subgroup_size=64 = BLOCK_SIZE=64 the workgroup IS a
+    /// single subgroup so the shmem dance is pure overhead — Path C is
+    /// what llama.cpp routes to on AMD non-GCN. Opt-in via
+    /// `VF_GEMV_NO_SHMEM=1`; default OFF until we have a parity bench.
+    MulMatVecQ3KSubgroupNoShmem,
+    MulMatVecQ4KSubgroupNoShmem,
+    MulMatVecQ5KSubgroupNoShmem,
+    MulMatVecQ6KSubgroupNoShmem,
     /// Sprint 17B — Q3_K decode GEMV (stock + subgroup variants).
     /// Q3_K_M GGUFs ship the bulk of their weights as Q3_K. The
     /// `mul_mat_vec_q3_k.comp` shader is byte-identical to llama.cpp
@@ -505,6 +516,10 @@ impl ShaderId {
             ShaderId::MulMatVecQ6K => "mul_mat_vec_q6_k_f32_f32",
             ShaderId::MulMatVecQ4KSubgroup => "mul_mat_vec_q4_k_f32_f32_subgroup",
             ShaderId::MulMatVecQ6KSubgroup => "mul_mat_vec_q6_k_f32_f32_subgroup",
+            ShaderId::MulMatVecQ3KSubgroupNoShmem => "mul_mat_vec_q3_k_f32_f32_subgroup_no_shmem",
+            ShaderId::MulMatVecQ4KSubgroupNoShmem => "mul_mat_vec_q4_k_f32_f32_subgroup_no_shmem",
+            ShaderId::MulMatVecQ5KSubgroupNoShmem => "mul_mat_vec_q5_k_f32_f32_subgroup_no_shmem",
+            ShaderId::MulMatVecQ6KSubgroupNoShmem => "mul_mat_vec_q6_k_f32_f32_subgroup_no_shmem",
             ShaderId::MulMatVecQ3K => "mul_mat_vec_q3_k_f32_f32",
             ShaderId::MulMatVecQ3KSubgroup => "mul_mat_vec_q3_k_f32_f32_subgroup",
             ShaderId::MulMatVecQ5K => "mul_mat_vec_q5_k_f32_f32",
@@ -661,6 +676,10 @@ impl ShaderId {
             ShaderId::MulMatVecQ6K => MUL_MAT_VEC_Q6_K_F32_F32,
             ShaderId::MulMatVecQ4KSubgroup => MUL_MAT_VEC_Q4_K_F32_F32_SUBGROUP,
             ShaderId::MulMatVecQ6KSubgroup => MUL_MAT_VEC_Q6_K_F32_F32_SUBGROUP,
+            ShaderId::MulMatVecQ3KSubgroupNoShmem => MUL_MAT_VEC_Q3_K_F32_F32_SUBGROUP_NO_SHMEM,
+            ShaderId::MulMatVecQ4KSubgroupNoShmem => MUL_MAT_VEC_Q4_K_F32_F32_SUBGROUP_NO_SHMEM,
+            ShaderId::MulMatVecQ5KSubgroupNoShmem => MUL_MAT_VEC_Q5_K_F32_F32_SUBGROUP_NO_SHMEM,
+            ShaderId::MulMatVecQ6KSubgroupNoShmem => MUL_MAT_VEC_Q6_K_F32_F32_SUBGROUP_NO_SHMEM,
             ShaderId::MulMatVecQ3K => MUL_MAT_VEC_Q3_K_F32_F32,
             ShaderId::MulMatVecQ3KSubgroup => MUL_MAT_VEC_Q3_K_F32_F32_SUBGROUP,
             ShaderId::MulMatVecQ5K => MUL_MAT_VEC_Q5_K_F32_F32,
@@ -824,6 +843,10 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::MulMatVecQ6K,
     ShaderId::MulMatVecQ4KSubgroup,
     ShaderId::MulMatVecQ6KSubgroup,
+    ShaderId::MulMatVecQ3KSubgroupNoShmem,
+    ShaderId::MulMatVecQ4KSubgroupNoShmem,
+    ShaderId::MulMatVecQ5KSubgroupNoShmem,
+    ShaderId::MulMatVecQ6KSubgroupNoShmem,
     ShaderId::MulMatVecQ3K,
     ShaderId::MulMatVecQ3KSubgroup,
     ShaderId::MulMatVecQ5K,
@@ -1013,6 +1036,16 @@ pub const MUL_MAT_VEC_Q3_K_F32_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q3_k_f32_f32.spv"));
 pub const MUL_MAT_VEC_Q3_K_F32_F32_SUBGROUP: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q3_k_f32_f32_subgroup.spv"));
+// Sprint G-5 — Path C (pure subgroupAdd, NO shared memory) variants for
+// the K-quant GEMVs. Defines `USE_SUBGROUP_ADD_NO_SHMEM=1` (build.rs).
+pub const MUL_MAT_VEC_Q3_K_F32_F32_SUBGROUP_NO_SHMEM: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q3_k_f32_f32_subgroup_no_shmem.spv"));
+pub const MUL_MAT_VEC_Q4_K_F32_F32_SUBGROUP_NO_SHMEM: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q4_k_f32_f32_subgroup_no_shmem.spv"));
+pub const MUL_MAT_VEC_Q5_K_F32_F32_SUBGROUP_NO_SHMEM: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q5_k_f32_f32_subgroup_no_shmem.spv"));
+pub const MUL_MAT_VEC_Q6_K_F32_F32_SUBGROUP_NO_SHMEM: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q6_k_f32_f32_subgroup_no_shmem.spv"));
 pub const MUL_MAT_VEC_Q5_K_F32_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q5_k_f32_f32.spv"));
 pub const MUL_MAT_VEC_Q5_K_F32_F32_SUBGROUP: &[u8] =

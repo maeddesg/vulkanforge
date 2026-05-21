@@ -521,7 +521,16 @@ impl Forward {
             let groups = if one_per_row {
                 m
             } else {
-                let n_rows = crate::backend::vulkan::pipeline_registry::MMV_NUM_ROWS;
+                // Sprint G-5 — K-quant GEMVs (Q2K..Q6K + their _Id
+                // variants) pick NUM_ROWS from VF_GEMV_NUM_ROWS_K
+                // (default 1), matching how the pipeline above was
+                // specialized. Non-K-quant GEMVs keep the legacy
+                // MMV_NUM_ROWS const.
+                let n_rows = if crate::backend::vulkan::pipeline_registry::shader_is_k_quant_gemv(shader) {
+                    crate::backend::vulkan::pipeline_registry::mmv_num_rows_k()
+                } else {
+                    crate::backend::vulkan::pipeline_registry::MMV_NUM_ROWS
+                };
                 (m + n_rows - 1) / n_rows
             };
             dev.device.cmd_dispatch(cmd, groups, 1, 1);
@@ -1375,7 +1384,12 @@ impl Forward {
             dev.device.cmd_push_constants(
                 cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
             );
-            let n_rows = crate::backend::vulkan::pipeline_registry::MMV_NUM_ROWS;
+            // Sprint G-5 — match the pipeline's NUM_ROWS spec when K-quant.
+            let n_rows = if crate::backend::vulkan::pipeline_registry::shader_is_k_quant_gemv(shader) {
+                crate::backend::vulkan::pipeline_registry::mmv_num_rows_k()
+            } else {
+                crate::backend::vulkan::pipeline_registry::MMV_NUM_ROWS
+            };
             let groups = (m + n_rows - 1) / n_rows;
             dev.device.cmd_dispatch(cmd, groups, 1, 1);
         });
@@ -1433,7 +1447,12 @@ impl Forward {
             dev.device.cmd_push_constants(
                 cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
             );
-            let n_rows = crate::backend::vulkan::pipeline_registry::MMV_NUM_ROWS;
+            // Sprint G-5 — match the pipeline's NUM_ROWS spec when K-quant.
+            let n_rows = if crate::backend::vulkan::pipeline_registry::shader_is_k_quant_gemv(shader) {
+                crate::backend::vulkan::pipeline_registry::mmv_num_rows_k()
+            } else {
+                crate::backend::vulkan::pipeline_registry::MMV_NUM_ROWS
+            };
             let groups = (m + n_rows - 1) / n_rows;
             dev.device.cmd_dispatch(cmd, groups, 1, 1);
         });
@@ -1582,7 +1601,12 @@ impl Forward {
             dev.device.cmd_push_constants(
                 cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
             );
-            let n_rows = crate::backend::vulkan::pipeline_registry::MMV_NUM_ROWS;
+            // Sprint G-5 — match the pipeline's NUM_ROWS spec when K-quant.
+            let n_rows = if crate::backend::vulkan::pipeline_registry::shader_is_k_quant_gemv(shader) {
+                crate::backend::vulkan::pipeline_registry::mmv_num_rows_k()
+            } else {
+                crate::backend::vulkan::pipeline_registry::MMV_NUM_ROWS
+            };
             let groups = (m + n_rows - 1) / n_rows;
             dev.device.cmd_dispatch(cmd, groups, 1, 1);
         });
@@ -1655,7 +1679,12 @@ impl Forward {
             dev.device.cmd_push_constants(
                 cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
             );
-            let n_rows = crate::backend::vulkan::pipeline_registry::MMV_NUM_ROWS;
+            // Sprint G-5 — match the pipeline's NUM_ROWS spec when K-quant.
+            let n_rows = if crate::backend::vulkan::pipeline_registry::shader_is_k_quant_gemv(shader) {
+                crate::backend::vulkan::pipeline_registry::mmv_num_rows_k()
+            } else {
+                crate::backend::vulkan::pipeline_registry::MMV_NUM_ROWS
+            };
             let groups_x = (m + n_rows - 1) / n_rows;
             dev.device.cmd_dispatch(cmd, groups_x, n_slots, 1);
         });

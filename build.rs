@@ -141,6 +141,67 @@ const JOBS: &[ShaderJob] = &[
             ("USE_SUBGROUP_ADD", "1"),
         ],
     },
+    // Sprint G-5 — Path C (`USE_SUBGROUP_ADD_NO_SHMEM`) variants for the
+    // K-quant GEMVs. Drops the inter-subgroup LDS reduction entirely:
+    // with BLOCK_SIZE=64 = subgroup_size=64 the workgroup IS a single
+    // subgroup so the shmem path is overhead. llama.cpp routes to this
+    // on AMD non-GCN by default; VF reaches feature-parity here.
+    ShaderJob {
+        out_name: "mul_mat_vec_q3_k_f32_f32_subgroup_no_shmem.spv",
+        entry_source: "mul_mat_vec_q3_k.comp",
+        defines: &[
+            ("DATA_A_Q3_K", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("USE_SUBGROUP_ADD_NO_SHMEM", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mat_vec_q4_k_f32_f32_subgroup_no_shmem.spv",
+        entry_source: "mul_mat_vec_q4_k.comp",
+        defines: &[
+            ("DATA_A_Q4_K", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("USE_SUBGROUP_ADD_NO_SHMEM", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mat_vec_q5_k_f32_f32_subgroup_no_shmem.spv",
+        entry_source: "mul_mat_vec_q5_k.comp",
+        defines: &[
+            ("DATA_A_Q5_K", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("USE_SUBGROUP_ADD_NO_SHMEM", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mat_vec_q6_k_f32_f32_subgroup_no_shmem.spv",
+        entry_source: "mul_mat_vec_q6_k.comp",
+        defines: &[
+            ("DATA_A_Q6_K", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("USE_SUBGROUP_ADD_NO_SHMEM", "1"),
+        ],
+    },
     // Sprint 17C — Q5_K decode GEMV. Q5_K_M GGUFs ship the bulk of
     // their weights as Q5_K (ggml type 13); Q3_K_M uses Q5_K for
     // attn_v + ffn_down. Shader byte-identical to llama.cpp upstream
