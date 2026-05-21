@@ -480,6 +480,15 @@ pub struct Forward {
     pub(super) cache_enabled: bool,
     pub profiler: Option<ShaderProfiler>,
 
+    /// Sprint G-7 — last `one_shot` timing (set when `VF_CPU_TIMER=1`).
+    /// Populated by `forward_token` so the decode loop in
+    /// `generate_from_tokens` can aggregate per-stage CPU breakdown
+    /// (reset / begin / record / end / submit / wait) plus the
+    /// surrounding readback. `None` outside of `VF_CPU_TIMER=1` to keep
+    /// the production hot path free of writes to this field.
+    pub last_one_shot_timings: Option<crate::backend::vulkan::commands::OneShotTimings>,
+    pub last_readback_time: Option<Duration>,
+
     // Sprint 24-Inline — Step 0: harness-style FP8 GEMV per-channel
     // resources, freshly created at Forward construction with the
     // perchannel SPV variant + null pipeline cache + dedicated

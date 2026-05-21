@@ -865,6 +865,8 @@ impl Forward {
             fa_tiled_bc,
             coopmat_attn_enabled,
             profiler,
+            last_one_shot_timings: None,
+            last_readback_time: None,
             rope_theta_scale, attn_scale,
             max_prefill_tokens,
             batch_input, batch_residual, batch_norm, batch_q8,

@@ -628,7 +628,10 @@ impl Forward {
         // Sprint 12D — fresh barrier-elision state per forward.
         self.reset_barrier_state();
         let cur_slot = self.current_slot;
-        cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
+        // Sprint G-7 — switch to one_shot_profiled when VF_CPU_TIMER=1 so
+        // `generate_from_tokens` can aggregate per-stage CPU breakdown.
+        let cpu_timer = std::env::var("VF_CPU_TIMER").map(|v| v == "1").unwrap_or(false);
+        let timings = cmd_ctx.one_shot_profiled(&dev.device, dev.compute_queue, |cmd| {
             if let Some(p) = self.profiler.as_mut() {
                 p.reset(&dev.device, cmd);
             }
@@ -642,6 +645,9 @@ impl Forward {
             }
             self.record_decode_dispatches(dev, registry, cmd, model, cur_slot, position);
         })?;
+        if cpu_timer {
+            self.last_one_shot_timings = Some(timings);
+        }
 
         // Sprint 43D-4 — VF_LAYER_DUMP_ALL=1 in the forward_token path
         // (force_per_token prefill). Mirrors the wait_and_read_logits
@@ -734,6 +740,9 @@ impl Forward {
         }
 
         // Logits readback (Sprint 27 — from host-mapped staging).
+        // Sprint G-7 — separately time the readback when VF_CPU_TIMER=1.
+        use std::time::Instant;
+        let readback_start = if cpu_timer { Some(Instant::now()) } else { None };
         let bytes = self.logits_staging.read_bytes()?;
         let _logits: Vec<f32> = bytemuck::cast_slice::<u8, f32>(
             &bytes[..(self.config.vocab_size as usize) * 4],
@@ -744,6 +753,9 @@ impl Forward {
             &bytes[..(self.config.vocab_size as usize) * 4],
         )
         .to_vec();
+        if let Some(rs) = readback_start {
+            self.last_readback_time = Some(rs.elapsed());
+        }
 
         // Profiling.
         let samples = if let Some(p) = self.profiler.as_ref() {

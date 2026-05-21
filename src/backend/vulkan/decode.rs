@@ -479,6 +479,21 @@ pub fn generate_from_tokens(
     let mut decode_tokens_profiled: u32 = 0;
     let mut prefill_tokens_profiled: u32 = 0;
 
+    // Sprint G-7 — CPU-side per-stage breakdown. Aggregates reset, begin,
+    // record, end, submit, gpu_wait (from `one_shot_profiled`) plus the
+    // readback time (logits_staging.read_bytes()) plus a wrap-time
+    // (everything else in the decode-loop iteration) so we can localise
+    // exactly where the 8-17 % CPU/idle wall-gap sits.
+    let cpu_timer = std::env::var("VF_CPU_TIMER").map(|v| v == "1").unwrap_or(false);
+    let mut acc_reset = Duration::ZERO;
+    let mut acc_begin = Duration::ZERO;
+    let mut acc_record = Duration::ZERO;
+    let mut acc_end = Duration::ZERO;
+    let mut acc_submit = Duration::ZERO;
+    let mut acc_wait = Duration::ZERO;
+    let mut acc_readback = Duration::ZERO;
+    let mut acc_other = Duration::ZERO;
+
     // ---- Prefill ----
     let prefill_start = Instant::now();
     let mut pos = start_pos;
@@ -585,25 +600,22 @@ pub fn generate_from_tokens(
     // race condition cannot fire. The legacy CPU-readback path is
     // still selectable via `VF_GPU_DIRECT_MOE=0` — in that case async
     // remains disabled for MoE to preserve the 54I workaround.
-    // Sprint G-2j — Qwen3.6 has a Heisenberg sync bug between async
-    // decode pipeline stages: async path produces gibberish even with
-    // all G-2g→G-2i barrier fixes, but the serial path (single CB,
-    // record+submit+wait per token) is fully coherent. Without this
-    // env-default the model emits `,` or `<think><think>` instead of
-    // the actual answer. Default OFF on cfg.qwen35.is_some() until the
-    // underlying race is found.
+    // Sprint G-2j — Qwen3.6 originally had a Heisenberg sync bug between
+    // async decode pipeline stages (gibberish at q_idx > 0). G-2g→G-2i
+    // landed the barrier fixes and G-2j confirmed the path was coherent
+    // again; the workaround was kept while G-3 reported no async
+    // speedup. Sprint G-7 — measured 18.3 → 20.5 tok/s (+12 %) for
+    // Qwen3.6 after G-6's redundant-trailing-barrier strip; the 8-shaped
+    // dispatch chain now actually overlaps token N+1's CPU record with
+    // token N's GPU wait. Re-enabled async-decode default-on. Opt-out
+    // via `VULKANFORGE_DISABLE_ASYNC_DECODE=1` retained as escape hatch.
     let async_decode = match std::env::var("VULKANFORGE_DISABLE_ASYNC_DECODE") {
         Ok(v) => v != "1" && !v.eq_ignore_ascii_case("true"),
         Err(_) => {
-            if cfg.qwen35.is_some() {
-                false
-            } else {
-                cfg
-                    .gemma4
-                    .as_ref()
-                    .map(|g| !g.enable_moe_block || gpu_direct_moe_enabled())
-                    .unwrap_or(true)
-            }
+            cfg.gemma4
+                .as_ref()
+                .map(|g| !g.enable_moe_block || gpu_direct_moe_enabled())
+                .unwrap_or(true)
         }
     };
 
@@ -705,7 +717,11 @@ pub fn generate_from_tokens(
             generated.push(next_id);
 
             let embd = embed_lookup(&embed_src, cfg, next_id)?;
+            let iter_start = if cpu_timer { Some(Instant::now()) } else { None };
             let stats = forward.forward_token(dev, registry, cmd_ctx, model, &embd, pos, next_id)?;
+            if gpu_timer || cpu_timer {
+                decode_tokens_profiled += 1;
+            }
             if gpu_timer {
                 for (k, (d, n)) in stats.per_shader {
                     let e = acc_per_shader.entry(k).or_insert((Duration::ZERO, 0));
@@ -715,7 +731,26 @@ pub fn generate_from_tokens(
                 if !stats.per_layer.is_empty() {
                     acc_per_layer_decode.push(stats.per_layer);
                 }
-                decode_tokens_profiled += 1;
+            }
+            if cpu_timer {
+                if let Some(t) = forward.last_one_shot_timings.take() {
+                    acc_reset += t.reset;
+                    acc_begin += t.begin;
+                    acc_record += t.record;
+                    acc_end += t.end;
+                    acc_submit += t.submit;
+                    acc_wait += t.wait;
+                }
+                if let Some(rb) = forward.last_readback_time.take() {
+                    acc_readback += rb;
+                }
+                // iter_total — full forward_token call (reset+begin+record+
+                // end+submit+wait+readback) plus whatever Rust glue runs
+                // between iter_start and here. Difference vs the sum is
+                // the "between" wrap time.
+                if let Some(s) = iter_start {
+                    acc_other += s.elapsed();
+                }
             }
             last_logits = forward.logits()?;
             pos += 1;
@@ -808,6 +843,37 @@ pub fn generate_from_tokens(
                 );
             }
         }
+        eprintln!();
+    }
+
+    // Sprint G-7 — CPU-side per-stage breakdown printout.
+    if cpu_timer && decode_tokens_profiled > 0 {
+        let n = decode_tokens_profiled as f64;
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let total = acc_reset + acc_begin + acc_record + acc_end
+            + acc_submit + acc_wait + acc_readback;
+        let between = if acc_other > total { acc_other - total } else { Duration::ZERO };
+        eprintln!();
+        eprintln!("=== VF_CPU_TIMER per-stage breakdown ===");
+        eprintln!("(decode_tok={decode_tokens_profiled}; values are TOTAL ms / cumulative + per-token ms/tok)");
+        eprintln!("  {:<14} {:>12} {:>14}", "stage", "total ms", "ms/tok");
+        eprintln!("  {}", "-".repeat(46));
+        eprintln!("  {:<14} {:>12.3} {:>14.4}", "reset",    ms(acc_reset),    ms(acc_reset)    / n);
+        eprintln!("  {:<14} {:>12.3} {:>14.4}", "begin",    ms(acc_begin),    ms(acc_begin)    / n);
+        eprintln!("  {:<14} {:>12.3} {:>14.4}", "record",   ms(acc_record),   ms(acc_record)   / n);
+        eprintln!("  {:<14} {:>12.3} {:>14.4}", "end",      ms(acc_end),      ms(acc_end)      / n);
+        eprintln!("  {:<14} {:>12.3} {:>14.4}", "submit",   ms(acc_submit),   ms(acc_submit)   / n);
+        eprintln!("  {:<14} {:>12.3} {:>14.4}", "GPU wait", ms(acc_wait),     ms(acc_wait)     / n);
+        eprintln!("  {:<14} {:>12.3} {:>14.4}", "readback", ms(acc_readback), ms(acc_readback) / n);
+        eprintln!("  {:<14} {:>12.3} {:>14.4}", "between",  ms(between),      ms(between)      / n);
+        eprintln!("  {}", "-".repeat(46));
+        eprintln!("  {:<14} {:>12.3} {:>14.4}", "CPU TOTAL (excl GPU wait)",
+            ms(total - acc_wait + between), (ms(total - acc_wait + between)) / n);
+        eprintln!("  {:<14} {:>12.3} {:>14.4}", "ITER TOTAL", ms(acc_other), ms(acc_other) / n);
+        eprintln!();
+        eprintln!("  Async-decode potential overlap:");
+        eprintln!("    - GPU wait ({:.2} ms/tok) hides record+submit+end of next token", ms(acc_wait) / n);
+        eprintln!("    - readback ({:.2} ms/tok) is post-wait CPU work; could hide if N+1 pre-records", ms(acc_readback) / n);
         eprintln!();
     }
 

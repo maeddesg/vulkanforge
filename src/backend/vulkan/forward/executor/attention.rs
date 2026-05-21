@@ -601,12 +601,19 @@ impl DecodeExec {
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[q_buf]);
         fwd.run_scalar_attn(ctx.dev, ctx.registry, ctx.cmd, ctx.layer, position);
         fwd.mark_written(&[attn_out]);
-        // Sprint G-6 — trailing barrier elided. step_attn_gated_output's
-        // leading barrier(&[attn_out, q_buf]) covers the RAW dependency
-        // on the Full-Attn path; on Llama/Qwen2 paths step_o_proj's
-        // leading is implicit (run_gemv reads via descriptor binding,
-        // pending_writes lookup triggers a barrier if any of the GEMV's
-        // bindings are in the dirty set).
+        // Sprint G-6 trailing-barrier strip restored Sprint G-7 — on the
+        // Llama / Gemma-4 paths the immediate next step is `step_o_proj`,
+        // which has NO leading `maybe_compute_barrier` of its own (relies
+        // on the producer's trailing). Stripping this trailing made
+        // async-decode'd Gemma-4-26B emit garbage tokens because the
+        // O-proj GEMV started before scalar_attn's writes were visible.
+        // Synchronisation-validation didn't catch the race in the
+        // sync-decode path because the single command-buffer issue order
+        // happened to drain attn_out before next dispatch. Keep this
+        // trailing barrier — the Qwen3.6 Full-Attn path (which has
+        // `step_attn_gated_output` between attention and o_proj) absorbs
+        // it as a no-op via the elision tracker.
+        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[attn_out]);
     }
 
     /// Sprint D2 (v0.4.6) — Qwen3.6 Full-Attention gated output.
