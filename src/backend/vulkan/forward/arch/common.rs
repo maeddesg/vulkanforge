@@ -570,6 +570,15 @@ pub(crate) fn layer_weight_mm_id_shader(
 }
 
 pub(crate) fn compute_barrier(dev: &VulkanDevice, cmd: vk::CommandBuffer) {
+    // Graph-analysis Teil 4 — diagnostic kill-switch. Setting
+    // VF_NO_BARRIERS=1 skips every COMPUTE→COMPUTE memory barrier
+    // emission. Output is guaranteed to be garbage (this disables
+    // GPU synchronization); only useful for measuring the WALL-TIME
+    // cost of barrier emission + drain + refill in the absence of
+    // any sync overhead. NEVER set this in production.
+    if std::env::var("VF_NO_BARRIERS").map(|v| v == "1").unwrap_or(false) {
+        return;
+    }
     let mb = vk::MemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::SHADER_WRITE)
         .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
