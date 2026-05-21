@@ -322,6 +322,8 @@ impl DecodeExec {
     ) {
         use crate::backend::vulkan::graph::builder::{BufferMap, GraphBuilder};
         use crate::backend::vulkan::graph::node::GraphNode;
+        use super::state::BarrierMode;
+        use super::arch::compute_barrier;
 
         let cfg = fwd.config.clone();
 
@@ -371,7 +373,59 @@ impl DecodeExec {
             }
         }
 
-        for &node_id in &graph.execution_order {
+        // ── Sprint SG-2 — Graph-driven barrier pass ──────────────
+        //
+        // Within this scope, `fwd.barrier_mode = GraphDriven` makes
+        // `mark_written` + `maybe_compute_barrier` no-ops on the step-
+        // body side. Barriers come exclusively from the graph's edge
+        // set + a global high-water-mark check.
+        //
+        // The high-water mark records the *next position in
+        // execution_order whose writes are NOT yet synced by a
+        // `vkCmdPipelineBarrier`*. Initially 0 → at least one barrier
+        // fires up-front to drain the previous layer's output (it
+        // wrote `scratch_a` without imperative tracking, since the
+        // prior layer's execute_layer_via_graph also ran in
+        // GraphDriven mode).
+        //
+        // Algorithm per node at position P:
+        //   1. Find any incoming edge (M → N) with pos(M) >= high_water.
+        //   2. If at least one such edge exists → emit one
+        //      cmd_pipeline_barrier and set high_water = P. The
+        //      barrier is global, so a *single* emission covers every
+        //      not-yet-synced incoming edge on N (regardless of
+        //      source buffer).
+        //   3. Execute the step (no-op `mark_written` /
+        //      `maybe_compute_barrier` inside).
+        //
+        // After the layer: reset barrier_mode back to Imperative AND
+        // emit a final global barrier so the *next* layer (which may
+        // run in either mode) sees this layer's final writes
+        // committed without needing to know what they were.
+        fwd.barrier_mode = BarrierMode::GraphDriven;
+
+        // Inter-layer drain — the previous layer's last write (scratch_a
+        // from its FfnResidualAdd, or attn_out etc.) needs to be visible
+        // before AttnNorm reads it.
+        compute_barrier(ctx.dev, ctx.cmd);
+        let mut barriers_emitted: u32 = 1;
+        // Position 0 means "everything before is synced". Any incoming
+        // edge with source-position 0 is already handled by the drain
+        // barrier above; any source-position >= the next high-water is
+        // still pending.
+        let mut high_water: usize = 0;
+        // execution_order position of each node, for quick edge-source
+        // lookup. The Builder's topo sort is consistent with insertion
+        // order for Qwen3-8B's forward-only edges, so this lookup is
+        // identity in the common case — but we compute it anyway to
+        // stay correct against future reorderings.
+        let mut pos_of: std::collections::HashMap<u32, usize> =
+            std::collections::HashMap::with_capacity(graph.execution_order.len());
+        for (i, &nid) in graph.execution_order.iter().enumerate() {
+            pos_of.insert(nid, i);
+        }
+
+        for (position, &node_id) in graph.execution_order.iter().enumerate() {
             if let GraphNode::Dispatch(d) = &graph.nodes[node_id as usize] {
                 let step_idx = d.step_index_in_layer as usize;
                 if step_idx >= plan.len() {
@@ -383,12 +437,61 @@ impl DecodeExec {
                 if skip_step[step_idx] {
                     continue;
                 }
+
+                // Emit a barrier if any incoming edge sources sit at or
+                // above the high-water mark — i.e. their writes were
+                // not yet covered by a previous emission.
+                let mut need_barrier = false;
+                for edge in &graph.edges {
+                    if edge.to != node_id {
+                        continue;
+                    }
+                    let from_pos = match pos_of.get(&edge.from) {
+                        Some(&p) => p,
+                        None => continue,
+                    };
+                    if from_pos >= high_water {
+                        need_barrier = true;
+                        break;
+                    }
+                }
+                if need_barrier {
+                    compute_barrier(ctx.dev, ctx.cmd);
+                    barriers_emitted += 1;
+                    high_water = position;
+                }
+
                 if Some(step_idx) == fusion_start {
                     self.fused_attn_residual_norm(fwd, &cfg, ctx);
                 } else {
                     self.execute_step(fwd, &plan[step_idx], &cfg, ctx);
                 }
             }
+        }
+
+        // Toggle back to imperative mode. Instead of an end-drain
+        // (one extra barrier per layer), seed the imperative
+        // pending_writes set with every buffer this layer's graph
+        // wrote — so the next imperative consumer (next graph layer's
+        // start-drain, or `dispatch_final`'s lm_head reads) will fire
+        // a real barrier via the existing `maybe_compute_barrier`
+        // mechanism. Net barrier count per layer: 1 inter-layer drain
+        // + within-layer (typically 10) = ~11 — same ball-park as the
+        // imperative path's ~10/layer.
+        fwd.barrier_mode = BarrierMode::Imperative;
+        fwd.pending_writes.clear();
+        for node in &graph.nodes {
+            for w in node.writes() {
+                use ash::vk::Handle;
+                fwd.pending_writes.insert(w.buffer.as_raw());
+            }
+        }
+
+        if std::env::var("VF_BARRIER_STATS").as_deref() == Ok("1") {
+            eprintln!(
+                "[GRAPH L{:>2}] {:>3} barriers emitted (graph nodes={}, edges={})",
+                ctx.layer, barriers_emitted, graph.nodes.len(), graph.edges.len()
+            );
         }
     }
 

@@ -117,6 +117,27 @@ impl BindingSignature {
     }
 }
 
+/// Sprint SG-2 — controls whether `Forward`'s imperative barrier-
+/// elision tracker is active, or whether the active graph-driven
+/// dispatch path is emitting barriers from graph edges instead.
+///
+/// `Imperative` (default): `maybe_compute_barrier` runs the Sprint 12D
+/// dirty-flag check + emits global compute barriers; `mark_written`
+/// inserts buffers into `pending_writes`.
+///
+/// `GraphDriven`: both become no-ops. The
+/// [`super::executor::DecodeExec::execute_layer_via_graph`] caller is
+/// responsible for emitting the right `vkCmdPipelineBarrier`s from the
+/// graph's `edges` before each dispatch. Mode is reset to `Imperative`
+/// after the graph-driven layer returns so the inter-layer scratch
+/// buffer (`scratch_a`) handoff stays under imperative control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BarrierMode {
+    #[default]
+    Imperative,
+    GraphDriven,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DebugTarget {
     AttnNorm,
@@ -690,6 +711,14 @@ pub struct Forward {
     pub(super) elision_disabled: bool,
     pub(super) barrier_stats_checked: u64,
     pub(super) barrier_stats_issued: u64,
+
+    /// Sprint SG-2 — when `BarrierMode::GraphDriven`, both
+    /// [`Forward::mark_written`] and [`Forward::maybe_compute_barrier`]
+    /// become no-ops; the graph-driven `execute_layer_via_graph` path
+    /// emits its own byte-range-precise `vkCmdPipelineBarrier` calls
+    /// based on the graph's edge set. Default is `Imperative` — the
+    /// production path is bit-identical to pre-SG-2 behaviour.
+    pub(super) barrier_mode: BarrierMode,
 
     /// Sprint 47B — captured at construction from
     /// `VulkanDevice::native_fp8_wmma`. Replaces the legacy

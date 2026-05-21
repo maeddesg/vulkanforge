@@ -72,7 +72,7 @@ mod runs;
 mod setup;
 mod state;
 pub use state::{
-    DebugTarget, Forward, ForwardStats, ForwardTokenProfile, IntermediateSlot,
+    BarrierMode, DebugTarget, Forward, ForwardStats, ForwardTokenProfile, IntermediateSlot,
 };
 
 /// Sprint 56C-3 — global env-var switch for the GPU-direct MoE expert
@@ -221,6 +221,12 @@ impl Forward {
     /// path doesn't need the tracker).
     #[inline]
     fn mark_written(&mut self, bufs: &[vk::Buffer]) {
+        // Sprint SG-2 — when the graph-driven dispatcher is active, the
+        // graph's edges drive barrier emission; the imperative dirty-
+        // flag tracker is bypassed entirely to avoid double-tracking.
+        if matches!(self.barrier_mode, state::BarrierMode::GraphDriven) {
+            return;
+        }
         if self.elision_disabled {
             return;
         }
@@ -239,6 +245,13 @@ impl Forward {
         cmd: vk::CommandBuffer,
         reads: &[vk::Buffer],
     ) -> bool {
+        // Sprint SG-2 — graph-driven dispatcher owns barrier emission;
+        // step-bodies' calls to this function become no-ops to avoid
+        // emitting both imperative + graph barriers around the same
+        // dispatch.
+        if matches!(self.barrier_mode, state::BarrierMode::GraphDriven) {
+            return false;
+        }
         self.barrier_stats_checked = self.barrier_stats_checked.saturating_add(1);
         if self.elision_disabled {
             compute_barrier(dev, cmd);

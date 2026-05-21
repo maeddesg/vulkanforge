@@ -894,6 +894,7 @@ impl Forward {
                 .unwrap_or(false),
             barrier_stats_checked: 0,
             barrier_stats_issued: 0,
+            barrier_mode: super::state::BarrierMode::Imperative,
             fp8pc,
             fp8pc_ds_cache: HashMap::new(),
             fp8bw,
