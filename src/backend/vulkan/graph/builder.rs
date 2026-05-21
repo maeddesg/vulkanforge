@@ -49,6 +49,12 @@ pub struct GraphBuilder<'a> {
     cfg: &'a ModelConfig,
     /// Decode position (used by `Attention` for KV-cache range).
     position: u32,
+    /// Per-layer step counter — the index of the next `LayerStep` within
+    /// the current layer's plan. Incremented exactly once per `add_step`
+    /// call so each `DispatchNode.step_index_in_layer` reflects its plan
+    /// position. Reset to 0 when a new layer begins (see
+    /// [`Self::begin_layer`]).
+    current_step_in_layer: u32,
 }
 
 /// Resolved set of `vk::Buffer` handles the Builder threads into
@@ -115,15 +121,47 @@ impl<'a> GraphBuilder<'a> {
             bufs,
             cfg,
             position,
+            current_step_in_layer: 0,
         };
         for (layer, plan) in per_layer_plans.iter().enumerate() {
+            builder.current_step_in_layer = 0;
             for step in plan {
                 builder.add_step(step, layer as u32);
+                builder.current_step_in_layer += 1;
             }
         }
         // lm_head is an architecture-independent terminal node; left
         // to SG-1.3 to add since it depends on `output.weight` lookup.
 
+        let mut graph = builder.graph;
+        graph.resolve_dependencies();
+        graph.sort();
+        graph
+    }
+
+    /// Sprint SG-1.3 — build a graph for a single layer's plan only.
+    /// The Recorder integration point in `forward::executor` lives at
+    /// the per-layer granularity (`execute_layer`), so the Builder
+    /// also offers per-layer construction. Each `DispatchNode` carries
+    /// its `step_index_in_layer` so the Recorder can index back into
+    /// the original `LayerPlan` and call `DecodeExec::execute_step`.
+    pub fn build_per_layer(
+        bufs: &'a BufferMap,
+        cfg: &'a ModelConfig,
+        layer: u32,
+        plan: &LayerPlan,
+    ) -> VulkanGraph {
+        let mut builder = Self {
+            graph: VulkanGraph::with_capacity(plan.len()),
+            bufs,
+            cfg,
+            position: 0,
+            current_step_in_layer: 0,
+        };
+        for step in plan {
+            builder.add_step(step, layer);
+            builder.current_step_in_layer += 1;
+        }
         let mut graph = builder.graph;
         graph.resolve_dependencies();
         graph.sort();
@@ -288,6 +326,7 @@ impl<'a> GraphBuilder<'a> {
         let bytes = (cols as u64) * (rows as u64) * 4;
         self.graph.add_dispatch(DispatchNode {
             id: 0,
+            step_index_in_layer: self.current_step_in_layer,
             pipeline: vk::Pipeline::null(),
             pipeline_layout: vk::PipelineLayout::null(),
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
@@ -314,6 +353,7 @@ impl<'a> GraphBuilder<'a> {
         let output_bytes = (m as u64) * 4;
         self.graph.add_dispatch(DispatchNode {
             id: 0,
+            step_index_in_layer: self.current_step_in_layer,
             pipeline: vk::Pipeline::null(),
             pipeline_layout: vk::PipelineLayout::null(),
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
@@ -340,6 +380,7 @@ impl<'a> GraphBuilder<'a> {
         let bytes = (dim as u64) * 4;
         self.graph.add_dispatch(DispatchNode {
             id: 0,
+            step_index_in_layer: self.current_step_in_layer,
             pipeline: vk::Pipeline::null(),
             pipeline_layout: vk::PipelineLayout::null(),
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
@@ -375,6 +416,7 @@ impl<'a> GraphBuilder<'a> {
         let v_bytes = k_bytes;
         self.graph.add_dispatch(DispatchNode {
             id: 0,
+            step_index_in_layer: self.current_step_in_layer,
             pipeline: vk::Pipeline::null(),
             pipeline_layout: vk::PipelineLayout::null(),
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
@@ -404,6 +446,7 @@ impl<'a> GraphBuilder<'a> {
         let attn_bytes = q_bytes;
         self.graph.add_dispatch(DispatchNode {
             id: 0,
+            step_index_in_layer: self.current_step_in_layer,
             pipeline: vk::Pipeline::null(),
             pipeline_layout: vk::PipelineLayout::null(),
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
@@ -433,6 +476,7 @@ impl<'a> GraphBuilder<'a> {
         };
         self.graph.add_dispatch(DispatchNode {
             id: 0,
+            step_index_in_layer: self.current_step_in_layer,
             pipeline: vk::Pipeline::null(),
             pipeline_layout: vk::PipelineLayout::null(),
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
@@ -461,6 +505,7 @@ impl<'a> GraphBuilder<'a> {
         let bytes = (ne as u64) * 4;
         self.graph.add_dispatch(DispatchNode {
             id: 0,
+            step_index_in_layer: self.current_step_in_layer,
             pipeline: vk::Pipeline::null(),
             pipeline_layout: vk::PipelineLayout::null(),
             descriptor_set_layout: vk::DescriptorSetLayout::null(),

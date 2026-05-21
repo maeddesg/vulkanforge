@@ -269,6 +269,7 @@ mod tests {
     fn dummy_dispatch_node() -> DispatchNode {
         DispatchNode {
             id: 0, // overwritten by add_dispatch
+            step_index_in_layer: 0,
             pipeline: vk::Pipeline::null(),
             pipeline_layout: vk::PipelineLayout::null(),
             descriptor_set_layout: vk::DescriptorSetLayout::null(),

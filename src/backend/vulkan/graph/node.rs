@@ -99,6 +99,12 @@ impl MemAccess {
 /// the same vkCmd* sequence the imperative executor uses today.
 pub struct DispatchNode {
     pub id: NodeId,
+    /// Index into the layer's plan vector (`LayerPlan[step_index_in_layer]`).
+    /// Sprint SG-1.3 — the Recorder uses this to call back into the
+    /// existing imperative `DecodeExec::execute_step` for the bit-
+    /// identical-output Qwen3-8B gate. Older Sprint SG-1.2 tests that
+    /// build nodes without a plan context can leave this at 0.
+    pub step_index_in_layer: u32,
     /// Vulkan compute pipeline (from `PipelineRegistry::get(...)`).
     pub pipeline: vk::Pipeline,
     /// Matching pipeline layout. Stored explicitly so the Recorder

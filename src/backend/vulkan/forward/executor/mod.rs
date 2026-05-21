@@ -255,6 +255,23 @@ impl DecodeExec {
         plan: &LayerPlan,
         ctx: &ExecCtx,
     ) {
+        // Sprint SG-1.3 — VF_USE_GRAPH=1 opt-in graph-dispatch path.
+        // Default OFF; the imperative loop below is the production
+        // default. When ON, build a per-layer VulkanGraph, sort it
+        // topologically, and execute steps in that order.
+        //
+        // For Qwen3-8B the topological order matches plan-order (the
+        // Builder's forward-only RAW edges preserve insertion order),
+        // so output is bit-identical to the imperative path. SG-1.3's
+        // value is *plumbing* — it proves Builder → resolve → sort →
+        // execute_step round-trips correctly. The actual byte-range
+        // barrier reduction (the analysis-Teil-4 lever) lands in SG-2
+        // as a `Pass` over the same graph.
+        if std::env::var("VF_USE_GRAPH").as_deref() == Ok("1") {
+            self.execute_layer_via_graph(fwd, plan, ctx);
+            return;
+        }
+
         let cfg = fwd.config.clone();
         let mut i = 0;
         while i < plan.len() {
@@ -282,6 +299,96 @@ impl DecodeExec {
             }
             self.execute_step(fwd, &plan[i], &cfg, ctx);
             i += 1;
+        }
+    }
+
+    /// Sprint SG-1.3 — graph-dispatch path. Builds a per-layer
+    /// `VulkanGraph` from `plan`, resolves byte-range dependencies,
+    /// runs Kahn's topological sort, then calls `execute_step` on
+    /// each node's source `LayerStep` in topological order.
+    ///
+    /// Output is bit-identical to the imperative `execute_layer` loop
+    /// because the Builder emits strictly-forward RAW edges, so the
+    /// topological order coincides with the build order. The plumbing
+    /// is what proves out here — Sprint SG-2 will hang a barrier-
+    /// optimization `Pass` off the same graph and emit byte-range-
+    /// precise `vkCmdPipelineBarrier`s, replacing the imperative
+    /// path's whole-buffer-dirty tracker.
+    fn execute_layer_via_graph(
+        &self,
+        fwd: &mut Forward,
+        plan: &LayerPlan,
+        ctx: &ExecCtx,
+    ) {
+        use crate::backend::vulkan::graph::builder::{BufferMap, GraphBuilder};
+        use crate::backend::vulkan::graph::node::GraphNode;
+
+        let cfg = fwd.config.clone();
+
+        // Per-layer Builder. BufferMap carries real `vk::Buffer`
+        // handles so byte-range dependency resolution distinguishes
+        // distinct buffers correctly (not all-null poison).
+        let bufs = BufferMap {
+            scratch_a:    fwd.cur().scratch_a.handle,
+            hidden_norm:  fwd.cur().hidden_norm.handle,
+            q_buf:        fwd.cur().q_buf.handle,
+            k_buf:        fwd.cur().k_buf.handle,
+            v_buf:        fwd.cur().v_buf.handle,
+            attn_out:     fwd.cur().attn_out.handle,
+            o_buf:        fwd.cur().o_buf.handle,
+            res1:         fwd.cur().res1.handle,
+            gate_buf:     fwd.cur().gate_buf.handle,
+            up_buf:       fwd.cur().up_buf.handle,
+            ffn_hidden:   fwd.cur().ffn_hidden.handle,
+            ffn_out:      fwd.cur().ffn_out.handle,
+            // For SG-1.3 the layer output equals scratch_a (cur slot
+            // recycles; the next layer reads its own scratch_a). The
+            // graph only uses this for byte-range tracking, not actual
+            // dispatching.
+            layer_output: fwd.cur().scratch_a.handle,
+            kv_cache:     fwd.kv_cache.k_buffer.handle,
+        };
+
+        let graph = GraphBuilder::build_per_layer(&bufs, &cfg, ctx.layer, plan);
+
+        // Mirror the imperative-path Llama AttnResidualAdd + PreFfnNorm
+        // → multi_add_rms fusion (see the loop above). Identify the
+        // index of the AttnResidualAdd that pairs with a following
+        // PreFfnNorm; both indices then get skipped during the
+        // topo-order walk and the fusion gets emitted at the
+        // AttnResidualAdd's execution point.
+        let mut fusion_start: Option<usize> = None;
+        let mut skip_step: Vec<bool> = vec![false; plan.len()];
+        if cfg.gemma4.is_none() && cfg.qwen35.is_none() {
+            for i in 0..plan.len().saturating_sub(1) {
+                if matches!(plan[i], LayerStep::AttnResidualAdd)
+                    && matches!(plan[i + 1], LayerStep::PreFfnNorm)
+                {
+                    fusion_start = Some(i);
+                    skip_step[i + 1] = true;
+                    break;
+                }
+            }
+        }
+
+        for &node_id in &graph.execution_order {
+            if let GraphNode::Dispatch(d) = &graph.nodes[node_id as usize] {
+                let step_idx = d.step_index_in_layer as usize;
+                if step_idx >= plan.len() {
+                    panic!(
+                        "graph node L{} step_index_in_layer {} out of bounds for plan.len()={}",
+                        ctx.layer, step_idx, plan.len(),
+                    );
+                }
+                if skip_step[step_idx] {
+                    continue;
+                }
+                if Some(step_idx) == fusion_start {
+                    self.fused_attn_residual_norm(fwd, &cfg, ctx);
+                } else {
+                    self.execute_step(fwd, &plan[step_idx], &cfg, ctx);
+                }
+            }
         }
     }
 
