@@ -265,8 +265,18 @@ impl Forward {
         reads: &[vk::Buffer],
     ) {
         if matches!(self.barrier_mode, state::BarrierMode::GraphDriven) {
+            if std::env::var("VF_BARRIER_TRACE").as_deref() == Ok("1") {
+                let h: Vec<String> = reads.iter()
+                    .map(|b| format!("{:x}", b.as_raw() & 0xFFFFFF)).collect();
+                eprintln!("[BTRACE] FRC mode=Grph reads=[{}]", h.join(","));
+            }
             compute_barrier(dev, cmd);
             return;
+        }
+        if std::env::var("VF_BARRIER_TRACE").as_deref() == Ok("1") {
+            let h: Vec<String> = reads.iter()
+                .map(|b| format!("{:x}", b.as_raw() & 0xFFFFFF)).collect();
+            eprintln!("[BTRACE] FRC mode=Imp reads=[{}]", h.join(","));
         }
         self.maybe_compute_barrier(dev, cmd, reads);
     }
@@ -277,12 +287,18 @@ impl Forward {
         cmd: vk::CommandBuffer,
         reads: &[vk::Buffer],
     ) -> bool {
+        let trace = std::env::var("VF_BARRIER_TRACE").as_deref() == Ok("1");
         // Sprint SG-2 — graph-driven dispatcher owns barrier emission;
         // step-bodies' calls to this function become no-ops to avoid
         // emitting both imperative + graph barriers around the same
         // dispatch. SSM sub-dispatch sites should use
         // `force_internal_barrier` instead (Sprint SG-1.4-b).
         if matches!(self.barrier_mode, state::BarrierMode::GraphDriven) {
+            if trace {
+                let h: Vec<String> = reads.iter()
+                    .map(|b| format!("{:x}", b.as_raw() & 0xFFFFFF)).collect();
+                eprintln!("[BTRACE] IMP SKIPPED-GraphDriven reads=[{}]", h.join(","));
+            }
             return false;
         }
         self.barrier_stats_checked = self.barrier_stats_checked.saturating_add(1);
@@ -293,6 +309,11 @@ impl Forward {
         }
         let any_dirty = reads.iter().any(|b| self.pending_writes.contains(&b.as_raw()));
         if any_dirty {
+            if trace {
+                let h: Vec<String> = reads.iter()
+                    .map(|b| format!("{:x}", b.as_raw() & 0xFFFFFF)).collect();
+                eprintln!("[BTRACE] IMP EMITTED reads=[{}]", h.join(","));
+            }
             compute_barrier(dev, cmd);
             self.pending_writes.clear();
             self.barrier_stats_issued = self.barrier_stats_issued.saturating_add(1);

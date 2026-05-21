@@ -435,7 +435,14 @@ impl DecodeExec {
         // one more missing edge or barrier site. Documented in
         // `results/sprint_sg1_4c_edge_audit.md`. Gemma-4 also stays
         // imperative.
-        let use_graph_barriers = cfg.gemma4.is_none() && cfg.qwen35.is_none();
+        // SG-1.4-d — VF_GRAPH_BARRIERS_ALL=1 is a diagnostic env that
+        // forces graph-driven barriers on every architecture (incl.
+        // qwen35 / gemma4). Use with VF_BARRIER_TRACE=1 to find the
+        // remaining missing-edge bug on Qwen3.6.
+        let force_all = std::env::var("VF_GRAPH_BARRIERS_ALL").as_deref() == Ok("1");
+        let use_graph_barriers = force_all
+            || (cfg.gemma4.is_none() && cfg.qwen35.is_none());
+        let trace = std::env::var("VF_BARRIER_TRACE").as_deref() == Ok("1");
         if use_graph_barriers {
             fwd.barrier_mode = BarrierMode::GraphDriven;
         }
@@ -446,6 +453,9 @@ impl DecodeExec {
         // are still active (they'd cover this themselves).
         let mut barriers_emitted: u32 = 0;
         if use_graph_barriers {
+            if trace {
+                eprintln!("[BTRACE] GRF L{:>2} inter-layer-drain", ctx.layer);
+            }
             compute_barrier(ctx.dev, ctx.cmd);
             barriers_emitted = 1;
         }
@@ -496,6 +506,13 @@ impl DecodeExec {
                     }
                 }
                 if need_barrier && use_graph_barriers {
+                    if trace {
+                        let lbl = d.label.as_deref().unwrap_or("?");
+                        eprintln!(
+                            "[BTRACE] GRF L{:>2} node={:>3} pos={:>3} step_idx={} label={}",
+                            ctx.layer, node_id, position, step_idx, lbl
+                        );
+                    }
                     compute_barrier(ctx.dev, ctx.cmd);
                     barriers_emitted += 1;
                     high_water = position;
