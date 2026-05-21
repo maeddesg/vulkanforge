@@ -76,6 +76,15 @@ impl DecodeExec {
         let (_, ffn_dim, _, _) = layer_dims_local(cfg, ctx.layer);
         let hidden_norm = fwd.cur().hidden_norm.handle;
         let up_buf = fwd.cur().up_buf.handle;
+        // Sprint G-4 — diagnostic: insert an opt-in barrier between
+        // gemv_gate and gemv_up so each timestamp measures itself rather
+        // than the tail of the previous adjacent RAW-independent dispatch
+        // on RADV. See feedback_per_dispatch_timestamps.md. Default off
+        // (zero cost) to keep the production path untouched.
+        if std::env::var("VF_GPU_TIMER_DIAG_FFN").map(|v| v == "1").unwrap_or(false) {
+            let gate_buf = fwd.cur().gate_buf.handle;
+            fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[gate_buf]);
+        }
         let wu = layer_weight(ctx.model, ctx.layer, "ffn_up.weight");
         let su = layer_weight_shader(
             ctx.model, ctx.layer, "ffn_up.weight", fwd.mul_mat_vec_subgroup_enabled,

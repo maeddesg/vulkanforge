@@ -493,7 +493,27 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
     // unwritten); harmless for Llama / Qwen (every pos slot is
     // fully overwritten by its layer).
     kv_cache.zero_fill(&dev)?;
-    let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;
+    // Sprint G-4 — optional GPU timestamp profiler. Off by default
+    // (zero overhead); set VF_GPU_TIMER=1 to install a ShaderProfiler
+    // sized for ~1500 dispatches/forward_token (65 layers × ~15-20
+    // dispatches each + lm_head). The accumulated per-shader breakdown
+    // is printed by generate_from_tokens at end of decode.
+    let profiler = if std::env::var("VF_GPU_TIMER").map(|v| v == "1").unwrap_or(false) {
+        let capacity_pairs = std::env::var("VF_GPU_TIMER_CAPACITY")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(4096);
+        Some(vulkanforge::backend::vulkan::profiler::ShaderProfiler::new(
+            &dev.instance,
+            dev.physical_device,
+            dev.queue_family_index,
+            &dev.device,
+            capacity_pairs,
+        )?)
+    } else {
+        None
+    };
+    let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None.or(profiler))?;
     // Sprint 56B — GPU-side MoE router init. No-op for non-MoE models.
     forward.init_moe_router_gpu(&dev, &mut allocator, &model, max_context)?;
 

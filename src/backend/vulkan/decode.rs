@@ -18,6 +18,7 @@
 //! to stdout" path; callers that want to filter or render differently
 //! pass an explicit callback to `generate_from_tokens`.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
@@ -466,6 +467,18 @@ pub fn generate_from_tokens(
         .into());
     }
 
+    // Sprint G-4 — per-shader GPU-time accumulator. Enabled by
+    // `VF_GPU_TIMER=1` plus a ShaderProfiler installed at Forward::new.
+    // Aggregates per-label totals across every forward_token call in
+    // both prefill (per-token path) and decode, then prints a sorted
+    // breakdown at the end. Zero overhead when the env-gate is off
+    // (Forward's profile() helper short-circuits on profiler=None).
+    let gpu_timer = std::env::var("VF_GPU_TIMER").map(|v| v == "1").unwrap_or(false);
+    let mut acc_per_shader: BTreeMap<String, (Duration, u32)> = BTreeMap::new();
+    let mut acc_per_layer_decode: Vec<Vec<Duration>> = Vec::new();
+    let mut decode_tokens_profiled: u32 = 0;
+    let mut prefill_tokens_profiled: u32 = 0;
+
     // ---- Prefill ----
     let prefill_start = Instant::now();
     let mut pos = start_pos;
@@ -493,7 +506,15 @@ pub fn generate_from_tokens(
             // future work (Sprint 19A-style coopmat coverage).
             for &tid in prefill_tokens {
                 let embd = embed_lookup(&embed_src, cfg, tid)?;
-                forward.forward_token(dev, registry, cmd_ctx, model, &embd, pos, tid)?;
+                let stats = forward.forward_token(dev, registry, cmd_ctx, model, &embd, pos, tid)?;
+                if gpu_timer {
+                    for (k, (d, n)) in stats.per_shader {
+                        let e = acc_per_shader.entry(k).or_insert((Duration::ZERO, 0));
+                        e.0 += d;
+                        e.1 += n;
+                    }
+                    prefill_tokens_profiled += 1;
+                }
                 pos += 1;
             }
         } else {
@@ -684,7 +705,18 @@ pub fn generate_from_tokens(
             generated.push(next_id);
 
             let embd = embed_lookup(&embed_src, cfg, next_id)?;
-            forward.forward_token(dev, registry, cmd_ctx, model, &embd, pos, next_id)?;
+            let stats = forward.forward_token(dev, registry, cmd_ctx, model, &embd, pos, next_id)?;
+            if gpu_timer {
+                for (k, (d, n)) in stats.per_shader {
+                    let e = acc_per_shader.entry(k).or_insert((Duration::ZERO, 0));
+                    e.0 += d;
+                    e.1 += n;
+                }
+                if !stats.per_layer.is_empty() {
+                    acc_per_layer_decode.push(stats.per_layer);
+                }
+                decode_tokens_profiled += 1;
+            }
             last_logits = forward.logits()?;
             pos += 1;
         }
@@ -700,6 +732,84 @@ pub fn generate_from_tokens(
         utf8_buf.clear();
     }
     let decode_time = decode_start.elapsed();
+
+    // Sprint G-4 — print accumulated per-shader GPU-time breakdown.
+    if gpu_timer && (decode_tokens_profiled > 0 || prefill_tokens_profiled > 0) {
+        let total_tokens = decode_tokens_profiled + prefill_tokens_profiled;
+        eprintln!();
+        eprintln!("=== VF_GPU_TIMER per-shader breakdown ===");
+        eprintln!("(prefill_tok={prefill_tokens_profiled}, decode_tok={decode_tokens_profiled}; values are TOTAL across all profiled forward_token calls)");
+        let mut rows: Vec<(String, Duration, u32)> = acc_per_shader
+            .iter()
+            .map(|(k, (d, n))| (k.clone(), *d, *n))
+            .collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        let total_ns: u128 = rows.iter().map(|r| r.1.as_nanos()).sum();
+        let total_ms = total_ns as f64 / 1e6;
+        let per_tok_ms = if total_tokens > 0 {
+            total_ms / total_tokens as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "  {:<32} {:>10} {:>10} {:>8}   {:>10}",
+            "shader", "total ms", "calls", "%", "ms/tok"
+        );
+        eprintln!("  {}", "-".repeat(78));
+        for (name, dur, calls) in &rows {
+            let ms = dur.as_nanos() as f64 / 1e6;
+            let pct = if total_ns > 0 {
+                100.0 * (dur.as_nanos() as f64) / (total_ns as f64)
+            } else {
+                0.0
+            };
+            let mstok = if total_tokens > 0 {
+                ms / total_tokens as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "  {:<32} {:>10.3} {:>10} {:>7.2}%   {:>10.3}",
+                name, ms, calls, pct, mstok
+            );
+        }
+        eprintln!("  {}", "-".repeat(78));
+        eprintln!(
+            "  {:<32} {:>10.3} ms ({:>5.2} ms/tok)",
+            "TOTAL GPU TIME", total_ms, per_tok_ms
+        );
+        let wall_decode_ms = decode_time.as_nanos() as f64 / 1e6;
+        if decode_tokens_profiled > 0 {
+            let wall_per_tok = wall_decode_ms / decode_tokens_profiled as f64;
+            eprintln!(
+                "  {:<32} {:>10.3} ms  ({:>5.2} ms/tok decode wall)",
+                "WALL DECODE", wall_decode_ms, wall_per_tok
+            );
+            let gpu_decode_ns: u128 = acc_per_layer_decode
+                .iter()
+                .flat_map(|v| v.iter().map(|d| d.as_nanos()))
+                .sum::<u128>();
+            let gpu_decode_ms = gpu_decode_ns as f64 / 1e6;
+            let gpu_per_tok = if decode_tokens_profiled > 0 {
+                gpu_decode_ms / decode_tokens_profiled as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "  {:<32} {:>10.3} ms  ({:>5.2} ms/tok per_layer sum, decode-only)",
+                "GPU DECODE (per_layer sum)", gpu_decode_ms, gpu_per_tok
+            );
+            if wall_decode_ms > 0.0 {
+                let busy_pct = 100.0 * gpu_decode_ms / wall_decode_ms;
+                eprintln!(
+                    "  GPU-busy fraction (decode wall): {:.1}%   CPU/idle gap: {:.1}%",
+                    busy_pct,
+                    100.0 - busy_pct,
+                );
+            }
+        }
+        eprintln!();
+    }
 
     let generated_text = tokenizer.decode(&generated);
     let visible_text = if config.think_filter {
