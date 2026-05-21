@@ -474,6 +474,20 @@ impl DecodeExec {
         };
         let trace = std::env::var("VF_BARRIER_TRACE").as_deref() == Ok("1");
         if use_graph_barriers {
+            // SG-1.4-h — clear pending_writes BEFORE switching into
+            // GraphDriven mode. Otherwise leftover state from the
+            // imperative caller (prefill BatchExec, prior decode
+            // layers in mixed VF_GRAPH_BARRIERS_LAYERS scenarios)
+            // sits unflushed during the graph window. Hypothesis (3)
+            // from `results/sprint_sg1_4g_l0_fix.md` §4 — the L0
+            // deterministic break may stem from this state-leak.
+            if trace && !fwd.pending_writes.is_empty() {
+                eprintln!(
+                    "[BTRACE] GRF L{:>2} entry: pending_writes had {} stale entries",
+                    ctx.layer, fwd.pending_writes.len(),
+                );
+            }
+            fwd.pending_writes.clear();
             fwd.barrier_mode = BarrierMode::GraphDriven;
         }
 
