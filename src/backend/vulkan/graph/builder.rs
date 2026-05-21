@@ -813,12 +813,23 @@ impl<'a> GraphBuilder<'a> {
 
     fn add_norm_gated(&mut self, layer: u32) {
         // RMSNorm + SiLU + Mul → ssm_norm_out.
+        //
+        // SG-1.4-e — in-place write audit: step_norm_gated's middle
+        // sub-dispatch is `run_silu(z, z, ...)` which writes ssm_z
+        // in-place (executor/attention.rs:1277-1281). Without listing
+        // ssm_z as a write, the graph couldn't see the WAW that lets
+        // a later consumer of ssm_z (e.g. the NEXT layer's
+        // NormGated, after the inter-layer drain) observe the
+        // silu'd value.
         self.ssm_simple_node(layer,
             vec![
                 MemAccess::whole(self.bufs.ssm_gdn_out),  // output portion
                 MemAccess::new(self.bufs.ssm_z, 0, Self::D_INNER_BYTES),
             ],
-            vec![MemAccess::new(self.bufs.ssm_norm_out, 0, Self::D_INNER_BYTES)],
+            vec![
+                MemAccess::new(self.bufs.ssm_norm_out, 0, Self::D_INNER_BYTES),
+                MemAccess::new(self.bufs.ssm_z, 0, Self::D_INNER_BYTES),  // SiLU in-place
+            ],
             "norm_gated",
         );
     }
