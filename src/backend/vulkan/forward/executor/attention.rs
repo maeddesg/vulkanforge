@@ -601,7 +601,12 @@ impl DecodeExec {
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[q_buf]);
         fwd.run_scalar_attn(ctx.dev, ctx.registry, ctx.cmd, ctx.layer, position);
         fwd.mark_written(&[attn_out]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[attn_out]);
+        // Sprint G-6 — trailing barrier elided. step_attn_gated_output's
+        // leading barrier(&[attn_out, q_buf]) covers the RAW dependency
+        // on the Full-Attn path; on Llama/Qwen2 paths step_o_proj's
+        // leading is implicit (run_gemv reads via descriptor binding,
+        // pending_writes lookup triggers a barrier if any of the GEMV's
+        // bindings are in the dirty set).
     }
 
     /// Sprint D2 (v0.4.6) — Qwen3.6 Full-Attention gated output.
@@ -815,7 +820,12 @@ impl DecodeExec {
             d_conv, d_conv, conv_channels, 1, 1, "ssm_conv",
         );
         fwd.mark_written(&[conv_output]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_output]);
+        // Sprint G-6 — trailing barrier elided. The next consumer
+        // (step_ssm_silu's leading maybe_compute_barrier(&[conv_output]))
+        // will emit a barrier once it sees conv_output in pending_writes;
+        // emitting one here forces an unconditional drain of all in-flight
+        // dispatches, which serializes the 4 RAW-independent SSM-side
+        // GEMVs above it. Matches the lean FFN-step pattern in ffn.rs.
     }
 
     // ──────────────────────────────────────────────────────────
@@ -856,7 +866,7 @@ impl DecodeExec {
             cfg.hidden_dim, spec.conv_channels(), scale, "gemv_ssm_qkv",
         );
         fwd.mark_written(&[qkv_buf]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[qkv_buf]);
+        // Sprint G-6 — trailing barrier elided (see step_ssm_conv1d comment).
     }
 
     /// Sprint G-2d (v0.4.6) — `attn_gate.weight` GEMV
@@ -884,7 +894,8 @@ impl DecodeExec {
             cfg.hidden_dim, spec.ssm_d_inner, scale, "gemv_ssm_z",
         );
         fwd.mark_written(&[z_buf]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[z_buf]);
+        // Sprint G-6 — trailing barrier elided. z_buf isn't read until
+        // step_norm_gated, whose leading barrier will emit if needed.
     }
 
     /// Sprint G-2d (v0.4.6) — `ssm_beta.weight` GEMV `[5120, 48]` F32 +
@@ -916,7 +927,8 @@ impl DecodeExec {
             beta_buf, spec.num_v_heads(), "ssm_beta_sigmoid",
         );
         fwd.mark_written(&[beta_buf]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[beta_buf]);
+        // Sprint G-6 — trailing barrier elided. beta_buf is consumed
+        // by step_gated_delta_net, whose leading barrier covers it.
     }
 
     /// Sprint G-2d (v0.4.6) — fused alpha-gate compose (Ops 6-9 of
@@ -979,7 +991,9 @@ impl DecodeExec {
             n_heads, "ssm_alpha_mul_a",
         );
         fwd.mark_written(&[gate_buf]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[gate_buf]);
+        // Sprint G-6 — trailing barrier elided. gate_buf is consumed
+        // by step_gated_delta_net (binding g), whose leading barrier
+        // (&[q, k, v, g, beta]) covers it.
     }
 
     /// Sprint G-2c (v0.4.6) — in-place SiLU on `ssm_conv_output_buf`
@@ -1000,7 +1014,8 @@ impl DecodeExec {
             spec.conv_channels(), "ssm_silu",
         );
         fwd.mark_written(&[conv_output]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_output]);
+        // Sprint G-6 — trailing barrier elided. step_ssm_qk_l2_norm's
+        // leading barrier(&[conv_output]) covers the RAW dependency.
     }
 
     /// Sprint G-2c (v0.4.6) — in-place L2-norm on the Q and K slices
@@ -1041,7 +1056,8 @@ impl DecodeExec {
             eps, "ssm_l2_norm_k",
         );
         fwd.mark_written(&[conv_output]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_output]);
+        // Sprint G-6 — trailing barrier elided. step_ssm_repeat_qk's
+        // leading barrier(&[conv_output]) covers the RAW dependency.
     }
 
     /// Sprint G-2d (v0.4.6) — Head-axis 16 → 48 repeat for Q + K
@@ -1079,7 +1095,8 @@ impl DecodeExec {
             head_dim, n_src_heads, n_dst_heads, n_tokens, "ssm_repeat_k",
         );
         fwd.mark_written(&[qrep, krep]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[qrep, krep]);
+        // Sprint G-6 — trailing barrier elided. step_gated_delta_net
+        // reads q/k via its leading barrier(&[q, k, v, g, beta]).
     }
 
     /// Sprint G-2e (v0.4.6) — The recurrence at the heart of Qwen3.6
@@ -1264,7 +1281,8 @@ impl DecodeExec {
             ne, "ssm_norm_gated_mul",
         );
         fwd.mark_written(&[norm_out]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[norm_out]);
+        // Sprint G-6 — trailing barrier elided. step_ssm_out_proj's
+        // leading barrier(&[norm_out]) covers the RAW dependency.
     }
 
     /// Sprint G-2d (v0.4.6) — `ssm_out.weight` GEMV `[6144, 5120]` Q4_K
@@ -1293,7 +1311,8 @@ impl DecodeExec {
             spec.ssm_d_inner, cfg.hidden_dim, scale, "gemv_ssm_out",
         );
         fwd.mark_written(&[o_buf]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[o_buf]);
+        // Sprint G-6 — trailing barrier elided. step_attn_residual_add's
+        // leading barrier(&[res1, addend]) (addend = o_buf) covers it.
     }
 }
 
