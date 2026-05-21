@@ -239,6 +239,38 @@ impl Forward {
     /// `reads` is in the pending-write set. After issuance, every dirty
     /// flag clears (the barrier is a global `VkMemoryBarrier`).
     /// Returns `true` if a barrier was actually emitted (telemetry).
+    /// Sprint SG-1.4-b — guaranteed sub-dispatch barrier emission that
+    /// survives both `BarrierMode` settings.
+    ///
+    /// SSM step bodies (`step_ssm_alpha_gate`, `step_norm_gated`,
+    /// `step_ssm_beta_proj`, etc.) issue 2-4 sub-dispatches that share
+    /// the same small SSM buffer (e.g. `ssm_alpha_buf` is written
+    /// three times across one alpha-gate call). Imperative path
+    /// synchronises those sub-dispatches via `maybe_compute_barrier`
+    /// + the dirty-flag tracker, but under `BarrierMode::GraphDriven`
+    /// `mark_written` is a no-op so the tracker is empty and
+    /// `maybe_compute_barrier` returns false → race.
+    ///
+    /// The graph models each `LayerStep` as a single node and
+    /// therefore cannot place barriers BETWEEN sub-dispatches inside
+    /// one step body — only between steps. `force_internal_barrier`
+    /// emits the sub-dispatch barrier unconditionally in GraphDriven
+    /// mode; in Imperative mode it falls through to the elision-aware
+    /// `maybe_compute_barrier` so existing telemetry + elision behave
+    /// unchanged.
+    pub(super) fn force_internal_barrier(
+        &mut self,
+        dev: &VulkanDevice,
+        cmd: vk::CommandBuffer,
+        reads: &[vk::Buffer],
+    ) {
+        if matches!(self.barrier_mode, state::BarrierMode::GraphDriven) {
+            compute_barrier(dev, cmd);
+            return;
+        }
+        self.maybe_compute_barrier(dev, cmd, reads);
+    }
+
     fn maybe_compute_barrier(
         &mut self,
         dev: &VulkanDevice,
@@ -248,7 +280,8 @@ impl Forward {
         // Sprint SG-2 — graph-driven dispatcher owns barrier emission;
         // step-bodies' calls to this function become no-ops to avoid
         // emitting both imperative + graph barriers around the same
-        // dispatch.
+        // dispatch. SSM sub-dispatch sites should use
+        // `force_internal_barrier` instead (Sprint SG-1.4-b).
         if matches!(self.barrier_mode, state::BarrierMode::GraphDriven) {
             return false;
         }

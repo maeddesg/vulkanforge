@@ -817,7 +817,11 @@ impl DecodeExec {
             conv_channels, "ssm_conv_setup",
         );
         fwd.mark_written(&[conv_input, conv_state_buf]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_input]);
+        // Sprint SG-1.4-b — sub-dispatch barrier MUST fire even under
+        // BarrierMode::GraphDriven (the graph models step_ssm_conv1d
+        // as one node; it can't place a barrier between the two
+        // internal sub-dispatches).
+        fwd.force_internal_barrier(ctx.dev, ctx.cmd, &[conv_input]);
 
         // Real conv dispatch (decode: n_t = 1, n_s = 1, ncs = d_conv).
         let conv_weight = layer_weight(ctx.model, layer, "ssm_conv1d.weight");
@@ -970,7 +974,8 @@ impl DecodeExec {
             cfg.hidden_dim, n_heads, scale, "gemv_ssm_alpha",
         );
         fwd.mark_written(&[alpha_buf]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[alpha_buf]);
+        // SG-1.4-b — sub-dispatch barrier (alpha just written by GEMV).
+        fwd.force_internal_barrier(ctx.dev, ctx.cmd, &[alpha_buf]);
 
         // 2. alpha += ssm_dt.bias
         let dt_bias = layer_weight(ctx.model, layer, "ssm_dt.bias");
@@ -980,7 +985,8 @@ impl DecodeExec {
             n_heads, "ssm_alpha_add_dt",
         );
         fwd.mark_written(&[alpha_buf]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[alpha_buf]);
+        // SG-1.4-b — sub-dispatch barrier (alpha just written by Add).
+        fwd.force_internal_barrier(ctx.dev, ctx.cmd, &[alpha_buf]);
 
         // 3. alpha = softplus(alpha) in-place
         fwd.run_softplus(
@@ -988,7 +994,8 @@ impl DecodeExec {
             alpha_buf, n_heads, "ssm_alpha_softplus",
         );
         fwd.mark_written(&[alpha_buf]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[alpha_buf]);
+        // SG-1.4-b — sub-dispatch barrier (alpha just written by Softplus).
+        fwd.force_internal_barrier(ctx.dev, ctx.cmd, &[alpha_buf]);
 
         // 4. gate = alpha * ssm_a (note: ssm_a has NO .weight suffix in GGUF).
         let ssm_a = layer_weight(ctx.model, layer, "ssm_a");
@@ -1279,7 +1286,9 @@ impl DecodeExec {
             z, z, ne, "ssm_z_silu",
         );
         fwd.mark_written(&[z]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[norm_out, z]);
+        // SG-1.4-b — sub-dispatch barrier (norm_out + z both just
+        // written by RMSNorm + SiLU above; Mul reads both).
+        fwd.force_internal_barrier(ctx.dev, ctx.cmd, &[norm_out, z]);
 
         // 3. norm_out *= silu(z) (elementwise).
         fwd.run_binary(

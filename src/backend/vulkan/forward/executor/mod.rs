@@ -420,16 +420,15 @@ impl DecodeExec {
         // emit a final global barrier so the *next* layer (which may
         // run in either mode) sees this layer's final writes
         // committed without needing to know what they were.
-        // SG-1.4 diagnostic — non-Llama architectures (qwen35, gemma4)
-        // have step-body internal sub-dispatch barriers (e.g.
-        // step_gated_delta_net's cmd_pipeline_barrier calls between
-        // its sub-dispatches) that get skipped under BarrierMode::
-        // GraphDriven and produce incoherent output. Until those
-        // step-body barriers are graph-modeled, keep barrier emission
-        // imperative for these arches; the graph still drives
-        // execute_step order via execution_order. This way SG-1.4
-        // ships builder coverage without breaking output.
-        let use_graph_barriers = cfg.gemma4.is_none() && cfg.qwen35.is_none();
+        // SG-1.4-b — qwen35 now uses graph-driven barriers thanks to
+        // `Forward::force_internal_barrier`, which preserves SSM sub-
+        // dispatch sync regardless of `BarrierMode` (see attention.rs
+        // step_ssm_alpha_gate, step_ssm_beta_proj, step_ssm_conv1d,
+        // step_norm_gated for the 6 forced sub-dispatch sites).
+        // Gemma-4 still keeps imperative barriers — its MoE / KV-share
+        // step bodies have additional barrier patterns that SG-1.5/1.6
+        // will audit.
+        let use_graph_barriers = cfg.gemma4.is_none() && cfg.qwen35.is_none(); // SG-1.4 stance temp
         if use_graph_barriers {
             fwd.barrier_mode = BarrierMode::GraphDriven;
         }
