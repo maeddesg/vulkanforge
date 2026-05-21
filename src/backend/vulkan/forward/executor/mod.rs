@@ -349,6 +349,24 @@ impl DecodeExec {
             // dispatching.
             layer_output: fwd.cur().scratch_a.handle,
             kv_cache:     fwd.kv_cache.k_buffer.handle,
+
+            // Sprint SG-1.4 — Qwen3.6 SSM buffers (`Option<GpuBuffer>` on
+            // Forward; None → null handle for non-qwen35 builds). Plans
+            // for non-qwen35 architectures never emit the SSM/Q-Gate
+            // variants, so null handles never appear in graph edges.
+            ssm_qkv:         fwd.ssm_qkv_buf.as_ref().map(|b| b.handle).unwrap_or(ash::vk::Buffer::null()),
+            ssm_z:           fwd.ssm_z_buf.as_ref().map(|b| b.handle).unwrap_or(ash::vk::Buffer::null()),
+            ssm_beta:        fwd.ssm_beta_buf.as_ref().map(|b| b.handle).unwrap_or(ash::vk::Buffer::null()),
+            ssm_alpha:       fwd.ssm_alpha_buf.as_ref().map(|b| b.handle).unwrap_or(ash::vk::Buffer::null()),
+            ssm_gate:        fwd.ssm_gate_buf.as_ref().map(|b| b.handle).unwrap_or(ash::vk::Buffer::null()),
+            ssm_conv_input:  fwd.ssm_conv_input_buf.as_ref().map(|b| b.handle).unwrap_or(ash::vk::Buffer::null()),
+            ssm_conv_output: fwd.ssm_conv_output_buf.as_ref().map(|b| b.handle).unwrap_or(ash::vk::Buffer::null()),
+            ssm_qrep:        fwd.ssm_qrep_buf.as_ref().map(|b| b.handle).unwrap_or(ash::vk::Buffer::null()),
+            ssm_krep:        fwd.ssm_krep_buf.as_ref().map(|b| b.handle).unwrap_or(ash::vk::Buffer::null()),
+            ssm_gdn_out:     fwd.ssm_gdn_out_buf.as_ref().map(|b| b.handle).unwrap_or(ash::vk::Buffer::null()),
+            ssm_norm_out:    fwd.ssm_norm_out_buf.as_ref().map(|b| b.handle).unwrap_or(ash::vk::Buffer::null()),
+            ssm_state:       fwd.ssm_state_buf.as_ref().map(|b| b.handle).unwrap_or(ash::vk::Buffer::null()),
+            conv_state:      fwd.conv_state_buf.as_ref().map(|b| b.handle).unwrap_or(ash::vk::Buffer::null()),
         };
 
         let graph = GraphBuilder::build_per_layer(&bufs, &cfg, ctx.layer, plan);
@@ -402,13 +420,29 @@ impl DecodeExec {
         // emit a final global barrier so the *next* layer (which may
         // run in either mode) sees this layer's final writes
         // committed without needing to know what they were.
-        fwd.barrier_mode = BarrierMode::GraphDriven;
+        // SG-1.4 diagnostic — non-Llama architectures (qwen35, gemma4)
+        // have step-body internal sub-dispatch barriers (e.g.
+        // step_gated_delta_net's cmd_pipeline_barrier calls between
+        // its sub-dispatches) that get skipped under BarrierMode::
+        // GraphDriven and produce incoherent output. Until those
+        // step-body barriers are graph-modeled, keep barrier emission
+        // imperative for these arches; the graph still drives
+        // execute_step order via execution_order. This way SG-1.4
+        // ships builder coverage without breaking output.
+        let use_graph_barriers = cfg.gemma4.is_none() && cfg.qwen35.is_none();
+        if use_graph_barriers {
+            fwd.barrier_mode = BarrierMode::GraphDriven;
+        }
 
         // Inter-layer drain — the previous layer's last write (scratch_a
         // from its FfnResidualAdd, or attn_out etc.) needs to be visible
-        // before AttnNorm reads it.
-        compute_barrier(ctx.dev, ctx.cmd);
-        let mut barriers_emitted: u32 = 1;
+        // before AttnNorm reads it. Skipped when imperative barriers
+        // are still active (they'd cover this themselves).
+        let mut barriers_emitted: u32 = 0;
+        if use_graph_barriers {
+            compute_barrier(ctx.dev, ctx.cmd);
+            barriers_emitted = 1;
+        }
         // Position 0 means "everything before is synced". Any incoming
         // edge with source-position 0 is already handled by the drain
         // barrier above; any source-position >= the next high-water is
@@ -455,7 +489,7 @@ impl DecodeExec {
                         break;
                     }
                 }
-                if need_barrier {
+                if need_barrier && use_graph_barriers {
                     compute_barrier(ctx.dev, ctx.cmd);
                     barriers_emitted += 1;
                     high_water = position;
@@ -478,12 +512,14 @@ impl DecodeExec {
         // mechanism. Net barrier count per layer: 1 inter-layer drain
         // + within-layer (typically 10) = ~11 — same ball-park as the
         // imperative path's ~10/layer.
-        fwd.barrier_mode = BarrierMode::Imperative;
-        fwd.pending_writes.clear();
-        for node in &graph.nodes {
-            for w in node.writes() {
-                use ash::vk::Handle;
-                fwd.pending_writes.insert(w.buffer.as_raw());
+        if use_graph_barriers {
+            fwd.barrier_mode = BarrierMode::Imperative;
+            fwd.pending_writes.clear();
+            for node in &graph.nodes {
+                for w in node.writes() {
+                    use ash::vk::Handle;
+                    fwd.pending_writes.insert(w.buffer.as_raw());
+                }
             }
         }
 

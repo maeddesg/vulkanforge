@@ -80,6 +80,31 @@ pub struct BufferMap {
     pub layer_output: BufferHandle,
     /// KV-cache slab (shared across all layers via per-layer offsets).
     pub kv_cache: BufferHandle,
+
+    // ── Sprint SG-1.4 — Qwen3.6 SSM / Q-Gate buffers ──────────────
+    //
+    // All `Forward::ssm_*_buf` are `Option<GpuBuffer>` (None on non-
+    // qwen35 builds). The Recorder unpacks `.handle` when present and
+    // leaves these as `vk::Buffer::null()` otherwise. The graph
+    // builder doesn't care — non-qwen35 plans never use SSM variants
+    // and the dep-resolver naturally skips null-vs-null overlaps via
+    // distinct buffer identity (but won't generate noise from them
+    // either; null handles compare equal but the per-step helpers
+    // only touch SSM bufs when emitted by qwen35-only LayerStep
+    // variants).
+    pub ssm_qkv: BufferHandle,
+    pub ssm_z: BufferHandle,
+    pub ssm_beta: BufferHandle,
+    pub ssm_alpha: BufferHandle,
+    pub ssm_gate: BufferHandle,
+    pub ssm_conv_input: BufferHandle,
+    pub ssm_conv_output: BufferHandle,
+    pub ssm_qrep: BufferHandle,
+    pub ssm_krep: BufferHandle,
+    pub ssm_gdn_out: BufferHandle,
+    pub ssm_norm_out: BufferHandle,
+    pub ssm_state: BufferHandle,
+    pub conv_state: BufferHandle,
 }
 
 impl BufferMap {
@@ -101,6 +126,19 @@ impl BufferMap {
             ffn_out: vk::Buffer::null(),
             layer_output: vk::Buffer::null(),
             kv_cache: vk::Buffer::null(),
+            ssm_qkv: vk::Buffer::null(),
+            ssm_z: vk::Buffer::null(),
+            ssm_beta: vk::Buffer::null(),
+            ssm_alpha: vk::Buffer::null(),
+            ssm_gate: vk::Buffer::null(),
+            ssm_conv_input: vk::Buffer::null(),
+            ssm_conv_output: vk::Buffer::null(),
+            ssm_qrep: vk::Buffer::null(),
+            ssm_krep: vk::Buffer::null(),
+            ssm_gdn_out: vk::Buffer::null(),
+            ssm_norm_out: vk::Buffer::null(),
+            ssm_state: vk::Buffer::null(),
+            conv_state: vk::Buffer::null(),
         }
     }
 }
@@ -227,10 +265,33 @@ impl<'a> GraphBuilder<'a> {
                 self.cfg.n_heads * self.cfg.head_dim, self.cfg.hidden_dim,
                 "o_proj",
             ),
-            LayerStep::AttnResidualAdd => self.add_binary(
-                layer, self.bufs.scratch_a, self.bufs.o_buf, self.bufs.res1,
-                self.cfg.hidden_dim, "attn_residual_add",
-            ),
+            LayerStep::AttnResidualAdd => {
+                // Llama/Qwen3 paths feed o_buf into the add; Qwen3.6
+                // SSM layers route via attn_out (written by
+                // SsmOutProj) instead. Read BOTH so the byte-range
+                // graph picks up the right RAW edge regardless of
+                // architecture — `execute_step` dispatches the
+                // correct buffer either way.
+                let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
+                self.graph.add_dispatch(DispatchNode {
+                    id: 0,
+                    step_index_in_layer: self.current_step_in_layer,
+                    pipeline: vk::Pipeline::null(),
+                    pipeline_layout: vk::PipelineLayout::null(),
+                    descriptor_set_layout: vk::DescriptorSetLayout::null(),
+                    bindings: Vec::new(),
+                    push_constants: Vec::new(),
+                    dispatch: (self.cfg.hidden_dim.div_ceil(64), 1, 1),
+                    reads: vec![
+                        MemAccess::new(self.bufs.scratch_a, 0, hidden_bytes),
+                        MemAccess::new(self.bufs.o_buf, 0, hidden_bytes),
+                        MemAccess::new(self.bufs.attn_out, 0, hidden_bytes),
+                    ],
+                    writes: vec![MemAccess::new(self.bufs.res1, 0, hidden_bytes)],
+                    layer,
+                    label: Some(format!("L{layer}_attn_residual_add")),
+                });
+            }
             LayerStep::PreFfnNorm => self.add_rms_norm(
                 layer, self.bufs.res1, self.bufs.hidden_norm,
                 self.cfg.hidden_dim, 1, "pre_ffn_norm",
@@ -253,27 +314,37 @@ impl<'a> GraphBuilder<'a> {
                 self.cfg.hidden_dim, "ffn_residual_add",
             ),
 
-            // ===== Qwen3.6 Linear-Attention (SG-1.4 — stubbed) =====
-            LayerStep::AttnQkvProj { .. }
-            | LayerStep::AttnGateZProj { .. }
-            | LayerStep::SsmBetaProj { .. }
-            | LayerStep::SsmAlphaGate { .. }
-            | LayerStep::SsmConv1d { .. }
-            | LayerStep::SsmSilu { .. }
-            | LayerStep::SsmQkL2Norm { .. }
-            | LayerStep::SsmRepeatQK { .. }
-            | LayerStep::GatedDeltaNet { .. }
-            | LayerStep::NormGated { .. }
-            | LayerStep::SsmOutProj { .. }
-            | LayerStep::AttnQGateProj { .. }
-            | LayerStep::AttnGatedOutput { .. }
-            | LayerStep::ResidualIdentitySeed => {
-                unimplemented!(
-                    "SG-1.4 — Qwen3.6 SSM / Q-Gate variant {step:?} not yet \
-                     implemented in GraphBuilder. Use the imperative \
-                     executor (VF_USE_GRAPH=0, default in v0.5.0-dev)."
-                );
-            }
+            // ===== Qwen3.6 Linear-Attention (SG-1.4) =====
+            //
+            // Shapes derived from qwen35 spec:
+            //   conv_channels = 2*(d_state*n_group) + d_inner
+            //                 = 2*(128*16) + 6144 = 10240
+            //   Q slice: [   0 ..  8192) bytes = 2048 floats (16×128)
+            //   K slice: [8192 .. 16384) bytes = 2048 floats
+            //   V slice: [16384 .. 40960) bytes = 6144 floats (48×128)
+            //   d_inner = 6144 = ssm_z_buf, ssm_qrep_buf, ssm_krep_buf,
+            //                    ssm_norm_out_buf  (= 24576 bytes each)
+            //   d_state = 128, n_v_heads = 48 → ssm_beta/alpha/gate = 48 f32 = 192 B
+            //
+            // Each helper emits one DispatchNode whose reads/writes
+            // describe the whole step body (which the imperative
+            // `execute_step` actually issues). The byte-range graph
+            // is what SG-2's barrier pass keys on; the dispatch is
+            // unchanged.
+            LayerStep::AttnQkvProj { .. } => self.add_ssm_qkv_proj(layer),
+            LayerStep::AttnGateZProj { .. } => self.add_ssm_gate_z_proj(layer),
+            LayerStep::SsmBetaProj { .. } => self.add_ssm_beta_proj(layer),
+            LayerStep::SsmAlphaGate { .. } => self.add_ssm_alpha_gate(layer),
+            LayerStep::SsmConv1d { .. } => self.add_ssm_conv1d(layer),
+            LayerStep::SsmSilu { .. } => self.add_ssm_silu(layer),
+            LayerStep::SsmQkL2Norm { .. } => self.add_ssm_qk_l2_norm(layer),
+            LayerStep::SsmRepeatQK { .. } => self.add_ssm_repeat_qk(layer),
+            LayerStep::GatedDeltaNet { .. } => self.add_gated_delta_net(layer),
+            LayerStep::NormGated { .. } => self.add_norm_gated(layer),
+            LayerStep::SsmOutProj { .. } => self.add_ssm_out_proj(layer),
+            LayerStep::AttnQGateProj { q_dim } => self.add_attn_q_gate_proj(layer, *q_dim),
+            LayerStep::AttnGatedOutput { q_dim } => self.add_attn_gated_output(layer, *q_dim),
+            LayerStep::ResidualIdentitySeed => self.add_residual_identity_seed(layer),
 
             // ===== Gemma-4 KV-share + 4-norm + PLE (SG-1.5 — stubbed) =====
             LayerStep::VFromKRaw
@@ -525,6 +596,280 @@ impl<'a> GraphBuilder<'a> {
             label: Some(format!("L{layer}_{label}")),
         });
     }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Sprint SG-1.4 — Qwen3.6 SSM / Q-Gate variant helpers.
+    //
+    // Each helper emits one DispatchNode whose `reads` / `writes`
+    // describe the byte-ranges touched by the corresponding
+    // `executor::attention::step_*` body (multi-dispatch bodies are
+    // modelled as a single graph node so step_index_in_layer remains
+    // 1:1 with the layer plan — `execute_step` dispatches the whole
+    // body in one call). For multi-buffer steps with disjoint slice
+    // accesses (L2Norm Q vs K), we emit precise byte-ranges so the
+    // SG-2 barrier pass can later see that disjoint writes don't
+    // require RAW sync.
+    //
+    // GatedDeltaNet also emits a TransferNode for the persistent SSM
+    // state copy-back (cmd_copy_buffer issued from inside the step).
+    // ─────────────────────────────────────────────────────────────────
+
+    // Shape constants. Pulled out so per-helper code stays readable;
+    // these match Qwen35Spec used by `executor::attention`.
+    const D_INNER: u64 = 6144;           // V projection / SSM hidden
+    const N_GROUP_KV: u64 = 16;          // Q + K groups
+    const D_STATE: u64 = 128;
+    const N_V_HEADS: u64 = 48;           // V heads / β / α head count
+    const D_HEAD_V: u64 = 128;
+    const D_CONV: u64 = 4;
+
+    // 16 × 128 × 4 = 8192  (Q + K slice each)
+    const QK_SLICE_BYTES: u64 = Self::N_GROUP_KV * Self::D_STATE * 4;
+    // 4096 + 6144 = 10240 floats × 4 = 40960 bytes
+    const CONV_CHANNELS_BYTES: u64 =
+        (2 * Self::N_GROUP_KV * Self::D_STATE + Self::D_INNER) * 4;
+    // V slice = conv_channels - 2*Q = 24576 bytes
+    const V_SLICE_BYTES: u64 = Self::CONV_CHANNELS_BYTES - 2 * Self::QK_SLICE_BYTES;
+    // d_inner × 4 = 24576 bytes  (ssm_z_buf, ssm_qrep_buf, etc.)
+    const D_INNER_BYTES: u64 = Self::D_INNER * 4;
+    // n_v_heads × 4 = 192 bytes (ssm_beta, ssm_alpha, ssm_gate)
+    const N_V_HEADS_BYTES: u64 = Self::N_V_HEADS * 4;
+    // GDN output: d_inner floats of output + state copy region (which
+    // is variable per layer). We model the output region precisely
+    // and use whole() for the state copy back.
+
+    fn ssm_simple_node(
+        &mut self,
+        layer: u32,
+        reads: Vec<MemAccess>,
+        writes: Vec<MemAccess>,
+        label: &str,
+    ) {
+        self.graph.add_dispatch(DispatchNode {
+            id: 0,
+            step_index_in_layer: self.current_step_in_layer,
+            pipeline: vk::Pipeline::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            bindings: Vec::new(),
+            push_constants: Vec::new(),
+            dispatch: (1, 1, 1),
+            reads,
+            writes,
+            layer,
+            label: Some(format!("L{layer}_{label}")),
+        });
+    }
+
+    fn add_ssm_qkv_proj(&mut self, layer: u32) {
+        let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
+        self.ssm_simple_node(layer,
+            vec![MemAccess::new(self.bufs.hidden_norm, 0, hidden_bytes)],
+            vec![MemAccess::new(self.bufs.ssm_qkv, 0, Self::CONV_CHANNELS_BYTES)],
+            "ssm_qkv_proj",
+        );
+    }
+
+    fn add_ssm_gate_z_proj(&mut self, layer: u32) {
+        let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
+        self.ssm_simple_node(layer,
+            vec![MemAccess::new(self.bufs.hidden_norm, 0, hidden_bytes)],
+            vec![MemAccess::new(self.bufs.ssm_z, 0, Self::D_INNER_BYTES)],
+            "ssm_gate_z_proj",
+        );
+    }
+
+    fn add_ssm_beta_proj(&mut self, layer: u32) {
+        let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
+        self.ssm_simple_node(layer,
+            vec![MemAccess::new(self.bufs.hidden_norm, 0, hidden_bytes)],
+            vec![MemAccess::new(self.bufs.ssm_beta, 0, Self::N_V_HEADS_BYTES)],
+            "ssm_beta_proj",
+        );
+    }
+
+    fn add_ssm_alpha_gate(&mut self, layer: u32) {
+        // Composite: GEMV → alpha; add dt.bias → alpha; softplus → alpha;
+        // × ssm_a → gate. All within one step_attn_alpha_gate body.
+        let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
+        self.ssm_simple_node(layer,
+            vec![MemAccess::new(self.bufs.hidden_norm, 0, hidden_bytes)],
+            vec![
+                MemAccess::new(self.bufs.ssm_alpha, 0, Self::N_V_HEADS_BYTES),
+                MemAccess::new(self.bufs.ssm_gate, 0, Self::N_V_HEADS_BYTES),
+            ],
+            "ssm_alpha_gate",
+        );
+    }
+
+    fn add_ssm_conv1d(&mut self, layer: u32) {
+        // Reads: ssm_qkv (current input) + conv_state (rolling window).
+        // Writes: ssm_conv_input (built window), ssm_conv_output, and
+        // updates conv_state in place. Per-layer offsets into the
+        // state buffer aren't material here — whole() suffices.
+        self.ssm_simple_node(layer,
+            vec![
+                MemAccess::new(self.bufs.ssm_qkv, 0, Self::CONV_CHANNELS_BYTES),
+                MemAccess::whole(self.bufs.conv_state),
+            ],
+            vec![
+                MemAccess::new(self.bufs.ssm_conv_input, 0,
+                    Self::CONV_CHANNELS_BYTES * Self::D_CONV),
+                MemAccess::new(self.bufs.ssm_conv_output, 0, Self::CONV_CHANNELS_BYTES),
+                MemAccess::whole(self.bufs.conv_state),
+            ],
+            "ssm_conv1d",
+        );
+    }
+
+    fn add_ssm_silu(&mut self, layer: u32) {
+        // In-place SiLU on the whole conv_output buffer.
+        self.ssm_simple_node(layer,
+            vec![MemAccess::new(self.bufs.ssm_conv_output, 0, Self::CONV_CHANNELS_BYTES)],
+            vec![MemAccess::new(self.bufs.ssm_conv_output, 0, Self::CONV_CHANNELS_BYTES)],
+            "ssm_silu",
+        );
+    }
+
+    fn add_ssm_qk_l2_norm(&mut self, layer: u32) {
+        // Disjoint Q + K slices in conv_output. Two `MemAccess`
+        // entries for both reads and writes — the SG-2 barrier pass
+        // sees that the K slice's overlap-with-prior-writes is
+        // independent from the Q slice's, allowing per-slice
+        // resolution in the future.
+        self.ssm_simple_node(layer,
+            vec![
+                MemAccess::new(self.bufs.ssm_conv_output, 0,                       Self::QK_SLICE_BYTES),
+                MemAccess::new(self.bufs.ssm_conv_output, Self::QK_SLICE_BYTES,    Self::QK_SLICE_BYTES),
+            ],
+            vec![
+                MemAccess::new(self.bufs.ssm_conv_output, 0,                       Self::QK_SLICE_BYTES),
+                MemAccess::new(self.bufs.ssm_conv_output, Self::QK_SLICE_BYTES,    Self::QK_SLICE_BYTES),
+            ],
+            "ssm_qk_l2_norm",
+        );
+    }
+
+    fn add_ssm_repeat_qk(&mut self, layer: u32) {
+        // 16 → 48 head repeat (n_group_kv → n_v_heads). Reads Q+K
+        // slices in conv_output, writes ssm_qrep + ssm_krep.
+        self.ssm_simple_node(layer,
+            vec![
+                MemAccess::new(self.bufs.ssm_conv_output, 0,                       Self::QK_SLICE_BYTES),
+                MemAccess::new(self.bufs.ssm_conv_output, Self::QK_SLICE_BYTES,    Self::QK_SLICE_BYTES),
+            ],
+            vec![
+                MemAccess::new(self.bufs.ssm_qrep, 0, Self::D_INNER_BYTES),
+                MemAccess::new(self.bufs.ssm_krep, 0, Self::D_INNER_BYTES),
+            ],
+            "ssm_repeat_qk",
+        );
+    }
+
+    fn add_gated_delta_net(&mut self, layer: u32) {
+        // GDN: dispatch (reads many SSM bufs + ssm_state, writes
+        // ssm_gdn_out) + cmd_copy_buffer (reads ssm_gdn_out state
+        // region, writes ssm_state). We model the copy as a separate
+        // TransferNode so SG-2 sees both deps.
+        let gdn_dispatch_id = self.graph.add_dispatch(DispatchNode {
+            id: 0,
+            step_index_in_layer: self.current_step_in_layer,
+            pipeline: vk::Pipeline::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            bindings: Vec::new(),
+            push_constants: Vec::new(),
+            dispatch: (1, 1, 1),
+            reads: vec![
+                MemAccess::new(self.bufs.ssm_qrep, 0, Self::D_INNER_BYTES),
+                MemAccess::new(self.bufs.ssm_krep, 0, Self::D_INNER_BYTES),
+                MemAccess::new(self.bufs.ssm_conv_output,
+                    2 * Self::QK_SLICE_BYTES, Self::V_SLICE_BYTES),  // V slice
+                MemAccess::new(self.bufs.ssm_gate, 0, Self::N_V_HEADS_BYTES),
+                MemAccess::new(self.bufs.ssm_beta, 0, Self::N_V_HEADS_BYTES),
+                MemAccess::whole(self.bufs.ssm_state),
+            ],
+            writes: vec![MemAccess::whole(self.bufs.ssm_gdn_out)],
+            layer,
+            label: Some(format!("L{layer}_gdn")),
+        });
+        // State copy-back as a Transfer node.
+        let _copy_id = self.graph.add_transfer(super::node::TransferNode {
+            id: 0,
+            src_buffer: self.bufs.ssm_gdn_out,
+            src_offset: 0,
+            dst_buffer: self.bufs.ssm_state,
+            dst_offset: 0,
+            size: 0, // exact per-layer offsets/sizes are runtime;
+                     // whole() in reads/writes below covers it for the
+                     // SG-2 dep-pass.
+            reads:  vec![MemAccess::whole(self.bufs.ssm_gdn_out)],
+            writes: vec![MemAccess::whole(self.bufs.ssm_state)],
+            layer,
+            label: Some(format!("L{layer}_gdn_state_copy")),
+        });
+        let _ = gdn_dispatch_id;
+    }
+
+    fn add_norm_gated(&mut self, layer: u32) {
+        // RMSNorm + SiLU + Mul → ssm_norm_out.
+        self.ssm_simple_node(layer,
+            vec![
+                MemAccess::whole(self.bufs.ssm_gdn_out),  // output portion
+                MemAccess::new(self.bufs.ssm_z, 0, Self::D_INNER_BYTES),
+            ],
+            vec![MemAccess::new(self.bufs.ssm_norm_out, 0, Self::D_INNER_BYTES)],
+            "norm_gated",
+        );
+    }
+
+    fn add_ssm_out_proj(&mut self, layer: u32) {
+        // GEMV ssm_norm_out → linear_attn_out (uses attn_out slot).
+        let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
+        self.ssm_simple_node(layer,
+            vec![MemAccess::new(self.bufs.ssm_norm_out, 0, Self::D_INNER_BYTES)],
+            vec![MemAccess::new(self.bufs.attn_out, 0, hidden_bytes)],
+            "ssm_out_proj",
+        );
+    }
+
+    fn add_attn_q_gate_proj(&mut self, layer: u32, q_dim: u32) {
+        // Qwen3.6 Full-Attn: fused Q+Gate GEMV writes q_buf as
+        // [Q (q_dim) | Gate (q_dim)] = 2*q_dim floats.
+        let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
+        let combined_bytes = (q_dim as u64) * 2 * 4;
+        self.ssm_simple_node(layer,
+            vec![MemAccess::new(self.bufs.hidden_norm, 0, hidden_bytes)],
+            vec![MemAccess::new(self.bufs.q_buf, 0, combined_bytes)],
+            "attn_q_gate_proj",
+        );
+    }
+
+    fn add_attn_gated_output(&mut self, layer: u32, q_dim: u32) {
+        // In-place sigmoid-gate-multiply on attn_out using gate slice
+        // of q_buf at offset q_dim*4.
+        let q_bytes = (q_dim as u64) * 4;
+        self.ssm_simple_node(layer,
+            vec![
+                MemAccess::new(self.bufs.attn_out, 0, q_bytes),
+                MemAccess::new(self.bufs.q_buf, q_bytes, q_bytes),  // gate slice
+            ],
+            vec![MemAccess::new(self.bufs.attn_out, 0, q_bytes)],
+            "attn_gated_output",
+        );
+    }
+
+    fn add_residual_identity_seed(&mut self, layer: u32) {
+        // Seeds res1 with the layer input (identity / no-op for
+        // recurrent layers that don't have a real Q/K/V/Attention
+        // sub-block). Modeled as: reads scratch_a, writes res1.
+        let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
+        self.ssm_simple_node(layer,
+            vec![MemAccess::new(self.bufs.scratch_a, 0, hidden_bytes)],
+            vec![MemAccess::new(self.bufs.res1, 0, hidden_bytes)],
+            "residual_identity_seed",
+        );
+    }
 }
 
 #[cfg(test)]
@@ -576,6 +921,19 @@ mod tests {
             ffn_out: fake_buffer(12),
             layer_output: fake_buffer(13),
             kv_cache: fake_buffer(14),
+            ssm_qkv: fake_buffer(15),
+            ssm_z: fake_buffer(16),
+            ssm_beta: fake_buffer(17),
+            ssm_alpha: fake_buffer(18),
+            ssm_gate: fake_buffer(19),
+            ssm_conv_input: fake_buffer(20),
+            ssm_conv_output: fake_buffer(21),
+            ssm_qrep: fake_buffer(22),
+            ssm_krep: fake_buffer(23),
+            ssm_gdn_out: fake_buffer(24),
+            ssm_norm_out: fake_buffer(25),
+            ssm_state: fake_buffer(26),
+            conv_state: fake_buffer(27),
         }
     }
 
@@ -672,11 +1030,32 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "SG-1.4 — Qwen3.6 SSM")]
-    fn builder_panics_on_unimplemented_ssm_variant() {
+    fn builder_handles_qwen35_ssm_variants() {
+        // SG-1.4 — SsmConv1d (and the other 13 SSM/Q-Gate variants)
+        // now build instead of panicking. The previous test
+        // (`builder_panics_on_unimplemented_ssm_variant`) was the
+        // SG-1.3-era deferral assertion; SG-1.4 ships the helpers so
+        // the same plan now produces a graph node with byte-range
+        // metadata.
         let cfg = dummy_qwen3_cfg();
         let bufs = distinct_buffer_map();
         let plans = vec![vec![LayerStep::SsmConv1d { layer: 0 }]];
+        let graph = GraphBuilder::build_decode_token(&bufs, &cfg, 0, &plans);
+        assert_eq!(graph.len(), 1);
+        let writes = graph.nodes[0].writes();
+        // SsmConv1d writes ssm_conv_input + ssm_conv_output + conv_state.
+        assert!(writes.iter().any(|w| w.buffer == bufs.ssm_conv_output));
+        assert!(writes.iter().any(|w| w.buffer == bufs.conv_state));
+    }
+
+    #[test]
+    #[should_panic(expected = "SG-1.5")]
+    fn builder_still_panics_on_gemma4_variant() {
+        // SG-1.5 still pending — Gemma-4 variants should panic with
+        // the appropriate deferral message.
+        let cfg = dummy_qwen3_cfg();
+        let bufs = distinct_buffer_map();
+        let plans = vec![vec![LayerStep::VNorm]];
         let _ = GraphBuilder::build_decode_token(&bufs, &cfg, 0, &plans);
     }
 }
