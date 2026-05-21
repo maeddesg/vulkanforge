@@ -824,11 +824,20 @@ impl<'a> GraphBuilder<'a> {
     }
 
     fn add_ssm_out_proj(&mut self, layer: u32) {
-        // GEMV ssm_norm_out → linear_attn_out (uses attn_out slot).
+        // SG-1.4-c — corrected from SG-1.4: the actual
+        // `step_ssm_out_proj` body writes `o_buf` (NOT `attn_out`) —
+        // see `executor/attention.rs:1326`. AttnResidualAdd's
+        // dispatcher then consumes `o_buf` as `addend`.
+        //
+        // Previous SG-1.4 stub wrote `attn_out`, breaking the RAW
+        // edge to `AttnResidualAdd` (which reads `o_buf`) and causing
+        // topo-order drift + partial-coherence under
+        // `BarrierMode::GraphDriven` on Qwen3.6 (the "0language.com:"
+        // signature in SG-1.4-b §3).
         let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
         self.ssm_simple_node(layer,
             vec![MemAccess::new(self.bufs.ssm_norm_out, 0, Self::D_INNER_BYTES)],
-            vec![MemAccess::new(self.bufs.attn_out, 0, hidden_bytes)],
+            vec![MemAccess::new(self.bufs.o_buf, 0, hidden_bytes)],
             "ssm_out_proj",
         );
     }

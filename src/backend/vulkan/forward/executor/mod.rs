@@ -428,7 +428,14 @@ impl DecodeExec {
         // Gemma-4 still keeps imperative barriers — its MoE / KV-share
         // step bodies have additional barrier patterns that SG-1.5/1.6
         // will audit.
-        let use_graph_barriers = cfg.gemma4.is_none() && cfg.qwen35.is_none(); // SG-1.4 stance temp
+        // SG-1.4-c — kept at SG-1.4 stance. The o_buf-vs-attn_out
+        // fix in `add_ssm_out_proj` (this sprint) closes one missing
+        // RAW edge but the qwen35 flip still produces partial-
+        // coherence (`" 0language- to any  5"`), indicating at least
+        // one more missing edge or barrier site. Documented in
+        // `results/sprint_sg1_4c_edge_audit.md`. Gemma-4 also stays
+        // imperative.
+        let use_graph_barriers = cfg.gemma4.is_none() && cfg.qwen35.is_none();
         if use_graph_barriers {
             fwd.barrier_mode = BarrierMode::GraphDriven;
         }
