@@ -579,14 +579,35 @@ pub(crate) fn compute_barrier(dev: &VulkanDevice, cmd: vk::CommandBuffer) {
     if std::env::var("VF_NO_BARRIERS").map(|v| v == "1").unwrap_or(false) {
         return;
     }
+    // SG-1.4-g — widen to cover TRANSFER as well. Graph-driven
+    // dispatch uses `compute_barrier` as its per-node barrier in
+    // `execute_layer_via_graph`. Several step bodies issue TRANSFER
+    // ops inside their dispatch (cmd_fill_buffer in
+    // `ensure_ssm_persistent_initialized`, cmd_copy_buffer in
+    // `step_gated_delta_net`'s state copy-back, embed-copy on the
+    // initial token); without TRANSFER coverage the graph barriers
+    // skipped those writes and produced the deterministic L0 break +
+    // non-deterministic L6 race that Sprint SG-1.4-f bisected.
+    //
+    // Imperative-path callers see only compute writes upstream, so
+    // the extra TRANSFER coverage is a no-op for them on real GPUs
+    // (the driver collapses unused stages).
     let mb = vk::MemoryBarrier::default()
-        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-        .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+        .src_access_mask(
+            vk::AccessFlags::SHADER_WRITE
+                | vk::AccessFlags::TRANSFER_WRITE,
+        )
+        .dst_access_mask(
+            vk::AccessFlags::SHADER_READ
+                | vk::AccessFlags::SHADER_WRITE
+                | vk::AccessFlags::TRANSFER_READ
+                | vk::AccessFlags::TRANSFER_WRITE,
+        );
     unsafe {
         dev.device.cmd_pipeline_barrier(
             cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
             vk::DependencyFlags::empty(),
             std::slice::from_ref(&mb),
             &[], &[],
