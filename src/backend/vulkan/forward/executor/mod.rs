@@ -481,23 +481,16 @@ impl DecodeExec {
                     None
                 }
             });
-        // Sprint SG-1.7 — graph-driven barriers stay enabled for
-        // Qwen3.6 (SG-3 decomposed) and Llama-family (single-dispatch
-        // steps). Gemma-4 remains under `BarrierMode::Imperative` as
-        // an HONEST-PARTIAL: the SG-1.7 decomposition infrastructure
-        // is shipped (MoE + PLE Builder helpers + sub_* recorder
-        // helpers) but the gate-flip uncovered residual race surfaces
-        // not yet bisected (E2B output diverged from imperative,
-        // 26B produced `<pad>` garbage at +29 % speed = ceiling). The
-        // graph still drives topo-order for Gemma-4 under
-        // `VF_USE_GRAPH=1`; sync stays imperative until SG-1.7-bisect.
-        // Force-all (`VF_GRAPH_BARRIERS_ALL=1`) overrides for diag.
+        // Sprint SG-1.7-bisect — graph-driven barriers ON for all
+        // architectures now that the missing Gemma-4 reads (gate_buf
+        // on Attn/FfnResidualAdd) and PleBlock's internal barriers
+        // (force_internal_barrier) are in place.
         let use_graph_barriers = if force_all {
             true
         } else if let Some((lo, hi)) = layer_range {
             ctx.layer >= lo && ctx.layer <= hi
         } else {
-            cfg.gemma4.is_none()
+            true
         };
         let trace = std::env::var("VF_BARRIER_TRACE").as_deref() == Ok("1");
         if use_graph_barriers {

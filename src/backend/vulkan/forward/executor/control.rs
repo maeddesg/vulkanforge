@@ -57,7 +57,13 @@ impl DecodeExec {
             cfg.hidden_dim, hps, scale_gate, "ple_gemv_gate",
         );
         fwd.mark_written(&[gate_buf]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[gate_buf]);
+        // SG-1.7-bisect — `force_internal_barrier` instead of
+        // `maybe_compute_barrier` so the sub-dispatch sync fires
+        // unconditionally under `BarrierMode::GraphDriven` (SG-1.4-b
+        // pattern). The graph models PleBlock as a single FullStep
+        // node and emits the leading edge-barrier; the 4 internal
+        // sync points stay live here.
+        fwd.force_internal_barrier(ctx.dev, ctx.cmd, &[gate_buf]);
 
         // (2) gate ← gelu_pytorch_tanh(gate) * per_layer_inputs[layer]
         let kernel = ctx.registry.get(ShaderId::GeluPytorchTanhGlu);
@@ -84,7 +90,8 @@ impl DecodeExec {
             dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
         });
         fwd.mark_written(&[gate_buf]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[gate_buf]);
+        // SG-1.7-bisect — force barrier after GELU-GLU.
+        fwd.force_internal_barrier(ctx.dev, ctx.cmd, &[gate_buf]);
 
         // (3) proj = per_layer_projection @ gate  — F32 GEMV (256 → 1536).
         let w_proj = layer_weight(ctx.model, ctx.layer, "per_layer_projection.weight");
@@ -101,7 +108,8 @@ impl DecodeExec {
             hps, cfg.hidden_dim, scale_proj, "ple_gemv_proj",
         );
         fwd.mark_written(&[o_buf]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[o_buf]);
+        // SG-1.7-bisect — force barrier after proj GEMV.
+        fwd.force_internal_barrier(ctx.dev, ctx.cmd, &[o_buf]);
 
         // (4) normed = rms_norm(proj, post_per_layer_input_norm.weight) → attn_out.
         let w_pln = layer_weight(ctx.model, ctx.layer, "post_per_layer_input_norm.weight");
@@ -110,7 +118,9 @@ impl DecodeExec {
             cfg.hidden_dim, 1, cfg.rms_norm_eps, "ple_rms_norm",
         );
         fwd.mark_written(&[attn_out]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[attn_out, output]);
+        // SG-1.7-bisect — force barrier after RMSNorm (output needs
+        // to be visible too because the next Add reads it).
+        fwd.force_internal_barrier(ctx.dev, ctx.cmd, &[attn_out, output]);
 
         // (5) output += normed.
         fwd.run_binary(

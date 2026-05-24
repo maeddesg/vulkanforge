@@ -290,10 +290,14 @@ impl<'a> GraphBuilder<'a> {
             LayerStep::AttnResidualAdd => {
                 // Llama/Qwen3 paths feed o_buf into the add; Qwen3.6
                 // SSM layers route via attn_out (written by
-                // SsmOutProj) instead. Read BOTH so the byte-range
-                // graph picks up the right RAW edge regardless of
-                // architecture — `execute_step` dispatches the
-                // correct buffer either way.
+                // SsmOutProj) instead; Gemma-4 paths use gate_buf
+                // (written by PostAttnNorm). Read ALL THREE so the
+                // byte-range graph picks up the right RAW edge
+                // regardless of architecture — `execute_step`
+                // dispatches the correct buffer either way.
+                // Sprint SG-1.7-bisect: gate_buf was missing, which
+                // left the PostAttnNorm → AttnResidualAdd edge
+                // unmodelled on Gemma-4 → race under GraphDriven.
                 let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
                 self.graph.add_dispatch(DispatchNode {
                     id: 0,
@@ -308,6 +312,7 @@ impl<'a> GraphBuilder<'a> {
                         MemAccess::new(self.bufs.scratch_a, 0, hidden_bytes),
                         MemAccess::new(self.bufs.o_buf, 0, hidden_bytes),
                         MemAccess::new(self.bufs.attn_out, 0, hidden_bytes),
+                        MemAccess::new(self.bufs.gate_buf, 0, hidden_bytes),
                     ],
                     writes: vec![MemAccess::new(self.bufs.res1, 0, hidden_bytes)],
                     layer,
@@ -331,10 +336,35 @@ impl<'a> GraphBuilder<'a> {
                 layer, self.bufs.ffn_hidden, self.bufs.ffn_out,
                 self.cfg.ffn_dim, self.cfg.hidden_dim, "down_proj",
             ),
-            LayerStep::FfnResidualAdd => self.add_binary(
-                layer, self.bufs.res1, self.bufs.ffn_out, self.bufs.layer_output,
-                self.cfg.hidden_dim, "ffn_residual_add",
-            ),
+            LayerStep::FfnResidualAdd => {
+                // Llama/Qwen3 paths read res1 + ffn_out; Gemma-4 paths
+                // read res1 + gate_buf (the PostFfnNorm-scratch). Read
+                // ALL THREE so the byte-range graph picks up the right
+                // RAW edge regardless of architecture — `execute_step`
+                // dispatches the correct buffer either way.
+                // Sprint SG-1.7-bisect: gate_buf was missing, which
+                // left the PostFfnNorm → FfnResidualAdd edge
+                // unmodelled on Gemma-4 → race under GraphDriven.
+                let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
+                self.graph.add_dispatch(DispatchNode {
+                    id: 0,
+                    sub_dispatch: SubDispatch::FullStep(self.current_step_in_layer),
+                    pipeline: vk::Pipeline::null(),
+                    pipeline_layout: vk::PipelineLayout::null(),
+                    descriptor_set_layout: vk::DescriptorSetLayout::null(),
+                    bindings: Vec::new(),
+                    push_constants: Vec::new(),
+                    dispatch: (self.cfg.hidden_dim.div_ceil(64), 1, 1),
+                    reads: vec![
+                        MemAccess::new(self.bufs.res1, 0, hidden_bytes),
+                        MemAccess::new(self.bufs.ffn_out, 0, hidden_bytes),
+                        MemAccess::new(self.bufs.gate_buf, 0, hidden_bytes),
+                    ],
+                    writes: vec![MemAccess::new(self.bufs.layer_output, 0, hidden_bytes)],
+                    layer,
+                    label: Some(format!("L{layer}_ffn_residual_add")),
+                });
+            }
 
             // ===== Qwen3.6 Linear-Attention (SG-1.4) =====
             //

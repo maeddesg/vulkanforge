@@ -765,7 +765,10 @@ impl DecodeExec {
             gate_up_shader,
         );
         fwd.mark_written(&[gate_up_out]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[gate_up_out]);
+        // SG-1.7-bisect — `force_internal_barrier` for sub-dispatch
+        // sync that must fire even under `BarrierMode::GraphDriven`
+        // (SG-1.4-b pattern; MoE step body has 18 internal dispatches).
+        fwd.force_internal_barrier(ctx.dev, ctx.cmd, &[gate_up_out]);
 
         // (2) Per-slot GLU. Each iteration reads slot k's gate
         //     [k*2*mi .. k*2*mi + mi] and up [k*2*mi + mi .. (k+1)*2*mi]
@@ -802,7 +805,8 @@ impl DecodeExec {
             });
         }
         fwd.mark_written(&[glu_out]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[glu_out]);
+        // SG-1.7-bisect — force-barrier after GLU loop, before down.
+        fwd.force_internal_barrier(ctx.dev, ctx.cmd, &[glu_out]);
 
         // (3) Batched down indexed GEMV. Per-slot B: slot k reads its
         //     own mi-block of glu_out at offset `k * down_k`, so
@@ -822,7 +826,8 @@ impl DecodeExec {
             down_shader,
         );
         fwd.mark_written(&[down_out]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[down_out]);
+        // SG-1.7-bisect — force-barrier after down, before FMA loop.
+        fwd.force_internal_barrier(ctx.dev, ctx.cmd, &[down_out]);
 
         // (4) Per-slot indexed FMA: ffn_hidden += weights[k] * down_out[k*h..(k+1)*h].
         //     Sprint 61G — `compute_barrier` after each FMA serialises
@@ -840,7 +845,10 @@ impl DecodeExec {
                 "moe_fma_add_batched",
             );
             fwd.mark_written(&[ffn_hidden]);
-            fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[ffn_hidden]);
+            // SG-1.7-bisect — force-barrier between FMA slots (Sprint
+            // 61G multi-FMA race precedent). Under GraphDriven this
+            // is the critical per-FMA accumulator serialiser.
+            fwd.force_internal_barrier(ctx.dev, ctx.cmd, &[ffn_hidden]);
         }
     }
 
