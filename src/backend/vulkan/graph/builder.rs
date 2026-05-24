@@ -64,6 +64,10 @@ pub struct GraphBuilder<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct BufferMap {
     pub scratch_a: BufferHandle,
+    /// Sprint SG-1.6 — Gemma-4-26B MoE block scratch (PreMoeNorm output,
+    /// MoE input). Present on all model states (`Forward::scratch_b`),
+    /// only consumed by the Gemma-4 MoE Builder helpers.
+    pub scratch_b: BufferHandle,
     pub hidden_norm: BufferHandle,
     pub q_buf: BufferHandle,
     pub k_buf: BufferHandle,
@@ -113,6 +117,7 @@ impl BufferMap {
     pub fn null() -> Self {
         Self {
             scratch_a: vk::Buffer::null(),
+            scratch_b: vk::Buffer::null(),
             hidden_norm: vk::Buffer::null(),
             q_buf: vk::Buffer::null(),
             k_buf: vk::Buffer::null(),
@@ -370,21 +375,19 @@ impl<'a> GraphBuilder<'a> {
             LayerStep::PleBlock => self.add_ple_block(layer),
             LayerStep::LayerScalarMul => self.add_layer_scalar_mul(layer),
 
-            // ===== Gemma-4-26B MoE (SG-1.6 — stubbed) =====
-            LayerStep::PostDenseMlpNorm
-            | LayerStep::PreMoeNorm
-            | LayerStep::MoeRoute { .. }
-            | LayerStep::MoeExpertFfn { .. }
-            | LayerStep::PostMoeNorm
-            | LayerStep::MoeBranchAdd => {
-                unimplemented!(
-                    "SG-1.6 — Gemma-4 MoE variant {step:?} not yet \
-                     implemented in GraphBuilder. Use the imperative \
-                     executor (the analysis-Teil-4 lever for Gemma-4 is \
-                     here — biggest VF Decode-Gap. SG-1.6 ist die \
-                     ranghöchste Folge-Arbeit nach SG-1.3-ship)."
-                );
-            }
+            // ===== Gemma-4-26B MoE (SG-1.6) =====
+            // All emit FullStep nodes — `BarrierMode::Imperative`
+            // (`cfg.gemma4.is_none()` gate) keeps the step bodies'
+            // internal `maybe_compute_barrier` + `mark_written` calls
+            // live. MoeExpertFfn is internally 18-32 sub-dispatches
+            // (P0-1 batched / per-slot); SG-3-style decomposition is
+            // SG-1.7+ follow-up before the GraphDriven gate can open.
+            LayerStep::PostDenseMlpNorm => self.add_post_dense_mlp_norm(layer),
+            LayerStep::PreMoeNorm => self.add_pre_moe_norm(layer),
+            LayerStep::MoeRoute { .. } => self.add_moe_route(layer),
+            LayerStep::MoeExpertFfn { .. } => self.add_moe_expert_ffn(layer),
+            LayerStep::PostMoeNorm => self.add_post_moe_norm(layer),
+            LayerStep::MoeBranchAdd => self.add_moe_branch_add(layer),
         }
     }
 
@@ -1126,6 +1129,175 @@ impl<'a> GraphBuilder<'a> {
             label: Some(format!("L{layer}_scalar_mul")),
         });
     }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Sprint SG-1.6 — Gemma-4-26B-A4B MoE block helpers.
+    //
+    // Type-B layers (19 of 30 on the 26B Q3_K_M) run a parallel
+    // Dense-MLP + MoE branch then merge. Step ordering (from
+    // `layer_plan::build_gemma4_layer`):
+    //
+    //   PostAttnNorm → AttnResidualAdd (writes res1)
+    //   ── Dense branch ──
+    //     PreFfnNorm → Gate/Up → SwiGLU → Down (writes ffn_out)
+    //     PostDenseMlpNorm (ffn_out → scratch_a = h1)
+    //   ── MoE branch ──
+    //     PreMoeNorm (res1 → scratch_b = MoE input)
+    //     MoeRoute (res1 → router GPU/CPU state)
+    //     MoeExpertFfn (scratch_b + router → ffn_hidden)
+    //     PostMoeNorm (ffn_hidden → ffn_out = h2)
+    //   ── Merge ──
+    //     MoeBranchAdd (ffn_out += scratch_a)
+    //     FfnResidualAdd / PleBlock / LayerScalarMul tail
+    //
+    // All FullStep nodes — Gemma-4 stays under `BarrierMode::Imperative`
+    // until SG-1.7 decomposes MoeExpertFfn (18-32 sub-dispatches with
+    // internal `maybe_compute_barrier` calls). Byte-range modeling
+    // is coarse-but-correct; weights + router-internal buffers are
+    // intentionally omitted (constant within a forward + not in
+    // BufferMap; topo-order falls out of insertion order regardless
+    // since the layer plan is forward-only).
+    // ─────────────────────────────────────────────────────────────────
+
+    /// `step_post_dense_mlp_norm` — RMSNorm of the Dense-MLP output
+    /// into the h1 scratch. Reads ffn_out (DownProj output), writes
+    /// scratch_a (= h1, lives until MoeBranchAdd).
+    fn add_post_dense_mlp_norm(&mut self, layer: u32) {
+        let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
+        self.graph.add_dispatch(DispatchNode {
+            id: 0,
+            sub_dispatch: SubDispatch::FullStep(self.current_step_in_layer),
+            pipeline: vk::Pipeline::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            bindings: Vec::new(),
+            push_constants: Vec::new(),
+            dispatch: (1, 1, 1),
+            reads:  vec![MemAccess::new(self.bufs.ffn_out, 0, hidden_bytes)],
+            writes: vec![MemAccess::new(self.bufs.scratch_a, 0, hidden_bytes)],
+            layer,
+            label: Some(format!("L{layer}_post_dense_mlp_norm")),
+        });
+    }
+
+    /// `step_pre_moe_norm` — RMSNorm of the raw post-attention
+    /// residual into the MoE-input scratch. Reads res1, writes
+    /// scratch_b. Both branches read the SAME res1 (not the
+    /// Dense-MLP-normed value) per HF's Gemma-4 reference.
+    fn add_pre_moe_norm(&mut self, layer: u32) {
+        let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
+        self.graph.add_dispatch(DispatchNode {
+            id: 0,
+            sub_dispatch: SubDispatch::FullStep(self.current_step_in_layer),
+            pipeline: vk::Pipeline::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            bindings: Vec::new(),
+            push_constants: Vec::new(),
+            dispatch: (1, 1, 1),
+            reads:  vec![MemAccess::new(self.bufs.res1, 0, hidden_bytes)],
+            writes: vec![MemAccess::new(self.bufs.scratch_b, 0, hidden_bytes)],
+            layer,
+            label: Some(format!("L{layer}_pre_moe_norm")),
+        });
+    }
+
+    /// `step_moe_route` — Router. Reads res1 (raw post-attention
+    /// residual; HF's `self.router(residual)`), writes router-internal
+    /// indices + weights scratch buffers (GPU path) or `fwd.moe_routing`
+    /// (CPU path). Both are intentionally not in BufferMap — only the
+    /// dep on res1 matters for graph topo-order, and the next step
+    /// (MoeExpertFfn) carries the consume-side dep on the router
+    /// outputs via its step body.
+    fn add_moe_route(&mut self, layer: u32) {
+        let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
+        self.graph.add_dispatch(DispatchNode {
+            id: 0,
+            sub_dispatch: SubDispatch::FullStep(self.current_step_in_layer),
+            pipeline: vk::Pipeline::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            bindings: Vec::new(),
+            push_constants: Vec::new(),
+            dispatch: (1, 1, 1),
+            reads:  vec![MemAccess::new(self.bufs.res1, 0, hidden_bytes)],
+            // No graph-visible write — router state lives in buffers
+            // not modeled here (see comment above).
+            writes: Vec::new(),
+            layer,
+            label: Some(format!("L{layer}_moe_route")),
+        });
+    }
+
+    /// `step_moe_expert_ffn` — the workhorse. Internally 18 dispatches
+    /// (P0-1 batched default: gate_up Y-dispatch + 8 GLU + down Y-
+    /// dispatch + 8 FMA) or 32 (per-slot opt-out). Modeled as one
+    /// FullStep with coarse reads/writes: reads scratch_b (MoE input)
+    /// + the GPU-router-written indices/weights (via the step body's
+    /// own SSBO bindings); writes ffn_hidden (= MoE expert weighted
+    /// sum).
+    fn add_moe_expert_ffn(&mut self, layer: u32) {
+        let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
+        self.graph.add_dispatch(DispatchNode {
+            id: 0,
+            sub_dispatch: SubDispatch::FullStep(self.current_step_in_layer),
+            pipeline: vk::Pipeline::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            bindings: Vec::new(),
+            push_constants: Vec::new(),
+            dispatch: (1, 1, 1),
+            reads:  vec![MemAccess::new(self.bufs.scratch_b, 0, hidden_bytes)],
+            writes: vec![MemAccess::new(self.bufs.ffn_hidden, 0, hidden_bytes)],
+            layer,
+            label: Some(format!("L{layer}_moe_expert_ffn")),
+        });
+    }
+
+    /// `step_post_moe_norm` — RMSNorm of the MoE-branch sum. Reads
+    /// ffn_hidden (MoE expert weighted sum), writes ffn_out (= h2,
+    /// aliasing the now-freed Dense-MLP-output slot).
+    fn add_post_moe_norm(&mut self, layer: u32) {
+        let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
+        self.graph.add_dispatch(DispatchNode {
+            id: 0,
+            sub_dispatch: SubDispatch::FullStep(self.current_step_in_layer),
+            pipeline: vk::Pipeline::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            bindings: Vec::new(),
+            push_constants: Vec::new(),
+            dispatch: (1, 1, 1),
+            reads:  vec![MemAccess::new(self.bufs.ffn_hidden, 0, hidden_bytes)],
+            writes: vec![MemAccess::new(self.bufs.ffn_out, 0, hidden_bytes)],
+            layer,
+            label: Some(format!("L{layer}_post_moe_norm")),
+        });
+    }
+
+    /// `step_moe_branch_add` — `ffn_out (h2) += scratch_a (h1)`. The
+    /// merge of Dense-MLP branch and MoE branch into ffn_out. In-place
+    /// on ffn_out.
+    fn add_moe_branch_add(&mut self, layer: u32) {
+        let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
+        self.graph.add_dispatch(DispatchNode {
+            id: 0,
+            sub_dispatch: SubDispatch::FullStep(self.current_step_in_layer),
+            pipeline: vk::Pipeline::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            bindings: Vec::new(),
+            push_constants: Vec::new(),
+            dispatch: (1, 1, 1),
+            reads: vec![
+                MemAccess::new(self.bufs.ffn_out, 0, hidden_bytes),
+                MemAccess::new(self.bufs.scratch_a, 0, hidden_bytes),
+            ],
+            writes: vec![MemAccess::new(self.bufs.ffn_out, 0, hidden_bytes)],
+            layer,
+            label: Some(format!("L{layer}_moe_branch_add")),
+        });
+    }
 }
 
 #[cfg(test)]
@@ -1164,6 +1336,7 @@ mod tests {
     fn distinct_buffer_map() -> BufferMap {
         BufferMap {
             scratch_a: fake_buffer(1),
+            scratch_b: fake_buffer(28),
             hidden_norm: fake_buffer(2),
             q_buf: fake_buffer(3),
             k_buf: fake_buffer(4),
@@ -1385,12 +1558,35 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "SG-1.6")]
-    fn builder_still_panics_on_gemma4_moe_variant() {
-        // SG-1.6 still pending — Gemma-4 MoE variants should panic.
+    fn builder_handles_gemma4_moe_variants() {
+        // SG-1.6 — All 6 Gemma-4 MoE block variants now build.
         let cfg = dummy_qwen3_cfg();
         let bufs = distinct_buffer_map();
-        let plans = vec![vec![LayerStep::PreMoeNorm]];
-        let _ = GraphBuilder::build_decode_token(&bufs, &cfg, 0, &plans);
+        let plans = vec![vec![
+            LayerStep::PostDenseMlpNorm,
+            LayerStep::PreMoeNorm,
+            LayerStep::MoeRoute { n_experts: 128, top_k: 8 },
+            LayerStep::MoeExpertFfn { n_experts: 128, top_k: 8, moe_intermediate: 2048 },
+            LayerStep::PostMoeNorm,
+            LayerStep::MoeBranchAdd,
+        ]];
+        let graph = GraphBuilder::build_decode_token(&bufs, &cfg, 0, &plans);
+        assert_eq!(graph.len(), 6, "6 Gemma-4 MoE variants emit 6 FullStep nodes");
+        // PreMoeNorm writes scratch_b; MoeExpertFfn reads scratch_b → RAW (1→3).
+        assert!(graph.edges.iter().any(|e| e.from == 1 && e.to == 3
+                && e.buffer == bufs.scratch_b),
+            "expected PreMoeNorm→MoeExpertFfn RAW on scratch_b");
+        // MoeExpertFfn writes ffn_hidden; PostMoeNorm reads ffn_hidden → RAW (3→4).
+        assert!(graph.edges.iter().any(|e| e.from == 3 && e.to == 4
+                && e.buffer == bufs.ffn_hidden),
+            "expected MoeExpertFfn→PostMoeNorm RAW on ffn_hidden");
+        // PostDenseMlpNorm writes scratch_a; MoeBranchAdd reads scratch_a → RAW (0→5).
+        assert!(graph.edges.iter().any(|e| e.from == 0 && e.to == 5
+                && e.buffer == bufs.scratch_a),
+            "expected PostDenseMlpNorm→MoeBranchAdd RAW on scratch_a");
+        // PostMoeNorm writes ffn_out; MoeBranchAdd reads+writes ffn_out → RAW + WAW (4→5).
+        assert!(graph.edges.iter().any(|e| e.from == 4 && e.to == 5
+                && e.buffer == bufs.ffn_out),
+            "expected PostMoeNorm→MoeBranchAdd RAW on ffn_out");
     }
 }

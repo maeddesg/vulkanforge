@@ -352,6 +352,9 @@ impl DecodeExec {
         let (layer_input, layer_output_handle) = decode_io(ctx);
         let bufs = BufferMap {
             scratch_a:    layer_input,
+            // Sprint SG-1.6 — Gemma-4-26B MoE PreMoeNorm output / MoE
+            // input. Always present on `Forward`.
+            scratch_b:    fwd.cur().scratch_b.handle,
             hidden_norm:  fwd.cur().hidden_norm.handle,
             q_buf:        fwd.cur().q_buf.handle,
             k_buf:        fwd.cur().k_buf.handle,
