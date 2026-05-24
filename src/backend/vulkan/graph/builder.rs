@@ -661,6 +661,38 @@ impl<'a> GraphBuilder<'a> {
         });
     }
 
+    /// Sprint SG-3 — decomposed-step node emitter. Same as
+    /// [`Self::ssm_simple_node`] but the caller specifies the
+    /// `SubDispatch` discriminator, so the Recorder routes via its
+    /// per-variant `sub_*` helper instead of `execute_step`. The
+    /// decomposed multi-dispatch steps (NormGated, AlphaGate,
+    /// Conv1d, BetaProj, GatedDeltaNet) emit one of these per
+    /// internal sub-dispatch, with precise byte-range reads/writes so
+    /// the graph's dep-pass discovers the intra-step RAW/WAW edges.
+    fn decomposed_node(
+        &mut self,
+        layer: u32,
+        sub: SubDispatch,
+        reads: Vec<MemAccess>,
+        writes: Vec<MemAccess>,
+        label: &str,
+    ) {
+        self.graph.add_dispatch(DispatchNode {
+            id: 0,
+            sub_dispatch: sub,
+            pipeline: vk::Pipeline::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            bindings: Vec::new(),
+            push_constants: Vec::new(),
+            dispatch: (1, 1, 1),
+            reads,
+            writes,
+            layer,
+            label: Some(format!("L{layer}_{label}")),
+        });
+    }
+
     fn add_ssm_qkv_proj(&mut self, layer: u32) {
         let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
         self.ssm_simple_node(layer,
@@ -679,35 +711,65 @@ impl<'a> GraphBuilder<'a> {
         );
     }
 
+    /// Sprint SG-3 — decomposed: GEMV(hidden → beta) + Sigmoid(beta).
+    /// 2 nodes. Old single-node version used `force_internal_barrier`
+    /// inside the step body; decomposition lets the graph's barrier
+    /// pass own the intra-step beta_buf RAW/WAW.
     fn add_ssm_beta_proj(&mut self, layer: u32) {
         let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
-        self.ssm_simple_node(layer,
+        self.decomposed_node(layer, SubDispatch::BetaGemv,
             vec![MemAccess::new(self.bufs.hidden_norm, 0, hidden_bytes)],
             vec![MemAccess::new(self.bufs.ssm_beta, 0, Self::N_V_HEADS_BYTES)],
-            "ssm_beta_proj",
+            "ssm_beta_gemv",
+        );
+        self.decomposed_node(layer, SubDispatch::BetaSigmoid,
+            vec![MemAccess::new(self.bufs.ssm_beta, 0, Self::N_V_HEADS_BYTES)],
+            vec![MemAccess::new(self.bufs.ssm_beta, 0, Self::N_V_HEADS_BYTES)],
+            "ssm_beta_sigmoid",
         );
     }
 
+    /// Sprint SG-3 — decomposed: 4 nodes covering the 4 sub-dispatches
+    /// inside `step_ssm_alpha_gate`. Previous SG-1.4-b version
+    /// inserted 3 `force_internal_barrier` calls between them; the
+    /// graph dep-pass now sees explicit RAW/WAW edges (alpha → alpha
+    /// → alpha → gate) and emits real cmd_pipeline_barriers between
+    /// adjacent nodes.
     fn add_ssm_alpha_gate(&mut self, layer: u32) {
-        // Composite: GEMV → alpha; add dt.bias → alpha; softplus → alpha;
-        // × ssm_a → gate. All within one step_attn_alpha_gate body.
         let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
-        self.ssm_simple_node(layer,
+        // 1. alpha = ssm_alpha.weight @ hidden_norm
+        self.decomposed_node(layer, SubDispatch::AlphaGateGemv,
             vec![MemAccess::new(self.bufs.hidden_norm, 0, hidden_bytes)],
-            vec![
-                MemAccess::new(self.bufs.ssm_alpha, 0, Self::N_V_HEADS_BYTES),
-                MemAccess::new(self.bufs.ssm_gate, 0, Self::N_V_HEADS_BYTES),
-            ],
-            "ssm_alpha_gate",
+            vec![MemAccess::new(self.bufs.ssm_alpha, 0, Self::N_V_HEADS_BYTES)],
+            "ssm_alpha_gemv",
+        );
+        // 2. alpha += ssm_dt.bias
+        self.decomposed_node(layer, SubDispatch::AlphaGateAdd,
+            vec![MemAccess::new(self.bufs.ssm_alpha, 0, Self::N_V_HEADS_BYTES)],
+            vec![MemAccess::new(self.bufs.ssm_alpha, 0, Self::N_V_HEADS_BYTES)],
+            "ssm_alpha_add_dt",
+        );
+        // 3. alpha = softplus(alpha)
+        self.decomposed_node(layer, SubDispatch::AlphaGateSoftplus,
+            vec![MemAccess::new(self.bufs.ssm_alpha, 0, Self::N_V_HEADS_BYTES)],
+            vec![MemAccess::new(self.bufs.ssm_alpha, 0, Self::N_V_HEADS_BYTES)],
+            "ssm_alpha_softplus",
+        );
+        // 4. gate = alpha * ssm_a
+        self.decomposed_node(layer, SubDispatch::AlphaGateMulA,
+            vec![MemAccess::new(self.bufs.ssm_alpha, 0, Self::N_V_HEADS_BYTES)],
+            vec![MemAccess::new(self.bufs.ssm_gate, 0, Self::N_V_HEADS_BYTES)],
+            "ssm_alpha_mul_a",
         );
     }
 
+    /// Sprint SG-3 — decomposed: ConvSetup (builds conv_input from
+    /// qkv + conv_state) + ConvDispatch (runs the conv shader). 2
+    /// nodes. The graph dep-pass discovers conv_input RAW between
+    /// them, replacing the SG-1.4-b `force_internal_barrier`.
     fn add_ssm_conv1d(&mut self, layer: u32) {
-        // Reads: ssm_qkv (current input) + conv_state (rolling window).
-        // Writes: ssm_conv_input (built window), ssm_conv_output, and
-        // updates conv_state in place. Per-layer offsets into the
-        // state buffer aren't material here — whole() suffices.
-        self.ssm_simple_node(layer,
+        // 1. Setup: builds conv_input + advances conv_state window.
+        self.decomposed_node(layer, SubDispatch::ConvSetup,
             vec![
                 MemAccess::new(self.bufs.ssm_qkv, 0, Self::CONV_CHANNELS_BYTES),
                 MemAccess::whole(self.bufs.conv_state),
@@ -715,10 +777,16 @@ impl<'a> GraphBuilder<'a> {
             vec![
                 MemAccess::new(self.bufs.ssm_conv_input, 0,
                     Self::CONV_CHANNELS_BYTES * Self::D_CONV),
-                MemAccess::new(self.bufs.ssm_conv_output, 0, Self::CONV_CHANNELS_BYTES),
                 MemAccess::whole(self.bufs.conv_state),
             ],
-            "ssm_conv1d",
+            "ssm_conv_setup",
+        );
+        // 2. Conv: reads conv_input, writes conv_output.
+        self.decomposed_node(layer, SubDispatch::ConvDispatch,
+            vec![MemAccess::new(self.bufs.ssm_conv_input, 0,
+                Self::CONV_CHANNELS_BYTES * Self::D_CONV)],
+            vec![MemAccess::new(self.bufs.ssm_conv_output, 0, Self::CONV_CHANNELS_BYTES)],
+            "ssm_conv",
         );
     }
 
@@ -766,21 +834,17 @@ impl<'a> GraphBuilder<'a> {
         );
     }
 
+    /// Sprint SG-3 — decomposed: 1 Dispatch (the gated_delta_net
+    /// shader) + 1 Transfer (cmd_copy_buffer of new-state slice from
+    /// gdn_out back into ssm_state). The graph dep-pass discovers
+    /// the gdn_out RAW between them; the Recorder's per-Transfer
+    /// barrier emit handles the COMPUTE→TRANSFER stage transition
+    /// the same way `step_gated_delta_net`'s `pre_copy` MemoryBarrier
+    /// did before.
     fn add_gated_delta_net(&mut self, layer: u32) {
-        // GDN: dispatch (reads many SSM bufs + ssm_state, writes
-        // ssm_gdn_out) + cmd_copy_buffer (reads ssm_gdn_out state
-        // region, writes ssm_state). We model the copy as a separate
-        // TransferNode so SG-2 sees both deps.
-        let gdn_dispatch_id = self.graph.add_dispatch(DispatchNode {
-            id: 0,
-            sub_dispatch: SubDispatch::FullStep(self.current_step_in_layer),
-            pipeline: vk::Pipeline::null(),
-            pipeline_layout: vk::PipelineLayout::null(),
-            descriptor_set_layout: vk::DescriptorSetLayout::null(),
-            bindings: Vec::new(),
-            push_constants: Vec::new(),
-            dispatch: (1, 1, 1),
-            reads: vec![
+        // 1. GDN compute dispatch.
+        self.decomposed_node(layer, SubDispatch::GdnCompute,
+            vec![
                 MemAccess::new(self.bufs.ssm_qrep, 0, Self::D_INNER_BYTES),
                 MemAccess::new(self.bufs.ssm_krep, 0, Self::D_INNER_BYTES),
                 MemAccess::new(self.bufs.ssm_conv_output,
@@ -789,11 +853,12 @@ impl<'a> GraphBuilder<'a> {
                 MemAccess::new(self.bufs.ssm_beta, 0, Self::N_V_HEADS_BYTES),
                 MemAccess::whole(self.bufs.ssm_state),
             ],
-            writes: vec![MemAccess::whole(self.bufs.ssm_gdn_out)],
-            layer,
-            label: Some(format!("L{layer}_gdn")),
-        });
-        // State copy-back as a Transfer node.
+            vec![MemAccess::whole(self.bufs.ssm_gdn_out)],
+            "gdn",
+        );
+        // 2. State copy-back as a Transfer node (Recorder issues
+        // cmd_copy_buffer + the COMPUTE→TRANSFER pre_copy barrier +
+        // a closing transfer_to_compute_barrier in `sub_gdn_state_copy`).
         let _copy_id = self.graph.add_transfer(super::node::TransferNode {
             id: 0,
             sub_dispatch: SubDispatch::GdnStateCopy,
@@ -801,37 +866,40 @@ impl<'a> GraphBuilder<'a> {
             src_offset: 0,
             dst_buffer: self.bufs.ssm_state,
             dst_offset: 0,
-            size: 0, // exact per-layer offsets/sizes are runtime;
-                     // whole() in reads/writes below covers it for the
-                     // SG-2 dep-pass.
+            size: 0,
             reads:  vec![MemAccess::whole(self.bufs.ssm_gdn_out)],
             writes: vec![MemAccess::whole(self.bufs.ssm_state)],
             layer,
             label: Some(format!("L{layer}_gdn_state_copy")),
         });
-        let _ = gdn_dispatch_id;
     }
 
+    /// Sprint SG-3 — decomposed: RMSNorm + SiLU + Mul, 3 nodes. The
+    /// previous SG-1.4-e single-node modelled SiLU's in-place z write
+    /// via a whole-step `writes: [ssm_z]` so the WAW propagated; with
+    /// decomposition the SiLU node carries its own writes(z) and the
+    /// Mul node's reads(z) drive an explicit RAW.
     fn add_norm_gated(&mut self, layer: u32) {
-        // RMSNorm + SiLU + Mul → ssm_norm_out.
-        //
-        // SG-1.4-e — in-place write audit: step_norm_gated's middle
-        // sub-dispatch is `run_silu(z, z, ...)` which writes ssm_z
-        // in-place (executor/attention.rs:1277-1281). Without listing
-        // ssm_z as a write, the graph couldn't see the WAW that lets
-        // a later consumer of ssm_z (e.g. the NEXT layer's
-        // NormGated, after the inter-layer drain) observe the
-        // silu'd value.
-        self.ssm_simple_node(layer,
-            vec![
-                MemAccess::whole(self.bufs.ssm_gdn_out),  // output portion
-                MemAccess::new(self.bufs.ssm_z, 0, Self::D_INNER_BYTES),
-            ],
+        // 1. RMSNorm: reads gdn_out (output portion) + weight, writes norm_out.
+        self.decomposed_node(layer, SubDispatch::NormGatedRms,
+            vec![MemAccess::new(self.bufs.ssm_gdn_out, 0, Self::D_INNER_BYTES)],
+            vec![MemAccess::new(self.bufs.ssm_norm_out, 0, Self::D_INNER_BYTES)],
+            "ssm_norm_gated_rms",
+        );
+        // 2. SiLU: reads z, writes z (in-place).
+        self.decomposed_node(layer, SubDispatch::NormGatedSilu,
+            vec![MemAccess::new(self.bufs.ssm_z, 0, Self::D_INNER_BYTES)],
+            vec![MemAccess::new(self.bufs.ssm_z, 0, Self::D_INNER_BYTES)],
+            "ssm_z_silu",
+        );
+        // 3. Mul: reads norm_out + z, writes norm_out.
+        self.decomposed_node(layer, SubDispatch::NormGatedMul,
             vec![
                 MemAccess::new(self.bufs.ssm_norm_out, 0, Self::D_INNER_BYTES),
-                MemAccess::new(self.bufs.ssm_z, 0, Self::D_INNER_BYTES),  // SiLU in-place
+                MemAccess::new(self.bufs.ssm_z, 0, Self::D_INNER_BYTES),
             ],
-            "norm_gated",
+            vec![MemAccess::new(self.bufs.ssm_norm_out, 0, Self::D_INNER_BYTES)],
+            "ssm_norm_gated_mul",
         );
     }
 
@@ -1052,21 +1120,75 @@ mod tests {
 
     #[test]
     fn builder_handles_qwen35_ssm_variants() {
-        // SG-1.4 — SsmConv1d (and the other 13 SSM/Q-Gate variants)
-        // now build instead of panicking. The previous test
-        // (`builder_panics_on_unimplemented_ssm_variant`) was the
-        // SG-1.3-era deferral assertion; SG-1.4 ships the helpers so
-        // the same plan now produces a graph node with byte-range
-        // metadata.
+        // SG-3 — SsmConv1d now decomposes to 2 nodes (ConvSetup +
+        // ConvDispatch). The previous SG-1.4-era assertion of 1
+        // node-per-step is no longer correct.
         let cfg = dummy_qwen3_cfg();
         let bufs = distinct_buffer_map();
         let plans = vec![vec![LayerStep::SsmConv1d { layer: 0 }]];
         let graph = GraphBuilder::build_decode_token(&bufs, &cfg, 0, &plans);
-        assert_eq!(graph.len(), 1);
-        let writes = graph.nodes[0].writes();
-        // SsmConv1d writes ssm_conv_input + ssm_conv_output + conv_state.
-        assert!(writes.iter().any(|w| w.buffer == bufs.ssm_conv_output));
-        assert!(writes.iter().any(|w| w.buffer == bufs.conv_state));
+        assert_eq!(graph.len(), 2, "SsmConv1d decomposes to 2 nodes");
+        // ConvSetup writes ssm_conv_input + conv_state.
+        let setup_writes = graph.nodes[0].writes();
+        assert!(setup_writes.iter().any(|w| w.buffer == bufs.ssm_conv_input));
+        assert!(setup_writes.iter().any(|w| w.buffer == bufs.conv_state));
+        // ConvDispatch writes ssm_conv_output.
+        let conv_writes = graph.nodes[1].writes();
+        assert!(conv_writes.iter().any(|w| w.buffer == bufs.ssm_conv_output));
+        // RAW edge from ConvSetup to ConvDispatch on ssm_conv_input.
+        assert!(
+            graph.edges.iter().any(|e| e.from == 0 && e.to == 1
+                && e.buffer == bufs.ssm_conv_input),
+            "expected ConvSetup→ConvDispatch RAW on ssm_conv_input, got {:?}",
+            graph.edges
+        );
+    }
+
+    #[test]
+    fn builder_decomposes_norm_gated_into_three_nodes() {
+        // SG-3 — NormGated emits RMSNorm + SiLU + Mul (3 nodes) with
+        // the intra-step RAW edges (rms→mul on norm_out, silu→mul on z).
+        let cfg = dummy_qwen3_cfg();
+        let bufs = distinct_buffer_map();
+        let plans = vec![vec![LayerStep::NormGated { layer: 0 }]];
+        let graph = GraphBuilder::build_decode_token(&bufs, &cfg, 0, &plans);
+        assert_eq!(graph.len(), 3, "NormGated decomposes to 3 nodes");
+        // RAW edge from RMSNorm (node 0) → Mul (node 2) on norm_out.
+        assert!(graph.edges.iter().any(|e| e.from == 0 && e.to == 2
+                && e.buffer == bufs.ssm_norm_out));
+        // RAW edge from SiLU (node 1) → Mul (node 2) on z.
+        assert!(graph.edges.iter().any(|e| e.from == 1 && e.to == 2
+                && e.buffer == bufs.ssm_z));
+    }
+
+    #[test]
+    fn builder_decomposes_alpha_gate_into_four_nodes() {
+        let cfg = dummy_qwen3_cfg();
+        let bufs = distinct_buffer_map();
+        let plans = vec![vec![LayerStep::SsmAlphaGate { layer: 0 }]];
+        let graph = GraphBuilder::build_decode_token(&bufs, &cfg, 0, &plans);
+        assert_eq!(graph.len(), 4, "SsmAlphaGate decomposes to 4 nodes");
+        // Chain: GEMV → Add → Softplus → MulA (each RAW on alpha_buf).
+        for i in 0..3 {
+            assert!(
+                graph.edges.iter().any(|e| e.from == i && e.to == i + 1
+                    && e.buffer == bufs.ssm_alpha),
+                "expected node {i}→{} RAW on alpha", i + 1,
+            );
+        }
+    }
+
+    #[test]
+    fn builder_decomposes_gdn_into_dispatch_plus_transfer() {
+        let cfg = dummy_qwen3_cfg();
+        let bufs = distinct_buffer_map();
+        let plans = vec![vec![LayerStep::GatedDeltaNet { layer: 0 }]];
+        let graph = GraphBuilder::build_decode_token(&bufs, &cfg, 0, &plans);
+        assert_eq!(graph.len(), 2, "GDN emits 1 Dispatch + 1 Transfer");
+        // node 0 = Dispatch, node 1 = Transfer.
+        // RAW from compute → state copy on ssm_gdn_out.
+        assert!(graph.edges.iter().any(|e| e.from == 0 && e.to == 1
+                && e.buffer == bufs.ssm_gdn_out));
     }
 
     #[test]
