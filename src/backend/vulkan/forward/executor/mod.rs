@@ -465,12 +465,21 @@ impl DecodeExec {
                     None
                 }
             });
+        // Sprint SG-3 — graph-driven barriers are the production path
+        // for Qwen3.6 now that the 5 multi-dispatch SSM steps are
+        // decomposed into per-sub-dispatch graph nodes. The new sub_*
+        // helpers issue ONLY the inner dispatch (no maybe_compute_barrier,
+        // no mark_written, no force_internal_barrier) so the graph's
+        // barrier-pass MUST own all SSM synchronization — running them
+        // under `BarrierMode::Imperative` would produce no barriers at
+        // all between adjacent sub-dispatches. Gemma-4 stays imperative
+        // until SG-1.5 lands KV-share / 4-norm / PLE Builder coverage.
         let use_graph_barriers = if force_all {
             true
         } else if let Some((lo, hi)) = layer_range {
             ctx.layer >= lo && ctx.layer <= hi
         } else {
-            cfg.gemma4.is_none() && cfg.qwen35.is_none()
+            cfg.gemma4.is_none()
         };
         let trace = std::env::var("VF_BARRIER_TRACE").as_deref() == Ok("1");
         if use_graph_barriers {
