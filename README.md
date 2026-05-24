@@ -18,6 +18,15 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
 
 ## Highlights
 
+- **Software Graph dispatch pipeline (v0.5.0, default-on)** — the
+  `LayerStep`-based imperative executor is now scheduled through a
+  topologically-sorted dependency graph (`SubDispatch` enum, byte-
+  range edge resolution, high-water-mark barrier pass). Validated
+  15/15 coherent across 6 release-target architectures (Llama,
+  Mistral, Qwen3, DeepSeek-R1, Qwen3.6 GDN, Gemma-4-26B MoE) with
+  0 Vulkan synchronization hazards under `validate_sync`. Decode
+  +28 % on Qwen3.6 (SG-3 SSM step decomposition); see
+  `results/v050_release_bench.md`.
 - **Wins decode on every direct comparison on RDNA4** — beats
   llama.cpp (Vulkan + ROCm) on Q4_K_M 8B, beats vLLM 0.20.1 ROCm
   on FP8 single-user decode (1.3–2× ahead).

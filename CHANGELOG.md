@@ -1,5 +1,104 @@
 # Changelog
 
+## v0.5.0 — Software Graph default ON (2026-05-24)
+
+`VF_USE_GRAPH=1` is now the production default. The software-graph
+dispatch pipeline that shipped opt-in in v0.4.7 has been hardened
+through the **SG-1.5 → SG-1.6 → SG-1.7-bisect → SG-1.8** chain, and
+validates 6/6 release-target models at 15/15 coherence across the
+inference-test prompt suite.
+
+### Release gate (v0.5.0 bench)
+
+15 prompts × 7 models (`inference_test_prompts_15.json`,
+max_tokens 64–1024, Mesa 26.1.1, RX 9070 XT):
+
+| Model | Coherence | avg tok/s | peak tok/s |
+|---|---|---|---|
+| Qwen3-8B Q4_K_M             | 15/15 | 101.2 | 107.0 |
+| Llama-3.1-8B Q4_K_M         | 15/15 | 106.4 | 114.2 |
+| Mistral-7B Q4_K_M           | 15/15 | 115.9 | 127.3 |
+| DeepSeek-R1-Distill-8B Q4_K_M | 15/15 | 105.8 | 113.8 |
+| Qwen3.6-27B Q3_K_S          | 15/15 |  24.0 |  24.5 |
+| Gemma-4-26B-A4B Q3_K_M      | 15/15 |  28.8 |  30.5 |
+| Gemma-4-E2B Q4_K_M (legacy bug) | 3/15 | 55.0 | 58.1 |
+
+102/105 coherent on the 6 release-target models. Gemma-4-E2B's
+pre-existing coherence regression is graph-independent (bit-identical
+to imperative-path output) and not v0.5.0-blocking.
+
+### Architecture coverage
+
+- **Llama family** (Qwen3, Llama-3.1, Mistral, DeepSeek-R1): graph
+  path is bit-equivalent to imperative; FullStep nodes, SG-1.7-bisect
+  edge fixes (`gate_buf` reads on `AttnResidualAdd`/`FfnResidualAdd`).
+- **Qwen3.6 (Gated-Delta-Net)**: SG-3 SubDispatch decomposition for
+  the 5 multi-dispatch SSM steps (NormGated, AlphaGate, Conv1d,
+  BetaProj, GDN). Decode 20.1 → 25.8 tok/s (+28 % vs SG-1.4-c
+  imperative-barriers stance).
+- **Gemma-4-26B-A4B (MoE)**: SG-1.5 (KV-share + 4-norm + PLE) + SG-1.6
+  (MoE Builder) + SG-1.7-bisect (force_internal_barrier in step
+  bodies + missing-edge fix). Graph decode 28.5 → 28.9 tok/s (graph
+  matches imperative; the ±5 % run noise prevents declaring a stable
+  win on gfx1201).
+- **Gemma-4-E2B**: graph path is bit-identical to imperative —
+  same pre-existing coherence regression on both, out of scope
+  for v0.5.0.
+
+### Graph infrastructure shipped
+
+- **SubDispatch enum** (29 variants — `FullStep(u32)` + 13 Qwen3.6
+  SSM + 15 Gemma-4 PLE/MoE). Exhaustive recorder match enforces
+  coverage at compile time.
+- **GraphBuilder** decomposes 5 Qwen3.6 SSM multi-dispatch steps into
+  N graph nodes (SG-3). Gemma-4 PleBlock + MoeRoute + MoeExpertFfn
+  decomposed variants ship as `#[allow(dead_code)]` for the SG-2
+  byte-range-elision follow-up.
+- **Builder helpers** for all 26 `LayerStep` variants (no
+  `unimplemented!()` stubs).
+- **BufferMap** carries 14 model-state + 6 MoE-router-scratch + 14
+  Qwen3.6-SSM buffer handles end-to-end into the graph dep-pass.
+- **Recorder** routes 30+ SubDispatch variants to per-sub-dispatch
+  `sub_*` helpers (`executor/attention.rs` for Qwen3.6 SSM,
+  `executor/moe.rs` + `executor/control.rs` for Gemma-4 dead-code
+  paths). Graph-driven barrier emission via the high-water-mark
+  algorithm.
+- **Validation Layers**: 0 SYNC-HAZARDs under
+  `VK_LAYER_KHRONOS_validation` + `validate_sync = true`.
+- **Diagnostic env-flags** (all default-OFF, in-tree for production
+  debug): `VF_USE_GRAPH`, `VF_GRAPH_BARRIERS_ALL`,
+  `VF_GRAPH_BARRIERS_LAYERS=N-M`, `VF_BARRIER_TRACE`,
+  `VF_BARRIER_STATS`, `VF_NO_BARRIERS`, `VF_CPU_TIMER`.
+
+### Other v0.5.0 changes
+
+- **`VF_MOE_BATCHED_DECODE` default ON** (P0-1) — Gemma-4-26B-A4B
+  decode +5.9 % from 18 batched dispatches (vs 32 per-slot) per MoE
+  layer. Opt-out via `VF_MOE_BATCHED_DECODE=0`.
+- Honest-negative: **P0-2 submit-batching** measured but not shipped —
+  async-decode (Sprint G-7) already amortizes CPU recording behind
+  GPU work on gfx1201 (record/GPU = ~13 %), leaving no production
+  headroom for the additional intra-token overlap that
+  llama.cpp-style submit-batching would deliver.
+- **`238 / 238` lib tests** (+19 vs v0.4.7), all running under
+  `cargo test --release --lib -- --test-threads=1`.
+
+### Migration
+
+`VF_USE_GRAPH=0` falls back to the v0.4.x imperative dispatch path
+for regression-bisect; no expected behaviour change there. The
+graph path is the default and tested production path going forward.
+
+---
+
+## v0.4.7 — Software Graph (opt-in, 2026-05-23)
+
+Initial opt-in ship of the software-graph dispatch pipeline behind
+`VF_USE_GRAPH=1`. Covered Llama-family + Qwen3.6; Gemma-4 panicked
+with `SG-1.5 not yet implemented` deferral message (lifted in v0.5.0).
+See git log between `e266d69` (v0.4.6) and `dba1005` (v0.4.7) for
+the SG-1.1 → SG-3 commit chain.
+
 ## v0.4.5 — Expert-Grouped MoE Prefill + Batched Decode + UX/Validation Fixes (2026-05-17)
 
 Opt-in Expert-Grouped Dispatch lands for the Gemma-4-26B-A4B MoE
