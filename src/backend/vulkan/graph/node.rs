@@ -137,6 +137,28 @@ pub enum SubDispatch {
     // step_gated_delta_net(L) → 1 Dispatch + 1 Transfer.
     GdnCompute,
     GdnStateCopy,
+
+    // ── Sprint SG-1.7 — Gemma-4 MoE + PLE decomposition ────────────
+    // step_moe_route (GPU-direct) → 2 nodes (matches the 2 dispatches
+    // inside `run_moe_router_gpu`).
+    MoeRouterNormGemv,
+    MoeRouterSoftmaxTopk,
+
+    // step_moe_expert_ffn_gpu_direct_batched(L) → 1 clear + 1 gate_up
+    // + top_k GLU + 1 down + top_k FMA = 18 nodes (for top_k=8).
+    // GluSlot / FmaSlot carry the slot index (u8 fits top_k ≤ 8).
+    MoeFfnClear,
+    MoeFfnGateUp,
+    MoeFfnGluSlot(u8),
+    MoeFfnDown,
+    MoeFfnFmaSlot(u8),
+
+    // step_ple_block(L) → 5 nodes.
+    PleGemvGate,
+    PleGeluGlu,
+    PleGemvProj,
+    PleRmsNorm,
+    PleAddOutput,
 }
 
 /// A compute dispatch: bind pipeline → bind descriptor set →

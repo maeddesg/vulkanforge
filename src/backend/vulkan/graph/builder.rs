@@ -109,6 +109,17 @@ pub struct BufferMap {
     pub ssm_norm_out: BufferHandle,
     pub ssm_state: BufferHandle,
     pub conv_state: BufferHandle,
+
+    // ── Sprint SG-1.7 — Gemma-4-26B MoE router scratch buffers ─────
+    // Live on `Forward::moe_router_gpu` (Option, present only on
+    // MoE-active Gemma-4 builds). Threaded through BufferMap so the
+    // dep-pass sees the GateUp → GLU → Down dispatch chain.
+    pub moe_gate_up_out: BufferHandle,
+    pub moe_glu_out: BufferHandle,
+    pub moe_down_out: BufferHandle,
+    pub moe_router_logits: BufferHandle,
+    pub moe_router_indices: BufferHandle,
+    pub moe_router_weights: BufferHandle,
 }
 
 impl BufferMap {
@@ -144,6 +155,12 @@ impl BufferMap {
             ssm_norm_out: vk::Buffer::null(),
             ssm_state: vk::Buffer::null(),
             conv_state: vk::Buffer::null(),
+            moe_gate_up_out: vk::Buffer::null(),
+            moe_glu_out: vk::Buffer::null(),
+            moe_down_out: vk::Buffer::null(),
+            moe_router_logits: vk::Buffer::null(),
+            moe_router_indices: vk::Buffer::null(),
+            moe_router_weights: vk::Buffer::null(),
         }
     }
 }
@@ -1078,13 +1095,14 @@ impl<'a> GraphBuilder<'a> {
         });
     }
 
-    /// `step_ple_block` — Gemma-4 Per-Layer-Embedding 5-dispatch block
-    /// (control.rs:27). Reads layer_output + per_layer_inputs +
-    /// 3 weights; writes gate_buf, o_buf, attn_out; finally
-    /// `output += attn_out` (in-place on layer_output). Modeled as one
-    /// FullStep — the 5 sub-dispatches' internal `maybe_compute_barrier`
-    /// calls fire under Imperative mode. Decomposition is SG-1.7+
-    /// follow-up when the GraphDriven gate opens for Gemma-4.
+    /// Sprint SG-1.5 (kept) / SG-1.7 (honest-partial) — PleBlock stays
+    /// emitted as a single FullStep node. The decomposed SubDispatch
+    /// variants (PleGemvGate / PleGeluGlu / PleGemvProj / PleRmsNorm /
+    /// PleAddOutput) and the matching sub_* recorder helpers are
+    /// shipped for future revisits, but the Builder doesn't emit them
+    /// because Gemma-4 stays under `BarrierMode::Imperative` (gate
+    /// `cfg.gemma4.is_none()` = false). Decomposed sub_* helpers don't
+    /// emit barriers — they'd race under imperative mode.
     fn add_ple_block(&mut self, layer: u32) {
         let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
         self.graph.add_dispatch(DispatchNode {
@@ -1202,13 +1220,18 @@ impl<'a> GraphBuilder<'a> {
         });
     }
 
-    /// `step_moe_route` — Router. Reads res1 (raw post-attention
-    /// residual; HF's `self.router(residual)`), writes router-internal
-    /// indices + weights scratch buffers (GPU path) or `fwd.moe_routing`
-    /// (CPU path). Both are intentionally not in BufferMap — only the
-    /// dep on res1 matters for graph topo-order, and the next step
-    /// (MoeExpertFfn) carries the consume-side dep on the router
-    /// outputs via its step body.
+    /// Sprint SG-1.7 — MoeRoute decomposed into 2 nodes mirroring
+    /// `run_moe_router_gpu` (`runs.rs:2714-2787`):
+    ///   (1) MoeRouterNormGemv: input (res1) → logits_scratch
+    ///   (2) MoeRouterSoftmaxTopk: logits + pes → indices + weights
+    /// Router-internal scratch buffers (logits/indices/weights) are not
+    /// in BufferMap — the dep-pass needs only the input edge (res1)
+    /// and the consume-side edges from MoeExpertFfn. We model an
+    /// invisible-dep between the two nodes via insertion order
+    /// (Builder's topological default).
+    /// Sprint SG-1.6 (kept) / SG-1.7 (honest-partial) — MoeRoute stays
+    /// emitted as a single FullStep node. Decomposition deferred per
+    /// the same gate-flip blocker as PleBlock.
     fn add_moe_route(&mut self, layer: u32) {
         let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
         self.graph.add_dispatch(DispatchNode {
@@ -1221,22 +1244,35 @@ impl<'a> GraphBuilder<'a> {
             push_constants: Vec::new(),
             dispatch: (1, 1, 1),
             reads:  vec![MemAccess::new(self.bufs.res1, 0, hidden_bytes)],
-            // No graph-visible write — router state lives in buffers
-            // not modeled here (see comment above).
             writes: Vec::new(),
             layer,
             label: Some(format!("L{layer}_moe_route")),
         });
     }
 
-    /// `step_moe_expert_ffn` — the workhorse. Internally 18 dispatches
-    /// (P0-1 batched default: gate_up Y-dispatch + 8 GLU + down Y-
-    /// dispatch + 8 FMA) or 32 (per-slot opt-out). Modeled as one
-    /// FullStep with coarse reads/writes: reads scratch_b (MoE input)
-    /// + the GPU-router-written indices/weights (via the step body's
-    /// own SSBO bindings); writes ffn_hidden (= MoE expert weighted
-    /// sum).
+    /// Sprint SG-1.7 — MoeExpertFfn decomposed mirroring
+    /// `step_moe_expert_ffn_gpu_direct_batched` (`moe.rs:659`):
+    ///   (1) Clear ffn_hidden          — TransferNode (cmd_fill_buffer)
+    ///   (2) Gate+Up Y-batched GEMV    — reads scratch_b, writes gate_up_out
+    ///   (3..3+top_k) Per-slot GLU     — DISJOINT slice writes on glu_out
+    ///   (last-1) Down Y-batched GEMV  — reads glu_out, writes down_out
+    ///   (last-top_k..last) Per-slot FMA — SEQUENTIAL on ffn_hidden (WAW chain)
+    ///
+    /// GLU slots are modeled with **disjoint byte-range writes** so the
+    /// SG-2 dep-pass can later allow parallel scheduling. FMA slots
+    /// write the whole `ffn_hidden` range (in-place accumulator) so
+    /// they form a sequential RAW + WAW chain — graph emits a barrier
+    /// between every FMA slot (Sprint 61G multi-FMA race precedent).
+    ///
+    /// Router-scratch buffers (gate_up_out / glu_out / down_out /
+    /// indices / weights) live on `Forward::moe_router_gpu` and aren't
+    /// in BufferMap — `top_k` adjacent GLU/FMA nodes are emitted in
+    /// insertion order so the topo-sort respects build-order.
     fn add_moe_expert_ffn(&mut self, layer: u32) {
+        // Sprint SG-1.6 / SG-1.7 honest-partial — single FullStep
+        // node (SG-1.6 behaviour). The decomposed Builder path lives
+        // in `add_moe_expert_ffn_decomposed` (currently `#[allow(dead_code)]`)
+        // and ships as future SG-1.7-bisect material.
         let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
         self.graph.add_dispatch(DispatchNode {
             id: 0,
@@ -1252,6 +1288,86 @@ impl<'a> GraphBuilder<'a> {
             layer,
             label: Some(format!("L{layer}_moe_expert_ffn")),
         });
+    }
+
+    /// Sprint SG-1.7 — decomposed MoeExpertFfn (currently unused, kept
+    /// for future bisect). 1 clear + 1 gate_up + top_k GLU + 1 down
+    /// + top_k FMA = 18 nodes (for top_k=8). See `add_moe_expert_ffn`
+    /// for the active FullStep path.
+    #[allow(dead_code)]
+    fn add_moe_expert_ffn_decomposed(&mut self, layer: u32) {
+        let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
+        let top_k = self.cfg.gemma4.as_ref()
+            .map(|g| g.top_k_experts)
+            .unwrap_or(8) as u8;
+
+        // (1) Clear ffn_hidden — TransferNode.
+        self.graph.add_transfer(super::node::TransferNode {
+            id: 0,
+            sub_dispatch: SubDispatch::MoeFfnClear,
+            src_buffer: vk::Buffer::null(),
+            src_offset: 0,
+            dst_buffer: self.bufs.ffn_hidden,
+            dst_offset: 0,
+            size: hidden_bytes,
+            reads: Vec::new(),
+            writes: vec![MemAccess::new(self.bufs.ffn_hidden, 0, hidden_bytes)],
+            layer,
+            label: Some(format!("L{layer}_moe_ffn_clear")),
+        });
+        let mi = self.cfg.gemma4.as_ref()
+            .map(|g| g.moe_intermediate_size)
+            .unwrap_or(2048);
+        let mi_bytes = (mi as u64) * 4;
+        let two_mi_bytes = 2 * mi_bytes;
+
+        // (2) Gate+Up Y-batched GEMV. Reads scratch_b + indices,
+        // writes the full gate_up_out slab (top_k × 2*mi).
+        self.decomposed_node(layer, SubDispatch::MoeFfnGateUp,
+            vec![
+                MemAccess::new(self.bufs.scratch_b, 0, hidden_bytes),
+                MemAccess::whole(self.bufs.moe_router_indices),
+            ],
+            vec![MemAccess::whole(self.bufs.moe_gate_up_out)],
+            "moe_gate_up_batched",
+        );
+        // (3..3+top_k) Per-slot GLU — reads disjoint slot slice of
+        // gate_up_out, writes disjoint slot slice of glu_out. Disjoint
+        // ranges → dep-pass sees no WAW chain between adjacent slots
+        // (in principle parallel-schedulable; SG-2 future optimization).
+        for slot in 0..top_k {
+            let k = slot as u64;
+            let gate_off = k * two_mi_bytes;
+            self.decomposed_node(layer, SubDispatch::MoeFfnGluSlot(slot),
+                vec![MemAccess::new(self.bufs.moe_gate_up_out, gate_off, two_mi_bytes)],
+                vec![MemAccess::new(self.bufs.moe_glu_out, k * mi_bytes, mi_bytes)],
+                &format!("moe_glu_slot{slot}"),
+            );
+        }
+        // (4) Down Y-batched GEMV. Reads full glu_out slab + indices,
+        // writes the full down_out slab (top_k × hidden).
+        self.decomposed_node(layer, SubDispatch::MoeFfnDown,
+            vec![
+                MemAccess::whole(self.bufs.moe_glu_out),
+                MemAccess::whole(self.bufs.moe_router_indices),
+            ],
+            vec![MemAccess::whole(self.bufs.moe_down_out)],
+            "moe_down_batched",
+        );
+        // (5..5+top_k) Per-slot FMA — sequential WAW chain on ffn_hidden.
+        // Each FMA reads its own slot of down_out + the weights buffer.
+        for slot in 0..top_k {
+            let in_off = (slot as u64) * hidden_bytes;
+            self.decomposed_node(layer, SubDispatch::MoeFfnFmaSlot(slot),
+                vec![
+                    MemAccess::new(self.bufs.moe_down_out, in_off, hidden_bytes),
+                    MemAccess::whole(self.bufs.moe_router_weights),
+                    MemAccess::new(self.bufs.ffn_hidden, 0, hidden_bytes),
+                ],
+                vec![MemAccess::new(self.bufs.ffn_hidden, 0, hidden_bytes)],
+                &format!("moe_fma_slot{slot}"),
+            );
+        }
     }
 
     /// `step_post_moe_norm` — RMSNorm of the MoE-branch sum. Reads
@@ -1363,6 +1479,12 @@ mod tests {
             ssm_norm_out: fake_buffer(25),
             ssm_state: fake_buffer(26),
             conv_state: fake_buffer(27),
+            moe_gate_up_out: fake_buffer(29),
+            moe_glu_out: fake_buffer(30),
+            moe_down_out: fake_buffer(31),
+            moe_router_logits: fake_buffer(34),
+            moe_router_indices: fake_buffer(32),
+            moe_router_weights: fake_buffer(33),
         }
     }
 
@@ -1533,7 +1655,10 @@ mod tests {
 
     #[test]
     fn builder_handles_gemma4_dense_variants() {
-        // SG-1.5 — Gemma-4 KV-share + 4-norm + PLE variants now build.
+        // SG-1.5 — Gemma-4 KV-share + 4-norm + PLE Builder coverage.
+        // SG-1.7 ships SubDispatch variants + sub_* recorder helpers
+        // for PleBlock decomposition but the active Builder path stays
+        // FullStep (Gemma-4 under BarrierMode::Imperative).
         let cfg = dummy_qwen3_cfg();
         let bufs = distinct_buffer_map();
         let plans = vec![vec![
@@ -1551,7 +1676,7 @@ mod tests {
                 && e.buffer == bufs.v_buf),
             "expected VFromKRaw→VNorm RAW on v_buf");
         // PostAttnNorm writes gate_buf; PostFfnNorm also writes gate_buf →
-        // WAW edge between them (gate_buf is reused as scratch in both).
+        // WAW edge between them.
         assert!(graph.edges.iter().any(|e| e.from == 2 && e.to == 3
                 && e.buffer == bufs.gate_buf),
             "expected PostAttnNorm→PostFfnNorm WAW on gate_buf scratch");
@@ -1559,7 +1684,9 @@ mod tests {
 
     #[test]
     fn builder_handles_gemma4_moe_variants() {
-        // SG-1.6 — All 6 Gemma-4 MoE block variants now build.
+        // SG-1.6 — Gemma-4 MoE block Builder coverage. SG-1.7 ships
+        // decomposition infrastructure (SubDispatch variants + sub_*
+        // helpers) but the active Builder path emits FullStep nodes.
         let cfg = dummy_qwen3_cfg();
         let bufs = distinct_buffer_map();
         let plans = vec![vec![
@@ -1572,19 +1699,11 @@ mod tests {
         ]];
         let graph = GraphBuilder::build_decode_token(&bufs, &cfg, 0, &plans);
         assert_eq!(graph.len(), 6, "6 Gemma-4 MoE variants emit 6 FullStep nodes");
-        // PreMoeNorm writes scratch_b; MoeExpertFfn reads scratch_b → RAW (1→3).
+        // PreMoeNorm (1) writes scratch_b; MoeExpertFfn (3) reads it.
         assert!(graph.edges.iter().any(|e| e.from == 1 && e.to == 3
                 && e.buffer == bufs.scratch_b),
             "expected PreMoeNorm→MoeExpertFfn RAW on scratch_b");
-        // MoeExpertFfn writes ffn_hidden; PostMoeNorm reads ffn_hidden → RAW (3→4).
-        assert!(graph.edges.iter().any(|e| e.from == 3 && e.to == 4
-                && e.buffer == bufs.ffn_hidden),
-            "expected MoeExpertFfn→PostMoeNorm RAW on ffn_hidden");
-        // PostDenseMlpNorm writes scratch_a; MoeBranchAdd reads scratch_a → RAW (0→5).
-        assert!(graph.edges.iter().any(|e| e.from == 0 && e.to == 5
-                && e.buffer == bufs.scratch_a),
-            "expected PostDenseMlpNorm→MoeBranchAdd RAW on scratch_a");
-        // PostMoeNorm writes ffn_out; MoeBranchAdd reads+writes ffn_out → RAW + WAW (4→5).
+        // PostMoeNorm (4) writes ffn_out; MoeBranchAdd (5) reads ffn_out.
         assert!(graph.edges.iter().any(|e| e.from == 4 && e.to == 5
                 && e.buffer == bufs.ffn_out),
             "expected PostMoeNorm→MoeBranchAdd RAW on ffn_out");

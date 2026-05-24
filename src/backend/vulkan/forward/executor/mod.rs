@@ -388,6 +388,15 @@ impl DecodeExec {
             ssm_norm_out:    fwd.ssm_norm_out_buf.as_ref().map(|b| b.handle).unwrap_or(ash::vk::Buffer::null()),
             ssm_state:       fwd.ssm_state_buf.as_ref().map(|b| b.handle).unwrap_or(ash::vk::Buffer::null()),
             conv_state:      fwd.conv_state_buf.as_ref().map(|b| b.handle).unwrap_or(ash::vk::Buffer::null()),
+            // Sprint SG-1.7 — Gemma-4 MoE router scratch buffers. None
+            // on non-MoE builds; the dep-pass distinguishes by buffer
+            // identity, so null-vs-null doesn't generate noise edges.
+            moe_gate_up_out:     fwd.moe_router_gpu.as_ref().map(|r| r.grouped_gate_up_out.handle).unwrap_or(ash::vk::Buffer::null()),
+            moe_glu_out:         fwd.moe_router_gpu.as_ref().map(|r| r.grouped_glu_out.handle).unwrap_or(ash::vk::Buffer::null()),
+            moe_down_out:        fwd.moe_router_gpu.as_ref().map(|r| r.grouped_down_out.handle).unwrap_or(ash::vk::Buffer::null()),
+            moe_router_logits:   fwd.moe_router_gpu.as_ref().map(|r| r.logits_scratch.handle).unwrap_or(ash::vk::Buffer::null()),
+            moe_router_indices:  fwd.moe_router_gpu.as_ref().map(|r| r.indices_scratch.handle).unwrap_or(ash::vk::Buffer::null()),
+            moe_router_weights:  fwd.moe_router_gpu.as_ref().map(|r| r.weights_scratch.handle).unwrap_or(ash::vk::Buffer::null()),
         };
 
         let graph = GraphBuilder::build_per_layer(&bufs, &cfg, ctx.layer, plan);
@@ -472,15 +481,17 @@ impl DecodeExec {
                     None
                 }
             });
-        // Sprint SG-3 — graph-driven barriers are the production path
-        // for Qwen3.6 now that the 5 multi-dispatch SSM steps are
-        // decomposed into per-sub-dispatch graph nodes. The new sub_*
-        // helpers issue ONLY the inner dispatch (no maybe_compute_barrier,
-        // no mark_written, no force_internal_barrier) so the graph's
-        // barrier-pass MUST own all SSM synchronization — running them
-        // under `BarrierMode::Imperative` would produce no barriers at
-        // all between adjacent sub-dispatches. Gemma-4 stays imperative
-        // until SG-1.5 lands KV-share / 4-norm / PLE Builder coverage.
+        // Sprint SG-1.7 — graph-driven barriers stay enabled for
+        // Qwen3.6 (SG-3 decomposed) and Llama-family (single-dispatch
+        // steps). Gemma-4 remains under `BarrierMode::Imperative` as
+        // an HONEST-PARTIAL: the SG-1.7 decomposition infrastructure
+        // is shipped (MoE + PLE Builder helpers + sub_* recorder
+        // helpers) but the gate-flip uncovered residual race surfaces
+        // not yet bisected (E2B output diverged from imperative,
+        // 26B produced `<pad>` garbage at +29 % speed = ceiling). The
+        // graph still drives topo-order for Gemma-4 under
+        // `VF_USE_GRAPH=1`; sync stays imperative until SG-1.7-bisect.
+        // Force-all (`VF_GRAPH_BARRIERS_ALL=1`) overrides for diag.
         let use_graph_barriers = if force_all {
             true
         } else if let Some((lo, hi)) = layer_range {
@@ -606,12 +617,34 @@ impl DecodeExec {
                         SD::GdnStateCopy => unreachable!(
                             "GdnStateCopy is a TransferNode, not a DispatchNode"
                         ),
+                        // ── Sprint SG-1.7 — Gemma-4 MoE + PLE sub-dispatches ──
+                        SD::MoeRouterNormGemv =>
+                            self.sub_moe_router_norm_gemv(fwd, &cfg, ctx, d.layer),
+                        SD::MoeRouterSoftmaxTopk =>
+                            self.sub_moe_router_softmax_topk(fwd, &cfg, ctx, d.layer),
+                        SD::MoeFfnClear => unreachable!(
+                            "MoeFfnClear is a TransferNode, not a DispatchNode"
+                        ),
+                        SD::MoeFfnGateUp =>
+                            self.sub_moe_ffn_gate_up(fwd, &cfg, ctx, d.layer),
+                        SD::MoeFfnGluSlot(slot) =>
+                            self.sub_moe_ffn_glu(fwd, &cfg, ctx, d.layer, slot),
+                        SD::MoeFfnDown =>
+                            self.sub_moe_ffn_down(fwd, &cfg, ctx, d.layer),
+                        SD::MoeFfnFmaSlot(slot) =>
+                            self.sub_moe_ffn_fma(fwd, &cfg, ctx, d.layer, slot),
+                        SD::PleGemvGate => self.sub_ple_gemv_gate(fwd, &cfg, ctx, d.layer),
+                        SD::PleGeluGlu => self.sub_ple_gelu_glu(fwd, &cfg, ctx, d.layer),
+                        SD::PleGemvProj => self.sub_ple_gemv_proj(fwd, &cfg, ctx, d.layer),
+                        SD::PleRmsNorm => self.sub_ple_rms_norm(fwd, &cfg, ctx, d.layer),
+                        SD::PleAddOutput => self.sub_ple_add_output(fwd, &cfg, ctx),
                     }
                 }
                 GraphNode::Transfer(t) => {
                     use crate::backend::vulkan::graph::node::SubDispatch as SD;
                     match t.sub_dispatch {
                         SD::GdnStateCopy => self.sub_gdn_state_copy(fwd, &cfg, ctx, t.layer),
+                        SD::MoeFfnClear => self.sub_moe_ffn_clear(fwd, &cfg, ctx),
                         _ => unreachable!(
                             "TransferNode sub_dispatch must be a transfer variant, got {:?}",
                             t.sub_dispatch

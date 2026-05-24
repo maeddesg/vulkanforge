@@ -843,6 +843,315 @@ impl DecodeExec {
             fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[ffn_hidden]);
         }
     }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Sprint SG-1.7 — Gemma-4 MoE sub-dispatches.
+    //
+    // Each helper issues a single Vulkan operation (compute dispatch
+    // or buffer fill) WITHOUT internal barriers, mark_written, or
+    // maybe_compute_barrier — graph dep-pass owns sync.
+    //
+    // The metadata (gate_up_t / down_t shapes + indexed-GEMV shader
+    // selection) is recomputed per sub-dispatch. The CPU cost is
+    // ~microseconds × 18 sub-dispatches × ~30 MoE layers ≈ 0.5 ms/token,
+    // dwarfed by the GPU compute time (the alternative — storing
+    // metadata on Forward — would couple the graph path to runtime
+    // state and complicate the existing imperative path).
+    // ──────────────────────────────────────────────────────────────────
+
+    /// `run_moe_router_gpu` Shader 1 (norm + scale + GEMV → logits).
+    /// Mirrors `runs.rs:2714-2743`. Reads input (res1 in decode), proj
+    /// weight, scale; writes logits_scratch.
+    pub(super) fn sub_moe_router_norm_gemv(
+        &self, fwd: &mut Forward, _cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
+    ) {
+        let (input_buf, input_offset) = (fwd.cur().res1.handle, 0u64);
+        let router = fwd.moe_router_gpu.as_ref()
+            .expect("sub_moe_router_norm_gemv requires moe_router_gpu");
+        let gpu_idx = router.layer_to_gpu_idx[layer as usize];
+        debug_assert!(gpu_idx != u32::MAX, "layer {layer} not an MoE layer");
+        let router_layer = &router.layers[gpu_idx as usize];
+        let n_experts = router.n_experts;
+        let hidden_size = router.hidden_size;
+        let rms_eps = router.rms_norm_eps;
+        let proj_buf  = router_layer.proj.handle;
+        let scale_buf = router_layer.scale.handle;
+        let logits_buf = router.logits_scratch.handle;
+
+        let seq_len = 1u32; // decode-only sub-dispatch
+        let input_bytes = (seq_len as u64) * (hidden_size as u64) * 4;
+        let logits_bytes = (seq_len as u64) * (n_experts as u64) * 4;
+
+        let k1 = ctx.registry.get(ShaderId::MoeRouterNormGemv);
+        let set1 = fwd.alloc_or_get_set(
+            ctx.dev, k1.descriptor_set_layout,
+            &[
+                (0, input_buf, input_offset, input_bytes),
+                (1, proj_buf, 0, 0),
+                (2, scale_buf, 0, 0),
+                (3, logits_buf, 0, logits_bytes),
+            ],
+        );
+        let pc1 = crate::backend::vulkan::pipeline::MoeRouterNormGemvPushConstants {
+            seq_len, hidden_size, n_experts, rms_norm_eps: rms_eps,
+        };
+        let layout1 = k1.pipeline_layout;
+        let pipeline1 = k1.pipeline;
+        fwd.profile("moe_router_norm_gemv", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline1);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout1, 0, &[set1], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout1, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc1),
+            );
+            dev.device.cmd_dispatch(cmd, seq_len, 1, 1);
+        });
+    }
+
+    /// `run_moe_router_gpu` Shader 2 (softmax + top-K + renorm + pes).
+    /// Mirrors `runs.rs:2759-2787`. Reads logits, pes; writes
+    /// indices_scratch + weights_scratch.
+    pub(super) fn sub_moe_router_softmax_topk(
+        &self, fwd: &mut Forward, _cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
+    ) {
+        let router = fwd.moe_router_gpu.as_ref()
+            .expect("sub_moe_router_softmax_topk requires moe_router_gpu");
+        let gpu_idx = router.layer_to_gpu_idx[layer as usize];
+        let router_layer = &router.layers[gpu_idx as usize];
+        let n_experts = router.n_experts;
+        let top_k = router.top_k;
+        let pes_buf = router_layer.pes.handle;
+        let logits_buf  = router.logits_scratch.handle;
+        let indices_buf = router.indices_scratch.handle;
+        let weights_buf = router.weights_scratch.handle;
+
+        let seq_len = 1u32;
+        let logits_bytes = (seq_len as u64) * (n_experts as u64) * 4;
+        let topk_bytes = (seq_len as u64) * (top_k as u64) * 4;
+
+        let k2 = ctx.registry.get(ShaderId::MoeRouterSoftmaxTopk);
+        let set2 = fwd.alloc_or_get_set(
+            ctx.dev, k2.descriptor_set_layout,
+            &[
+                (0, logits_buf, 0, logits_bytes),
+                (1, pes_buf, 0, 0),
+                (2, indices_buf, 0, topk_bytes),
+                (3, weights_buf, 0, topk_bytes),
+            ],
+        );
+        let pc2 = crate::backend::vulkan::pipeline::MoeRouterSoftmaxTopkPushConstants {
+            seq_len, n_experts, top_k,
+        };
+        let layout2 = k2.pipeline_layout;
+        let pipeline2 = k2.pipeline;
+        fwd.profile("moe_router_softmax_topk", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline2);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout2, 0, &[set2], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout2, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc2),
+            );
+            dev.device.cmd_dispatch(cmd, seq_len, 1, 1);
+        });
+    }
+
+    /// `cmd_fill_buffer(ffn_hidden, 0)` + transfer→compute barrier.
+    /// Per SG-3 GdnStateCopy precedent, the stage transition is
+    /// emitted inline (graph's COMPUTE→COMPUTE barriers don't cover
+    /// TRANSFER→COMPUTE). The Recorder routes this from a TransferNode.
+    pub(super) fn sub_moe_ffn_clear(
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx,
+    ) {
+        let ffn_hidden = fwd.cur().ffn_hidden.handle;
+        let h = cfg.hidden_dim;
+        unsafe {
+            ctx.dev.device.cmd_fill_buffer(
+                ctx.cmd, ffn_hidden, 0, (h as u64) * 4, 0,
+            );
+        }
+        transfer_to_compute_barrier(ctx.dev, ctx.cmd);
+    }
+
+    /// Helper: derive `(mi, mi_padded, gate_up_elems, down_elems, down_k,
+    /// gate_up_shader, down_shader, gate_up_w, down_w)` for layer.
+    /// Mirrors the metadata setup in
+    /// `step_moe_expert_ffn_gpu_direct_batched` lines 670–710.
+    fn moe_ffn_metadata<'a>(
+        &self, fwd: &Forward, cfg: &'a ModelConfig, ctx: &'a ExecCtx, layer: u32,
+    ) -> MoeFfnMeta {
+        let g = cfg.gemma4.as_ref()
+            .expect("MoE sub-dispatch emitted for non-Gemma-4 config");
+        let n_experts = g.n_experts;
+        let mi = g.moe_intermediate_size;
+        let mi_padded: u32 = ((mi + 255) / 256) * 256;
+        let gate_up_t = ctx.model
+            .tensor(&format!("blk.{layer}.moe_experts.gate_up_proj"))
+            .expect("moe_experts.gate_up_proj missing");
+        let down_t = ctx.model
+            .tensor(&format!("blk.{layer}.moe_experts.down_proj"))
+            .expect("moe_experts.down_proj missing");
+        let gate_up_block = gate_up_t.ggml_type.block_size() as u32;
+        let gate_up_type  = gate_up_t.ggml_type.type_size() as u32;
+        let gate_up_bytes_per_expert = (gate_up_t.byte_size / (n_experts as u64)) as u32;
+        let gate_up_elems = gate_up_bytes_per_expert / gate_up_type * gate_up_block;
+        let down_block = down_t.ggml_type.block_size() as u32;
+        let down_type  = down_t.ggml_type.type_size() as u32;
+        let down_bytes_per_expert = (down_t.byte_size / (n_experts as u64)) as u32;
+        let down_elems = down_bytes_per_expert / down_type * down_block;
+        let down_k = if down_t.shape[0] as u32 == n_experts {
+            mi_padded
+        } else {
+            down_t.shape[0] as u32
+        };
+        let gate_up_shader = layer_weight_indexed_shader(
+            ctx.model, layer, "moe_experts.gate_up_proj",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
+        let down_shader = layer_weight_indexed_shader(
+            ctx.model, layer, "moe_experts.down_proj",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
+        let gate_up_w = layer_weight(ctx.model, layer, "moe_experts.gate_up_proj");
+        let down_w    = layer_weight(ctx.model, layer, "moe_experts.down_proj");
+        MoeFfnMeta {
+            mi, top_k: g.top_k_experts, n_experts,
+            gate_up_elems, down_elems, down_k,
+            gate_up_shader, down_shader, gate_up_w, down_w,
+        }
+    }
+
+    pub(super) fn sub_moe_ffn_gate_up(
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
+    ) {
+        let m = self.moe_ffn_metadata(fwd, cfg, ctx, layer);
+        let h = cfg.hidden_dim;
+        let h_bytes = (h as u64) * 4;
+        let two_mi_bytes = 2 * (m.mi as u64) * 4;
+        let gate_up_out_total = (m.top_k as u64) * two_mi_bytes;
+        let scratch_b = fwd.cur().scratch_b.handle;
+        let (indices_buf, gate_up_out) = {
+            let r = fwd.moe_router_gpu.as_ref().expect("requires moe_router_gpu");
+            (r.indices_scratch.handle, r.grouped_gate_up_out.handle)
+        };
+        fwd.run_gemv_indexed_batched(
+            ctx.dev, ctx.registry, ctx.cmd,
+            m.gate_up_w,
+            scratch_b, 0, h_bytes,
+            gate_up_out, 0, gate_up_out_total,
+            indices_buf,
+            h, 2 * m.mi,
+            m.gate_up_elems,
+            m.top_k,
+            0, 1,
+            "moe_gate_up_batched",
+            m.gate_up_shader,
+        );
+    }
+
+    pub(super) fn sub_moe_ffn_glu(
+        &self, fwd: &mut Forward, _cfg: &ModelConfig, ctx: &ExecCtx, layer: u32, slot: u8,
+    ) {
+        let m = self.moe_ffn_metadata(fwd, _cfg, ctx, layer);
+        let mi = m.mi;
+        let mi_bytes = (mi as u64) * 4;
+        let two_mi_bytes = 2 * mi_bytes;
+        let (gate_up_out, glu_out) = {
+            let r = fwd.moe_router_gpu.as_ref().expect("requires moe_router_gpu");
+            (r.grouped_gate_up_out.handle, r.grouped_glu_out.handle)
+        };
+        let k = slot as u64;
+        let gate_off = k * two_mi_bytes;
+        let up_off   = gate_off + mi_bytes;
+        let out_off  = k * mi_bytes;
+        let kernel = ctx.registry.get(ShaderId::GeluPytorchTanhGlu);
+        let set = fwd.alloc_or_get_set(
+            ctx.dev, kernel.descriptor_set_layout,
+            &[
+                (0, gate_up_out, gate_off, mi_bytes),
+                (1, gate_up_out, up_off,   mi_bytes),
+                (2, glu_out,     out_off,  mi_bytes),
+            ],
+        );
+        let pc = SwigluPushConstants { n: mi };
+        let dispatch_x = (mi + 255) / 256;
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        fwd.profile("moe_glu_batched", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
+        });
+    }
+
+    pub(super) fn sub_moe_ffn_down(
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
+    ) {
+        let m = self.moe_ffn_metadata(fwd, cfg, ctx, layer);
+        let h = cfg.hidden_dim;
+        let h_bytes = (h as u64) * 4;
+        let down_out_total = (m.top_k as u64) * h_bytes;
+        let glu_total = (m.top_k as u64) * (m.down_k as u64) * 4;
+        let (indices_buf, glu_out, down_out) = {
+            let r = fwd.moe_router_gpu.as_ref().expect("requires moe_router_gpu");
+            (r.indices_scratch.handle, r.grouped_glu_out.handle, r.grouped_down_out.handle)
+        };
+        fwd.run_gemv_indexed_batched(
+            ctx.dev, ctx.registry, ctx.cmd,
+            m.down_w,
+            glu_out, 0, glu_total,
+            down_out, 0, down_out_total,
+            indices_buf,
+            m.down_k, h,
+            m.down_elems,
+            m.top_k,
+            m.down_k, m.top_k,
+            "moe_down_batched",
+            m.down_shader,
+        );
+    }
+
+    pub(super) fn sub_moe_ffn_fma(
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, _layer: u32, slot: u8,
+    ) {
+        let ffn_hidden = fwd.cur().ffn_hidden.handle;
+        let h = cfg.hidden_dim;
+        let h_bytes = (h as u64) * 4;
+        let (weights_buf, down_out) = {
+            let r = fwd.moe_router_gpu.as_ref().expect("requires moe_router_gpu");
+            (r.weights_scratch.handle, r.grouped_down_out.handle)
+        };
+        let in_off = (slot as u64) * h_bytes;
+        fwd.run_fma_add_indexed(
+            ctx.dev, ctx.registry, ctx.cmd,
+            down_out, in_off,
+            ffn_hidden, 0,
+            weights_buf,
+            h, slot as u32,
+            "moe_fma_add_batched",
+        );
+    }
+}
+
+/// Sprint SG-1.7 — bundle of metadata pulled per sub-dispatch (see
+/// `DecodeExec::moe_ffn_metadata`).
+struct MoeFfnMeta {
+    mi: u32,
+    top_k: u32,
+    #[allow(dead_code)] n_experts: u32,
+    gate_up_elems: u32,
+    down_elems: u32,
+    down_k: u32,
+    gate_up_shader: ShaderId,
+    down_shader: ShaderId,
+    gate_up_w: vk::Buffer,
+    down_w: vk::Buffer,
 }
 
 impl BatchExec {

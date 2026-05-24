@@ -131,6 +131,120 @@ impl DecodeExec {
         );
         fwd.mark_written(&[output]);
     }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Sprint SG-1.7 — PleBlock decomposed sub-dispatches.
+    //
+    // Mirror `step_ple_block` (5 sub-dispatches) without the internal
+    // `maybe_compute_barrier` / `mark_written` calls. Graph dep-pass
+    // owns the intra-step sync.
+    // ──────────────────────────────────────────────────────────────────
+
+    fn ple_hps(&self, fwd: &Forward, ctx: &ExecCtx) -> u32 {
+        let _ = fwd;
+        ctx.model.ple_data.as_ref()
+            .expect("PleBlock sub-dispatch emitted but model has no PleData")
+            .hps
+    }
+
+    pub(super) fn sub_ple_gemv_gate(
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
+    ) {
+        let hps = self.ple_hps(fwd, ctx);
+        let (_, output) = decode_io(ctx);
+        let gate_buf = fwd.cur().gate_buf.handle;
+        let w_gate = layer_weight(ctx.model, layer, "per_layer_input_gate.weight");
+        let s_gate = layer_weight_shader(
+            ctx.model, layer, "per_layer_input_gate.weight",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
+        let scale = layer_weight_scale_scalar(
+            ctx.model, layer, "per_layer_input_gate.weight",
+        );
+        fwd.run_gemv(
+            ctx.dev, ctx.registry, ctx.cmd, s_gate, w_gate,
+            output, gate_buf,
+            cfg.hidden_dim, hps, scale, "ple_gemv_gate",
+        );
+    }
+
+    pub(super) fn sub_ple_gelu_glu(
+        &self, fwd: &mut Forward, _cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
+    ) {
+        let hps = self.ple_hps(fwd, ctx);
+        let hps_bytes = (hps as u64) * 4;
+        let ple_inputs_buf = fwd.cur().per_layer_inputs.handle;
+        let ple_inputs_offset = (layer as u64) * hps_bytes;
+        let gate_buf = fwd.cur().gate_buf.handle;
+        let kernel = ctx.registry.get(ShaderId::GeluPytorchTanhGlu);
+        let set = fwd.alloc_or_get_set(
+            ctx.dev, kernel.descriptor_set_layout,
+            &[
+                (0, gate_buf, 0, hps_bytes),
+                (1, ple_inputs_buf, ple_inputs_offset, hps_bytes),
+                (2, gate_buf, 0, hps_bytes),
+            ],
+        );
+        let pc = SwigluPushConstants { n: hps };
+        let dispatch_x = (hps + 255) / 256;
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        fwd.profile("ple_gelu_glu", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
+        });
+    }
+
+    pub(super) fn sub_ple_gemv_proj(
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
+    ) {
+        let hps = self.ple_hps(fwd, ctx);
+        let gate_buf = fwd.cur().gate_buf.handle;
+        let o_buf = fwd.cur().o_buf.handle;
+        let w_proj = layer_weight(ctx.model, layer, "per_layer_projection.weight");
+        let s_proj = layer_weight_shader(
+            ctx.model, layer, "per_layer_projection.weight",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
+        let scale = layer_weight_scale_scalar(
+            ctx.model, layer, "per_layer_projection.weight",
+        );
+        fwd.run_gemv(
+            ctx.dev, ctx.registry, ctx.cmd, s_proj, w_proj,
+            gate_buf, o_buf,
+            hps, cfg.hidden_dim, scale, "ple_gemv_proj",
+        );
+    }
+
+    pub(super) fn sub_ple_rms_norm(
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
+    ) {
+        let o_buf = fwd.cur().o_buf.handle;
+        let attn_out = fwd.cur().attn_out.handle;
+        let w_pln = layer_weight(ctx.model, layer, "post_per_layer_input_norm.weight");
+        fwd.run_rms_norm(
+            ctx.dev, ctx.registry, ctx.cmd, o_buf, w_pln, attn_out,
+            cfg.hidden_dim, 1, cfg.rms_norm_eps, "ple_rms_norm",
+        );
+    }
+
+    pub(super) fn sub_ple_add_output(
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx,
+    ) {
+        let (_, output) = decode_io(ctx);
+        let attn_out = fwd.cur().attn_out.handle;
+        fwd.run_binary(
+            ctx.dev, ctx.registry, ctx.cmd, ShaderId::Add,
+            output, attn_out, output,
+            cfg.hidden_dim, "ple_add_output",
+        );
+    }
 }
 
 impl BatchExec {
