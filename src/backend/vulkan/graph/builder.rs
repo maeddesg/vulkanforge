@@ -346,18 +346,29 @@ impl<'a> GraphBuilder<'a> {
             LayerStep::AttnGatedOutput { q_dim } => self.add_attn_gated_output(layer, *q_dim),
             LayerStep::ResidualIdentitySeed => self.add_residual_identity_seed(layer),
 
-            // ===== Gemma-4 KV-share + 4-norm + PLE (SG-1.5 — stubbed) =====
-            LayerStep::VFromKRaw
-            | LayerStep::VNorm
-            | LayerStep::PostAttnNorm
-            | LayerStep::PostFfnNorm
-            | LayerStep::PleBlock
-            | LayerStep::LayerScalarMul => {
-                unimplemented!(
-                    "SG-1.5 — Gemma-4 variant {step:?} not yet implemented \
-                     in GraphBuilder. Use the imperative executor."
-                );
-            }
+            // ===== Gemma-4 KV-share + 4-norm + PLE (SG-1.5) =====
+            // Each helper emits a single FullStep DispatchNode whose
+            // reads/writes describe the byte-range flow of the
+            // corresponding `executor::*` step body. Under
+            // `BarrierMode::Imperative` (the Gemma-4 default in
+            // `execute_layer_via_graph`'s gate), the step body owns
+            // synchronization via its existing `maybe_compute_barrier`
+            // / `mark_written` / explicit `cmd_pipeline_barrier` calls.
+            // The graph nodes here drive the topo-order walk and the
+            // future-SG-2 byte-range optimization passes.
+            //
+            // PleBlock is internally 5 sub-dispatches. SG-3-style
+            // decomposition would replace `force_internal_barrier`-
+            // class workarounds — but Gemma-4 doesn't use that pattern
+            // (PleBlock's internal `maybe_compute_barrier`s fire under
+            // Imperative mode), so we keep it as FullStep until the
+            // GraphDriven gate also opens for Gemma-4 (SG-1.7+).
+            LayerStep::VFromKRaw => self.add_v_from_k_raw(layer),
+            LayerStep::VNorm => self.add_v_norm(layer),
+            LayerStep::PostAttnNorm => self.add_post_attn_norm(layer),
+            LayerStep::PostFfnNorm => self.add_post_ffn_norm(layer),
+            LayerStep::PleBlock => self.add_ple_block(layer),
+            LayerStep::LayerScalarMul => self.add_layer_scalar_mul(layer),
 
             // ===== Gemma-4-26B MoE (SG-1.6 — stubbed) =====
             LayerStep::PostDenseMlpNorm
@@ -959,6 +970,162 @@ impl<'a> GraphBuilder<'a> {
             "residual_identity_seed",
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Sprint SG-1.5 — Gemma-4 dense (KV-share + 4-norm + PLE) helpers.
+    //
+    // All FullStep nodes — Gemma-4 stays under `BarrierMode::Imperative`
+    // in `execute_layer_via_graph` (gated by `cfg.gemma4.is_none()`),
+    // so the corresponding `step_*` bodies emit their own internal
+    // barriers. The graph carries dep metadata only for topo-order
+    // and future SG-2 byte-range optimization passes.
+    //
+    // Byte-range modelling stays coarse-but-correct: each helper lists
+    // the principal buffer reads/writes that matter for layer-to-layer
+    // ordering. Weights + constant scratch buffers (`vnorm_ones`,
+    // `layer_scalar`, `per_layer_inputs`) are intentionally skipped —
+    // they're constant within a forward and don't drive sync edges.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// `step_v_from_k_raw` — Gemma-4 KV-share. Issues
+    /// `cmd_copy_buffer(k_buf → v_buf)` wrapped in COMPUTE→TRANSFER
+    /// and TRANSFER→COMPUTE barriers (see `executor/attention.rs:250`).
+    /// Modeled as a FullStep DispatchNode (not a TransferNode) so the
+    /// Recorder routes via `execute_step` which handles the barriers
+    /// inline — same as the imperative path.
+    fn add_v_from_k_raw(&mut self, layer: u32) {
+        // n_kv_heads × head_dim × 4 bytes. Use whole(k_buf) for read
+        // since the helper trusts the runtime kv-head count.
+        let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
+        self.graph.add_dispatch(DispatchNode {
+            id: 0,
+            sub_dispatch: SubDispatch::FullStep(self.current_step_in_layer),
+            pipeline: vk::Pipeline::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            bindings: Vec::new(),
+            push_constants: Vec::new(),
+            dispatch: (1, 1, 1),
+            reads:  vec![MemAccess::new(self.bufs.k_buf, 0, hidden_bytes)],
+            writes: vec![MemAccess::new(self.bufs.v_buf, 0, hidden_bytes)],
+            layer,
+            label: Some(format!("L{layer}_v_from_k_raw")),
+        });
+    }
+
+    /// `step_v_norm` — Gemma-4 RMSNorm on v_buf with per-arch
+    /// `vnorm_ones` constant. In-place: reads + writes v_buf.
+    fn add_v_norm(&mut self, layer: u32) {
+        let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
+        self.graph.add_dispatch(DispatchNode {
+            id: 0,
+            sub_dispatch: SubDispatch::FullStep(self.current_step_in_layer),
+            pipeline: vk::Pipeline::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            bindings: Vec::new(),
+            push_constants: Vec::new(),
+            dispatch: (1, 1, 1),
+            reads:  vec![MemAccess::new(self.bufs.v_buf, 0, hidden_bytes)],
+            writes: vec![MemAccess::new(self.bufs.v_buf, 0, hidden_bytes)],
+            layer,
+            label: Some(format!("L{layer}_v_norm")),
+        });
+    }
+
+    /// `step_post_attn_norm` — Gemma-4 extra RMSNorm after attention.
+    /// Reads o_buf + `ffn_norm.weight`, writes `gate_buf` (reused as
+    /// scratch since gate_buf isn't live until FFN gate-proj).
+    fn add_post_attn_norm(&mut self, layer: u32) {
+        let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
+        self.graph.add_dispatch(DispatchNode {
+            id: 0,
+            sub_dispatch: SubDispatch::FullStep(self.current_step_in_layer),
+            pipeline: vk::Pipeline::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            bindings: Vec::new(),
+            push_constants: Vec::new(),
+            dispatch: (1, 1, 1),
+            reads:  vec![MemAccess::new(self.bufs.o_buf, 0, hidden_bytes)],
+            writes: vec![MemAccess::new(self.bufs.gate_buf, 0, hidden_bytes)],
+            layer,
+            label: Some(format!("L{layer}_post_attn_norm")),
+        });
+    }
+
+    /// `step_post_ffn_norm` — Gemma-4 extra RMSNorm after FFN down-proj.
+    /// Reads ffn_out + `ffn_post_norm.weight`, writes `gate_buf`
+    /// (SwiGLU/GELU is done by this point so gate_buf is reusable).
+    fn add_post_ffn_norm(&mut self, layer: u32) {
+        let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
+        self.graph.add_dispatch(DispatchNode {
+            id: 0,
+            sub_dispatch: SubDispatch::FullStep(self.current_step_in_layer),
+            pipeline: vk::Pipeline::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            bindings: Vec::new(),
+            push_constants: Vec::new(),
+            dispatch: (1, 1, 1),
+            reads:  vec![MemAccess::new(self.bufs.ffn_out, 0, hidden_bytes)],
+            writes: vec![MemAccess::new(self.bufs.gate_buf, 0, hidden_bytes)],
+            layer,
+            label: Some(format!("L{layer}_post_ffn_norm")),
+        });
+    }
+
+    /// `step_ple_block` — Gemma-4 Per-Layer-Embedding 5-dispatch block
+    /// (control.rs:27). Reads layer_output + per_layer_inputs +
+    /// 3 weights; writes gate_buf, o_buf, attn_out; finally
+    /// `output += attn_out` (in-place on layer_output). Modeled as one
+    /// FullStep — the 5 sub-dispatches' internal `maybe_compute_barrier`
+    /// calls fire under Imperative mode. Decomposition is SG-1.7+
+    /// follow-up when the GraphDriven gate opens for Gemma-4.
+    fn add_ple_block(&mut self, layer: u32) {
+        let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
+        self.graph.add_dispatch(DispatchNode {
+            id: 0,
+            sub_dispatch: SubDispatch::FullStep(self.current_step_in_layer),
+            pipeline: vk::Pipeline::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            bindings: Vec::new(),
+            push_constants: Vec::new(),
+            dispatch: (1, 1, 1),
+            reads: vec![
+                MemAccess::new(self.bufs.layer_output, 0, hidden_bytes),
+            ],
+            writes: vec![
+                MemAccess::new(self.bufs.gate_buf, 0, hidden_bytes),
+                MemAccess::new(self.bufs.o_buf, 0, hidden_bytes),
+                MemAccess::new(self.bufs.attn_out, 0, hidden_bytes),
+                MemAccess::new(self.bufs.layer_output, 0, hidden_bytes),
+            ],
+            layer,
+            label: Some(format!("L{layer}_ple")),
+        });
+    }
+
+    /// `step_layer_scalar_mul` — Gemma-4 per-layer scalar multiply.
+    /// In-place: reads + writes layer_output.
+    fn add_layer_scalar_mul(&mut self, layer: u32) {
+        let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
+        self.graph.add_dispatch(DispatchNode {
+            id: 0,
+            sub_dispatch: SubDispatch::FullStep(self.current_step_in_layer),
+            pipeline: vk::Pipeline::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            bindings: Vec::new(),
+            push_constants: Vec::new(),
+            dispatch: (1, 1, 1),
+            reads:  vec![MemAccess::new(self.bufs.layer_output, 0, hidden_bytes)],
+            writes: vec![MemAccess::new(self.bufs.layer_output, 0, hidden_bytes)],
+            layer,
+            label: Some(format!("L{layer}_scalar_mul")),
+        });
+    }
 }
 
 #[cfg(test)]
@@ -1192,13 +1359,38 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "SG-1.5")]
-    fn builder_still_panics_on_gemma4_variant() {
-        // SG-1.5 still pending — Gemma-4 variants should panic with
-        // the appropriate deferral message.
+    fn builder_handles_gemma4_dense_variants() {
+        // SG-1.5 — Gemma-4 KV-share + 4-norm + PLE variants now build.
         let cfg = dummy_qwen3_cfg();
         let bufs = distinct_buffer_map();
-        let plans = vec![vec![LayerStep::VNorm]];
+        let plans = vec![vec![
+            LayerStep::VFromKRaw,
+            LayerStep::VNorm,
+            LayerStep::PostAttnNorm,
+            LayerStep::PostFfnNorm,
+            LayerStep::PleBlock,
+            LayerStep::LayerScalarMul,
+        ]];
+        let graph = GraphBuilder::build_decode_token(&bufs, &cfg, 0, &plans);
+        assert_eq!(graph.len(), 6, "6 Gemma-4 dense variants emit 6 FullStep nodes");
+        // VFromKRaw → VNorm RAW edge on v_buf.
+        assert!(graph.edges.iter().any(|e| e.from == 0 && e.to == 1
+                && e.buffer == bufs.v_buf),
+            "expected VFromKRaw→VNorm RAW on v_buf");
+        // PostAttnNorm writes gate_buf; PostFfnNorm also writes gate_buf →
+        // WAW edge between them (gate_buf is reused as scratch in both).
+        assert!(graph.edges.iter().any(|e| e.from == 2 && e.to == 3
+                && e.buffer == bufs.gate_buf),
+            "expected PostAttnNorm→PostFfnNorm WAW on gate_buf scratch");
+    }
+
+    #[test]
+    #[should_panic(expected = "SG-1.6")]
+    fn builder_still_panics_on_gemma4_moe_variant() {
+        // SG-1.6 still pending — Gemma-4 MoE variants should panic.
+        let cfg = dummy_qwen3_cfg();
+        let bufs = distinct_buffer_map();
+        let plans = vec![vec![LayerStep::PreMoeNorm]];
         let _ = GraphBuilder::build_decode_token(&bufs, &cfg, 0, &plans);
     }
 }
