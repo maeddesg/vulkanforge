@@ -94,17 +94,61 @@ impl MemAccess {
     }
 }
 
+/// Sprint SG-3 — sub-dispatch discriminator. Replaces the old
+/// `step_index_in_layer: u32` field on `DispatchNode`. Most graph
+/// nodes carry `FullStep(idx)` — the Recorder calls
+/// `execute_step(plan[idx])` and the whole step body runs. The
+/// remaining variants represent **decomposed multi-dispatch SSM
+/// steps**: each Qwen3.6 SSM step that used to dispatch N internal
+/// shaders + N-1 `force_internal_barrier` calls now appears in the
+/// graph as N separate nodes. The Recorder issues only the inner
+/// dispatch for each, and graph-emitted barriers between nodes
+/// replace the `force_internal_barrier` workaround.
+///
+/// Exhaustive `match` over this enum at the recorder (coding-standards
+/// §4.4) — adding a variant breaks compilation until handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubDispatch {
+    /// Default: the node represents a whole `LayerStep` at the given
+    /// `step_index_in_layer`. The Recorder dispatches via
+    /// `execute_step(plan[idx])`.
+    FullStep(u32),
+
+    // ── Qwen3.6 SSM step decomposition ─────────────────────────────
+    // step_norm_gated(L) → 3 nodes (RMSNorm + SiLU + Mul).
+    NormGatedRms,
+    NormGatedSilu,
+    NormGatedMul,
+
+    // step_ssm_alpha_gate(L) → 4 nodes (GEMV + Add + Softplus + Mul).
+    AlphaGateGemv,
+    AlphaGateAdd,
+    AlphaGateSoftplus,
+    AlphaGateMulA,
+
+    // step_ssm_conv1d(L) → 2 nodes (Setup + Conv).
+    ConvSetup,
+    ConvDispatch,
+
+    // step_ssm_beta_proj(L) → 2 nodes (GEMV + Sigmoid).
+    BetaGemv,
+    BetaSigmoid,
+
+    // step_gated_delta_net(L) → 1 Dispatch + 1 Transfer.
+    GdnCompute,
+    GdnStateCopy,
+}
+
 /// A compute dispatch: bind pipeline → bind descriptor set →
 /// push-constants → `vkCmdDispatch`. The Recorder turns this back into
 /// the same vkCmd* sequence the imperative executor uses today.
 pub struct DispatchNode {
     pub id: NodeId,
-    /// Index into the layer's plan vector (`LayerPlan[step_index_in_layer]`).
-    /// Sprint SG-1.3 — the Recorder uses this to call back into the
-    /// existing imperative `DecodeExec::execute_step` for the bit-
-    /// identical-output Qwen3-8B gate. Older Sprint SG-1.2 tests that
-    /// build nodes without a plan context can leave this at 0.
-    pub step_index_in_layer: u32,
+    /// Sprint SG-3 — sub-dispatch discriminator. `FullStep(idx)` for
+    /// all non-decomposed steps (idx = plan position); the decomposed
+    /// SSM variants carry no payload (layer comes from
+    /// [`DispatchNode::layer`]).
+    pub sub_dispatch: SubDispatch,
     /// Vulkan compute pipeline (from `PipelineRegistry::get(...)`).
     pub pipeline: vk::Pipeline,
     /// Matching pipeline layout. Stored explicitly so the Recorder
@@ -137,6 +181,9 @@ pub struct DispatchNode {
 /// and transfer→compute transitions.
 pub struct TransferNode {
     pub id: NodeId,
+    /// Sprint SG-3 — sub-dispatch discriminator. Most transfer nodes
+    /// today are GDN state copy-backs (`SubDispatch::GdnStateCopy`).
+    pub sub_dispatch: SubDispatch,
     pub src_buffer: BufferHandle,
     pub src_offset: u64,
     pub dst_buffer: BufferHandle,

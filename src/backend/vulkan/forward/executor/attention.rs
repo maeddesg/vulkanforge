@@ -1330,6 +1330,332 @@ impl DecodeExec {
         // Sprint G-6 — trailing barrier elided. step_attn_residual_add's
         // leading barrier(&[res1, addend]) (addend = o_buf) covers it.
     }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Sprint SG-3 — decomposed SSM sub-dispatches.
+    //
+    // Each helper below issues exactly ONE compute dispatch (or one
+    // transfer + barriers, for `sub_gdn_state_copy`). NO leading
+    // `maybe_compute_barrier`, NO trailing `mark_written`, NO
+    // `force_internal_barrier` — all synchronization comes from the
+    // graph's edge set + barrier pass in `execute_layer_via_graph`.
+    //
+    // The corresponding monolithic `step_*` bodies above remain in
+    // place: they are still called via `execute_step` from the
+    // imperative path (`execute_layer` loop) and from the graph's
+    // `SubDispatch::FullStep` arm. The decomposition splits ONE
+    // FullStep into N SubDispatch nodes per step in the graph build.
+    // ──────────────────────────────────────────────────────────────────
+
+    // ── NormGated (3) ───────────────────────────────────────────────
+    pub(super) fn sub_norm_gated_rms(
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
+    ) {
+        let spec = cfg.qwen35.as_ref().expect(
+            "sub_norm_gated_rms emitted for non-qwen35 config",
+        );
+        let h   = spec.num_v_heads();
+        let s_v = spec.ssm_d_state;
+        let gdn_out  = fwd.ssm_gdn_out_buf.as_ref().unwrap().handle;
+        let norm_out = fwd.ssm_norm_out_buf.as_ref().unwrap().handle;
+        let norm_w   = layer_weight(ctx.model, layer, "ssm_norm.weight");
+        fwd.run_rms_norm(
+            ctx.dev, ctx.registry, ctx.cmd,
+            gdn_out, norm_w, norm_out,
+            s_v, h, cfg.rms_norm_eps, "ssm_norm_gated_rms",
+        );
+    }
+
+    pub(super) fn sub_norm_gated_silu(
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx,
+    ) {
+        let spec = cfg.qwen35.as_ref().expect(
+            "sub_norm_gated_silu emitted for non-qwen35 config",
+        );
+        let ne = spec.num_v_heads() * spec.ssm_d_state;
+        let z  = fwd.ssm_z_buf.as_ref().unwrap().handle;
+        fwd.run_silu(
+            ctx.dev, ctx.registry, ctx.cmd,
+            z, z, ne, "ssm_z_silu",
+        );
+    }
+
+    pub(super) fn sub_norm_gated_mul(
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx,
+    ) {
+        let spec = cfg.qwen35.as_ref().expect(
+            "sub_norm_gated_mul emitted for non-qwen35 config",
+        );
+        let ne = spec.num_v_heads() * spec.ssm_d_state;
+        let z        = fwd.ssm_z_buf.as_ref().unwrap().handle;
+        let norm_out = fwd.ssm_norm_out_buf.as_ref().unwrap().handle;
+        fwd.run_binary(
+            ctx.dev, ctx.registry, ctx.cmd, ShaderId::Mul,
+            norm_out, z, norm_out,
+            ne, "ssm_norm_gated_mul",
+        );
+    }
+
+    // ── SsmAlphaGate (4) ────────────────────────────────────────────
+    pub(super) fn sub_alpha_gate_gemv(
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
+    ) {
+        let spec = cfg.qwen35.as_ref().expect(
+            "sub_alpha_gate_gemv emitted for non-qwen35 config",
+        );
+        let hidden_norm = fwd.cur().hidden_norm.handle;
+        let alpha_buf   = fwd.ssm_alpha_buf.as_ref().unwrap().handle;
+        let w_alpha = layer_weight(ctx.model, layer, "ssm_alpha.weight");
+        let s_alpha = layer_weight_shader(
+            ctx.model, layer, "ssm_alpha.weight",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
+        let scale = layer_weight_scale_scalar(ctx.model, layer, "ssm_alpha.weight");
+        fwd.run_gemv(
+            ctx.dev, ctx.registry, ctx.cmd, s_alpha, w_alpha, hidden_norm, alpha_buf,
+            cfg.hidden_dim, spec.num_v_heads(), scale, "gemv_ssm_alpha",
+        );
+    }
+
+    pub(super) fn sub_alpha_gate_add(
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
+    ) {
+        let spec = cfg.qwen35.as_ref().expect(
+            "sub_alpha_gate_add emitted for non-qwen35 config",
+        );
+        let alpha_buf = fwd.ssm_alpha_buf.as_ref().unwrap().handle;
+        let dt_bias = layer_weight(ctx.model, layer, "ssm_dt.bias");
+        fwd.run_binary(
+            ctx.dev, ctx.registry, ctx.cmd, ShaderId::Add,
+            alpha_buf, dt_bias, alpha_buf,
+            spec.num_v_heads(), "ssm_alpha_add_dt",
+        );
+    }
+
+    pub(super) fn sub_alpha_gate_softplus(
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx,
+    ) {
+        let spec = cfg.qwen35.as_ref().expect(
+            "sub_alpha_gate_softplus emitted for non-qwen35 config",
+        );
+        let alpha_buf = fwd.ssm_alpha_buf.as_ref().unwrap().handle;
+        fwd.run_softplus(
+            ctx.dev, ctx.registry, ctx.cmd,
+            alpha_buf, spec.num_v_heads(), "ssm_alpha_softplus",
+        );
+    }
+
+    pub(super) fn sub_alpha_gate_mul_a(
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
+    ) {
+        let spec = cfg.qwen35.as_ref().expect(
+            "sub_alpha_gate_mul_a emitted for non-qwen35 config",
+        );
+        let alpha_buf = fwd.ssm_alpha_buf.as_ref().unwrap().handle;
+        let gate_buf  = fwd.ssm_gate_buf.as_ref().unwrap().handle;
+        let ssm_a = layer_weight(ctx.model, layer, "ssm_a");
+        fwd.run_binary(
+            ctx.dev, ctx.registry, ctx.cmd, ShaderId::Mul,
+            alpha_buf, ssm_a, gate_buf,
+            spec.num_v_heads(), "ssm_alpha_mul_a",
+        );
+    }
+
+    // ── SsmConv1d (2) ───────────────────────────────────────────────
+    pub(super) fn sub_conv_setup(
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
+    ) {
+        let spec = cfg.qwen35.as_ref().expect(
+            "sub_conv_setup emitted for non-qwen35 config",
+        );
+        let conv_channels = spec.conv_channels();
+        let d_conv = spec.ssm_d_conv;
+        let slots = d_conv - 1;
+        let recurrent_idx = spec.recurrent_index(layer);
+
+        // First-token zero-init for the persistent SSM buffers. Flag-
+        // gated; subsequent calls are a no-op. This is the only
+        // remaining `transfer_to_compute_barrier` issued from inside
+        // an SG-3 sub-dispatch — the cmd_fill_buffer happens before
+        // any graph-tracked dispatch reads conv_state / ssm_state, so
+        // the graph's edge pass doesn't model it.
+        ensure_ssm_persistent_initialized(fwd, ctx);
+
+        let conv_state_buf = fwd.conv_state_buf.as_ref().unwrap().handle;
+        let qkv_buf       = fwd.ssm_qkv_buf.as_ref().unwrap().handle;
+        let conv_input    = fwd.ssm_conv_input_buf.as_ref().unwrap().handle;
+
+        let state_bytes_per_layer = slots as u64 * conv_channels as u64 * 4;
+        let state_offset_bytes    = recurrent_idx as u64 * state_bytes_per_layer;
+
+        fwd.run_ssm_conv_setup(
+            ctx.dev, ctx.registry, ctx.cmd,
+            conv_state_buf, state_offset_bytes, state_bytes_per_layer,
+            qkv_buf, conv_input,
+            conv_channels, "ssm_conv_setup",
+        );
+    }
+
+    pub(super) fn sub_conv_dispatch(
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
+    ) {
+        let spec = cfg.qwen35.as_ref().expect(
+            "sub_conv_dispatch emitted for non-qwen35 config",
+        );
+        let conv_channels = spec.conv_channels();
+        let d_conv = spec.ssm_d_conv;
+
+        let conv_input  = fwd.ssm_conv_input_buf.as_ref().unwrap().handle;
+        let conv_output = fwd.ssm_conv_output_buf.as_ref().unwrap().handle;
+        let conv_weight = layer_weight(ctx.model, layer, "ssm_conv1d.weight");
+
+        fwd.run_ssm_conv(
+            ctx.dev, ctx.registry, ctx.cmd,
+            conv_input, conv_weight, conv_output,
+            d_conv, d_conv, conv_channels, 1, 1, "ssm_conv",
+        );
+    }
+
+    // ── SsmBetaProj (2) ─────────────────────────────────────────────
+    pub(super) fn sub_beta_gemv(
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
+    ) {
+        let spec = cfg.qwen35.as_ref().expect(
+            "sub_beta_gemv emitted for non-qwen35 config",
+        );
+        let hidden_norm = fwd.cur().hidden_norm.handle;
+        let beta_buf = fwd.ssm_beta_buf.as_ref().unwrap().handle;
+        let w = layer_weight(ctx.model, layer, "ssm_beta.weight");
+        let s = layer_weight_shader(
+            ctx.model, layer, "ssm_beta.weight",
+            fwd.mul_mat_vec_subgroup_enabled,
+        );
+        let scale = layer_weight_scale_scalar(ctx.model, layer, "ssm_beta.weight");
+        fwd.run_gemv(
+            ctx.dev, ctx.registry, ctx.cmd, s, w, hidden_norm, beta_buf,
+            cfg.hidden_dim, spec.num_v_heads(), scale, "gemv_ssm_beta",
+        );
+    }
+
+    pub(super) fn sub_beta_sigmoid(
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx,
+    ) {
+        let spec = cfg.qwen35.as_ref().expect(
+            "sub_beta_sigmoid emitted for non-qwen35 config",
+        );
+        let beta_buf = fwd.ssm_beta_buf.as_ref().unwrap().handle;
+        fwd.run_sigmoid(
+            ctx.dev, ctx.registry, ctx.cmd,
+            beta_buf, spec.num_v_heads(), "ssm_beta_sigmoid",
+        );
+    }
+
+    // ── GatedDeltaNet (1 Dispatch + 1 Transfer) ─────────────────────
+    pub(super) fn sub_gdn_compute(
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
+    ) {
+        let spec = cfg.qwen35.as_ref().expect(
+            "sub_gdn_compute emitted for non-qwen35 config",
+        );
+        let h           = spec.num_v_heads();
+        let s_v         = spec.ssm_d_state;
+        let head_k      = spec.head_k_dim();
+        let num_k_heads = spec.num_k_heads();
+        let recurrent_idx = spec.recurrent_index(layer);
+
+        let q     = fwd.ssm_qrep_buf.as_ref().unwrap().handle;
+        let k     = fwd.ssm_krep_buf.as_ref().unwrap().handle;
+        let v     = fwd.ssm_conv_output_buf.as_ref().unwrap().handle;
+        let g     = fwd.ssm_gate_buf.as_ref().unwrap().handle;
+        let beta  = fwd.ssm_beta_buf.as_ref().unwrap().handle;
+        let state = fwd.ssm_state_buf.as_ref().unwrap().handle;
+        let dst   = fwd.ssm_gdn_out_buf.as_ref().unwrap().handle;
+
+        let v_offset_bytes = (head_k as u64) * (num_k_heads as u64) * 2 * 4;
+        let v_bytes        = (s_v as u64) * (h as u64) * 4;
+
+        let state_bytes_per_layer = (h as u64) * (s_v as u64) * (s_v as u64) * 4;
+        let state_offset_bytes    = recurrent_idx as u64 * state_bytes_per_layer;
+
+        let s_off = s_v * h;
+
+        let push = GatedDeltaNetPushConstants {
+            h,
+            n_tokens: 1,
+            n_seqs:   1,
+            s_off,
+            sq1: head_k, sq2: head_k * h, sq3: head_k * h,
+            sv1: s_v,    sv2: s_v * h,    sv3: s_v * h,
+            sb1: 1, sb2: h, sb3: h,
+            neq1: h,
+            rq3:  1,
+            scale: 1.0 / (s_v as f32).sqrt(),
+            k: 1,
+        };
+
+        fwd.run_gated_delta_net(
+            ctx.dev, ctx.registry, ctx.cmd,
+            q, k,
+            v, v_offset_bytes, v_bytes,
+            g, beta,
+            state, state_offset_bytes, state_bytes_per_layer,
+            dst,
+            s_v, /* cols_per_wg */ 2,
+            &push, "gdn",
+        );
+    }
+
+    pub(super) fn sub_gdn_state_copy(
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
+    ) {
+        let spec = cfg.qwen35.as_ref().expect(
+            "sub_gdn_state_copy emitted for non-qwen35 config",
+        );
+        let h           = spec.num_v_heads();
+        let s_v         = spec.ssm_d_state;
+        let recurrent_idx = spec.recurrent_index(layer);
+
+        let state = fwd.ssm_state_buf.as_ref().unwrap().handle;
+        let dst   = fwd.ssm_gdn_out_buf.as_ref().unwrap().handle;
+
+        let state_bytes_per_layer = (h as u64) * (s_v as u64) * (s_v as u64) * 4;
+        let state_offset_bytes    = recurrent_idx as u64 * state_bytes_per_layer;
+        let s_off = s_v * h;
+
+        // Sprint G-2i — WAW/RAW pre-copy barrier (compute writes
+        // followed by transfer writes on `state`). This is a TRANSFER-
+        // path stage transition that the graph's COMPUTE-only edge
+        // pass doesn't model, so it stays inline here.
+        let pre_copy = vk::MemoryBarrier::default()
+            .src_access_mask(
+                vk::AccessFlags::SHADER_WRITE
+                | vk::AccessFlags::SHADER_READ
+                | vk::AccessFlags::TRANSFER_WRITE,
+            )
+            .dst_access_mask(
+                vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE,
+            );
+        unsafe {
+            ctx.dev.device.cmd_pipeline_barrier(
+                ctx.cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                std::slice::from_ref(&pre_copy), &[], &[],
+            );
+        }
+        let region = vk::BufferCopy {
+            src_offset: (s_off as u64) * 4,
+            dst_offset: state_offset_bytes,
+            size:       state_bytes_per_layer,
+        };
+        unsafe {
+            ctx.dev.device.cmd_copy_buffer(
+                ctx.cmd, dst, state, std::slice::from_ref(&region),
+            );
+        }
+        transfer_to_compute_barrier(ctx.dev, ctx.cmd);
+    }
 }
 
 impl BatchExec {

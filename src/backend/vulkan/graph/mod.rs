@@ -52,7 +52,8 @@ use ash::vk;
 
 pub use edge::{Dependency, DependencyKind};
 pub use node::{
-    Binding, BufferHandle, ByteRange, DispatchNode, GraphNode, MemAccess, NodeId, TransferNode,
+    Binding, BufferHandle, ByteRange, DispatchNode, GraphNode, MemAccess, NodeId,
+    SubDispatch, TransferNode,
 };
 
 /// A planned, dependency-aware sequence of Vulkan compute dispatches +
@@ -269,7 +270,7 @@ mod tests {
     fn dummy_dispatch_node() -> DispatchNode {
         DispatchNode {
             id: 0, // overwritten by add_dispatch
-            step_index_in_layer: 0,
+            sub_dispatch: SubDispatch::FullStep(0),
             pipeline: vk::Pipeline::null(),
             pipeline_layout: vk::PipelineLayout::null(),
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
@@ -286,6 +287,7 @@ mod tests {
     fn dummy_transfer_node() -> TransferNode {
         TransferNode {
             id: 0,
+            sub_dispatch: SubDispatch::GdnStateCopy,
             src_buffer: vk::Buffer::null(),
             src_offset: 0,
             dst_buffer: vk::Buffer::null(),

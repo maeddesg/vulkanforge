@@ -520,52 +520,87 @@ impl DecodeExec {
         }
 
         for (position, &node_id) in graph.execution_order.iter().enumerate() {
-            if let GraphNode::Dispatch(d) = &graph.nodes[node_id as usize] {
-                let step_idx = d.step_index_in_layer as usize;
-                if step_idx >= plan.len() {
-                    panic!(
-                        "graph node L{} step_index_in_layer {} out of bounds for plan.len()={}",
-                        ctx.layer, step_idx, plan.len(),
-                    );
-                }
-                if skip_step[step_idx] {
+            // Emit a barrier (covering this node's reads) if any
+            // incoming edge sources sit at or above the high-water
+            // mark — i.e. their writes were not yet covered by a
+            // previous emission. Applies to both Dispatch and Transfer
+            // nodes (SG-3 — TransferNode for GDN state copy is now
+            // graph-tracked, not run inline inside the dispatch body).
+            let mut need_barrier = false;
+            for edge in &graph.edges {
+                if edge.to != node_id {
                     continue;
                 }
+                let from_pos = match pos_of.get(&edge.from) {
+                    Some(&p) => p,
+                    None => continue,
+                };
+                if from_pos >= high_water {
+                    need_barrier = true;
+                    break;
+                }
+            }
+            if need_barrier && use_graph_barriers {
+                if trace {
+                    let lbl = graph.nodes[node_id as usize].label().unwrap_or("?");
+                    eprintln!(
+                        "[BTRACE] GRF L{:>2} node={:>3} pos={:>3} label={}",
+                        ctx.layer, node_id, position, lbl
+                    );
+                }
+                compute_barrier(ctx.dev, ctx.cmd);
+                barriers_emitted += 1;
+                high_water = position;
+            }
 
-                // Emit a barrier if any incoming edge sources sit at or
-                // above the high-water mark — i.e. their writes were
-                // not yet covered by a previous emission.
-                let mut need_barrier = false;
-                for edge in &graph.edges {
-                    if edge.to != node_id {
-                        continue;
-                    }
-                    let from_pos = match pos_of.get(&edge.from) {
-                        Some(&p) => p,
-                        None => continue,
-                    };
-                    if from_pos >= high_water {
-                        need_barrier = true;
-                        break;
+            match &graph.nodes[node_id as usize] {
+                GraphNode::Dispatch(d) => {
+                    use crate::backend::vulkan::graph::node::SubDispatch as SD;
+                    match d.sub_dispatch {
+                        SD::FullStep(step_idx_u32) => {
+                            let step_idx = step_idx_u32 as usize;
+                            if step_idx >= plan.len() {
+                                panic!(
+                                    "graph node L{} FullStep({}) out of bounds for plan.len()={}",
+                                    ctx.layer, step_idx, plan.len(),
+                                );
+                            }
+                            if skip_step[step_idx] {
+                                continue;
+                            }
+                            if Some(step_idx) == fusion_start {
+                                self.fused_attn_residual_norm(fwd, &cfg, ctx);
+                            } else {
+                                self.execute_step(fwd, &plan[step_idx], &cfg, ctx);
+                            }
+                        }
+                        // ── SG-3 decomposed SSM sub-dispatches ─────────
+                        SD::NormGatedRms => self.sub_norm_gated_rms(fwd, &cfg, ctx, d.layer),
+                        SD::NormGatedSilu => self.sub_norm_gated_silu(fwd, &cfg, ctx),
+                        SD::NormGatedMul => self.sub_norm_gated_mul(fwd, &cfg, ctx),
+                        SD::AlphaGateGemv => self.sub_alpha_gate_gemv(fwd, &cfg, ctx, d.layer),
+                        SD::AlphaGateAdd => self.sub_alpha_gate_add(fwd, &cfg, ctx, d.layer),
+                        SD::AlphaGateSoftplus => self.sub_alpha_gate_softplus(fwd, &cfg, ctx),
+                        SD::AlphaGateMulA => self.sub_alpha_gate_mul_a(fwd, &cfg, ctx, d.layer),
+                        SD::ConvSetup => self.sub_conv_setup(fwd, &cfg, ctx, d.layer),
+                        SD::ConvDispatch => self.sub_conv_dispatch(fwd, &cfg, ctx, d.layer),
+                        SD::BetaGemv => self.sub_beta_gemv(fwd, &cfg, ctx, d.layer),
+                        SD::BetaSigmoid => self.sub_beta_sigmoid(fwd, &cfg, ctx),
+                        SD::GdnCompute => self.sub_gdn_compute(fwd, &cfg, ctx, d.layer),
+                        SD::GdnStateCopy => unreachable!(
+                            "GdnStateCopy is a TransferNode, not a DispatchNode"
+                        ),
                     }
                 }
-                if need_barrier && use_graph_barriers {
-                    if trace {
-                        let lbl = d.label.as_deref().unwrap_or("?");
-                        eprintln!(
-                            "[BTRACE] GRF L{:>2} node={:>3} pos={:>3} step_idx={} label={}",
-                            ctx.layer, node_id, position, step_idx, lbl
-                        );
+                GraphNode::Transfer(t) => {
+                    use crate::backend::vulkan::graph::node::SubDispatch as SD;
+                    match t.sub_dispatch {
+                        SD::GdnStateCopy => self.sub_gdn_state_copy(fwd, &cfg, ctx, t.layer),
+                        _ => unreachable!(
+                            "TransferNode sub_dispatch must be a transfer variant, got {:?}",
+                            t.sub_dispatch
+                        ),
                     }
-                    compute_barrier(ctx.dev, ctx.cmd);
-                    barriers_emitted += 1;
-                    high_water = position;
-                }
-
-                if Some(step_idx) == fusion_start {
-                    self.fused_attn_residual_norm(fwd, &cfg, ctx);
-                } else {
-                    self.execute_step(fwd, &plan[step_idx], &cfg, ctx);
                 }
             }
         }

@@ -31,7 +31,7 @@ use crate::backend::vulkan::forward::layer_plan::{
 use crate::backend::vulkan::gguf::ModelConfig;
 
 use super::node::{
-    Binding, BufferHandle, ByteRange, DispatchNode, MemAccess, NodeId,
+    Binding, BufferHandle, ByteRange, DispatchNode, MemAccess, NodeId, SubDispatch,
 };
 use super::VulkanGraph;
 
@@ -275,7 +275,7 @@ impl<'a> GraphBuilder<'a> {
                 let hidden_bytes = self.cfg.hidden_dim as u64 * 4;
                 self.graph.add_dispatch(DispatchNode {
                     id: 0,
-                    step_index_in_layer: self.current_step_in_layer,
+                    sub_dispatch: SubDispatch::FullStep(self.current_step_in_layer),
                     pipeline: vk::Pipeline::null(),
                     pipeline_layout: vk::PipelineLayout::null(),
                     descriptor_set_layout: vk::DescriptorSetLayout::null(),
@@ -397,7 +397,7 @@ impl<'a> GraphBuilder<'a> {
         let bytes = (cols as u64) * (rows as u64) * 4;
         self.graph.add_dispatch(DispatchNode {
             id: 0,
-            step_index_in_layer: self.current_step_in_layer,
+            sub_dispatch: SubDispatch::FullStep(self.current_step_in_layer),
             pipeline: vk::Pipeline::null(),
             pipeline_layout: vk::PipelineLayout::null(),
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
@@ -424,7 +424,7 @@ impl<'a> GraphBuilder<'a> {
         let output_bytes = (m as u64) * 4;
         self.graph.add_dispatch(DispatchNode {
             id: 0,
-            step_index_in_layer: self.current_step_in_layer,
+            sub_dispatch: SubDispatch::FullStep(self.current_step_in_layer),
             pipeline: vk::Pipeline::null(),
             pipeline_layout: vk::PipelineLayout::null(),
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
@@ -451,7 +451,7 @@ impl<'a> GraphBuilder<'a> {
         let bytes = (dim as u64) * 4;
         self.graph.add_dispatch(DispatchNode {
             id: 0,
-            step_index_in_layer: self.current_step_in_layer,
+            sub_dispatch: SubDispatch::FullStep(self.current_step_in_layer),
             pipeline: vk::Pipeline::null(),
             pipeline_layout: vk::PipelineLayout::null(),
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
@@ -487,7 +487,7 @@ impl<'a> GraphBuilder<'a> {
         let v_bytes = k_bytes;
         self.graph.add_dispatch(DispatchNode {
             id: 0,
-            step_index_in_layer: self.current_step_in_layer,
+            sub_dispatch: SubDispatch::FullStep(self.current_step_in_layer),
             pipeline: vk::Pipeline::null(),
             pipeline_layout: vk::PipelineLayout::null(),
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
@@ -517,7 +517,7 @@ impl<'a> GraphBuilder<'a> {
         let attn_bytes = q_bytes;
         self.graph.add_dispatch(DispatchNode {
             id: 0,
-            step_index_in_layer: self.current_step_in_layer,
+            sub_dispatch: SubDispatch::FullStep(self.current_step_in_layer),
             pipeline: vk::Pipeline::null(),
             pipeline_layout: vk::PipelineLayout::null(),
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
@@ -547,7 +547,7 @@ impl<'a> GraphBuilder<'a> {
         };
         self.graph.add_dispatch(DispatchNode {
             id: 0,
-            step_index_in_layer: self.current_step_in_layer,
+            sub_dispatch: SubDispatch::FullStep(self.current_step_in_layer),
             pipeline: vk::Pipeline::null(),
             pipeline_layout: vk::PipelineLayout::null(),
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
@@ -576,7 +576,7 @@ impl<'a> GraphBuilder<'a> {
         let bytes = (ne as u64) * 4;
         self.graph.add_dispatch(DispatchNode {
             id: 0,
-            step_index_in_layer: self.current_step_in_layer,
+            sub_dispatch: SubDispatch::FullStep(self.current_step_in_layer),
             pipeline: vk::Pipeline::null(),
             pipeline_layout: vk::PipelineLayout::null(),
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
@@ -647,7 +647,7 @@ impl<'a> GraphBuilder<'a> {
     ) {
         self.graph.add_dispatch(DispatchNode {
             id: 0,
-            step_index_in_layer: self.current_step_in_layer,
+            sub_dispatch: SubDispatch::FullStep(self.current_step_in_layer),
             pipeline: vk::Pipeline::null(),
             pipeline_layout: vk::PipelineLayout::null(),
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
@@ -773,7 +773,7 @@ impl<'a> GraphBuilder<'a> {
         // TransferNode so SG-2 sees both deps.
         let gdn_dispatch_id = self.graph.add_dispatch(DispatchNode {
             id: 0,
-            step_index_in_layer: self.current_step_in_layer,
+            sub_dispatch: SubDispatch::FullStep(self.current_step_in_layer),
             pipeline: vk::Pipeline::null(),
             pipeline_layout: vk::PipelineLayout::null(),
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
@@ -796,6 +796,7 @@ impl<'a> GraphBuilder<'a> {
         // State copy-back as a Transfer node.
         let _copy_id = self.graph.add_transfer(super::node::TransferNode {
             id: 0,
+            sub_dispatch: SubDispatch::GdnStateCopy,
             src_buffer: self.bufs.ssm_gdn_out,
             src_offset: 0,
             dst_buffer: self.bufs.ssm_state,
