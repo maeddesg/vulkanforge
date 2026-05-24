@@ -1030,9 +1030,12 @@ impl Forward {
         // / `grouped_glu_out` / `grouped_down_out` but at decode-scale
         // (seq_len=1 × top_k × per-slot), ~155 KiB for 26B vs ~640 MiB
         // for the full prefill grouped scratch.
-        let batched_decode_active = std::env::var("VF_MOE_BATCHED_DECODE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        // Sprint P0-1 — delegate to the canonical gate in
+        // `executor::moe::batched_decode_moe_enabled` so the executor +
+        // setup paths stay in sync. Default ON; opt-out
+        // `VF_MOE_BATCHED_DECODE=0`.
+        let batched_decode_active =
+            crate::backend::vulkan::forward::executor::batched_decode_moe_enabled();
         let (
             input_q8_bytes,
             gate_up_out_bytes,

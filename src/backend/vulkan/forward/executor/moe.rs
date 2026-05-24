@@ -65,10 +65,15 @@ pub(crate) fn moe_grouped_subgroup_enabled() -> bool {
 pub(crate) fn batched_decode_moe_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
+    // Sprint P0-1 — default ON (was OFF). The batched-decode path
+    // replaces the per-slot loop (32 dispatches + 32 barriers per MoE
+    // layer) with 18 dispatches + 18 barriers via Y-dispatch over
+    // the slot axis on gate_up + down. Opt-out via
+    // `VF_MOE_BATCHED_DECODE=0` (or "false") for regression bisects.
     *FLAG.get_or_init(|| {
         std::env::var("VF_MOE_BATCHED_DECODE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true)
     })
 }
 

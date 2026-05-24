@@ -52,6 +52,10 @@ mod dispatch;
 mod ffn;
 mod moe;
 
+// Sprint P0-1 — re-export the canonical MoE batched-decode gate so
+// `setup.rs` can call it instead of duplicating the env check.
+pub(crate) use moe::batched_decode_moe_enabled;
+
 /// Sprint 51D-D — one-shot log-on-first-call for the layer-0 router
 /// decision (debug aid). Prevents flooding decode-token logs with
 /// per-token prints; only the first decode token reports.
