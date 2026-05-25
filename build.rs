@@ -598,6 +598,24 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "gelu_pytorch_tanh.comp",
         defines: &[],
     },
+    // Sprint P1-2 — Batched GELU(pytorch_tanh)-GLU over all top_k expert
+    // slots in one dispatch (decode MoE fusion). 2 SSBOs (interleaved
+    // gate_up_out, glu_out), single u32 push (mi). Dispatched with
+    // .y = top_k so the slot is the workgroup-y index.
+    ShaderJob {
+        out_name: "gelu_pytorch_tanh_glu_batched_f32.spv",
+        entry_source: "gelu_pytorch_tanh_glu_batched.comp",
+        defines: &[],
+    },
+    // Sprint P1-2 — Weighted-sum expert reduction (down_out × router
+    // weights → ffn_hidden) in one dispatch. Replaces the 8 sequential
+    // per-slot indexed-FMA dispatches + WAW barriers. 3 SSBOs (down_out,
+    // ffn_hidden, weights), 8-byte push (ne + top_k).
+    ShaderJob {
+        out_name: "fma_reduce_f32.spv",
+        entry_source: "fma_reduce.comp",
+        defines: &[],
+    },
     // Sprint D2 (v0.4.6) — strided in-place sigmoid-gate multiply
     // for Qwen3.6 Full-Attention gated output (`attn = attn *
     // sigmoid(gate)`). 2 SSBOs (gate readonly, inout in-place), 4

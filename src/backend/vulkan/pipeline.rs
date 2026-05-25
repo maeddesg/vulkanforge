@@ -213,6 +213,19 @@ pub struct SwigluPushConstants {
 }
 const _: () = assert!(std::mem::size_of::<SwigluPushConstants>() == 4);
 
+/// Sprint P1-2 — weighted-sum expert reduction push block. Field order
+/// matches `fma_reduce.comp`'s `Params` block.
+///
+/// - `ne` — output element count (= hidden_size).
+/// - `top_k` — number of active expert slots summed per output element.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct FmaReducePushConstants {
+    pub ne: u32,
+    pub top_k: u32,
+}
+const _: () = assert!(std::mem::size_of::<FmaReducePushConstants>() == 8);
+
 /// Sprint D2 (v0.4.6) — strided in-place sigmoid-gate multiply
 /// push block. Field order matches `sigmoid_mul.comp`'s `parameter`
 /// block exactly.

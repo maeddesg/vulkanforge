@@ -20,7 +20,7 @@ use super::super::arch::{
 };
 use super::super::state::Forward;
 use super::super::super::gguf::ModelConfig;
-use super::super::super::pipeline::SwigluPushConstants;
+use super::super::super::pipeline::{FmaReducePushConstants, SwigluPushConstants};
 use super::super::super::shaders::ShaderId;
 
 use ash::vk;
@@ -72,6 +72,24 @@ pub(crate) fn batched_decode_moe_enabled() -> bool {
     // `VF_MOE_BATCHED_DECODE=0` (or "false") for regression bisects.
     *FLAG.get_or_init(|| {
         std::env::var("VF_MOE_BATCHED_DECODE")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true)
+    })
+}
+
+/// Sprint P1-2 — GLU-batch + FMA-reduce fusion for the batched-decode
+/// MoE path. Collapses the 8 per-slot GELU-GLU dispatches into 1
+/// (`GeluPytorchTanhGluBatched`, slot = workgroup-y) and the 8
+/// sequential per-slot indexed-FMA dispatches into 1 (`FmaReduce`,
+/// per-thread weighted sum over top_k). Net: 18 → 4 compute dispatches
+/// + barriers per MoE layer. Bit-identical to the per-slot path (same
+/// GELU constants, same FP reduction order). Default ON; opt-out via
+/// `VF_MOE_FUSED_GLU_FMA=0` (or "false") for regression bisects.
+pub(crate) fn moe_fused_glu_fma_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("VF_MOE_FUSED_GLU_FMA")
             .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
             .unwrap_or(true)
     })
@@ -776,24 +794,25 @@ impl DecodeExec {
         //     existing GeluPytorchTanhGlu shader takes 3 SSBOs at
         //     descriptor offsets, so per-slot the descriptor set
         //     rebinds with new offsets.
-        for k in 0..(top_k as u64) {
-            let gate_off = k * two_mi_bytes;
-            let up_off   = gate_off + mi_bytes;
-            let out_off  = k * mi_bytes;
-            let kernel = ctx.registry.get(ShaderId::GeluPytorchTanhGlu);
+        if moe_fused_glu_fma_enabled() {
+            // Sprint P1-2 — Fused batched GELU-GLU: 1 dispatch over all
+            // top_k slots. Grid (ceil(mi/256), top_k, 1); workgroup .y
+            // selects the slot. Reads the whole interleaved gate_up_out
+            // [top_k][2*mi], writes the whole glu_out [top_k][mi].
+            // Bit-identical to the per-slot path (same GELU constants).
+            let kernel = ctx.registry.get(ShaderId::GeluPytorchTanhGluBatched);
             let set = fwd.alloc_or_get_set(
                 ctx.dev, kernel.descriptor_set_layout,
                 &[
-                    (0, gate_up_out, gate_off, mi_bytes),
-                    (1, gate_up_out, up_off,   mi_bytes),
-                    (2, glu_out,     out_off,  mi_bytes),
+                    (0, gate_up_out, 0, gate_up_out_total),
+                    (1, glu_out,     0, (top_k as u64) * mi_bytes),
                 ],
             );
             let pc = SwigluPushConstants { n: mi };
             let dispatch_x = (mi + 255) / 256;
             let layout = kernel.pipeline_layout;
             let pipeline = kernel.pipeline;
-            fwd.profile("moe_glu_batched", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
+            fwd.profile("moe_glu_fused", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
                 dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
                 dev.device.cmd_bind_descriptor_sets(
                     cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
@@ -801,8 +820,37 @@ impl DecodeExec {
                 dev.device.cmd_push_constants(
                     cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
                 );
-                dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
+                dev.device.cmd_dispatch(cmd, dispatch_x, top_k, 1);
             });
+        } else {
+            for k in 0..(top_k as u64) {
+                let gate_off = k * two_mi_bytes;
+                let up_off   = gate_off + mi_bytes;
+                let out_off  = k * mi_bytes;
+                let kernel = ctx.registry.get(ShaderId::GeluPytorchTanhGlu);
+                let set = fwd.alloc_or_get_set(
+                    ctx.dev, kernel.descriptor_set_layout,
+                    &[
+                        (0, gate_up_out, gate_off, mi_bytes),
+                        (1, gate_up_out, up_off,   mi_bytes),
+                        (2, glu_out,     out_off,  mi_bytes),
+                    ],
+                );
+                let pc = SwigluPushConstants { n: mi };
+                let dispatch_x = (mi + 255) / 256;
+                let layout = kernel.pipeline_layout;
+                let pipeline = kernel.pipeline;
+                fwd.profile("moe_glu_batched", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
+                    dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                    dev.device.cmd_bind_descriptor_sets(
+                        cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+                    );
+                    dev.device.cmd_push_constants(
+                        cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+                    );
+                    dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
+                });
+            }
         }
         fwd.mark_written(&[glu_out]);
         // SG-1.7-bisect — force-barrier after GLU loop, before down.
@@ -834,21 +882,55 @@ impl DecodeExec {
         //     the accumulator chain (the bug that bit grouped path was
         //     the same multi-FMA race on `batch_out`; preserved here
         //     by mirroring the slot-loop's per-slot barrier).
-        for slot in 0..top_k {
-            let in_off = (slot as u64) * h_bytes;
-            fwd.run_fma_add_indexed(
-                ctx.dev, ctx.registry, ctx.cmd,
-                down_out, in_off,
-                ffn_hidden, 0,
-                weights_buf,
-                h, slot,
-                "moe_fma_add_batched",
+        if moe_fused_glu_fma_enabled() {
+            // Sprint P1-2 — Fused weighted-sum reduce: 1 dispatch sums
+            // all top_k slots per output element. Each thread owns one
+            // ffn_hidden[i] and accumulates in slot order 0..top_k-1 —
+            // bit-identical FP order to the per-slot accumulate, with
+            // no inter-thread race (so no per-slot barrier). Eliminates
+            // the decode FMA barrier hotspot (8 → 1).
+            let kernel = ctx.registry.get(ShaderId::FmaReduce);
+            let set = fwd.alloc_or_get_set(
+                ctx.dev, kernel.descriptor_set_layout,
+                &[
+                    (0, down_out,    0, down_out_total),
+                    (1, ffn_hidden,  0, h_bytes),
+                    (2, weights_buf, 0, (top_k as u64) * 4),
+                ],
             );
+            let pc = FmaReducePushConstants { ne: h, top_k };
+            let dispatch_x = (h + 255) / 256;
+            let layout = kernel.pipeline_layout;
+            let pipeline = kernel.pipeline;
+            fwd.profile("moe_fma_reduce", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
+                dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                dev.device.cmd_bind_descriptor_sets(
+                    cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+                );
+                dev.device.cmd_push_constants(
+                    cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+                );
+                dev.device.cmd_dispatch(cmd, dispatch_x, 1, 1);
+            });
             fwd.mark_written(&[ffn_hidden]);
-            // SG-1.7-bisect — force-barrier between FMA slots (Sprint
-            // 61G multi-FMA race precedent). Under GraphDriven this
-            // is the critical per-FMA accumulator serialiser.
             fwd.force_internal_barrier(ctx.dev, ctx.cmd, &[ffn_hidden]);
+        } else {
+            for slot in 0..top_k {
+                let in_off = (slot as u64) * h_bytes;
+                fwd.run_fma_add_indexed(
+                    ctx.dev, ctx.registry, ctx.cmd,
+                    down_out, in_off,
+                    ffn_hidden, 0,
+                    weights_buf,
+                    h, slot,
+                    "moe_fma_add_batched",
+                );
+                fwd.mark_written(&[ffn_hidden]);
+                // SG-1.7-bisect — force-barrier between FMA slots (Sprint
+                // 61G multi-FMA race precedent). Under GraphDriven this
+                // is the critical per-FMA accumulator serialiser.
+                fwd.force_internal_barrier(ctx.dev, ctx.cmd, &[ffn_hidden]);
+            }
         }
     }
 

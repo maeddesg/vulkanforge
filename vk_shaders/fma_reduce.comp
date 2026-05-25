@@ -1,0 +1,43 @@
+#version 450
+
+// Sprint P1-2 — Weighted-sum expert reduction in ONE dispatch. Replaces
+// the 8 sequential per-slot indexed-FMA dispatches in the Gemma-4 MoE
+// decode path, each of which was gated by a WAW barrier on the shared
+// accumulator (`ffn_hidden`) — the decode barrier hotspot.
+//
+//   ffn_hidden[i] = sum_{k=0..top_k-1} weights[k] * down_out[k*ne + i]
+//
+// Buffer layout (FP32):
+//   down_out    : [top_k][ne]  (ne = hidden_size; slot k at k*ne)
+//   weights     : [top_k]      (router weight per slot)
+//   ffn_hidden  : [ne]
+//
+// Each thread owns one output element `i` and accumulates the top_k
+// expert contributions in slot order 0..top_k-1 — the SAME FP
+// reduction order as the clear-then-accumulate per-slot loop, so the
+// result is bit-identical. Each thread writes a distinct ffn_hidden[i],
+// so there is no inter-thread race and no per-slot barrier. The shader
+// overwrites (the per-slot path cleared ffn_hidden to 0 first, so a
+// fresh sum is equivalent).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0, std430) readonly  buffer DownOut { float data_down[]; };
+layout (binding = 1, std430) writeonly buffer Out     { float data_ffn[];  };
+layout (binding = 2, std430) readonly  buffer Weights { float weights[];   };
+
+layout (push_constant) uniform Params {
+    uint ne;     // hidden_size (output element count)
+    uint top_k;  // number of active expert slots
+} p;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= p.ne) return;
+
+    float acc = 0.0;
+    for (uint k = 0u; k < p.top_k; ++k) {
+        acc += weights[k] * data_down[k * p.ne + i];
+    }
+    data_ffn[i] = acc;
+}

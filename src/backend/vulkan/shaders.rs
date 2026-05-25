@@ -148,6 +148,16 @@ pub enum ShaderId {
     /// pytorch-tanh GELU approximation
     /// (`0.5*x*(1+tanh(sqrt(2/pi)*(x + 0.044715*x^3)))`).
     GeluPytorchTanhGlu,
+    /// Sprint P1-2 — batched GELU(pytorch_tanh)-GLU over all top_k MoE
+    /// expert slots in one dispatch. 2 SSBOs (interleaved gate_up_out,
+    /// glu_out) + 1 u32 push (mi); dispatched with `.y = top_k`.
+    /// Activation matches `GeluPytorchTanhGlu` bit-for-bit.
+    GeluPytorchTanhGluBatched,
+    /// Sprint P1-2 — weighted-sum expert reduction (`ffn_hidden[i] =
+    /// Σ weights[k]·down_out[k·ne+i]`) in one dispatch. 3 SSBOs
+    /// (down_out, ffn_hidden, weights) + 8-byte push (ne + top_k).
+    /// Replaces the 8 sequential per-slot indexed-FMA dispatches.
+    FmaReduce,
     /// Sprint D2 (v0.4.6) — strided in-place sigmoid-gate multiply
     /// for Qwen3.6 Full-Attention's gated output. 2 SSBOs (gate
     /// readonly, inout in-place); 4 u32 push (ne / chunk / stride /
@@ -549,6 +559,8 @@ impl ShaderId {
             ShaderId::Silu => "silu_f32",
             ShaderId::SwiGLU => "swiglu_f32",
             ShaderId::GeluPytorchTanhGlu => "gelu_pytorch_tanh_f32",
+            ShaderId::GeluPytorchTanhGluBatched => "gelu_pytorch_tanh_glu_batched_f32",
+            ShaderId::FmaReduce => "fma_reduce_f32",
             ShaderId::SigmoidMul => "sigmoid_mul_f32",
             ShaderId::SsmConvF32 => "ssm_conv_f32",
             ShaderId::SsmConvSetupF32 => "ssm_conv_setup_f32",
@@ -709,6 +721,8 @@ impl ShaderId {
             ShaderId::Silu => SILU_F32,
             ShaderId::SwiGLU => SWIGLU_F32,
             ShaderId::GeluPytorchTanhGlu => GELU_PYTORCH_TANH_F32,
+            ShaderId::GeluPytorchTanhGluBatched => GELU_PYTORCH_TANH_GLU_BATCHED_F32,
+            ShaderId::FmaReduce => FMA_REDUCE_F32,
             ShaderId::SigmoidMul => SIGMOID_MUL_F32,
             ShaderId::SsmConvF32 => SSM_CONV_F32,
             ShaderId::SsmConvSetupF32 => SSM_CONV_SETUP_F32,
@@ -876,6 +890,8 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::Silu,
     ShaderId::SwiGLU,
     ShaderId::GeluPytorchTanhGlu,
+    ShaderId::GeluPytorchTanhGluBatched,
+    ShaderId::FmaReduce,
     ShaderId::SigmoidMul,
     ShaderId::SsmConvF32,
     ShaderId::SsmConvSetupF32,
@@ -1091,6 +1107,10 @@ pub const FMA_ADD_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fma_add
 pub const MUL_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_f32.spv"));
 pub const SILU_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silu_f32.spv"));
 pub const SWIGLU_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/swiglu_f32.spv"));
+pub const GELU_PYTORCH_TANH_GLU_BATCHED_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gelu_pytorch_tanh_glu_batched_f32.spv"));
+pub const FMA_REDUCE_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/fma_reduce_f32.spv"));
 pub const SIGMOID_MUL_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/sigmoid_mul_f32.spv"));
 pub const SSM_CONV_F32: &[u8] =

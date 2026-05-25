@@ -1,0 +1,51 @@
+#version 450
+
+// Sprint P1-2 — Batched GELU(pytorch_tanh)-GLU over ALL top_k expert
+// slots in ONE dispatch. Replaces the 8 per-slot GeluPytorchTanhGlu
+// dispatches (+ 8 barriers) in the Gemma-4 MoE decode path
+// (`step_moe_expert_ffn_gpu_direct_batched`).
+//
+//   out[slot][i] = gelu_pytorch_tanh(gate[slot][i]) * up[slot][i]
+//
+// Buffer layout (FP32):
+//   gate_up_out : [top_k][2*mi]  interleaved as [slot: gate(mi) up(mi)]
+//   glu_out     : [top_k][mi]
+//
+// Dispatch grid: (ceil(mi/256), top_k, 1). Workgroup .y selects the
+// slot, so there is no div/mod and no top_k push-constant — the slot
+// count is the dispatch.y extent. Each invocation owns one (slot, elem)
+// pair and the slots are disjoint output slices (no inter-slot race).
+//
+// The activation matches `gelu_pytorch_tanh.comp` bit-for-bit (same
+// constants, same arithmetic order) so the fused output is
+// argmax-identical to the per-slot path.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer GateUp { float data_in[];  };
+layout (binding = 1) writeonly buffer Out    { float data_out[]; };
+
+layout (push_constant) uniform parameter {
+    uint n;   // elements per slot (= moe_intermediate, "mi")
+} p;
+
+const float SQRT_2_OVER_PI = 0.7978845608028654;
+const float TANH_K0        = 0.044715;
+
+void main() {
+    const uint elem = gl_GlobalInvocationID.x;
+    if (elem >= p.n) return;
+    const uint slot = gl_GlobalInvocationID.y;
+
+    // gate occupies [base .. base+mi), up occupies [base+mi .. base+2*mi).
+    const uint base = slot * 2u * p.n;
+    const float g = data_in[base + elem];
+    const float u = data_in[base + p.n + elem];
+
+    // gelu_pytorch_tanh(g) — tanh form (matches gelu_pytorch_tanh.comp).
+    const float x3   = g * g * g;
+    const float arg  = SQRT_2_OVER_PI * (g + TANH_K0 * x3);
+    const float gelu = 0.5 * g * (1.0 + tanh(arg));
+
+    data_out[slot * p.n + elem] = gelu * u;
+}

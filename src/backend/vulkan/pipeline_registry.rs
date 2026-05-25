@@ -286,6 +286,11 @@ impl PipelineRegistry {
                 ShaderId::Silu
                 | ShaderId::SwiGLU
                 | ShaderId::GeluPytorchTanhGlu
+                // Sprint P1-2 — batched GLU + weighted-sum reduce. Same
+                // no-spec-constant surface; descriptor layout (2 / 3
+                // SSBOs) + push range auto-derived from SPIR-V reflection.
+                | ShaderId::GeluPytorchTanhGluBatched
+                | ShaderId::FmaReduce
                 | ShaderId::SigmoidMul
                 | ShaderId::MultiAddRms
                 | ShaderId::Copy
