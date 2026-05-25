@@ -21,9 +21,42 @@ use super::super::layer_plan::LayerStep;
 use super::super::state::Forward;
 use super::super::super::gguf::ModelConfig;
 
+/// Sprint P1-5 — gate for extending the Llama `AttnResidualAdd` +
+/// `PreFfnNorm` → `multi_add_rms` fusion to Qwen3.6. The fusion was
+/// historically `qwen35`-excluded only because the helper hard-coded
+/// the Llama norm-weight tensor name (`ffn_norm.weight`); Qwen3.6
+/// carries the pre-FFN norm as `post_attention_norm.weight`. With the
+/// per-arch tensor-name fix the fusion is bit-identical, so it's on by
+/// default. `VF_FUSE_QWEN36_RESNORM=0` (or "false") restores the
+/// 2-dispatch path for regression bisects. Gemma-4 stays excluded
+/// (its `PostAttnNorm` precedes `AttnResidualAdd`).
+pub(super) fn fuse_qwen36_resnorm_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("VF_FUSE_QWEN36_RESNORM")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true)
+    })
+}
+
+/// Sprint P1-5 — pre-FFN norm-weight tensor name for the fused
+/// `multi_add_rms` helper. Qwen3.6 carries it as
+/// `post_attention_norm.weight` (named for its position); the Llama/
+/// Qwen3 path uses `ffn_norm.weight`. Mirrors `step_pre_ffn_norm`'s
+/// per-arch suffix selection (`executor/ffn.rs`).
+fn fused_norm_weight_name(cfg: &ModelConfig) -> &'static str {
+    if cfg.qwen35.is_some() {
+        "post_attention_norm.weight"
+    } else {
+        "ffn_norm.weight"
+    }
+}
+
 impl DecodeExec {
     /// Fused `multi_add_rms`: `res1 = input + o_buf; hidden_norm =
-    /// rms_norm(res1) * ffn_norm.weight`. Llama path only.
+    /// rms_norm(res1) * <pre-ffn norm weight>`. Llama/Qwen3 path, and
+    /// Qwen3.6 since Sprint P1-5 (per-arch norm-weight name).
     pub(super) fn fused_attn_residual_norm(
         &self,
         fwd: &mut Forward,
@@ -34,7 +67,7 @@ impl DecodeExec {
         let o_buf = fwd.cur().o_buf.handle;
         let res1 = fwd.cur().res1.handle;
         let hidden_norm = fwd.cur().hidden_norm.handle;
-        let w = layer_weight(ctx.model, ctx.layer, "ffn_norm.weight");
+        let w = layer_weight(ctx.model, ctx.layer, fused_norm_weight_name(cfg));
         // Read deps for this fused dispatch: input + o_buf.
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[input, o_buf]);
         fwd.run_multi_add_rms(
@@ -148,7 +181,7 @@ impl BatchExec {
         ctx: &ExecCtx,
     ) {
         let seq_len = batch_seq_len(ctx);
-        let w_ffn = layer_weight(ctx.model, ctx.layer, "ffn_norm.weight");
+        let w_ffn = layer_weight(ctx.model, ctx.layer, fused_norm_weight_name(cfg));
         fwd.run_multi_add_rms(
             ctx.dev, ctx.registry, ctx.cmd,
             fwd.batch_residual.handle, fwd.batch_o.handle, w_ffn,

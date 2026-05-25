@@ -295,8 +295,11 @@ impl DecodeExec {
             // as two separate dispatches. PreFfnNorm's tensor-name
             // branch (executor/ffn.rs) already picks the right
             // `post_attention_norm.weight` for qwen35.
+            // Sprint P1-5 — Qwen3.6 now joins the fusion (per-arch
+            // norm-weight name in fused_attn_residual_norm); gated by
+            // VF_FUSE_QWEN36_RESNORM (default on). Gemma-4 stays out.
             if cfg.gemma4.is_none()
-                && cfg.qwen35.is_none()
+                && (cfg.qwen35.is_none() || dispatch::fuse_qwen36_resnorm_enabled())
                 && matches!(plan.get(i), Some(LayerStep::AttnResidualAdd))
                 && matches!(plan.get(i + 1), Some(LayerStep::PreFfnNorm))
             {
@@ -412,7 +415,11 @@ impl DecodeExec {
         // AttnResidualAdd's execution point.
         let mut fusion_start: Option<usize> = None;
         let mut skip_step: Vec<bool> = vec![false; plan.len()];
-        if cfg.gemma4.is_none() && cfg.qwen35.is_none() {
+        // Sprint P1-5 — Qwen3.6 joins the fusion (default on, gated by
+        // VF_FUSE_QWEN36_RESNORM); Gemma-4 stays excluded.
+        if cfg.gemma4.is_none()
+            && (cfg.qwen35.is_none() || dispatch::fuse_qwen36_resnorm_enabled())
+        {
             for i in 0..plan.len().saturating_sub(1) {
                 if matches!(plan[i], LayerStep::AttnResidualAdd)
                     && matches!(plan[i + 1], LayerStep::PreFfnNorm)
@@ -746,8 +753,10 @@ impl BatchExec {
             // the residual reads scratch instead of batch_o, and the
             // fusion shader can't model that).
             // Sprint D2 — same qwen35 carve-out as the DEC path above.
+            // Sprint P1-5 — Qwen3.6 joins the fusion (default on, gated
+            // by VF_FUSE_QWEN36_RESNORM); Gemma-4 stays excluded.
             if cfg.gemma4.is_none()
-                && cfg.qwen35.is_none()
+                && (cfg.qwen35.is_none() || dispatch::fuse_qwen36_resnorm_enabled())
                 && matches!(plan.get(i), Some(LayerStep::AttnResidualAdd))
                 && matches!(plan.get(i + 1), Some(LayerStep::PreFfnNorm))
             {
