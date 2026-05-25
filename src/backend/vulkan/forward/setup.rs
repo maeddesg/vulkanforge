@@ -994,6 +994,11 @@ impl Forward {
 
         let logits_scratch = mk_storage(
             allocator, logits_bytes, MemoryLocation::GpuOnly, "moe_router_logits_scratch")?;
+        // Sprint C.1 — [hidden] FP32 scratch for the optimized decode
+        // router path (RMSNorm output → coalesced mul_mat_vec_f32 GEMV input).
+        let router_normed_scratch = mk_storage(
+            allocator, (hidden_size as u64) * 4, MemoryLocation::GpuOnly,
+            "moe_router_normed_scratch")?;
         let indices_scratch = mk_storage(
             allocator, indices_bytes, MemoryLocation::GpuOnly, "moe_router_indices_scratch")?;
         let weights_scratch = mk_storage(
@@ -1091,6 +1096,7 @@ impl Forward {
             layers,
             layer_to_gpu_idx,
             logits_scratch,
+            router_normed_scratch,
             indices_scratch,
             weights_scratch,
             readback_staging,
@@ -1271,6 +1277,7 @@ impl Forward {
                 layer.pes.destroy(device, allocator);
             }
             gpu.logits_scratch.destroy(device, allocator);
+            gpu.router_normed_scratch.destroy(device, allocator);
             gpu.indices_scratch.destroy(device, allocator);
             gpu.weights_scratch.destroy(device, allocator);
             gpu.readback_staging.destroy(device, allocator);

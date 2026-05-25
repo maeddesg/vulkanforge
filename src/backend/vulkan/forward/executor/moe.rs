@@ -110,6 +110,23 @@ pub(crate) fn moe_fused_router_enabled() -> bool {
     })
 }
 
+/// Sprint C.1 — optimized DECODE router path. `VF_ROUTER_OPTIMIZED=1`
+/// replaces the hand-rolled, occupancy-starved router GEMV (1 workgroup,
+/// 128 threads, stride-2816 uncoalesced reads — measured 20 % of 26B
+/// decode GPU in C.0) with `rms_norm` + the coalesced `mul_mat_vec_f32`
+/// (128 workgroups, subgroup-reduced) + `moe_router_softmax_topk`.
+/// Decode-only (seq_len=1); prefill keeps the fused/2-dispatch path.
+/// Default OFF pending validation; opt-in to measure the win.
+pub(crate) fn moe_router_optimized_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("VF_ROUTER_OPTIMIZED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 impl DecodeExec {
     // === Sprint 51D-B Block 1 — Gemma-4-26B-A4B MoE FFN-Block norms + add ===
 

@@ -231,6 +231,11 @@ pub struct MoeRouterGpu {
     /// `[max_seq × n_experts]` FP32. Output of `moe_router_norm_gemv`,
     /// input to `moe_router_softmax_topk`.
     pub logits_scratch: GpuBuffer,
+    /// Sprint C.1 — `[hidden]` FP32 scratch for the optimized decode
+    /// router path: holds `rms_norm(input)·chan_scale` between the
+    /// RMSNorm dispatch and the coalesced `mul_mat_vec_f32` router GEMV.
+    /// Decode-only (seq_len=1), sized for one token.
+    pub router_normed_scratch: GpuBuffer,
     /// `[max_seq × top_k]` u32. Top-K expert indices per token.
     pub indices_scratch: GpuBuffer,
     /// `[max_seq × top_k]` FP32. Renormalised + pes-scaled weights.

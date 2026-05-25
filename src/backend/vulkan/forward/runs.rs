@@ -2706,11 +2706,68 @@ impl Forward {
         let scale_buf = layer.scale.handle;
         let pes_buf = layer.pes.handle;
         let logits_buf = router.logits_scratch.handle;
+        let normed_buf = router.router_normed_scratch.handle;
         let indices_buf = router.indices_scratch.handle;
         let weights_buf = router.weights_scratch.handle;
         let input_bytes = (seq_len as u64) * (hidden_size as u64) * 4;
         let logits_bytes = (seq_len as u64) * (n_experts as u64) * 4;
         let topk_bytes = (seq_len as u64) * (top_k as u64) * 4;
+
+        // ─── Sprint C.1 — optimized DECODE router: replace the
+        //     occupancy-starved hand-rolled GEMV (1 WG, 128 threads,
+        //     stride-2816 uncoalesced — 20 % of 26B decode GPU in C.0)
+        //     with rms_norm + coalesced mul_mat_vec_f32 (128 WGs,
+        //     subgroup-reduced) + softmax_topk. Decode-only
+        //     (seq_len=1, input_offset=0); prefill falls through. ───
+        if super::executor::moe_router_optimized_enabled()
+            && seq_len == 1
+            && input_offset == 0
+        {
+            // 1. RMSNorm with per-channel scale: normed = rms_inv·input·chan_scale.
+            self.run_rms_norm(
+                dev, registry, cmd,
+                input_buf, scale_buf, normed_buf,
+                hidden_size, seq_len, rms_eps, "moe_router_norm_opt",
+            );
+            compute_barrier(dev, cmd);
+            // 2. Coalesced router GEMV: logits = inv_sqrt_h · proj · normed.
+            //    inv_sqrt_h folds the router's 1/sqrt(hidden) factor into
+            //    the GEMV scale (the fused shader applies it per-element;
+            //    scale-outside-sum differs only in last-ULP FP rounding).
+            let inv_sqrt_h = 1.0f32 / (hidden_size as f32).sqrt();
+            self.run_gemv(
+                dev, registry, cmd,
+                ShaderId::MulMatVecF32,
+                proj_buf, normed_buf, logits_buf,
+                hidden_size, n_experts, inv_sqrt_h, "moe_router_gemv_opt",
+            );
+            compute_barrier(dev, cmd);
+            // 3. Softmax + top-K + renorm + pes (existing shader, unchanged).
+            let k2 = registry.get(ShaderId::MoeRouterSoftmaxTopk);
+            let set2 = self.alloc_or_get_set(
+                dev, k2.descriptor_set_layout,
+                &[
+                    (0, logits_buf, 0, logits_bytes),
+                    (1, pes_buf, 0, 0),
+                    (2, indices_buf, 0, topk_bytes),
+                    (3, weights_buf, 0, topk_bytes),
+                ],
+            );
+            let pc2 = MoeRouterSoftmaxTopkPushConstants { seq_len, n_experts, top_k };
+            let layout2 = k2.pipeline_layout;
+            let pipeline2 = k2.pipeline;
+            self.profile("moe_router_softmax_topk", dev, cmd, |dev, cmd| unsafe {
+                dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline2);
+                dev.device.cmd_bind_descriptor_sets(
+                    cmd, vk::PipelineBindPoint::COMPUTE, layout2, 0, &[set2], &[],
+                );
+                dev.device.cmd_push_constants(
+                    cmd, layout2, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc2),
+                );
+                dev.device.cmd_dispatch(cmd, seq_len, 1, 1);
+            });
+            return;
+        }
 
         // ─── Sprint P1-3 — fused router: norm+gemv+softmax+topk in one
         //     dispatch. Logits stay in shared memory (no `logits_scratch`
