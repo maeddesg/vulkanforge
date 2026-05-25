@@ -2116,6 +2116,14 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "moe_router_softmax_topk.comp",
         defines: &[],
     },
+    // Sprint P1-3 — fused MoE router (Stage 1 + Stage 2 in one dispatch;
+    // logits stay in shared memory, no global round-trip / barrier).
+    // 6 SSBOs, 20-byte push (seq_len/hidden_size/n_experts/top_k/eps).
+    ShaderJob {
+        out_name: "moe_router_fused.spv",
+        entry_source: "moe_router_fused.comp",
+        defines: &[],
+    },
 ];
 
 fn main() {

@@ -802,7 +802,11 @@ impl PipelineRegistry {
                     // Q4_K naive kernel's wave assumption.
                     ComputeKernel::from_spv(device, &words, cache)
                 }
-                ShaderId::MoeRouterNormGemv | ShaderId::MoeRouterSoftmaxTopk => {
+                ShaderId::MoeRouterNormGemv
+                | ShaderId::MoeRouterSoftmaxTopk
+                // Sprint P1-3 — fused router; same no-spec-const,
+                // local_size_x=128, shared-memory-reduction surface.
+                | ShaderId::MoeRouterFused => {
                     // Sprint 56A — GPU-side MoE router. No spec
                     // constants; workgroup size is `local_size_x = 128`
                     // in the shader source. Bindings + push constants

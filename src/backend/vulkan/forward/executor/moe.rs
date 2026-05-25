@@ -95,6 +95,21 @@ pub(crate) fn moe_fused_glu_fma_enabled() -> bool {
     })
 }
 
+/// Sprint P1-3 — fused MoE router gate. `VF_MOE_FUSED_ROUTER=1` (default)
+/// runs `run_moe_router_gpu` as a single `MoeRouterFused` dispatch
+/// (norm_gemv + softmax_topk, logits kept in shared memory) instead of
+/// the 2-dispatch + barrier path. Bit-identical; opt-out via
+/// `VF_MOE_FUSED_ROUTER=0` (or "false") for regression bisects.
+pub(crate) fn moe_fused_router_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("VF_MOE_FUSED_ROUTER")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true)
+    })
+}
+
 impl DecodeExec {
     // === Sprint 51D-B Block 1 — Gemma-4-26B-A4B MoE FFN-Block norms + add ===
 

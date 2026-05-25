@@ -34,6 +34,7 @@ use super::super::pipeline::{
     GenericHeadPushConstants, KvCopyFp16PushConstants,
     L2NormPushConstants, MatVecIdPushConstants, MatVecPushConstants,
     MmqIdPushConstants, MmqPushConstants,
+    MoeRouterFusedPushConstants,
     MoeRouterNormGemvPushConstants, MoeRouterSoftmaxTopkPushConstants,
     MultiAddRmsPushConstants, Q8_1QuantizePushConstants, RepeatInterleavePushConstants,
     RmsNormMulRopePushConstants,
@@ -2710,6 +2711,47 @@ impl Forward {
         let input_bytes = (seq_len as u64) * (hidden_size as u64) * 4;
         let logits_bytes = (seq_len as u64) * (n_experts as u64) * 4;
         let topk_bytes = (seq_len as u64) * (top_k as u64) * 4;
+
+        // ─── Sprint P1-3 — fused router: norm+gemv+softmax+topk in one
+        //     dispatch. Logits stay in shared memory (no `logits_scratch`
+        //     write/read + no inter-stage barrier). One workgroup per
+        //     token (same as both source stages), so this covers decode
+        //     (seq_len=1) and batch prefill (seq_len>1) alike. ───
+        if super::executor::moe_fused_router_enabled() {
+            let kf = registry.get(ShaderId::MoeRouterFused);
+            let setf = self.alloc_or_get_set(
+                dev,
+                kf.descriptor_set_layout,
+                &[
+                    (0, input_buf, input_offset, input_bytes),
+                    (1, proj_buf, 0, 0),
+                    (2, scale_buf, 0, 0),
+                    (3, pes_buf, 0, 0),
+                    (4, indices_buf, 0, topk_bytes),
+                    (5, weights_buf, 0, topk_bytes),
+                ],
+            );
+            let pcf = MoeRouterFusedPushConstants {
+                seq_len,
+                hidden_size,
+                n_experts,
+                top_k,
+                rms_norm_eps: rms_eps,
+            };
+            let layoutf = kf.pipeline_layout;
+            let pipelinef = kf.pipeline;
+            self.profile("moe_router_fused", dev, cmd, |dev, cmd| unsafe {
+                dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipelinef);
+                dev.device.cmd_bind_descriptor_sets(
+                    cmd, vk::PipelineBindPoint::COMPUTE, layoutf, 0, &[setf], &[],
+                );
+                dev.device.cmd_push_constants(
+                    cmd, layoutf, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pcf),
+                );
+                dev.device.cmd_dispatch(cmd, seq_len, 1, 1);
+            });
+            return;
+        }
 
         // ─── Shader 1: norm + scale + GEMV → logits ───
         let k1 = registry.get(ShaderId::MoeRouterNormGemv);

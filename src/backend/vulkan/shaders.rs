@@ -470,6 +470,10 @@ pub enum ShaderId {
     // bindings + push constants via SPIR-V reflection.
     MoeRouterNormGemv,
     MoeRouterSoftmaxTopk,
+    /// Sprint P1-3 — fused MoE router (norm_gemv + softmax_topk in one
+    /// dispatch; logits stay in shared memory). 6 SSBOs + 20-byte push,
+    /// auto-derived via SPIR-V reflection. Bit-identical to the 2 stages.
+    MoeRouterFused,
     // Sprint 56C-1 — Indexed-GEMV variants for GPU-direct MoE expert
     // FFN (port of llama.cpp's MUL_MAT_ID id-fused GEMV path). Pipelines
     // are registered but not yet dispatched; Sprint 56C-2 wires them
@@ -658,6 +662,7 @@ impl ShaderId {
             ShaderId::MulCoopmatQ4KNaivePaddedFp8 => "mul_coopmat_q4k_naive_padded_fp8",
             ShaderId::MoeRouterNormGemv => "moe_router_norm_gemv",
             ShaderId::MoeRouterSoftmaxTopk => "moe_router_softmax_topk",
+            ShaderId::MoeRouterFused => "moe_router_fused",
             ShaderId::MulMatVecQ3KId => "mul_mat_vec_q3_k_f32_f32_id",
             ShaderId::MulMatVecQ3KIdSubgroup => "mul_mat_vec_q3_k_f32_f32_id_subgroup",
             ShaderId::MulMatVecQ4KId => "mul_mat_vec_q4_k_f32_f32_id",
@@ -827,6 +832,7 @@ impl ShaderId {
             ShaderId::MulCoopmatQ4KNaivePaddedFp8 => MUL_COOPMAT_Q4K_NAIVE_PADDED_FP8,
             ShaderId::MoeRouterNormGemv => MOE_ROUTER_NORM_GEMV,
             ShaderId::MoeRouterSoftmaxTopk => MOE_ROUTER_SOFTMAX_TOPK,
+            ShaderId::MoeRouterFused => MOE_ROUTER_FUSED,
             ShaderId::MulMatVecQ3KId => MUL_MAT_VEC_Q3_K_F32_F32_ID,
             ShaderId::MulMatVecQ3KIdSubgroup => MUL_MAT_VEC_Q3_K_F32_F32_ID_SUBGROUP,
             ShaderId::MulMatVecQ4KId => MUL_MAT_VEC_Q4_K_F32_F32_ID,
@@ -992,6 +998,7 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     // Sprint 56B — GPU-side MoE router (always-on, used by Gemma-4 26B-A4B).
     ShaderId::MoeRouterNormGemv,
     ShaderId::MoeRouterSoftmaxTopk,
+    ShaderId::MoeRouterFused,
     // Sprint 56C-1 — Indexed-GEMV + indexed-FMA pipelines. Registered
     // always so the pipeline cache picks them up at startup; dispatched
     // only when Sprint 56C-2 lands the GPU-direct MoE path.
@@ -1279,6 +1286,8 @@ pub const MOE_ROUTER_NORM_GEMV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/moe_router_norm_gemv.spv"));
 pub const MOE_ROUTER_SOFTMAX_TOPK: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/moe_router_softmax_topk.spv"));
+pub const MOE_ROUTER_FUSED: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/moe_router_fused.spv"));
 
 // Sprint 56C-1 — Indexed-GEMV variants for GPU-direct MoE expert FFN.
 // Same source as the non-Id variants, compiled with `MUL_MAT_ID=1`.

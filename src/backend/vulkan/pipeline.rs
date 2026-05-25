@@ -307,6 +307,21 @@ pub struct MoeRouterSoftmaxTopkPushConstants {
 }
 const _: () = assert!(std::mem::size_of::<MoeRouterSoftmaxTopkPushConstants>() == 12);
 
+/// Sprint P1-3 — push block for `moe_router_fused.comp` (norm_gemv +
+/// softmax_topk fused). 20 B; field order matches the shader. Combines
+/// `MoeRouterNormGemvPushConstants` (seq_len/hidden_size/n_experts/eps)
+/// with the `top_k` from `MoeRouterSoftmaxTopkPushConstants`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct MoeRouterFusedPushConstants {
+    pub seq_len: u32,
+    pub hidden_size: u32,
+    pub n_experts: u32,
+    pub top_k: u32,
+    pub rms_norm_eps: f32,
+}
+const _: () = assert!(std::mem::size_of::<MoeRouterFusedPushConstants>() == 20);
+
 /// v0.2.1 Sprint 11G-C — push block for `bench_int8cm_q4k.comp`.
 /// 3 × u32 = 12 B. Same M/N/K convention as `MmqPushConstants` (M = weight
 /// rows, N = sequence length / activation tokens, K = hidden dim, multiple

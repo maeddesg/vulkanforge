@@ -1,0 +1,174 @@
+#version 450
+
+// Sprint P1-3 — Fused MoE router. Concatenates the two router stages
+// (`moe_router_norm_gemv.comp` + `moe_router_softmax_topk.comp`) into a
+// single dispatch, keeping the per-token expert logits in shared memory
+// instead of a global round-trip through `logits_scratch` (so the
+// inter-stage barrier disappears too).
+//
+// Both source stages already use one workgroup per token / 128 threads,
+// so the fusion is a verbatim concatenation: RMSNorm + per-channel scale
+// + [n_experts, hidden] GEMV produces the logit for expert `tid` in
+// shared `s_probs[tid]`, then the stable-softmax + top-K + renorm + pes
+// logic runs on it unchanged. The arithmetic and reduction order match
+// the 2-dispatch path exactly, so the output is bit-identical.
+//
+// Inputs:
+//   binding 0  Hidden          [seq_len, hidden_size]    FP32 (post-attn residual)
+//   binding 1  RouterProj      [n_experts, hidden_size]  FP32 (row-major)
+//   binding 2  RouterScale     [hidden_size]             FP32
+//   binding 3  PerExpertScale  [n_experts]               FP32
+// Outputs:
+//   binding 4  ExpertIndices   [seq_len, top_k]          uint32
+//   binding 5  ExpertWeights   [seq_len, top_k]          FP32 (post pes, sum=1 before pes)
+//
+// Push constants: seq_len, hidden_size, n_experts, top_k, rms_norm_eps
+//
+// Dispatch: one workgroup per token (gl_WorkGroupID.x = token index),
+// local_size_x = 128. Operates for any hidden_size <= MAX_HIDDEN and
+// n_experts <= TPB (Gemma-4-26B-A4B: hidden=2816, n_experts=128, top_k=8).
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly  buffer Hidden         { float data[]; } hidden;
+layout(set = 0, binding = 1) readonly  buffer RouterProj     { float data[]; } proj;
+layout(set = 0, binding = 2) readonly  buffer RouterScale    { float data[]; } chan_scale;
+layout(set = 0, binding = 3) readonly  buffer PerExpertScale { float data[]; } pes;
+layout(set = 0, binding = 4) writeonly buffer ExpertIndices  { uint  data[]; } indices;
+layout(set = 0, binding = 5) writeonly buffer ExpertWeights  { float data[]; } weights;
+
+layout(push_constant) uniform PushConstants {
+    uint seq_len;
+    uint hidden_size;
+    uint n_experts;
+    uint top_k;
+    float rms_norm_eps;
+} pc;
+
+const uint TPB = 128;
+const uint MAX_HIDDEN = 4096;
+const uint MAX_TOPK = 16;
+
+shared float s_normed[MAX_HIDDEN];
+shared float s_redux[TPB];   // RMSNorm sum-sq reduction scratchpad
+shared float s_probs[TPB];   // expert logits (from GEMV) → softmax probs
+shared uint  s_used[TPB];
+shared float s_max;
+shared float s_sum;
+
+void main() {
+    uint token = gl_WorkGroupID.x;
+    uint tid   = gl_LocalInvocationID.x;
+
+    if (token >= pc.seq_len) return;
+
+    uint base = token * pc.hidden_size;
+
+    // ─── norm_gemv Step 1: RMSNorm — mean(x^2) cooperatively. ───
+    float local_sum_sq = 0.0;
+    for (uint i = tid; i < pc.hidden_size; i += TPB) {
+        float v = hidden.data[base + i];
+        local_sum_sq += v * v;
+    }
+    s_redux[tid] = local_sum_sq;
+    barrier();
+    for (uint stride = TPB / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            s_redux[tid] += s_redux[tid + stride];
+        }
+        barrier();
+    }
+    float mean_sq = s_redux[0] / float(pc.hidden_size);
+    float rms_inv = inversesqrt(mean_sq + pc.rms_norm_eps);
+    barrier();
+
+    // ─── norm_gemv Step 2: per-channel scale × inv_sqrt(hidden_size). ───
+    float inv_sqrt_h = inversesqrt(float(pc.hidden_size));
+    for (uint i = tid; i < pc.hidden_size; i += TPB) {
+        s_normed[i] = hidden.data[base + i] * rms_inv * inv_sqrt_h * chan_scale.data[i];
+    }
+    barrier();
+
+    // ─── norm_gemv Step 3: GEMV — proj[expert, :] · normed → logit ───
+    // One thread per expert; logit lands in shared `s_probs` instead of
+    // a global buffer (this is the round-trip + barrier we eliminate).
+    if (tid < pc.n_experts) {
+        float acc = 0.0;
+        uint row_base = tid * pc.hidden_size;
+        for (uint i = 0; i < pc.hidden_size; i++) {
+            acc += proj.data[row_base + i] * s_normed[i];
+        }
+        s_probs[tid] = acc;
+    }
+    barrier();
+
+    // ─── softmax_topk Step 1: max(logits) for stable softmax. ───
+    float v = (tid < pc.n_experts) ? s_probs[tid] : -1e38;
+    s_probs[tid] = v;
+    barrier();
+    for (uint stride = TPB / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            s_probs[tid] = max(s_probs[tid], s_probs[tid + stride]);
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        s_max = s_probs[0];
+    }
+    barrier();
+
+    // ─── softmax_topk Step 2: exp(v - max), sum reduction → softmax ───
+    float p = (tid < pc.n_experts) ? exp(v - s_max) : 0.0;
+    s_probs[tid] = p;
+    barrier();
+    float my_p = p;
+    for (uint stride = TPB / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            s_probs[tid] += s_probs[tid + stride];
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        s_sum = s_probs[0];
+    }
+    barrier();
+    if (tid < pc.n_experts) {
+        s_probs[tid] = my_p / s_sum;
+        s_used[tid]  = 0u;
+    } else {
+        s_probs[tid] = 0.0;
+        s_used[tid]  = 1u;
+    }
+    barrier();
+
+    // ─── softmax_topk Step 3-5: top-K + renorm + per-expert scale. ───
+    if (tid == 0u) {
+        float top_sum = 0.0;
+        uint  picked_idx[MAX_TOPK];
+        float picked_prob[MAX_TOPK];
+
+        for (uint k = 0u; k < pc.top_k && k < MAX_TOPK; k++) {
+            float best = -1e38;
+            uint  best_idx = 0u;
+            for (uint i = 0u; i < pc.n_experts; i++) {
+                if (s_used[i] == 0u && s_probs[i] > best) {
+                    best = s_probs[i];
+                    best_idx = i;
+                }
+            }
+            picked_idx[k]  = best_idx;
+            picked_prob[k] = best;
+            s_used[best_idx] = 1u;
+            top_sum += best;
+        }
+
+        float renorm = (top_sum > 0.0) ? (1.0 / top_sum) : 0.0;
+        uint out_base = token * pc.top_k;
+        for (uint k = 0u; k < pc.top_k && k < MAX_TOPK; k++) {
+            uint e = picked_idx[k];
+            float w = picked_prob[k] * renorm * pes.data[e];
+            indices.data[out_base + k] = e;
+            weights.data[out_base + k] = w;
+        }
+    }
+}
