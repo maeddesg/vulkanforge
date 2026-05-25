@@ -116,14 +116,18 @@ pub(crate) fn moe_fused_router_enabled() -> bool {
 /// decode GPU in C.0) with `rms_norm` + the coalesced `mul_mat_vec_f32`
 /// (128 workgroups, subgroup-reduced) + `moe_router_softmax_topk`.
 /// Decode-only (seq_len=1); prefill keeps the fused/2-dispatch path.
-/// Default OFF pending validation; opt-in to measure the win.
+/// Default ON (Sprint C.1: +16 % Gemma-4-26B decode, 5/5 coherent,
+/// 238/238 tests). NOT bit-identical to the fused path — the coalesced
+/// GEMV's parallel reduction + scale-outside-sum differ in last-ULP FP
+/// rounding, which can flip a rare near-tie top-K → equivalent-coherent
+/// output. `VF_ROUTER_OPTIMIZED=0` restores the bit-exact fused router.
 pub(crate) fn moe_router_optimized_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
         std::env::var("VF_ROUTER_OPTIMIZED")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true)
     })
 }
 
