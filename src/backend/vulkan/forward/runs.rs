@@ -474,6 +474,17 @@ impl Forward {
         weight_scale: f32,
         label: &str,
     ) {
+        // Sprint D.2 — opt-in barrier-free Q6_K subgroup GEMV. Swaps the
+        // production Q6_K-subgroup kernel for its Q6K_MLP variant (drops the
+        // per-super-block scale barrier; bit-identical). Covers gemv_q + the
+        // Q6_K lm_head. Gated; default keeps the upstream path.
+        let shader = if shader == ShaderId::MulMatVecQ6KSubgroup
+            && crate::backend::vulkan::pipeline_registry::q6k_gemv_optimized_enabled()
+        {
+            ShaderId::MulMatVecQ6KSubgroupMlp
+        } else {
+            shader
+        };
         let kernel = registry.get(shader);
         let one_per_row = matches!(
             shader,

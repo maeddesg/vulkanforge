@@ -83,6 +83,7 @@ pub fn shader_is_k_quant_gemv(id: ShaderId) -> bool {
         | ShaderId::MulMatVecQ4K | ShaderId::MulMatVecQ4KSubgroup
         | ShaderId::MulMatVecQ5K | ShaderId::MulMatVecQ5KSubgroup
         | ShaderId::MulMatVecQ6K | ShaderId::MulMatVecQ6KSubgroup
+        | ShaderId::MulMatVecQ6KSubgroupMlp
         | ShaderId::MulMatVecQ3KSubgroupNoShmem
         | ShaderId::MulMatVecQ4KSubgroupNoShmem
         | ShaderId::MulMatVecQ5KSubgroupNoShmem
@@ -104,6 +105,20 @@ pub fn gemv_no_shmem_enabled() -> bool {
     std::env::var("VF_GEMV_NO_SHMEM")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+/// Sprint D.2 — opt-in barrier-free Q6_K subgroup GEMV (`Q6K_MLP`). When
+/// `VF_Q6K_GEMV_OPTIMIZED=1`, `run_gemv` swaps `MulMatVecQ6KSubgroup` for
+/// `MulMatVecQ6KSubgroupMlp` (drops the per-super-block scale barrier;
+/// bit-identical output). Default OFF; `=0`/unset keeps the upstream path.
+pub fn q6k_gemv_optimized_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("VF_Q6K_GEMV_OPTIMIZED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
 }
 
 fn entry(constant_id: u32, offset: u32, size: usize) -> vk::SpecializationMapEntry {
@@ -217,6 +232,7 @@ impl PipelineRegistry {
                 }
                 ShaderId::MulMatVecQ4K | ShaderId::MulMatVecQ6K
                 | ShaderId::MulMatVecQ4KSubgroup | ShaderId::MulMatVecQ6KSubgroup
+                | ShaderId::MulMatVecQ6KSubgroupMlp
                 | ShaderId::MulMatVecQ3K | ShaderId::MulMatVecQ3KSubgroup
                 | ShaderId::MulMatVecQ5K | ShaderId::MulMatVecQ5KSubgroup
                 // Sprint G-5 — Path C K-quant GEMVs share the same

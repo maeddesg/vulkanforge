@@ -124,6 +124,25 @@ const JOBS: &[ShaderJob] = &[
             ("USE_SUBGROUP_ADD", "1"),
         ],
     },
+    // Sprint D.2 — Q6_K subgroup GEMV, MLP variant: same source +
+    // Q6K_MLP, which drops the per-super-block scale barrier (each
+    // thread reads its scales into registers, mirroring Q4_K).
+    // Bit-identical output; gated by VF_Q6K_GEMV_OPTIMIZED.
+    ShaderJob {
+        out_name: "mul_mat_vec_q6_k_f32_f32_subgroup_mlp.spv",
+        entry_source: "mul_mat_vec_q6_k.comp",
+        defines: &[
+            ("DATA_A_Q6_K", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("USE_SUBGROUP_ADD", "1"),
+            ("Q6K_MLP", "1"),
+        ],
+    },
     // Sprint 17B — Q3_K subgroup GEMV (Path A). Same `subgroupAdd`
     // reduction the Q4_K / Q6_K subgroup variants use — required for
     // the v0.2.4 default-on decode reduction path.

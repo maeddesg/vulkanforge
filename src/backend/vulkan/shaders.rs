@@ -20,6 +20,11 @@ pub enum ShaderId {
     // K-quant decode; opt-out via VULKANFORGE_DISABLE_SUBGROUP_GEMV=1.
     MulMatVecQ4KSubgroup,
     MulMatVecQ6KSubgroup,
+    /// Sprint D.2 — Q6_K subgroup GEMV, MLP variant (`Q6K_MLP`): drops the
+    /// per-super-block scale `barrier()` (reads scales per-thread into
+    /// registers like Q4_K) to restore memory-level-parallelism. Bit-identical
+    /// output; gated by `VF_Q6K_GEMV_OPTIMIZED=1`.
+    MulMatVecQ6KSubgroupMlp,
     /// Sprint G-5 — Path C variants of the K-quant GEMVs (Q3K/Q4K/Q5K/Q6K).
     /// Defines `USE_SUBGROUP_ADD_NO_SHMEM=1` instead of `USE_SUBGROUP_ADD`,
     /// which removes the inter-subgroup LDS reduction entirely. On RDNA4
@@ -534,6 +539,7 @@ impl ShaderId {
             ShaderId::MulMatVecQ6K => "mul_mat_vec_q6_k_f32_f32",
             ShaderId::MulMatVecQ4KSubgroup => "mul_mat_vec_q4_k_f32_f32_subgroup",
             ShaderId::MulMatVecQ6KSubgroup => "mul_mat_vec_q6_k_f32_f32_subgroup",
+            ShaderId::MulMatVecQ6KSubgroupMlp => "mul_mat_vec_q6_k_f32_f32_subgroup_mlp",
             ShaderId::MulMatVecQ3KSubgroupNoShmem => "mul_mat_vec_q3_k_f32_f32_subgroup_no_shmem",
             ShaderId::MulMatVecQ4KSubgroupNoShmem => "mul_mat_vec_q4_k_f32_f32_subgroup_no_shmem",
             ShaderId::MulMatVecQ5KSubgroupNoShmem => "mul_mat_vec_q5_k_f32_f32_subgroup_no_shmem",
@@ -698,6 +704,7 @@ impl ShaderId {
             ShaderId::MulMatVecQ6K => MUL_MAT_VEC_Q6_K_F32_F32,
             ShaderId::MulMatVecQ4KSubgroup => MUL_MAT_VEC_Q4_K_F32_F32_SUBGROUP,
             ShaderId::MulMatVecQ6KSubgroup => MUL_MAT_VEC_Q6_K_F32_F32_SUBGROUP,
+            ShaderId::MulMatVecQ6KSubgroupMlp => MUL_MAT_VEC_Q6_K_F32_F32_SUBGROUP_MLP,
             ShaderId::MulMatVecQ3KSubgroupNoShmem => MUL_MAT_VEC_Q3_K_F32_F32_SUBGROUP_NO_SHMEM,
             ShaderId::MulMatVecQ4KSubgroupNoShmem => MUL_MAT_VEC_Q4_K_F32_F32_SUBGROUP_NO_SHMEM,
             ShaderId::MulMatVecQ5KSubgroupNoShmem => MUL_MAT_VEC_Q5_K_F32_F32_SUBGROUP_NO_SHMEM,
@@ -869,6 +876,7 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::MulMatVecQ6K,
     ShaderId::MulMatVecQ4KSubgroup,
     ShaderId::MulMatVecQ6KSubgroup,
+    ShaderId::MulMatVecQ6KSubgroupMlp,
     ShaderId::MulMatVecQ3KSubgroupNoShmem,
     ShaderId::MulMatVecQ4KSubgroupNoShmem,
     ShaderId::MulMatVecQ5KSubgroupNoShmem,
@@ -1060,6 +1068,9 @@ pub const MUL_MAT_VEC_Q4_K_F32_F32_SUBGROUP: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q4_k_f32_f32_subgroup.spv"));
 pub const MUL_MAT_VEC_Q6_K_F32_F32_SUBGROUP: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q6_k_f32_f32_subgroup.spv"));
+// Sprint D.2 — Q6_K subgroup GEMV, barrier-free MLP variant.
+pub const MUL_MAT_VEC_Q6_K_F32_F32_SUBGROUP_MLP: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q6_k_f32_f32_subgroup_mlp.spv"));
 pub const MUL_MAT_VEC_Q6_K_F32_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q6_k_f32_f32.spv"));
 pub const MUL_MAT_VEC_Q3_K_F32_F32: &[u8] =
