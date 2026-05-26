@@ -2116,6 +2116,14 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "moe_router_softmax_topk.comp",
         defines: &[],
     },
+    // Sprint C.2 — parallel top-K variant (rank-count selection across
+    // all threads instead of the thread-0 serial 8×128 max-find loop).
+    // Byte-identical output; same source, `TOPK_PARALLEL` define.
+    ShaderJob {
+        out_name: "moe_router_softmax_topk_par.spv",
+        entry_source: "moe_router_softmax_topk.comp",
+        defines: &[("TOPK_PARALLEL", "1")],
+    },
     // Sprint P1-3 — fused MoE router (Stage 1 + Stage 2 in one dispatch;
     // logits stay in shared memory, no global round-trip / barrier).
     // 6 SSBOs, 20-byte push (seq_len/hidden_size/n_experts/top_k/eps).

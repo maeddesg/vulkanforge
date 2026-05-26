@@ -42,6 +42,16 @@ shared uint  s_used[TPB];
 shared float s_max;           // step 1 result
 shared float s_sum;           // step 2 result
 
+#ifdef TOPK_PARALLEL
+// Sprint C.2 — parallel top-K scratch. `s_ordered_*[rank]` collects the
+// selected experts in descending-prob (ties → smaller index) order so
+// thread 0 can sum + renorm in the SAME order as the serial path,
+// keeping the output byte-identical (selection, ordering AND weights).
+shared float s_ordered_prob[MAX_TOPK];
+shared uint  s_ordered_idx[MAX_TOPK];
+shared float s_renorm;
+#endif
+
 void main() {
     uint token = gl_WorkGroupID.x;
     uint tid   = gl_LocalInvocationID.x;
@@ -94,6 +104,55 @@ void main() {
     }
     barrier();
 
+#ifdef TOPK_PARALLEL
+    // ─── Step 3 (parallel) — rank-count top-K. ───
+    // The serial path picks, for k=0..top_k, the strictly-greatest
+    // remaining prob, breaking ties toward the smaller index (`>` keeps
+    // the first encountered). That assigns expert `e` the position
+    //   rank(e) = #{j : p[j] > p[e]} + #{j : p[j] == p[e] && j < e}
+    // in the (prob desc, index asc) order. Each thread computes its own
+    // rank in one parallel O(n_experts) pass — no per-pass reduction
+    // barriers, ranks are a permutation so they never collide. An expert
+    // is selected iff rank < top_k, landing in output slot `rank` — the
+    // EXACT slot the serial loop would write. Bit-identical selection
+    // AND ordering.
+    float my_prob = (tid < pc.n_experts) ? s_probs[tid] : -1.0;
+    uint  my_rank = 0u;
+    if (tid < pc.n_experts) {
+        for (uint j = 0u; j < pc.n_experts; j++) {
+            float pj = s_probs[j];
+            if (pj > my_prob || (pj == my_prob && j < tid)) {
+                my_rank++;
+            }
+        }
+    }
+    barrier();  // all reads of s_probs done before s_ordered_* is written
+    if (tid < pc.n_experts && my_rank < pc.top_k && my_rank < MAX_TOPK) {
+        s_ordered_prob[my_rank] = my_prob;
+        s_ordered_idx[my_rank]  = tid;
+    }
+    barrier();
+    // Thread 0 sums + renorms in descending-prob order — the SAME
+    // accumulation order as the serial `top_sum += best` loop, so the
+    // renorm (and thus every weight) is byte-identical, not just
+    // FP-equivalent.
+    if (tid == 0u) {
+        float top_sum = 0.0;
+        for (uint k = 0u; k < pc.top_k && k < MAX_TOPK; k++) {
+            top_sum += s_ordered_prob[k];
+        }
+        s_renorm = (top_sum > 0.0) ? (1.0 / top_sum) : 0.0;
+    }
+    barrier();
+    // Each selected thread writes its own output slot in parallel.
+    if (tid < pc.n_experts && my_rank < pc.top_k && my_rank < MAX_TOPK) {
+        uint out_base = token * pc.top_k;
+        uint e = tid;
+        float w = my_prob * s_renorm * pes.data[e];
+        indices.data[out_base + my_rank] = e;
+        weights.data[out_base + my_rank] = w;
+    }
+#else
     // ─── Step 3: Top-K via sequential max-find + Step 4: renorm + ───
     // ─── Step 5: per-expert scale. All within thread 0 since top_k=8
     //              and n_experts=128 → 1024 compares is trivial.       ───
@@ -126,4 +185,5 @@ void main() {
             weights.data[out_base + k] = w;
         }
     }
+#endif
 }

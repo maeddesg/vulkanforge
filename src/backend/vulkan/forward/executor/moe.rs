@@ -131,6 +131,24 @@ pub(crate) fn moe_router_optimized_enabled() -> bool {
     })
 }
 
+/// Sprint C.2 — parallel top-K softmax. `VF_TOPK_OPTIMIZED=1` selects the
+/// `MoeRouterSoftmaxTopkPar` shader, which replaces the thread-0 serial
+/// 8×128 max-find loop (measured ~3.6 ms/tok across 30 MoE layers in the
+/// C.1 isolation re-profile — NOT a timestamp artifact: it persists under
+/// `VF_GPU_TIMER_ISOLATE=1`) with a rank-count selection spread across all
+/// 128 threads. Byte-identical output (same selection, ordering and renorm
+/// accumulation order), so this is a pure-speed change. Default OFF (opt-in)
+/// — a default-flip is a separate owner decision after validation.
+pub(crate) fn moe_topk_optimized_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("VF_TOPK_OPTIMIZED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 impl DecodeExec {
     // === Sprint 51D-B Block 1 — Gemma-4-26B-A4B MoE FFN-Block norms + add ===
 

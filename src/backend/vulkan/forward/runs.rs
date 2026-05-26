@@ -2709,6 +2709,13 @@ impl Forward {
         let normed_buf = router.router_normed_scratch.handle;
         let indices_buf = router.indices_scratch.handle;
         let weights_buf = router.weights_scratch.handle;
+        // Sprint C.2 — pick the parallel top-K shader under VF_TOPK_OPTIMIZED.
+        // Identical bindings/push/dispatch; byte-identical output.
+        let topk_shader = if super::executor::moe_topk_optimized_enabled() {
+            ShaderId::MoeRouterSoftmaxTopkPar
+        } else {
+            ShaderId::MoeRouterSoftmaxTopk
+        };
         let input_bytes = (seq_len as u64) * (hidden_size as u64) * 4;
         let logits_bytes = (seq_len as u64) * (n_experts as u64) * 4;
         let topk_bytes = (seq_len as u64) * (top_k as u64) * 4;
@@ -2743,7 +2750,7 @@ impl Forward {
             );
             compute_barrier(dev, cmd);
             // 3. Softmax + top-K + renorm + pes (existing shader, unchanged).
-            let k2 = registry.get(ShaderId::MoeRouterSoftmaxTopk);
+            let k2 = registry.get(topk_shader);
             let set2 = self.alloc_or_get_set(
                 dev, k2.descriptor_set_layout,
                 &[
@@ -2856,7 +2863,7 @@ impl Forward {
         }
 
         // ─── Shader 2: softmax + top-K + renorm + pes → indices + weights ───
-        let k2 = registry.get(ShaderId::MoeRouterSoftmaxTopk);
+        let k2 = registry.get(topk_shader);
         let set2 = self.alloc_or_get_set(
             dev,
             k2.descriptor_set_layout,

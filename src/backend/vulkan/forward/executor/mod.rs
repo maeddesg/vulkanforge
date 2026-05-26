@@ -60,6 +60,8 @@ pub(crate) use moe::batched_decode_moe_enabled;
 pub(crate) use moe::moe_fused_router_enabled;
 // Sprint C.1 — re-export the optimized-router gate for `run_moe_router_gpu`.
 pub(crate) use moe::moe_router_optimized_enabled;
+// Sprint C.2 — re-export the parallel top-K gate for `run_moe_router_gpu`.
+pub(crate) use moe::moe_topk_optimized_enabled;
 
 /// Sprint 51D-D — one-shot log-on-first-call for the layer-0 router
 /// decision (debug aid). Prevents flooding decode-token logs with

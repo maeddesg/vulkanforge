@@ -804,6 +804,9 @@ impl PipelineRegistry {
                 }
                 ShaderId::MoeRouterNormGemv
                 | ShaderId::MoeRouterSoftmaxTopk
+                // Sprint C.2 — parallel top-K variant; identical
+                // bindings/push/local_size, rank-count selection.
+                | ShaderId::MoeRouterSoftmaxTopkPar
                 // Sprint P1-3 — fused router; same no-spec-const,
                 // local_size_x=128, shared-memory-reduction surface.
                 | ShaderId::MoeRouterFused => {

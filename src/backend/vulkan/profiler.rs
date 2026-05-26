@@ -32,6 +32,19 @@ pub struct ShaderProfiler {
     pub entries: Vec<ProfileEntry>,
     pub next_query: u32,
     capacity: u32,
+    /// Pipeline stage for the *begin* timestamp. Default `TOP_OF_PIPE`
+    /// (the timestamp fires as soon as the command is fetched, so it
+    /// does not wait for prior dispatches to finish — fast, but on
+    /// RADV the duration of a barrier-gated dispatch then absorbs the
+    /// tail of its predecessor + the barrier drain → inflated number;
+    /// see `feedback_per_dispatch_timestamps`). `VF_GPU_TIMER_ISOLATE=1`
+    /// switches it to `BOTTOM_OF_PIPE`: the begin timestamp waits for
+    /// all prior work to drain, so the measured duration is the
+    /// dispatch's *isolated* GPU time. Writing a timestamp creates no
+    /// execution dependency for other commands, so this changes only
+    /// where the clock is sampled, not how the GPU actually executes —
+    /// the two readings can be compared to expose the artifact.
+    begin_stage: vk::PipelineStageFlags,
 }
 
 impl ShaderProfiler {
@@ -59,6 +72,17 @@ impl ShaderProfiler {
             instance.get_physical_device_queue_family_properties(physical_device)
         };
 
+        // VF_GPU_TIMER_ISOLATE=1 → BOTTOM_OF_PIPE begin (artifact-free
+        // per-dispatch isolation; see field doc).
+        let isolate = std::env::var("VF_GPU_TIMER_ISOLATE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let begin_stage = if isolate {
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE
+        } else {
+            vk::PipelineStageFlags::TOP_OF_PIPE
+        };
+
         Ok(Self {
             query_pool,
             timestamp_period_ns: props.limits.timestamp_period as f64,
@@ -66,6 +90,7 @@ impl ShaderProfiler {
             entries: Vec::with_capacity(capacity_pairs as usize),
             next_query: 0,
             capacity: total,
+            begin_stage,
         })
     }
 
@@ -95,7 +120,7 @@ impl ShaderProfiler {
         unsafe {
             device.cmd_write_timestamp(
                 cmd,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                self.begin_stage,
                 self.query_pool,
                 start,
             );
