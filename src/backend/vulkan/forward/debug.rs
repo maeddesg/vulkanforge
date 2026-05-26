@@ -504,3 +504,27 @@ pub(super) fn maybe_dump_hidden_staging(tag: &str, hidden: &[f32]) {
     let head: Vec<f32> = hidden.iter().take(8).copied().collect();
     eprintln!("[MAIN-CB-DUMP] {tag}: first8 = {:?}", head);
 }
+
+/// Sprint D.0 — `VF_DISPATCH_LOG=1` prints the dispatch grid for each
+/// distinct (shader-label, grid) pair exactly once. Joined with the
+/// `VF_GPU_TIMER` per-shader breakdown (label → ms/tok) this gives the
+/// shader → grid → duration mapping used to diagnose under-occupied
+/// dispatches (grid ≪ 64 CUs). Pure diagnostic, default OFF, no effect
+/// on execution. Called from the dispatch helpers in `runs.rs`.
+pub(super) fn log_dispatch(label: &str, gx: u32, gy: u32, gz: u32) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| {
+        std::env::var("VF_DISPATCH_LOG").map(|v| v == "1").unwrap_or(false)
+    }) {
+        return;
+    }
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let key = format!("{label}|{gx}x{gy}x{gz}");
+    if seen.lock().unwrap().insert(key) {
+        let total_wg = gx as u64 * gy as u64 * gz as u64;
+        eprintln!("VF_DISPATCH  {label:<28} grid=({gx},{gy},{gz})  total_wg={total_wg}");
+    }
+}
