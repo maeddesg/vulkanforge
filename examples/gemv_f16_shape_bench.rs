@@ -38,6 +38,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     let cmd_ctx = CommandContext::new(&dev.device, dev.queue_family_index)?;
 
+    // Sprint D.1 — VRAM-pressure / placement probe (env-gated, default OFF).
+    //   VF_BENCH_FILLER_GB=N    allocate+fill N GiB of GpuOnly filler so the
+    //                           total resident VRAM crosses the ~10 GB cliff.
+    //   VF_BENCH_FILLER_FIRST=1 allocate the filler BEFORE the weight buffer
+    //                           (pushes the measured weight to a high physical
+    //                           VRAM offset — the cliff condition). Default:
+    //                           weight first (low offset), filler after.
+    // Comparing {no filler} / {filler after} / {filler first} discriminates
+    // "total-VRAM pressure" (both filler orders slow) from "physical placement"
+    // (only filler-first slow) — the VF_LMHEAD_ALLOC_FIRST mechanism.
+    let filler_gb: u64 = std::env::var("VF_BENCH_FILLER_GB").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(0);
+    let filler_first = std::env::var("VF_BENCH_FILLER_FIRST").map(|v| v == "1").unwrap_or(false);
+    let mut filler_bufs: Vec<GpuBuffer> = Vec::new();
+    let mut alloc_filler = |allocator: &mut Allocator, bufs: &mut Vec<GpuBuffer>| -> Result<(), Box<dyn std::error::Error>> {
+        if filler_gb == 0 { return Ok(()); }
+        eprintln!("Allocating {filler_gb} GiB VRAM filler (first={filler_first}) ...");
+        // 16 MiB host seed, copied to fill each 1 GiB GpuOnly chunk so the
+        // pages are real-resident (not zero/compressed).
+        let chunk_bytes: u64 = 1024 * 1024 * 1024;
+        let seed_bytes: u64 = 16 * 1024 * 1024;
+        let mut seed = GpuBuffer::new(&dev.device, allocator, seed_bytes,
+            vk::BufferUsageFlags::TRANSFER_SRC, MemoryLocation::CpuToGpu, "filler_seed")?;
+        let sv: Vec<u8> = (0..seed_bytes).map(|i| (i & 0xff) as u8 ^ 0x5a).collect();
+        seed.write_bytes(&sv)?;
+        for c in 0..filler_gb {
+            let b = GpuBuffer::new(&dev.device, allocator, chunk_bytes,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                MemoryLocation::GpuOnly, "filler_chunk")?;
+            let mut off = 0u64;
+            while off < chunk_bytes {
+                let n = (chunk_bytes - off).min(seed_bytes);
+                cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| unsafe {
+                    let cp = vk::BufferCopy::default().src_offset(0).dst_offset(off).size(n);
+                    dev.device.cmd_copy_buffer(cmd, seed.handle, b.handle, std::slice::from_ref(&cp));
+                })?;
+                off += n;
+            }
+            bufs.push(b);
+            let _ = c;
+        }
+        seed.destroy(&dev.device, allocator);
+        Ok(())
+    };
+    if filler_first { alloc_filler(&mut allocator, &mut filler_bufs)?; }
+
     // Big enough to cover all test shapes' weight matrix.
     let weight_bytes = (MAX_M as u64) * (MAX_K as u64) * 2;
     eprintln!("Allocating weight buffer: {:.2} GiB", weight_bytes as f64 / (1024.0 * 1024.0 * 1024.0));
@@ -76,6 +122,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Fully filled weight buffer ({:.2} GiB)", (total_u16 * 2) as f64 / (1024.0 * 1024.0 * 1024.0));
         tmp.destroy(&dev.device, &mut allocator);
     }
+
+    // Filler AFTER the weight buffer (weight at low physical offset).
+    if !filler_first { alloc_filler(&mut allocator, &mut filler_bufs)?; }
 
     let mut input_buf = GpuBuffer::new(
         &dev.device, &mut allocator, (MAX_K * 4) as u64,
@@ -201,6 +250,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // -- Shape sweep --
     let shapes: &[(u32, u32, &str)] = &[
+        // Sprint D.1 — small-M shapes matching the real 26B decode GEMVs
+        // (gemv_q M=4096, gemv_o M=2816, gemv_k M=2048) to test whether the
+        // small grid / low wave-count is itself the BW limiter in the warm
+        // standalone environment (isolates grid effect from in-context env).
+        (  4096, 2816, "26B gemv_q     (  4096 × 2816)"),
+        (  2816, 4096, "26B gemv_o     (  2816 × 4096)"),
+        (  2048, 2816, "26B gemv_k     (  2048 × 2816)"),
+        (   128, 2816, "26B router     (   128 × 2816)"),
         (128256, 4096, "8B real        (128256 × 4096)"),
         (152064, 5120, "14B real       (152064 × 5120)"),
         (152064, 4096, "M=14B  K=8B    (152064 × 4096)"),
@@ -284,6 +341,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(input_buf);
     drop(fuse0);
     drop(fuse1);
+    for b in filler_bufs.drain(..) { b.destroy(&dev.device, &mut allocator); }
     drop(allocator);
     Ok(())
 }
