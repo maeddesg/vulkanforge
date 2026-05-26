@@ -211,7 +211,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // -- Descriptor set --
     let pool_sizes = [vk::DescriptorPoolSize {
-        ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 8,
+        ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 16,
     }];
     let pool = unsafe {
         dev.device.create_descriptor_pool(
@@ -325,6 +325,90 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let bw_gbps = weight_gb / (med_ms / 1000.0);
         println!("{:<32} {:>10.3} {:>10.3} {:>10.3} {:>10.1}",
                  label, min_ms, med_ms, max_ms, bw_gbps);
+    }
+
+    // ── Sprint D.2 — cold-MALL probe (VF_BENCH_COLD_MALL=1) ─────────────
+    // A small weight W (gemv_q-sized, ~23 MB, fits the 64 MB MALL) is
+    // measured WARM (re-read, MALL-resident) vs COLD (after a flush GEMV
+    // reads a disjoint >64 MB region of weight_buf, evicting W from MALL).
+    // Each measurement is its own submit (clean timing). This reproduces
+    // the in-context condition where W is cold because the per-layer
+    // tensors between visits thrash the MALL — answering whether the
+    // in-context cliff is the cold-short-read itself (kernel-independent).
+    if std::env::var("VF_BENCH_COLD_MALL").map(|v| v == "1").unwrap_or(false) {
+        // Flush descriptor set: weight_buf bound at a 1 GiB offset so the
+        // flush GEMV reads a region disjoint from W's [0, 23MB).
+        let flush_off: u64 = 1024 * 1024 * 1024;
+        let set_flush = unsafe { dev.device.allocate_descriptor_sets(
+            &vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&layouts))?[0] };
+        let infos_f = [
+            vk::DescriptorBufferInfo::default().buffer(weight_buf.handle).offset(flush_off).range(vk::WHOLE_SIZE - flush_off),
+            vk::DescriptorBufferInfo::default().buffer(input_buf.handle).offset(0).range(vk::WHOLE_SIZE),
+            vk::DescriptorBufferInfo::default().buffer(output_buf.handle).offset(0).range(vk::WHOLE_SIZE),
+            vk::DescriptorBufferInfo::default().buffer(fuse0.handle).offset(0).range(vk::WHOLE_SIZE),
+            vk::DescriptorBufferInfo::default().buffer(fuse1.handle).offset(0).range(vk::WHOLE_SIZE),
+        ];
+        let writes_f: Vec<_> = (0..5u32).map(|i| {
+            vk::WriteDescriptorSet::default().dst_set(set_flush).dst_binding(i).descriptor_count(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(&infos_f[i as usize]))
+        }).collect();
+        unsafe { dev.device.update_descriptor_sets(&writes_f, &[]) };
+
+        // helper: run shape (m,k) on a given descriptor set, optionally timed.
+        let dispatch = |set_in: vk::DescriptorSet, m: u32, k: u32, timed: bool| -> Result<f64, Box<dyn std::error::Error>> {
+            let pc = MatVecPushConstants {
+                ncols: k, stride_a: k, stride_b: k, stride_d: m,
+                batch_stride_a: k * m, batch_stride_b: k, batch_stride_d: m,
+                fusion_flags: 0, base_work_group_y: 0, ne02: 1, ne12: 1, broadcast2: 1,
+                broadcast3: 1.0_f32.to_bits(),
+            };
+            cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| unsafe {
+                if timed { dev.device.cmd_reset_query_pool(cmd, qpool, 0, 2); }
+                dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                dev.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, pipeline_layout, 0, &[set_in], &[]);
+                dev.device.cmd_push_constants(cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc));
+                if timed { dev.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, qpool, 0); }
+                dev.device.cmd_dispatch(cmd, m, 1, 1);
+                if timed { dev.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qpool, 1); }
+            })?;
+            if !timed { return Ok(0.0); }
+            let mut data = [0u64; 2];
+            unsafe { dev.device.get_query_pool_results(qpool, 0, &mut data,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT)?; }
+            Ok((data[1].wrapping_sub(data[0]) as f64) * ts_period_ns / 1e6)
+        };
+
+        let small: &[(u32, u32, &str)] = &[
+            (4096, 2816, "gemv_q (4096x2816, ~23MB)"),
+            (2048, 2816, "gemv_k (2048x2816, ~12MB)"),
+        ];
+        let flush_m: u32 = 131072; // 131072*2816*2 = ~738 MB >> 64 MB MALL
+        println!();
+        println!("=== VF_BENCH_COLD_MALL — warm (MALL-resident) vs cold (post-flush) ===");
+        println!("{:<28} {:>12} {:>12} {:>10} {:>10}", "shape", "warm GB/s", "cold GB/s", "warm ms", "cold ms");
+        println!("{}", "-".repeat(76));
+        for &(m, k, label) in small {
+            let gb = (m as f64) * (k as f64) * 2.0 / 1e9;
+            // warm: prime W into MALL, then time a re-read.
+            let mut warm = Vec::new();
+            for _ in 0..RUNS_PER_SHAPE {
+                dispatch(set, m, k, false)?;            // prime
+                warm.push(dispatch(set, m, k, true)?);   // timed (MALL-warm)
+            }
+            // cold: flush MALL with a disjoint >64 MB read, then time W (cold).
+            let mut cold = Vec::new();
+            for _ in 0..RUNS_PER_SHAPE {
+                dispatch(set_flush, flush_m, k, false)?; // evict W from MALL
+                cold.push(dispatch(set, m, k, true)?);   // timed (cold)
+            }
+            warm.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            cold.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let wm = warm[warm.len() / 2];
+            let cm = cold[cold.len() / 2];
+            println!("{:<28} {:>12.1} {:>12.1} {:>10.4} {:>10.4}",
+                     label, gb / (wm / 1000.0), gb / (cm / 1000.0), wm, cm);
+        }
     }
 
     // Cleanup
