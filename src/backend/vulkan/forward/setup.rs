@@ -472,6 +472,27 @@ impl Forward {
              None, None, None, None, None, None)
         };
 
+        // Sprint F.1 — MTP Phase-4 rollback snapshot buffers. Mirror the
+        // two persistent recurrent buffers (`ssm_state_buf` ~144 MB,
+        // `conv_state_buf` ~5.6 MB) so a rejected speculative draft can
+        // be rolled back. Gated on `VF_MTP`/`VF_MTP_ROLLBACK_TEST` so
+        // non-MTP runs don't pay the ~150 MB. See forward/mtp.rs.
+        let mtp_snapshots_enabled = std::env::var("VF_MTP").as_deref() == Ok("1")
+            || std::env::var("VF_MTP_ROLLBACK_TEST").as_deref() == Ok("1");
+        let (ssm_state_snapshot_buf, conv_state_snapshot_buf) = if mtp_snapshots_enabled {
+            let ssm_snap = ssm_state_buf
+                .as_ref()
+                .map(|b| mk_storage(b.size, MemoryLocation::GpuOnly, "ssm_state_snapshot_buf"))
+                .transpose()?;
+            let conv_snap = conv_state_buf
+                .as_ref()
+                .map(|b| mk_storage(b.size, MemoryLocation::GpuOnly, "conv_state_snapshot_buf"))
+                .transpose()?;
+            (ssm_snap, conv_snap)
+        } else {
+            (None, None)
+        };
+
         // Sprint 51D-D — host-readable staging for MoE router input.
         // Sized for the worst case: full prefill batch × hidden × 4 B.
         // Cheap (~1.4 MB on 26B at pp=128); always allocated so the
@@ -886,6 +907,8 @@ impl Forward {
             ssm_krep_buf,
             ssm_gdn_out_buf,
             ssm_norm_out_buf,
+            ssm_state_snapshot_buf,
+            conv_state_snapshot_buf,
             ssm_persistent_initialized: false,
             // Sprint 12D — barrier elision tracker.
             pending_writes: std::collections::HashSet::with_capacity(32),
@@ -1267,6 +1290,9 @@ impl Forward {
         if let Some(b) = self.ssm_krep_buf         { b.destroy(device, allocator); }
         if let Some(b) = self.ssm_gdn_out_buf      { b.destroy(device, allocator); }
         if let Some(b) = self.ssm_norm_out_buf     { b.destroy(device, allocator); }
+        // Sprint F.1 — MTP rollback snapshot buffers.
+        if let Some(b) = self.ssm_state_snapshot_buf  { b.destroy(device, allocator); }
+        if let Some(b) = self.conv_state_snapshot_buf { b.destroy(device, allocator); }
         // Sprint 51D-D — MoE router staging.
         self.moe_route_staging.destroy(device, allocator);
         // Sprint 56B — GPU-side MoE router buffers.

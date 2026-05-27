@@ -697,6 +697,16 @@ pub struct Forward {
     /// Final SSM activation feeding `step_ssm_out_proj`.
     pub(super) ssm_norm_out_buf: Option<GpuBuffer>,
 
+    /// Sprint F.1 (MTP Phase-4 spike) — snapshot copies of the two
+    /// persistent recurrent buffers, used to roll the GDN/conv state
+    /// back after a rejected speculative draft. Mirror `ssm_state_buf`
+    /// (~144 MB) and `conv_state_buf` (~5.6 MB) exactly. `Some` only
+    /// when `cfg.qwen35.is_some()` AND `VF_MTP`/`VF_MTP_ROLLBACK_TEST`
+    /// is set — non-MTP runs allocate nothing. Driven by
+    /// `snapshot_recurrent_state` / `restore_recurrent_state` (mtp.rs).
+    pub(super) ssm_state_snapshot_buf: Option<GpuBuffer>,
+    pub(super) conv_state_snapshot_buf: Option<GpuBuffer>,
+
     /// Sprint G-2c — lazy zero-init guard for the persistent SSM
     /// buffers. Flipped on the first conv-setup dispatch; resets to
     /// `false` only on `/reset` (G-2e). Cleared at construction so

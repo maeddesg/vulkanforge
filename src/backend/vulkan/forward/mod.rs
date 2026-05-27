@@ -67,6 +67,7 @@ mod executor;
 mod harness;
 pub(crate) mod layer_plan;
 mod mid_frame;
+mod mtp;
 mod prefill;
 mod runs;
 mod setup;

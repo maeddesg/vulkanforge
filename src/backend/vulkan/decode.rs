@@ -618,13 +618,21 @@ pub fn generate_from_tokens(
     // dispatch chain now actually overlaps token N+1's CPU record with
     // token N's GPU wait. Re-enabled async-decode default-on. Opt-out
     // via `VULKANFORGE_DISABLE_ASYNC_DECODE=1` retained as escape hatch.
-    let async_decode = match std::env::var("VULKANFORGE_DISABLE_ASYNC_DECODE") {
-        Ok(v) => v != "1" && !v.eq_ignore_ascii_case("true"),
-        Err(_) => {
-            cfg.gemma4
-                .as_ref()
-                .map(|g| !g.enable_moe_block || gpu_direct_moe_enabled())
-                .unwrap_or(true)
+    // Sprint F.1 — the MTP Phase-4 rollback self-test injects a
+    // throwaway forward + state restore per token, which only the
+    // serial path supports; force serial when it is active.
+    let mtp_rollback_test = std::env::var("VF_MTP_ROLLBACK_TEST").as_deref() == Ok("1");
+    let async_decode = if mtp_rollback_test {
+        false
+    } else {
+        match std::env::var("VULKANFORGE_DISABLE_ASYNC_DECODE") {
+            Ok(v) => v != "1" && !v.eq_ignore_ascii_case("true"),
+            Err(_) => {
+                cfg.gemma4
+                    .as_ref()
+                    .map(|g| !g.enable_moe_block || gpu_direct_moe_enabled())
+                    .unwrap_or(true)
+            }
         }
     };
 
@@ -725,6 +733,51 @@ pub fn generate_from_tokens(
             emit(next_id, on_token, &mut utf8_buf, &bytes);
             generated.push(next_id);
 
+            // Sprint F.1 — MTP Phase-4 rollback self-test. Snapshot the
+            // recurrent state, run a throwaway forward with a DIFFERENT
+            // token (genuinely advances + corrupts the GDN/conv state and
+            // writes garbage KV at `pos`), then restore. If snapshot/
+            // restore is complete, the generated stream stays
+            // token-identical to a normal serial run — the proof that the
+            // R3 recurrent-state rollback mechanism is correct.
+            if mtp_rollback_test && forward.mtp_snapshot_ready() {
+                // Diagnostics: VF_MTP_RB_NO_THROW skips the throwaway
+                // forward (snapshot+restore only → isolates the copy
+                // mechanism). VF_MTP_RB_SAMETOK uses next_id as the
+                // throwaway token (state advance matches the real one →
+                // isolates mechanism drift from un-restored state).
+                let no_throw = std::env::var("VF_MTP_RB_NO_THROW").as_deref() == Ok("1");
+                let sametok = std::env::var("VF_MTP_RB_SAMETOK").as_deref() == Ok("1");
+                let hash_dbg = std::env::var("VF_MTP_RB_HASH").as_deref() == Ok("1");
+                let saved_seq = forward.kv_seq_len();
+                forward.snapshot_recurrent_state(dev, cmd_ctx)?;
+                let h_snap = if hash_dbg { forward.mtp_debug_ssm_hash(dev, cmd_ctx)? } else { 0 };
+                if !no_throw {
+                    let garbage_id = if sametok {
+                        next_id
+                    } else if next_id == 0 {
+                        1
+                    } else {
+                        next_id - 1
+                    };
+                    let garbage_embd = embed_lookup(&embed_src, cfg, garbage_id)?;
+                    forward.forward_token(
+                        dev, registry, cmd_ctx, model, &garbage_embd, pos, garbage_id,
+                    )?;
+                }
+                let h_corrupt = if hash_dbg { forward.mtp_debug_ssm_hash(dev, cmd_ctx)? } else { 0 };
+                forward.restore_recurrent_state(dev, cmd_ctx)?;
+                let h_restore = if hash_dbg { forward.mtp_debug_ssm_hash(dev, cmd_ctx)? } else { 0 };
+                forward.set_kv_seq_len(saved_seq);
+                if hash_dbg {
+                    eprintln!(
+                        "[MTP_RB] pos={pos} h_snap={h_snap:#018x} h_corrupt={h_corrupt:#018x} \
+                         h_restore={h_restore:#018x} corrupt_changed={} restore_ok={}",
+                        h_corrupt != h_snap,
+                        h_restore == h_snap,
+                    );
+                }
+            }
             let embd = embed_lookup(&embed_src, cfg, next_id)?;
             let iter_start = if cpu_timer { Some(Instant::now()) } else { None };
             let stats = forward.forward_token(dev, registry, cmd_ctx, model, &embd, pos, next_id)?;
