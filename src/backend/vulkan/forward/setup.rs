@@ -493,6 +493,26 @@ impl Forward {
             (None, None)
         };
 
+        // Sprint F.2a — MTP nextn-draft-head buffers. qwen35 + (VF_MTP or
+        // VF_MTP_DRAFT). Dedicated (no ssm_qkv_buf reuse → no GDN aliasing).
+        let mtp_draft_enabled = config.qwen35.is_some()
+            && (std::env::var("VF_MTP").as_deref() == Ok("1")
+                || std::env::var("VF_MTP_DRAFT").as_deref() == Ok("1"));
+        let (mtp_h_buf, mtp_e_buf, mtp_enorm_buf, mtp_hnorm_buf, mtp_cat_buf) =
+            if mtp_draft_enabled {
+                let n = (config.hidden_dim as u64) * 4; // 5120 f32
+                (
+                    Some(mk_storage(n, MemoryLocation::GpuOnly, "mtp_h_buf")?),
+                    // host-writable: the CPU-dequant'd token embedding is written here.
+                    Some(mk_storage(n, MemoryLocation::CpuToGpu, "mtp_e_buf")?),
+                    Some(mk_storage(n, MemoryLocation::GpuOnly, "mtp_enorm_buf")?),
+                    Some(mk_storage(n, MemoryLocation::GpuOnly, "mtp_hnorm_buf")?),
+                    Some(mk_storage(n * 2, MemoryLocation::GpuOnly, "mtp_cat_buf")?),
+                )
+            } else {
+                (None, None, None, None, None)
+            };
+
         // Sprint 51D-D — host-readable staging for MoE router input.
         // Sized for the worst case: full prefill batch × hidden × 4 B.
         // Cheap (~1.4 MB on 26B at pp=128); always allocated so the
@@ -909,6 +929,12 @@ impl Forward {
             ssm_norm_out_buf,
             ssm_state_snapshot_buf,
             conv_state_snapshot_buf,
+            mtp_h_buf,
+            mtp_e_buf,
+            mtp_enorm_buf,
+            mtp_hnorm_buf,
+            mtp_cat_buf,
+            mtp_block64_kv_zeroed: false,
             ssm_persistent_initialized: false,
             // Sprint 12D — barrier elision tracker.
             pending_writes: std::collections::HashSet::with_capacity(32),
@@ -1293,6 +1319,12 @@ impl Forward {
         // Sprint F.1 — MTP rollback snapshot buffers.
         if let Some(b) = self.ssm_state_snapshot_buf  { b.destroy(device, allocator); }
         if let Some(b) = self.conv_state_snapshot_buf { b.destroy(device, allocator); }
+        // Sprint F.2a — MTP draft-head buffers.
+        if let Some(b) = self.mtp_h_buf      { b.destroy(device, allocator); }
+        if let Some(b) = self.mtp_e_buf      { b.destroy(device, allocator); }
+        if let Some(b) = self.mtp_enorm_buf  { b.destroy(device, allocator); }
+        if let Some(b) = self.mtp_hnorm_buf  { b.destroy(device, allocator); }
+        if let Some(b) = self.mtp_cat_buf    { b.destroy(device, allocator); }
         // Sprint 51D-D — MoE router staging.
         self.moe_route_staging.destroy(device, allocator);
         // Sprint 56B — GPU-side MoE router buffers.

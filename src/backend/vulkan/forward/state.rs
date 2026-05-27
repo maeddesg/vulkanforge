@@ -707,6 +707,24 @@ pub struct Forward {
     pub(super) ssm_state_snapshot_buf: Option<GpuBuffer>,
     pub(super) conv_state_snapshot_buf: Option<GpuBuffer>,
 
+    /// Sprint F.2a (MTP nextn-draft-head) — dedicated draft-forward
+    /// buffers. `Some` only when `cfg.qwen35.is_some()` AND
+    /// `VF_MTP`/`VF_MTP_DRAFT` is set; non-MTP runs allocate nothing.
+    /// `mtp_h_buf`: captured trunk pre-final-norm hidden h_t (5120).
+    /// `mtp_e_buf`: raw token embedding e_t (5120). `mtp_enorm_buf` /
+    /// `mtp_hnorm_buf`: RMSNorm(e,enorm) / RMSNorm(h,hnorm) (5120 each).
+    /// `mtp_cat_buf`: concat target [e_norm ∥ h_norm] (10240) — dedicated
+    /// (NOT a `ssm_qkv_buf` reuse) to avoid GDN-state aliasing (F.2a §1b).
+    /// Driven by `mtp_draft_logits` (mtp.rs).
+    pub(super) mtp_h_buf: Option<GpuBuffer>,
+    pub(super) mtp_e_buf: Option<GpuBuffer>,
+    pub(super) mtp_enorm_buf: Option<GpuBuffer>,
+    pub(super) mtp_hnorm_buf: Option<GpuBuffer>,
+    pub(super) mtp_cat_buf: Option<GpuBuffer>,
+    /// Lazy one-time guard: zero-init block-64's (cold) KV slot before
+    /// the first draft so its attention reads zeros, not garbage (§1b).
+    pub(super) mtp_block64_kv_zeroed: bool,
+
     /// Sprint G-2c — lazy zero-init guard for the persistent SSM
     /// buffers. Flipped on the first conv-setup dispatch; resets to
     /// `false` only on `/reset` (G-2e). Cleared at construction so

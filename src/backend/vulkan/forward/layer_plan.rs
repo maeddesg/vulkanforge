@@ -688,6 +688,50 @@ pub fn build_gemma4_layer(
 /// but the 17 Full-Attn layers now perform the real Q-Gate-Split,
 /// per-head Q/K norms, RoPE, GQA attention, and the sigmoid-gated
 /// output multiply.
+/// Sprint F.2a — the MTP nextn draft-head's block-64 transformer.
+///
+/// `graph_mtp` (qwen35.cpp) runs the MTP block (layer == n_main) as a
+/// **normal full-attention block** on the `eh_proj` output: attn_norm →
+/// Q-gate-split / q-k-norm / mRoPE → attention (over block-64's OWN KV,
+/// `kv_layer = n_main`) → ×sigmoid(gate) → o-proj → residual → post-norm
+/// → SwiGLU-FFN → residual. This returns exactly that plan (the same
+/// step sequence as a trunk full-attn layer, with layer-64 tensors). The
+/// caller (`mtp_draft_logits`) feeds the `eh_proj` output as the layer
+/// input and reads block-64 KV at the draft position. Returns `None`
+/// for non-qwen35 / no-MTP-block configs.
+pub fn build_qwen35_draft_block_plan(cfg: &ModelConfig) -> Option<LayerPlan> {
+    let spec = cfg.qwen35.as_ref()?;
+    if spec.nextn_predict_layers == 0 {
+        return None;
+    }
+    let layer = spec.n_main(); // the MTP block index (== 64 for Qwen3.6-27B)
+    let q_dim = cfg.n_heads * cfg.head_dim;
+    let rotary_dim = spec.n_rot_text_only();
+    let freq_base = cfg.rope_freq_base;
+    let theta_scale = (1.0_f32 / freq_base).powf(2.0 / rotary_dim as f32);
+
+    let mut plan: LayerPlan = Vec::with_capacity(18);
+    // Block-64 transformer (identical to the qwen35 full-attn branch).
+    plan.push(LayerStep::AttnNorm);
+    plan.push(LayerStep::AttnQGateProj { q_dim });
+    plan.push(LayerStep::QNormRope { rotary_dim, freq_base, theta_scale });
+    plan.push(LayerStep::KProj);
+    plan.push(LayerStep::KNormRope { rotary_dim, freq_base, theta_scale });
+    plan.push(LayerStep::VProj);
+    plan.push(LayerStep::KvWrite);
+    plan.push(LayerStep::Attention { kv_layer: layer, kv_start: 0 });
+    plan.push(LayerStep::AttnGatedOutput { q_dim });
+    plan.push(LayerStep::OProj);
+    plan.push(LayerStep::AttnResidualAdd);
+    plan.push(LayerStep::PreFfnNorm);
+    plan.push(LayerStep::GateProj);
+    plan.push(LayerStep::UpProj);
+    plan.push(LayerStep::Activation { kind: ActivationKind::SwiGlu });
+    plan.push(LayerStep::DownProj);
+    plan.push(LayerStep::FfnResidualAdd);
+    Some(plan)
+}
+
 pub fn build_qwen35_layer(
     cfg: &ModelConfig,
     layer: u32,

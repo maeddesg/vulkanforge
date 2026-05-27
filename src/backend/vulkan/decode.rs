@@ -521,6 +521,12 @@ pub fn generate_from_tokens(
         // already covers the multi-tile-within-one-prefill case;
         // chunked prefill is the same shape extended across multiple
         // prefill_batch submits.
+        // Sprint F.2a — MTP shadow-pass: when VF_MTP_DRAFT, also run the
+        // draft block at each prompt position so block-64's (cold) KV is
+        // populated over the FULL context (prompt + decode), not just the
+        // decode positions. Otherwise the decode-phase match-rate is
+        // confounded by missing prompt-position block-64 KV (§1b / Phase 2).
+        let mtp_shadow = std::env::var("VF_MTP_DRAFT").as_deref() == Ok("1");
         if force_per_token_prefill {
             // Sprint 20-M3 — SafeTensors FP8 models reach this branch:
             // batched prefill would hit the (FP16) `mul_mm.comp` GEMM
@@ -528,7 +534,7 @@ pub fn generate_from_tokens(
             // the per-token GEMV path. That's slow at long pp but
             // proves the end-to-end pipeline; an FP8 GEMM port is
             // future work (Sprint 19A-style coopmat coverage).
-            for &tid in prefill_tokens {
+            for (i, &tid) in prefill_tokens.iter().enumerate() {
                 let embd = embed_lookup(&embed_src, cfg, tid)?;
                 let stats = forward.forward_token(dev, registry, cmd_ctx, model, &embd, pos, tid)?;
                 if gpu_timer {
@@ -538,6 +544,18 @@ pub fn generate_from_tokens(
                         e.1 += n;
                     }
                     prefill_tokens_profiled += 1;
+                }
+                // Shadow-pass: write block-64 KV at pos+1 using h_pos +
+                // the (known) next prompt token. Skipped for the LAST
+                // prompt token (no next; and its trunk logits must survive
+                // to seed the first decode sample — the shadow-pass would
+                // overwrite logits_buf).
+                if mtp_shadow {
+                    if let Some(&next_tid) = prefill_tokens.get(i + 1) {
+                        let e = embed_lookup(&embed_src, cfg, next_tid)?;
+                        let _ = forward
+                            .mtp_draft_logits(dev, registry, cmd_ctx, model, &e, pos + 1)?;
+                    }
                 }
                 pos += 1;
             }
@@ -622,7 +640,10 @@ pub fn generate_from_tokens(
     // throwaway forward + state restore per token, which only the
     // serial path supports; force serial when it is active.
     let mtp_rollback_test = std::env::var("VF_MTP_ROLLBACK_TEST").as_deref() == Ok("1");
-    let async_decode = if mtp_rollback_test {
+    // Sprint F.2a — the MTP draft-head match-rate harness runs the draft
+    // between trunk tokens (serial path only); force serial when active.
+    let mtp_draft_test = std::env::var("VF_MTP_DRAFT").as_deref() == Ok("1");
+    let async_decode = if mtp_rollback_test || mtp_draft_test {
         false
     } else {
         match std::env::var("VULKANFORGE_DISABLE_ASYNC_DECODE") {
@@ -635,6 +656,12 @@ pub fn generate_from_tokens(
             }
         }
     };
+
+    // Sprint F.2a — MTP draft-head match-rate accumulators (VF_MTP_DRAFT).
+    let mut mtp_pending: Option<u32> = None;
+    let mut mtp_matches: u64 = 0;
+    let mut mtp_total: u64 = 0;
+    let mut mtp_history: Vec<bool> = Vec::new();
 
     if async_decode {
         // ---- Async 3-stage pipeline ----
@@ -815,10 +842,64 @@ pub fn generate_from_tokens(
                 }
             }
             last_logits = forward.logits()?;
+            // Sprint F.2a — MTP draft-head match-rate. Verify the previous
+            // draft's prediction against the trunk's greedy argmax, then
+            // compute the next draft from h_t (captured during the forward
+            // above) + the trunk's predicted token. argmax is NaN-safe.
+            if mtp_draft_test {
+                let argmax = |v: &[f32]| -> u32 {
+                    v.iter()
+                        .enumerate()
+                        .max_by(|a, b| {
+                            a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .map(|(i, _)| i as u32)
+                        .unwrap_or(0)
+                };
+                let trunk_argmax = argmax(&last_logits);
+                if let Some(p) = mtp_pending.take() {
+                    mtp_total += 1;
+                    let hit = p == trunk_argmax;
+                    if hit {
+                        mtp_matches += 1;
+                    }
+                    mtp_history.push(hit);
+                }
+                let e = embed_lookup(&embed_src, cfg, trunk_argmax)?;
+                let dl =
+                    forward.mtp_draft_logits(dev, registry, cmd_ctx, model, &e, pos + 1)?;
+                mtp_pending = Some(argmax(&dl));
+            }
             pos += 1;
         }
     }
     let _ = last_logits;
+    if mtp_draft_test {
+        let rate = if mtp_total > 0 {
+            100.0 * mtp_matches as f64 / mtp_total as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[MTP_DRAFT] n=1 standalone match-rate: {mtp_matches}/{mtp_total} = {rate:.1}% \
+             (draft.argmax == trunk next token; decode-incremental block-64 KV)"
+        );
+        // Windowed: does the rate climb as block-64 decode-KV accumulates?
+        // (climb → KV-warmup/prompt-gap; flat → wiring/quant.)
+        let n = mtp_history.len();
+        if n >= 8 {
+            let q = n / 4;
+            let win = |lo: usize, hi: usize| -> String {
+                let s: usize = mtp_history[lo..hi].iter().filter(|&&b| b).count();
+                let t = hi - lo;
+                format!("{s}/{t}={:.0}%", 100.0 * s as f64 / t.max(1) as f64)
+            };
+            eprintln!(
+                "[MTP_DRAFT] quartiles: Q1 {} | Q2 {} | Q3 {} | Q4 {}",
+                win(0, q), win(q, 2 * q), win(2 * q, 3 * q), win(3 * q, n),
+            );
+        }
+    }
     // Drain the UTF-8 buffer: any trailing partial bytes get a lossy
     // flush (the model produced an incomplete codepoint at EOS / max
     // tokens — surface it as U+FFFD rather than dropping bytes).

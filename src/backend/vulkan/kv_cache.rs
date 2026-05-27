@@ -290,6 +290,31 @@ impl KvCache {
         self.k_buffer.size
     }
 
+    /// Sprint F.2a — zero ONLY one layer's K/V region (NOT the whole
+    /// cache — that would erase the trunk's prompt/decode KV mid-run).
+    /// Used to make the qwen35 MTP block's cold KV slot (block 64, never
+    /// written by the trunk after F.1-fix) read zeros instead of garbage
+    /// before the first draft attention. One `vkCmdFillBuffer` per buffer.
+    pub fn zero_layer(
+        &self,
+        dev: &super::device::VulkanDevice,
+        layer: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let off = self.layer_offset_bytes(layer);
+        let size = self.layer_size_bytes(layer);
+        let cmd_ctx = super::commands::CommandContext::new(
+            &dev.device,
+            dev.queue_family_index,
+        )?;
+        let result = cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| unsafe {
+            dev.device.cmd_fill_buffer(cmd, self.k_buffer.handle, off, size, 0);
+            dev.device.cmd_fill_buffer(cmd, self.v_buffer.handle, off, size, 0);
+        });
+        cmd_ctx.destroy(&dev.device);
+        result?;
+        Ok(())
+    }
+
     /// Sprint 43D-1 — head_dim of layer `layer`. Returns the per-layer
     /// override when set (Gemma-4 heterogeneous), else the uniform
     /// `config.head_dim`.

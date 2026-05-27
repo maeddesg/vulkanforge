@@ -129,6 +129,28 @@ impl Forward {
                 );
             }
         }
+        // Sprint F.2a — capture the trunk pre-final-norm hidden (`input`,
+        // = h_t) for the MTP draft head. `mtp_h_buf` is `Some` only under
+        // `VF_MTP_DRAFT`, so this is gated + free otherwise. Copied before
+        // `dispatch_final` (which RMSNorms `input` for the lm_head).
+        if let Some(hb) = self.mtp_h_buf.as_ref().map(|b| b.handle) {
+            let bytes = (self.config.hidden_dim as u64) * 4;
+            let bar = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            let copy = vk::BufferCopy::default().src_offset(0).dst_offset(0).size(bytes);
+            unsafe {
+                dev.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&bar), &[], &[],
+                );
+                dev.device.cmd_copy_buffer(cmd, input, hb, std::slice::from_ref(&copy));
+            }
+        }
+
         self.dispatch_final(dev, registry, cmd, model, input);
 
         // Sprint 27 — copy logits from GpuOnly logits_buf to host-mapped
