@@ -1287,6 +1287,25 @@ mod tests {
         }
     }
 
+    // Sprint F.1-fix — the trunk forward must run `n_main` layers for
+    // qwen35 (the trailing MTP/nextn block stays loaded as the future
+    // draft head but must NOT run in the trunk residual → lm_head). For
+    // every other arch `trunk_layers() == n_layers`.
+    #[test]
+    fn trunk_layers_excludes_qwen35_mtp_block() {
+        let cfg = qwen35_cfg();
+        assert_eq!(cfg.n_layers, 65);
+        assert_eq!(cfg.trunk_layers(), 64, "qwen35 trunk must exclude the MTP block");
+        assert_eq!(cfg.trunk_layers(), cfg.qwen35.as_ref().unwrap().n_main());
+    }
+
+    #[test]
+    fn trunk_layers_unchanged_for_non_qwen35() {
+        let cfg = gemma4_cfg();
+        assert!(cfg.qwen35.is_none());
+        assert_eq!(cfg.trunk_layers(), cfg.n_layers, "non-qwen35 trunk == n_layers");
+    }
+
     /// Sprint G-2b — recurrent (Linear-Attn) layers emit the full
     /// 12-step SSM attention sub-block + 6-step FFN = 19 steps total
     /// (incl. the prefix `AttnNorm`). Mirrors llama.cpp's

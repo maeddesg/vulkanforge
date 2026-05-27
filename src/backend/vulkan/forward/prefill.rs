@@ -177,8 +177,11 @@ impl Forward {
         if !multi {
             cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
                 self.record_prefill_seed(dev, registry, cmd, model, &cfg, seq_len, hidden, hidden_bytes);
-                for layer in 0..cfg.n_layers {
-                    let next_w = if layer + 1 < cfg.n_layers {
+                // F.1-fix — trunk = trunk_layers() (n_main for qwen35), so
+                // the MTP block never runs in the batched prefill trunk.
+                let nl = cfg.trunk_layers();
+                for layer in 0..nl {
+                    let next_w = if layer + 1 < nl {
                         Some(layer_weight(model, layer + 1, "attn_norm.weight"))
                     } else {
                         None
@@ -208,10 +211,12 @@ impl Forward {
             self.record_prefill_seed(dev, registry, cb0, model, &cfg, seq_len, hidden, hidden_bytes);
 
             // Layer loop with chunk boundaries.
+            // F.1-fix — trunk = trunk_layers() (n_main for qwen35).
+            let nl = cfg.trunk_layers();
             let mut chunk: usize = 0;
-            for layer in 0..cfg.n_layers {
+            for layer in 0..nl {
                 let cmd = self.prefill_cbs[chunk];
-                let next_w = if layer + 1 < cfg.n_layers {
+                let next_w = if layer + 1 < nl {
                     Some(layer_weight(model, layer + 1, "attn_norm.weight"))
                 } else {
                     None
@@ -224,7 +229,7 @@ impl Forward {
                 // Only between chunks — never after the very last layer
                 // (that's the last-chunk path with the finalize tail).
                 let crossed_boundary = (layer + 1) % interval == 0;
-                let last_layer = layer + 1 == cfg.n_layers;
+                let last_layer = layer + 1 == nl;
                 if crossed_boundary && !last_layer {
                     unsafe {
                         dev.device.end_command_buffer(cmd)?;

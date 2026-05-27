@@ -71,7 +71,12 @@ impl Forward {
         // `hidden_staging.read_bytes()` path.
         let dump_all_layers = std::env::var("VF_LAYER_DUMP_ALL").is_ok();
         let bytes_per_slot = (self.config.hidden_dim as u64) * 4;
-        for layer in 0..self.config.n_layers {
+        // Sprint F.1-fix — trunk runs `trunk_layers()` (= n_main for
+        // qwen35), so the qwen35 MTP block (layer == n_main) is NOT
+        // dispatched into the trunk residual. `dispatch_final(input)`
+        // below then sees the post-trunk hidden state. Non-qwen35 archs:
+        // trunk_layers() == n_layers (unchanged).
+        for layer in 0..self.config.trunk_layers() {
             self.dispatch_layer(dev, registry, cmd, model, layer, position, input, output);
             let want_dump = dump_layer == (layer as i32) || dump_all_layers;
             if want_dump {
@@ -638,7 +643,8 @@ impl Forward {
             // (Sprint 15E — share the same recording body with the async
             // path. The serial path skips per-layer profile-boundary
             // capture; the async path doesn't use the profiler.)
-            for _ in 0..self.config.n_layers {
+            // F.1-fix — match the trunk dispatch count (trunk_layers()).
+            for _ in 0..self.config.trunk_layers() {
                 if let Some(p) = self.profiler.as_ref() {
                     per_layer_starts.push(p.entries_len());
                 }

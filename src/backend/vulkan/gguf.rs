@@ -1081,6 +1081,24 @@ impl Gemma4Spec {
 }
 
 impl ModelConfig {
+    /// Number of transformer layers the **trunk forward** executes.
+    ///
+    /// For qwen35 (Qwen3.5/3.6) this is `n_main = block_count -
+    /// nextn_predict_layers` — the trailing `nextn` block(s) are the MTP
+    /// draft head and must NOT run in the trunk (their tensors stay
+    /// loaded for the F.2 draft head). Mirrors llama.cpp
+    /// `qwen35.cpp:162` `n_transformer_layers`. For every other arch
+    /// this is just `n_layers` (no MTP block). Sprint F.1-fix: before
+    /// this, the decode/prefill loops ran `0..n_layers`, dispatching the
+    /// qwen35 MTP block's FFN into the trunk residual (a base deviation;
+    /// 65 vs 64 FFN/token).
+    pub fn trunk_layers(&self) -> u32 {
+        match self.qwen35.as_ref() {
+            Some(spec) => spec.n_main(),
+            None => self.n_layers,
+        }
+    }
+
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self, GgufError> {
         let architecture = gguf.metadata_str("general.architecture")?.to_string();
         let arch = architecture.as_str();
