@@ -517,6 +517,37 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Sprint 56B — GPU-side MoE router init. No-op for non-MoE models.
     forward.init_moe_router_gpu(&dev, &mut allocator, &model, max_context)?;
 
+    // Sprint G.9-spike — VF_BALLAST_MB env-gated, post-load read-never
+    // VRAM ballast. Reserves headroom to test whether the ≥12 GB BW cliff
+    // is pressure-driven or offset-fixed. Default unset → 0 effect; on
+    // unset the allocation block is skipped entirely (bit-identical to
+    // pre-spike main). Held by `_g9_ballast` until process exit; the OS
+    // reclaims VRAM, no explicit destroy needed for a diagnostic spike.
+    let _g9_ballast: Option<vulkanforge::backend::vulkan::buffers::GpuBuffer> = std::env::var("VF_BALLAST_MB")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .and_then(|mb| {
+            let bytes = mb * 1024 * 1024;
+            match vulkanforge::backend::vulkan::buffers::GpuBuffer::new(
+                &dev.device,
+                &mut allocator,
+                bytes,
+                ash::vk::BufferUsageFlags::STORAGE_BUFFER,
+                gpu_allocator::MemoryLocation::GpuOnly,
+                "g9_spike_ballast",
+            ) {
+                Ok(buf) => {
+                    eprintln!("[VF_BALLAST_MB] reserved {mb} MB of post-load VRAM ballast (read-never)");
+                    Some(buf)
+                }
+                Err(e) => {
+                    eprintln!("[VF_BALLAST_MB] could not allocate {mb} MB ballast: {e} (continuing without ballast)");
+                    None
+                }
+            }
+        });
+
     print_banner(
         &model_path,
         &cfg,
