@@ -15,7 +15,7 @@ use super::{
     MOE_LAYER0_LOGGED,
 };
 use super::super::arch::{
-    compute_barrier, layer_weight, layer_weight_indexed_shader, layer_weight_mm_id_shader,
+    compute_barrier, layer_weight, layer_weight_with_offset, layer_weight_indexed_shader, layer_weight_mm_id_shader,
     layer_weight_mmq_id_shader, layer_weight_shader, transfer_to_compute_barrier,
 };
 use super::super::state::Forward;
@@ -620,8 +620,11 @@ impl DecodeExec {
             "moe_experts.down_proj",
             fwd.mul_mat_vec_subgroup_enabled,
         );
-        let gate_up_w = layer_weight(ctx.model, ctx.layer, "moe_experts.gate_up_proj");
-        let down_w    = layer_weight(ctx.model, ctx.layer, "moe_experts.down_proj");
+        // Sprint B Phase 1 — bucket-aware lookup (decode non-batched gpu_direct).
+        let (gate_up_w, gate_up_off, gate_up_sz) =
+            layer_weight_with_offset(ctx.model, ctx.layer, "moe_experts.gate_up_proj");
+        let (down_w, down_off, down_sz) =
+            layer_weight_with_offset(ctx.model, ctx.layer, "moe_experts.down_proj");
 
         let router = fwd.moe_router_gpu.as_ref()
             .expect("step_moe_expert_ffn_gpu_direct requires moe_router_gpu");
@@ -644,7 +647,7 @@ impl DecodeExec {
             // (a) gate_up GEMV (indexed): scratch_b × experts.gate_up_proj[indices[slot]] → gate_buf.
             fwd.run_gemv_indexed_at_offset(
                 ctx.dev, ctx.registry, ctx.cmd,
-                gate_up_w,
+                gate_up_w, gate_up_off, gate_up_sz,    // Sprint B Phase 1: bucket sub-range
                 scratch_b, 0, h_bytes,
                 gate_buf, 0, 2 * mi_bytes,
                 indices_buf,
@@ -687,7 +690,7 @@ impl DecodeExec {
             // (c) down GEMV (indexed): up_buf × experts.down_proj[indices[slot]] → o_buf.
             fwd.run_gemv_indexed_at_offset(
                 ctx.dev, ctx.registry, ctx.cmd,
-                down_w,
+                down_w, down_off, down_sz,             // Sprint B Phase 1: bucket sub-range
                 up_buf, 0, (down_k as u64) * 4,
                 o_buf, 0, h_bytes,
                 indices_buf,
@@ -778,8 +781,16 @@ impl DecodeExec {
             "moe_experts.down_proj",
             fwd.mul_mat_vec_subgroup_enabled,
         );
-        let gate_up_w = layer_weight(ctx.model, ctx.layer, "moe_experts.gate_up_proj");
-        let down_w    = layer_weight(ctx.model, ctx.layer, "moe_experts.down_proj");
+        // Sprint B Phase 1 — bucket-aware lookup. For non-bucketed
+        // tensors `byte_offset=0` and `byte_size=tensor.byte_size`, so
+        // descriptor sub-range binding is equivalent to the legacy
+        // (handle, 0, WHOLE_SIZE) form. For bucketed tensors (under
+        // VF_BUCKET_POC=1) the handle is the shared bucket and the
+        // offset/size delimits this layer's slice within it.
+        let (gate_up_w, gate_up_off, gate_up_sz) =
+            layer_weight_with_offset(ctx.model, ctx.layer, "moe_experts.gate_up_proj");
+        let (down_w, down_off, down_sz) =
+            layer_weight_with_offset(ctx.model, ctx.layer, "moe_experts.down_proj");
 
         // Snapshot router + batched-scratch buffer handles up-front so
         // subsequent `&mut self` calls on Forward don't fight the
@@ -824,7 +835,7 @@ impl DecodeExec {
         //     (shared token hidden), so ne11=1 / stride_b=0.
         fwd.run_gemv_indexed_batched(
             ctx.dev, ctx.registry, ctx.cmd,
-            gate_up_w,
+            gate_up_w, gate_up_off, gate_up_sz,        // Sprint B Phase 1: bucket sub-range
             scratch_b, 0, h_bytes,
             gate_up_out, 0, gate_up_out_total,
             indices_buf,
@@ -915,7 +926,7 @@ impl DecodeExec {
         //     ne11=top_k / stride_b=down_k. Output `down_out[k * h]`.
         fwd.run_gemv_indexed_batched(
             ctx.dev, ctx.registry, ctx.cmd,
-            down_w,
+            down_w, down_off, down_sz,                 // Sprint B Phase 1: bucket sub-range
             glu_out, 0, (top_k as u64) * (down_k as u64) * 4,
             down_out, 0, down_out_total,
             indices_buf,
@@ -1157,12 +1168,15 @@ impl DecodeExec {
             ctx.model, layer, "moe_experts.down_proj",
             fwd.mul_mat_vec_subgroup_enabled,
         );
-        let gate_up_w = layer_weight(ctx.model, layer, "moe_experts.gate_up_proj");
-        let down_w    = layer_weight(ctx.model, layer, "moe_experts.down_proj");
+        let (gate_up_w, gate_up_off, gate_up_sz) =
+            layer_weight_with_offset(ctx.model, layer, "moe_experts.gate_up_proj");
+        let (down_w, down_off, down_sz) =
+            layer_weight_with_offset(ctx.model, layer, "moe_experts.down_proj");
         MoeFfnMeta {
             mi, top_k: g.top_k_experts, n_experts,
             gate_up_elems, down_elems, down_k,
             gate_up_shader, down_shader, gate_up_w, down_w,
+            gate_up_off, gate_up_sz, down_off, down_sz,
         }
     }
 
@@ -1181,7 +1195,7 @@ impl DecodeExec {
         };
         fwd.run_gemv_indexed_batched(
             ctx.dev, ctx.registry, ctx.cmd,
-            m.gate_up_w,
+            m.gate_up_w, m.gate_up_off, m.gate_up_sz,  // Sprint B Phase 1: bucket sub-range
             scratch_b, 0, h_bytes,
             gate_up_out, 0, gate_up_out_total,
             indices_buf,
@@ -1248,7 +1262,7 @@ impl DecodeExec {
         };
         fwd.run_gemv_indexed_batched(
             ctx.dev, ctx.registry, ctx.cmd,
-            m.down_w,
+            m.down_w, m.down_off, m.down_sz,           // Sprint B Phase 1: bucket sub-range
             glu_out, 0, glu_total,
             down_out, 0, down_out_total,
             indices_buf,
@@ -1296,6 +1310,13 @@ struct MoeFfnMeta {
     down_shader: ShaderId,
     gate_up_w: vk::Buffer,
     down_w: vk::Buffer,
+    // Sprint B Phase 1 — bucket sub-range info. For non-bucketed
+    // tensors `gate_up_off=0` / `gate_up_sz=tensor.byte_size`, which
+    // produces a legacy-equivalent descriptor binding.
+    gate_up_off: u64,
+    gate_up_sz: u64,
+    down_off: u64,
+    down_sz: u64,
 }
 
 impl BatchExec {
@@ -1748,8 +1769,11 @@ impl BatchExec {
             "moe_experts.down_proj",
             fwd.mul_mat_vec_subgroup_enabled,
         );
-        let gate_up_w = layer_weight(ctx.model, ctx.layer, "moe_experts.gate_up_proj");
-        let down_w    = layer_weight(ctx.model, ctx.layer, "moe_experts.down_proj");
+        // Sprint B Phase 1 — bucket-aware lookup (prefill batched path).
+        let (gate_up_w, gate_up_off, gate_up_sz) =
+            layer_weight_with_offset(ctx.model, ctx.layer, "moe_experts.gate_up_proj");
+        let (down_w, down_off, down_sz) =
+            layer_weight_with_offset(ctx.model, ctx.layer, "moe_experts.down_proj");
 
         let router = fwd.moe_router_gpu.as_ref()
             .expect("b_step_moe_expert_ffn_gpu_direct requires moe_router_gpu");
@@ -1779,7 +1803,7 @@ impl BatchExec {
                 // (a) gate_up indexed GEMV.
                 fwd.run_gemv_indexed_at_offset(
                     ctx.dev, ctx.registry, ctx.cmd,
-                    gate_up_w,
+                    gate_up_w, gate_up_off, gate_up_sz,  // Sprint B Phase 1: bucket sub-range
                     batch_in, in_off, h_bytes,
                     gate_buf, 0, 2 * mi_bytes,
                     indices_buf,
@@ -1822,7 +1846,7 @@ impl BatchExec {
                 // (c) down indexed GEMV.
                 fwd.run_gemv_indexed_at_offset(
                     ctx.dev, ctx.registry, ctx.cmd,
-                    down_w,
+                    down_w, down_off, down_sz,           // Sprint B Phase 1: bucket sub-range
                     up_buf, 0, (down_k as u64) * 4,
                     o_buf, 0, h_bytes,
                     indices_buf,
@@ -2131,7 +2155,8 @@ impl BatchExec {
                 ctx.model, ctx.layer, "moe_experts.down_proj",
                 fwd.mul_mat_vec_subgroup_enabled,
             );
-            let down_w = layer_weight(ctx.model, ctx.layer, "moe_experts.down_proj");
+            let (down_w, down_off_b, down_sz_b) =
+                layer_weight_with_offset(ctx.model, ctx.layer, "moe_experts.down_proj");
             let router_idx = router_indices;
             let router_w = router_weights;
             let o_buf = fwd.cur().o_buf.handle;
@@ -2154,7 +2179,7 @@ impl BatchExec {
                     //     at the slot's mi-block offset.
                     fwd.run_gemv_indexed_at_offset(
                         ctx.dev, ctx.registry, ctx.cmd,
-                        down_w,
+                        down_w, down_off_b, down_sz_b,    // Sprint B Phase 1: bucket sub-range
                         grouped_glu_out, glu_off, (down_k as u64) * 4,
                         o_buf, 0, h_bytes,
                         router_idx,

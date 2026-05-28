@@ -106,6 +106,13 @@ impl From<vk::Result> for LoaderError {
 
 pub struct GpuTensor {
     pub buffer: GpuBuffer,
+    /// Sprint B Phase 1 — byte-offset of this tensor's data within its
+    /// `buffer`. `0` for the default "1 VkBuffer per tensor" path; >0
+    /// when the tensor is packed into a contiguous bucket (then
+    /// `buffer.handle` is the bucket's shared VkBuffer and the
+    /// dispatch code must bind sub-range `(handle, byte_offset, byte_size)`
+    /// instead of `(handle, 0, WHOLE_SIZE)`).
+    pub byte_offset: u64,
     pub shape: Vec<u64>,
     pub ggml_type: GgmlType,
     pub byte_size: u64,
@@ -167,6 +174,14 @@ pub struct LoadedModel {
     /// upload to free ~21 MB of VRAM. `Some` only when the model is
     /// Gemma-4 with `enable_moe_block=true`.
     pub moe_router_data: Option<MoeRouterData>,
+    /// Sprint B Phase 1 — bucketed weight buffers (≥1 GB each) for
+    /// MoE-expert tensors under `VF_BUCKET_POC=1`. Empty Vec when
+    /// bucketing is off (default). Each tensor that was packed into a
+    /// bucket has `GpuTensor::buffer.shared = true` (non-owning view)
+    /// and `GpuTensor::byte_offset > 0`; this Vec owns the actual
+    /// VkDeviceMemory backing those tensors and is freed when
+    /// `LoadedModel` is dropped.
+    pub buckets: Vec<GpuBuffer>,
 }
 
 /// Sprint 43D-3 + 43D-4 — Per-Layer Embeddings runtime state for Gemma-4.
@@ -684,19 +699,132 @@ impl LoadedModel {
         // 5 % (59 → 56). Until Sprints F-G land real Linear-Attn
         // dispatch and the trade-off can be re-evaluated, this is
         // env-gated opt-in (not default).
-        if std::env::var("VF_LMHEAD_ALLOC_FIRST").is_ok() {
-            let lm_idx = tensor_names
-                .iter()
-                .position(|n| *n == "output.weight")
-                .or_else(|| tensor_names.iter().position(|n| *n == "token_embd.weight"));
-            if let Some(i) = lm_idx {
-                let lm = tensor_names.remove(i);
-                tensor_names.insert(0, lm);
-                eprintln!(
-                    "[VF_LMHEAD_ALLOC_FIRST] hoisted '{}' to position 0 ({}-th of {})",
-                    lm, i, tensor_names.len(),
-                );
+        // Sprint G.8 — Smart Allocation-Reorder Policy. Generalisiert die
+        // zwei Vorgänger-Flags (`VF_LMHEAD_ALLOC_FIRST` Sprint J,
+        // `VF_HOIST_ATTN_PROJ` G.7) zu einer einzigen Prioritäts-Policy.
+        // Ranking nach „Decode-BW-Sensitivität pro Byte": klein +
+        // decode-heiß zuerst, große sparse-MoE-Experten zuletzt.
+        // Reorder-only — keine Tensor-Daten oder per-Tensor-Allokations-
+        // Strategie berührt; der Forward liest Tensoren per Name. Logits
+        // bleiben bit-identisch (G.7-verifiziert).
+        //
+        // Tiers (höchste = fast-region):
+        //   0 lm_head            (output.weight / token_embd.weight)
+        //   1 attn-proj          (attn_q/k/v/output)
+        //   2 dense FFN          (ffn_gate/up/down — Gemma-4 dense, NICHT MoE)
+        //   3 small per-layer    (norms, scales, gate_inp)
+        //   4 MoE experts        (ffn_gate_up_exps, ffn_down_exps — sparse, top-8/128)
+        //   5 fallback           (alles andere)
+        //
+        // VF_ALLOC_POLICY values:
+        //   unset / "off"  → no reorder (baseline)
+        //   "lmhead"       → tier 0 only (= VF_LMHEAD_ALLOC_FIRST äquivalent)
+        //   "attn"         → tier 0+1   (= G.7-Hoist-Probe äquivalent)
+        //   "dense"        → tier 0+1+2
+        //   "small"        → tier 0+1+2+3
+        //   "smart"        → alias für "small"
+        //
+        // Abwärtskompatibilität: die zwei alten Flags wirken weiterhin als
+        // implizite Spezialfälle (siehe `policy_cutoff` Match unten).
+        let policy_cutoff: i32 = {
+            let explicit = std::env::var("VF_ALLOC_POLICY").ok();
+            let lmhead_legacy = std::env::var("VF_LMHEAD_ALLOC_FIRST").is_ok();
+            let attn_legacy   = std::env::var("VF_HOIST_ATTN_PROJ").is_ok();
+            match explicit.as_deref() {
+                Some("off") | Some("") => -1,
+                Some("lmhead")          => 0,
+                Some("attn")            => 1,
+                Some("dense")           => 2,
+                Some("small") | Some("smart") => 3,
+                Some(other) => {
+                    eprintln!("[VF_ALLOC_POLICY] unknown value '{other}', falling back to legacy flags");
+                    if attn_legacy { 1 }
+                    else if lmhead_legacy { 0 }
+                    else { -1 }
+                }
+                None => {
+                    if attn_legacy { 1 }
+                    else if lmhead_legacy { 0 }
+                    else { -1 }
+                }
             }
+        };
+
+        if policy_cutoff >= 0 {
+            fn tier_of(name: &str) -> i32 {
+                if name == "output.weight" || name == "token_embd.weight" {
+                    0
+                } else if name.ends_with(".attn_q.weight")
+                    || name.ends_with(".attn_k.weight")
+                    || name.ends_with(".attn_v.weight")
+                    || name.ends_with(".attn_output.weight")
+                {
+                    1
+                } else if name.ends_with(".ffn_gate.weight")
+                    || name.ends_with(".ffn_up.weight")
+                    || name.ends_with(".ffn_down.weight")
+                {
+                    2
+                } else if name.ends_with(".attn_norm.weight")
+                    || name.ends_with(".attn_q_norm.weight")
+                    || name.ends_with(".attn_k_norm.weight")
+                    || name.ends_with(".ffn_norm.weight")
+                    || name.ends_with(".post_attention_norm.weight")
+                    || name.ends_with(".post_ffw_norm.weight")
+                    || name.ends_with(".post_ffw_norm_1.weight")
+                    || name.ends_with(".post_ffw_norm_2.weight")
+                    || name.ends_with(".pre_ffw_norm_2.weight")
+                    || name.ends_with(".layer_output_scale.weight")
+                    || name.ends_with(".ffn_gate_inp.weight")
+                    || name.ends_with(".ffn_gate_inp.scale")
+                    || name == "output_norm.weight"
+                {
+                    3
+                } else if name.ends_with(".ffn_gate_up_exps.weight")
+                    || name.ends_with(".ffn_down_exps.weight")
+                {
+                    4
+                } else {
+                    5
+                }
+            }
+            // Stable two-class sort: hoisted tiers (≤ cutoff) sorted by tier
+            // (T0 first, T1 next, etc.); non-hoisted tiers (> cutoff) keep
+            // their ORIGINAL relative order. This means e.g. cutoff=0 hoists
+            // only lm_head while leaving ALL other tensors in the natural
+            // alphabetic order (= the old VF_LMHEAD_ALLOC_FIRST behaviour).
+            // Without this two-class split, lower-tier non-hoisted tensors
+            // would still get sub-sorted ahead of higher-tier ones, which
+            // would silently make "lmhead" behave like "smart".
+            let mut indexed: Vec<(i32, usize, &str)> = tensor_names
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(i, n)| {
+                    let t = tier_of(n);
+                    let rank = if t <= policy_cutoff {
+                        t                   // hoisted: arrange by tier
+                    } else {
+                        i32::MAX            // non-hoisted: stable on original index
+                    };
+                    (rank, i, n)
+                })
+                .collect();
+            indexed.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+            // Tier-Histogramm für Log
+            let mut tier_count = [0u32; 6];
+            for n in tensor_names.iter() {
+                let t = tier_of(n) as usize;
+                if t < 6 { tier_count[t] += 1; }
+            }
+            tensor_names = indexed.into_iter().map(|(_, _, n)| n).collect();
+            eprintln!(
+                "[VF_ALLOC_POLICY] cutoff={} (T0=lmhead T1=attn T2=denseFFN T3=norms T4=moeExps T5=rest) \
+                 per-tier-count={:?}",
+                policy_cutoff,
+                tier_count,
+            );
         }
 
         // Sprint 52A — Gemma-4 GGUFs use llama.cpp-style tensor suffixes
@@ -731,6 +859,103 @@ impl LoadedModel {
         let mut staging_off: u64 = 0;
         // (dst_buffer_handle, src_offset_in_staging, dst_offset, size)
         let mut pending: Vec<(vk::Buffer, vk::BufferCopy)> = Vec::new();
+
+        // Sprint B Phase 1 — MoE-expert PoC bucketing (env-gated).
+        // When `VF_BUCKET_POC=1`, pre-allocate two contiguous backend
+        // buffers (≥1 GB each, dedicated VkDeviceMemory) and pack all
+        // `*.ffn_gate_up_exps.weight` + `*.ffn_down_exps.weight` tensors
+        // into them at known offsets. This replicates llama.cpp's
+        // Vulkan-backend pattern (1 vk_buffer per ~1-GB region + per-
+        // tensor offsets via vk_subbuffer descriptor bindings) for the
+        // single biggest cliff group (G.9 verdict: VFs allocation-
+        // strategy is the cliff mechanism).
+        //
+        // For non-bucketed tensors (everything else), the normal
+        // 1-VkBuffer-per-tensor path is unchanged → `byte_offset=0`,
+        // descriptor-bind stays `(0, weights, 0, WHOLE_SIZE)`.
+        //
+        // The bucket buffers themselves are returned in
+        // `LoadedModel::buckets` so the caller owns the lifecycle.
+        let bucket_poc = std::env::var("VF_BUCKET_POC")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        // bucket_map: GGUF tensor name → (bucket-vk::Buffer, byte_offset, byte_size)
+        let mut bucket_map: HashMap<&str, (vk::Buffer, u64, u64)> = HashMap::new();
+        let mut buckets: Vec<GpuBuffer> = Vec::new();
+
+        if bucket_poc {
+            // Phase 1 scope: ONLY MoE-expert tensors. Sum sizes per bucket type,
+            // align offsets to `minStorageBufferOffsetAlignment` so descriptor
+            // sub-range bindings are valid.
+            let min_align = unsafe {
+                dev.instance
+                    .get_physical_device_properties(dev.physical_device)
+                    .limits
+                    .min_storage_buffer_offset_alignment
+            };
+            let align = min_align.max(16);
+            let align_up = |x: u64| ((x + align - 1) / align) * align;
+
+            let is_gate_up = |n: &str| n.ends_with(".ffn_gate_up_exps.weight");
+            let is_down    = |n: &str| n.ends_with(".ffn_down_exps.weight");
+
+            // Pass 1: compute total sizes
+            let mut total_gate_up: u64 = 0;
+            let mut total_down:    u64 = 0;
+            for n in &tensor_names {
+                let info = gguf.tensor(n).expect("name from same map");
+                let sz = info.byte_size();
+                if is_gate_up(n) { total_gate_up += align_up(sz); }
+                else if is_down(n) { total_down += align_up(sz); }
+            }
+
+            if total_gate_up > 0 {
+                let buf = GpuBuffer::new(
+                    &dev.device, allocator, total_gate_up,
+                    vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                    MemoryLocation::GpuOnly,
+                    "g.b.bucket_moe_gate_up_exps",
+                ).map_err(|e| LoaderError::Buffer(format!("bucket gate_up alloc: {e}")))?;
+                let handle = buf.handle;
+                let mut off: u64 = 0;
+                for n in &tensor_names {
+                    if !is_gate_up(n) { continue; }
+                    let sz = gguf.tensor(n).expect("name").byte_size();
+                    bucket_map.insert(*n, (handle, off, sz));
+                    off += align_up(sz);
+                }
+                eprintln!(
+                    "[VF_BUCKET_POC] gate_up bucket: {} bytes ({:.2} GiB), {} tensors packed",
+                    total_gate_up, total_gate_up as f64 / 1024.0 / 1024.0 / 1024.0,
+                    bucket_map.len(),
+                );
+                buckets.push(buf);
+            }
+            if total_down > 0 {
+                let n_before = bucket_map.len();
+                let buf = GpuBuffer::new(
+                    &dev.device, allocator, total_down,
+                    vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                    MemoryLocation::GpuOnly,
+                    "g.b.bucket_moe_down_exps",
+                ).map_err(|e| LoaderError::Buffer(format!("bucket down alloc: {e}")))?;
+                let handle = buf.handle;
+                let mut off: u64 = 0;
+                for n in &tensor_names {
+                    if !is_down(n) { continue; }
+                    let sz = gguf.tensor(n).expect("name").byte_size();
+                    bucket_map.insert(*n, (handle, off, sz));
+                    off += align_up(sz);
+                }
+                eprintln!(
+                    "[VF_BUCKET_POC] down bucket: {} bytes ({:.2} GiB), {} tensors packed",
+                    total_down, total_down as f64 / 1024.0 / 1024.0 / 1024.0,
+                    bucket_map.len() - n_before,
+                );
+                buckets.push(buf);
+            }
+        }
 
         // Load-progress bar (stderr, env-toggleable). For a 360-tensor
         // Gemma-4 GGUF this fires ~100 times; for an 8B Q4_K_M (~290
@@ -824,27 +1049,62 @@ impl LoadedModel {
                 staging_off = 0;
             }
 
-            // Allocate the destination buffer.
-            let dst = match GpuBuffer::new(
-                &dev.device,
-                allocator,
-                size,
-                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-                MemoryLocation::GpuOnly,
-                name,
-            ) {
-                Ok(b) => b,
-                Err(e) => {
-                    staging.destroy(&dev.device, allocator);
-                    cmd_ctx.destroy(&dev.device);
-                    for (_, t) in tensors.drain() {
-                        t.buffer.destroy(&dev.device, allocator);
-                    }
-                    return Err(LoaderError::Buffer(format!(
-                        "tensor '{name}' alloc: {e}"
-                    )));
+            // Sprint B Phase 1 — choose destination: bucket (shared
+            // view + offset) or per-tensor allocation (legacy path).
+            let bucket_entry = bucket_map.get(name).copied();
+            let (dst, tensor_byte_offset, copy_dst_offset, copy_dst_handle): (GpuBuffer, u64, u64, vk::Buffer) = match bucket_entry {
+                Some((bucket_handle, off, sz)) => {
+                    // Bucketed: non-owning view at the bucket's offset.
+                    // The cmd_copy_buffer destination must be the bucket
+                    // handle + per-tensor byte_offset.
+                    debug_assert_eq!(sz, size, "bucket-map size mismatch for '{name}'");
+                    (GpuBuffer::shared_view(bucket_handle, sz), off, off, bucket_handle)
+                }
+                None => {
+                    // Normal path: one VkBuffer per tensor.
+                    let b = match GpuBuffer::new(
+                        &dev.device,
+                        allocator,
+                        size,
+                        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                        MemoryLocation::GpuOnly,
+                        name,
+                    ) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            staging.destroy(&dev.device, allocator);
+                            cmd_ctx.destroy(&dev.device);
+                            for (_, t) in tensors.drain() {
+                                t.buffer.destroy(&dev.device, allocator);
+                            }
+                            for bk in buckets.drain(..) { bk.destroy(&dev.device, allocator); }
+                            return Err(LoaderError::Buffer(format!(
+                                "tensor '{name}' alloc: {e}"
+                            )));
+                        }
+                    };
+                    let h = b.handle;
+                    (b, 0, 0, h)
                 }
             };
+
+            // Sprint G.6b — VF_VRAM_DIAG placement log (log-only, behaviour-
+            // identical with the flag off). For bucketed tensors logs the
+            // bucket-relative offset (debug_placement returns None for
+            // shared views).
+            if std::env::var("VF_VRAM_DIAG").is_ok() {
+                if let Some((mem, off)) = dst.debug_placement() {
+                    eprintln!(
+                        "[VF_VRAM_DIAG] ord={:04} size={:>11} mem=0x{:016x} off=0x{:010x} name={}",
+                        load_progress_i, size, mem, off, name,
+                    );
+                } else if bucket_entry.is_some() {
+                    eprintln!(
+                        "[VF_VRAM_DIAG] ord={:04} size={:>11} BUCKETED bucket_off=0x{:010x} name={}",
+                        load_progress_i, size, tensor_byte_offset, name,
+                    );
+                }
+            }
 
             // Copy mmap → staging. For BF16 tensors `upload_bytes_owned`
             // holds the host-expanded FP32 buffer; otherwise use the
@@ -858,10 +1118,10 @@ impl LoadedModel {
                 .map_err(|e| LoaderError::Buffer(e.to_string()))?;
 
             pending.push((
-                dst.handle,
+                copy_dst_handle,
                 vk::BufferCopy::default()
                     .src_offset(staging_off)
-                    .dst_offset(0)
+                    .dst_offset(copy_dst_offset)
                     .size(size),
             ));
             staging_off += size;
@@ -871,6 +1131,7 @@ impl LoadedModel {
                 stored_name,
                 GpuTensor {
                     buffer: dst,
+                    byte_offset: tensor_byte_offset,
                     shape: info.dimensions.clone(),
                     ggml_type: upload_type,
                     byte_size: size,
@@ -1067,6 +1328,7 @@ impl LoadedModel {
                         key,
                         GpuTensor {
                             buffer: dst,
+                            byte_offset: 0,
                             shape: vec![norm_dim as u64],
                             ggml_type: GgmlType::F32,
                             byte_size: synth_size,
@@ -1126,6 +1388,7 @@ impl LoadedModel {
             cpu_lm_head: None,
             ple_data,
             moe_router_data,
+            buckets,
         })
     }
 
@@ -1717,6 +1980,7 @@ impl LoadedModel {
                 plan.vf_name.clone(),
                 GpuTensor {
                     buffer: dst,
+                    byte_offset: 0,
                     shape: plan.shape.clone(),
                     ggml_type: plan.target_dtype,
                     byte_size: size,
@@ -2119,6 +2383,7 @@ impl LoadedModel {
                 cpu_lm_head,
                 ple_data,
                 moe_router_data,
+                buckets: Vec::new(),
             },
             host_embed,
             hf,

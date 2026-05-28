@@ -20,6 +20,13 @@ pub struct GpuBuffer {
     pub handle: vk::Buffer,
     pub size: u64,
     allocation: Option<Allocation>,
+    /// Sprint B Phase 1 — when `true`, this GpuBuffer is a non-owning
+    /// view into a shared backing buffer (a bucket). `destroy()` then
+    /// skips both `allocator.free()` AND `device.destroy_buffer()` to
+    /// avoid double-free on the shared handle. The bucket's own
+    /// GpuBuffer (with `shared=false`) is owned by the LoadedModel and
+    /// frees the memory at teardown.
+    shared: bool,
 }
 
 impl GpuBuffer {
@@ -59,7 +66,16 @@ impl GpuBuffer {
             handle,
             size,
             allocation: Some(allocation),
+            shared: false,
         })
+    }
+
+    /// Sprint B Phase 1 — construct a non-owning view that aliases an
+    /// existing `vk::Buffer` (a bucket). Returned `GpuBuffer` has
+    /// `shared=true` so `destroy()` is a no-op; the underlying bucket
+    /// is owned elsewhere (LoadedModel::buckets).
+    pub fn shared_view(handle: vk::Buffer, size: u64) -> Self {
+        Self { handle, size, allocation: None, shared: true }
     }
 
     /// Write up to `bytes.len()` host-visible bytes to the buffer.
@@ -104,6 +120,12 @@ impl GpuBuffer {
     }
 
     pub fn destroy(mut self, device: &ash::Device, allocator: &mut Allocator) {
+        if self.shared {
+            // Sprint B Phase 1 — non-owning view into a bucket; skip
+            // both allocator.free and device.destroy_buffer so we don't
+            // double-free the shared handle.
+            return;
+        }
         if let Some(alloc) = self.allocation.take() {
             // free is best-effort; if it fails we still need to destroy
             // the VkBuffer to avoid a leak the validation layer would
@@ -111,5 +133,21 @@ impl GpuBuffer {
             let _ = allocator.free(alloc);
         }
         unsafe { device.destroy_buffer(self.handle, None) };
+    }
+
+    /// Sprint G.6b diag accessor — returns the underlying VkDeviceMemory
+    /// handle (as u64) and the suballocation offset within that memory.
+    /// Pure read-only; used by `VF_VRAM_DIAG` to correlate physical
+    /// placement with per-call GEMV BW. Behaviour-free (only the caller's
+    /// `eprintln` consumes it); returns None if the buffer has been freed.
+    pub fn debug_placement(&self) -> Option<(u64, u64)> {
+        use ash::vk::Handle as _;
+        let alloc = self.allocation.as_ref()?;
+        // SAFETY: Allocation::memory() is marked unsafe only because the
+        // returned handle's lifetime is tied to the Allocation; we use the
+        // raw u64 immediately for logging and never store/dereference it,
+        // so the lifetime constraint cannot be violated here.
+        let mem = unsafe { alloc.memory() };
+        Some((mem.as_raw(), alloc.offset()))
     }
 }

@@ -311,6 +311,24 @@ pub(crate) fn layer_weight(model: &LoadedModel, layer: u32, suffix: &str) -> vk:
         .handle
 }
 
+/// Sprint B Phase 1 — bucket-aware lookup. Returns
+/// `(buffer_handle, byte_offset, byte_size)`. For the default
+/// 1-VkBuffer-per-tensor path, byte_offset is 0 and the result is
+/// equivalent to `(layer_weight(...), 0, tensor.byte_size)`. For
+/// bucketed MoE-expert tensors under `VF_BUCKET_POC=1`, the handle is
+/// the shared bucket and byte_offset is the per-layer position
+/// within it; callers must bind sub-range `(handle, byte_offset,
+/// byte_size)` instead of `(handle, 0, WHOLE_SIZE)`.
+pub(crate) fn layer_weight_with_offset(
+    model: &LoadedModel, layer: u32, suffix: &str,
+) -> (vk::Buffer, u64, u64) {
+    let key = format!("blk.{layer}.{suffix}");
+    let t = model
+        .tensor(&key)
+        .unwrap_or_else(|| panic!("missing tensor '{key}'"));
+    (t.buffer.handle, t.byte_offset, t.byte_size)
+}
+
 /// Sprint 20-M3 — per-tensor dequant scale lookup. Returns 1.0 for
 /// GGUF tensors (which carry no per-tensor scale; their per-block
 /// scales live in the weight bytes themselves) and the actual FP32

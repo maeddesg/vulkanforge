@@ -1572,6 +1572,8 @@ impl Forward {
         registry: &PipelineRegistry,
         cmd: vk::CommandBuffer,
         weights: vk::Buffer,
+        weights_offset: u64,          // Sprint B Phase 1 — bucket sub-range start
+        weights_range: u64,           // Sprint B Phase 1 — bucket sub-range size (0 = WHOLE_SIZE)
         input: vk::Buffer, input_offset: u64, input_range: u64,
         output: vk::Buffer, output_offset: u64, output_range: u64,
         indices: vk::Buffer,
@@ -1586,7 +1588,7 @@ impl Forward {
         let set = self.alloc_or_get_set(
             dev, kernel.descriptor_set_layout,
             &[
-                (0, weights, 0, 0),
+                (0, weights, weights_offset, weights_range),
                 (1, input,  input_offset,  input_range),
                 (2, output, output_offset, output_range),
                 (3, self.fuse0.handle, 0, 0),
@@ -1648,6 +1650,8 @@ impl Forward {
         registry: &PipelineRegistry,
         cmd: vk::CommandBuffer,
         weights: vk::Buffer,
+        weights_offset: u64,          // Sprint B Phase 1 — bucket sub-range start
+        weights_range: u64,           // Sprint B Phase 1 — bucket sub-range size (0 = WHOLE_SIZE)
         input: vk::Buffer, input_offset: u64, input_range: u64,
         output: vk::Buffer, output_offset: u64, output_range: u64,
         indices: vk::Buffer,
@@ -1664,7 +1668,7 @@ impl Forward {
         let set = self.alloc_or_get_set(
             dev, kernel.descriptor_set_layout,
             &[
-                (0, weights, 0, 0),
+                (0, weights, weights_offset, weights_range),
                 (1, input,  input_offset,  input_range),
                 (2, output, output_offset, output_range),
                 (3, self.fuse0.handle, 0, 0),
