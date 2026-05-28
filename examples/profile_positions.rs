@@ -79,7 +79,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let gguf = GgufFile::open(&model_path)?;
     let cfg = ModelConfig::from_gguf(&gguf)?;
     let load_start = Instant::now();
-    let model = LoadedModel::load(&dev, &mut allocator, &gguf)?;
+    let model = LoadedModel::load(&dev, &mut allocator, &gguf, None)?;
     println!(
         "  loaded {} tensors, {:.2} GiB in {:.1} s",
         model.tensors.len(),
@@ -97,21 +97,58 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             n_kv_heads: cfg.n_kv_heads,
             head_dim: cfg.head_dim,
             max_seq_len: MAX_SEQ_LEN,
+            // Mirror the chat path (main.rs:464-488) so heterogeneous
+            // architectures (Gemma-4 sliding/full head_dim + kv_heads,
+            // Qwen3.6 trunk full-attn vs recurrent) get a correctly
+            // sized cache. Uniform archs (Llama/Qwen3-8B) → None.
+            per_layer_head_dim: cfg
+                .gemma4
+                .as_ref()
+                .map(|g| g.layers.iter().map(|s| s.head_dim).collect()),
+            per_layer_n_kv_heads: cfg
+                .gemma4
+                .as_ref()
+                .map(|g| g.layers.iter().map(|s| s.n_kv_heads).collect::<Vec<_>>())
+                .or_else(|| {
+                    cfg.qwen35.as_ref().map(|q| {
+                        (0..q.block_count)
+                            .map(|l| {
+                                if q.is_full_attention_layer(l) {
+                                    q.n_head_kv_full_attn
+                                } else {
+                                    0
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                }),
         },
     )?;
+    // Gemma-4 sliding layers leave the upper half of each pos slot
+    // unwritten — one-shot zero-fill (harmless for Llama/Qwen).
+    kv_cache.zero_fill(&dev)?;
 
-    // 25 dispatches/layer × 36 layers + LM-head bracket = 904 entries
-    // worst case, well under capacity_pairs = 1024.
+    // Per-token dispatch count scales with arch: dense 8B ~900,
+    // 26B-MoE many more. Bump generously so the ISOLATE profiler
+    // never overflows (overridable via VF_GPU_TIMER_CAPACITY).
+    let capacity_pairs = std::env::var("VF_GPU_TIMER_CAPACITY")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(131072);
     let profiler = ShaderProfiler::new(
         &dev.instance,
         dev.physical_device,
         dev.queue_family_index,
         &dev.device,
-        1024,
+        capacity_pairs,
     )?;
     let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), Some(profiler))?;
 
-    let prompt_ids = apply_chat_template(&tokenizer, PROMPT, None);
+    // ChatML/Qwen2 archs get the proper template; others (Gemma-4) fall
+    // back to a plain encode — the profiler only needs a valid token
+    // stream to drive prefill+decode, not chat-correct formatting.
+    let prompt_ids = std::panic::catch_unwind(|| apply_chat_template(&tokenizer, PROMPT, None))
+        .unwrap_or_else(|_| tokenizer.encode(PROMPT));
     println!(
         "\n  Prompt:           {:?}\n  Prompt-tokens:    {}",
         PROMPT,
@@ -138,9 +175,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let total_positions = prompt_ids.len() as u32 + MAX_DECODE_TOKENS;
     let mut pos: u32 = 0;
     while pos < total_positions {
-        // Pick the next embedding.
-        let embd = if (pos as usize) < prompt_ids.len() {
-            embedding_row(&gguf, &cfg, prompt_ids[pos as usize])?
+        // Pick the next token id + embedding.
+        let cur_id: u32 = if (pos as usize) < prompt_ids.len() {
+            prompt_ids[pos as usize]
         } else {
             // Greedy decode from the last logits we read back.
             let next_id = argmax(&last_logits) as u32;
@@ -152,13 +189,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!(
                     "  (note: EOS hit at pos={pos}; substituting <think> id to keep advancing)"
                 );
-                embedding_row(&gguf, &cfg, 151667 /* <think> */)?
+                151667 /* <think> */
             } else {
-                embedding_row(&gguf, &cfg, next_id)?
+                next_id
             }
         };
+        let embd = embedding_row(&gguf, &cfg, cur_id)?;
 
-        let stats = forward.forward_token(&dev, &registry, &cmd_ctx, &model, &embd, pos)?;
+        let stats = forward.forward_token(&dev, &registry, &cmd_ctx, &model, &embd, pos, cur_id)?;
         last_logits = forward.logits()?;
 
         if PROFILE_POSITIONS.contains(&pos) {
