@@ -514,6 +514,10 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None.or(profiler))?;
+    // Sprint B Phase 2 — register Sprint-B bucket handles so
+    // `write_bindings`'s debug_assert can catch missing
+    // `layer_weight_with_offset` conversions. No-op when buckets is empty.
+    forward.register_buckets(&model);
     // Sprint 56B — GPU-side MoE router init. No-op for non-MoE models.
     forward.init_moe_router_gpu(&dev, &mut allocator, &model, max_context)?;
 
@@ -940,6 +944,7 @@ fn run_chat_safetensors(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>
     // fully overwritten by its layer).
     kv_cache.zero_fill(&dev)?;
     let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;
+    forward.register_buckets(&model);
     // Sprint 56B — GPU-side MoE router init (no-op for non-MoE / SafeTensors-without-router).
     forward.init_moe_router_gpu(&dev, &mut allocator, &model, max_context)?;
 
@@ -1599,6 +1604,7 @@ fn run_bench(
         },
     )?;
     let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;
+    forward.register_buckets(&model);
 
     println!();
     println!("  vulkanforge bench — {} runs/sample", runs);
@@ -1804,6 +1810,7 @@ fn run_bench_safetensors(
         },
     )?;
     let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;
+    forward.register_buckets(&model);
 
     println!();
     println!("  vulkanforge bench (SafeTensors FP8) — {} runs/sample", runs);

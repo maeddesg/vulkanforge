@@ -979,7 +979,16 @@ impl Forward {
             .tensor("output.weight")
             .or_else(|| model.tensor("token_embd.weight"))
             .expect("LM head present");
-        let w_lm = lm.buffer.handle;
+        // Sprint B Phase 2 — bucket-aware lm_head lookup. Picks the
+        // existing `output.weight` / `token_embd.weight` key and threads
+        // the per-tensor `(byte_offset, byte_size)` through to the
+        // GEMV / harness dispatch. `(0, 0)` on the legacy path; the
+        // sub-range when the lm_head is packed in a T0 Sprint-B bucket.
+        let (w_lm, w_lm_off, w_lm_sz) = if model.tensor("output.weight").is_some() {
+            super::arch::named_weight_with_offset(model, "output.weight")
+        } else {
+            super::arch::named_weight_with_offset(model, "token_embd.weight")
+        };
         // Sprint 20-M3 — lm_head can be F32 (SafeTensors FP8 models
         // exclude lm_head from quantization) or F8E4M3 (some FP8
         // builds also quantize lm_head). Both route through the
@@ -1149,7 +1158,7 @@ impl Forward {
                 );
             }
             self.run_gemv_lmhead_dedicated(
-                dev, cmd, w_lm, hidden_norm, self.logits_buf.handle,
+                dev, cmd, w_lm, w_lm_off, w_lm_sz, hidden_norm, self.logits_buf.handle,
                 self.config.hidden_dim, self.config.vocab_size, lm_scale,
             );
         } else {
@@ -1163,7 +1172,7 @@ impl Forward {
             }
             self.run_gemv(
                 dev, registry, cmd, lm_shader,
-                w_lm, hidden_norm, self.logits_buf.handle,
+                w_lm, w_lm_off, w_lm_sz, hidden_norm, self.logits_buf.handle,
                 self.config.hidden_dim, self.config.vocab_size, lm_scale, "lm_head",
             );
         }

@@ -944,6 +944,10 @@ impl Forward {
             barrier_stats_checked: 0,
             barrier_stats_issued: 0,
             barrier_mode: super::state::BarrierMode::Imperative,
+            // Sprint B Phase 2 — populated by `register_buckets(...)` from
+            // `LoadedModel::buckets` after construction. Empty here so
+            // legacy 1-VkBuffer-per-tensor builds skip the assert.
+            bucketed_handles: std::collections::HashSet::new(),
             fp8pc,
             fp8pc_ds_cache: HashMap::new(),
             fp8bw,
@@ -1353,6 +1357,33 @@ impl Forward {
             p.destroy(device);
         }
     }
+    /// Sprint B Phase 2 — register the `LoadedModel`'s contiguous
+    /// Sprint-B buckets so `write_bindings`'s `debug_assert!` safety
+    /// net can panic when a bucketed handle is bound with `WHOLE_SIZE`
+    /// (= a forgotten call-site that would read the bucket start
+    /// instead of the per-tensor slice). No-op when `model.buckets`
+    /// is empty (legacy 1-VkBuffer-per-tensor path). Safe to call
+    /// more than once — replaces the set each time.
+    pub fn register_buckets(
+        &mut self,
+        model: &crate::backend::vulkan::loader::LoadedModel,
+    ) {
+        use ash::vk::Handle as _;
+        self.bucketed_handles.clear();
+        for b in &model.buckets {
+            self.bucketed_handles.insert(b.handle.as_raw());
+        }
+        if !self.bucketed_handles.is_empty()
+            && std::env::var("VF_VRAM_DIAG").is_ok()
+        {
+            eprintln!(
+                "[VF_BUCKET] register_buckets: {} bucket handle(s) registered \
+                 for write_bindings safety assert",
+                self.bucketed_handles.len(),
+            );
+        }
+    }
+
     /// Override the cache-enabled flag set by `Forward::new` from
     /// `VULKANFORGE_CB_REUSE`. Used by the parity regression test to
     /// build two Forward instances with explicit cache settings; not

@@ -14,7 +14,8 @@ use super::{
     ExecMode,
 };
 use super::super::arch::{
-    compute_barrier, layer_weight, layer_weight_scale_block, layer_weight_scale_buf,
+    compute_barrier, layer_weight, layer_weight_with_offset,
+    layer_weight_scale_block, layer_weight_scale_buf,
     layer_weight_scale_scalar, layer_weight_shader,
 };
 use super::super::layer_plan::ActivationKind;
@@ -51,7 +52,7 @@ impl DecodeExec {
         let (_, ffn_dim, _, _) = layer_dims_local(cfg, ctx.layer);
         let hidden_norm = fwd.cur().hidden_norm.handle;
         let gate_buf = fwd.cur().gate_buf.handle;
-        let wg = layer_weight(ctx.model, ctx.layer, "ffn_gate.weight");
+        let (wg, wg_off, wg_sz) = layer_weight_with_offset(ctx.model, ctx.layer, "ffn_gate.weight");
         let sg = layer_weight_shader(
             ctx.model, ctx.layer, "ffn_gate.weight", fwd.mul_mat_vec_subgroup_enabled,
         );
@@ -65,7 +66,7 @@ impl DecodeExec {
             );
         } else {
             fwd.run_gemv(
-                ctx.dev, ctx.registry, ctx.cmd, sg, wg, hidden_norm, gate_buf,
+                ctx.dev, ctx.registry, ctx.cmd, sg, wg, wg_off, wg_sz, hidden_norm, gate_buf,
                 cfg.hidden_dim, ffn_dim, scale_g, "gemv_gate",
             );
         }
@@ -85,7 +86,7 @@ impl DecodeExec {
             let gate_buf = fwd.cur().gate_buf.handle;
             fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[gate_buf]);
         }
-        let wu = layer_weight(ctx.model, ctx.layer, "ffn_up.weight");
+        let (wu, wu_off, wu_sz) = layer_weight_with_offset(ctx.model, ctx.layer, "ffn_up.weight");
         let su = layer_weight_shader(
             ctx.model, ctx.layer, "ffn_up.weight", fwd.mul_mat_vec_subgroup_enabled,
         );
@@ -99,7 +100,7 @@ impl DecodeExec {
             );
         } else {
             fwd.run_gemv(
-                ctx.dev, ctx.registry, ctx.cmd, su, wu, hidden_norm, up_buf,
+                ctx.dev, ctx.registry, ctx.cmd, su, wu, wu_off, wu_sz, hidden_norm, up_buf,
                 cfg.hidden_dim, ffn_dim, scale_u, "gemv_up",
             );
         }
@@ -138,7 +139,7 @@ impl DecodeExec {
         let (_, ffn_dim, _, _) = layer_dims_local(cfg, ctx.layer);
         let ffn_hidden = fwd.cur().ffn_hidden.handle;
         let ffn_out = fwd.cur().ffn_out.handle;
-        let wd = layer_weight(ctx.model, ctx.layer, "ffn_down.weight");
+        let (wd, wd_off, wd_sz) = layer_weight_with_offset(ctx.model, ctx.layer, "ffn_down.weight");
         let sd = layer_weight_shader(
             ctx.model, ctx.layer, "ffn_down.weight", fwd.mul_mat_vec_subgroup_enabled,
         );
@@ -152,7 +153,7 @@ impl DecodeExec {
             );
         } else {
             fwd.run_gemv(
-                ctx.dev, ctx.registry, ctx.cmd, sd, wd, ffn_hidden, ffn_out,
+                ctx.dev, ctx.registry, ctx.cmd, sd, wd, wd_off, wd_sz, ffn_hidden, ffn_out,
                 ffn_dim, cfg.hidden_dim, scale_d, "gemv_down",
             );
         }

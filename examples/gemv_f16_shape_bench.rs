@@ -47,7 +47,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //                           weight first (low offset), filler after.
     // Comparing {no filler} / {filler after} / {filler first} discriminates
     // "total-VRAM pressure" (both filler orders slow) from "physical placement"
-    // (only filler-first slow) — the VF_LMHEAD_ALLOC_FIRST mechanism.
+    // (only filler-first slow) — the placement mechanism Sprint J first probed
+    // (since retired in v0.5.1; the production fix is `VF_BUCKET_ALLOC`).
     let filler_gb: u64 = std::env::var("VF_BENCH_FILLER_GB").ok()
         .and_then(|s| s.parse().ok()).unwrap_or(0);
     let filler_first = std::env::var("VF_BENCH_FILLER_FIRST").map(|v| v == "1").unwrap_or(false);

@@ -135,6 +135,14 @@ impl GpuBuffer {
         unsafe { device.destroy_buffer(self.handle, None) };
     }
 
+    /// Sprint B Phase 2 — `true` when this `GpuBuffer` is a non-owning
+    /// view into a shared bucket (set by `shared_view`). Consumers use
+    /// this to decide whether descriptor bindings need an explicit
+    /// sub-range (`byte_offset`, `byte_size`) instead of WHOLE_SIZE.
+    pub fn is_shared(&self) -> bool {
+        self.shared
+    }
+
     /// Sprint G.6b diag accessor — returns the underlying VkDeviceMemory
     /// handle (as u64) and the suballocation offset within that memory.
     /// Pure read-only; used by `VF_VRAM_DIAG` to correlate physical

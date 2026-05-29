@@ -408,6 +408,12 @@ impl Forward {
         dev: &VulkanDevice,
         cmd: vk::CommandBuffer,
         weights: vk::Buffer,
+        // Sprint B Phase 2 — bucket sub-range for the lm_head weight.
+        // Both 0 on the legacy path; `(byte_offset, byte_size)` when
+        // the lm_head tensor is packed in a contiguous Sprint-B bucket
+        // (T0 under `VF_BUCKET_ALLOC`).
+        weight_offset: u64,
+        weight_range: u64,
         input: vk::Buffer,
         output: vk::Buffer,
         k: u32,
@@ -419,8 +425,9 @@ impl Forward {
             .set_layouts(std::slice::from_ref(&self.lmhead.dsl));
         let set = unsafe { dev.device.allocate_descriptor_sets(&alloc_info) }
             .expect("lmhead descriptor set alloc")[0];
+        let w_range_actual = if weight_range == 0 { vk::WHOLE_SIZE } else { weight_range };
         let infos = [
-            vk::DescriptorBufferInfo::default().buffer(weights).offset(0).range(vk::WHOLE_SIZE),
+            vk::DescriptorBufferInfo::default().buffer(weights).offset(weight_offset).range(w_range_actual),
             vk::DescriptorBufferInfo::default().buffer(input).offset(0).range(vk::WHOLE_SIZE),
             vk::DescriptorBufferInfo::default().buffer(output).offset(0).range(vk::WHOLE_SIZE),
             vk::DescriptorBufferInfo::default().buffer(self.fuse0.handle).offset(0).range(vk::WHOLE_SIZE),
@@ -467,6 +474,12 @@ impl Forward {
         cmd: vk::CommandBuffer,
         shader: ShaderId,
         weights: vk::Buffer,
+        // Sprint B Phase 2 — bucket sub-range for the weight binding.
+        // Both 0 on the legacy 1-VkBuffer-per-tensor path (WHOLE_SIZE);
+        // `(byte_offset, byte_size)` on bucketed tensors. See
+        // `layer_weight_with_offset` for the lookup helper.
+        weight_offset: u64,
+        weight_range: u64,
         input: vk::Buffer,
         output: vk::Buffer,
         k: u32,
@@ -494,7 +507,7 @@ impl Forward {
             self.alloc_or_get_set(
                 dev, kernel.descriptor_set_layout,
                 &[
-                    (0, weights, 0, 0),
+                    (0, weights, weight_offset, weight_range),
                     (1, input, 0, 0),
                     (2, output, 0, 0),
                 ],
@@ -503,7 +516,7 @@ impl Forward {
             self.alloc_or_get_set(
                 dev, kernel.descriptor_set_layout,
                 &[
-                    (0, weights, 0, 0),
+                    (0, weights, weight_offset, weight_range),
                     (1, input, 0, 0),
                     (2, output, 0, 0),
                     (3, self.fuse0.handle, 0, 0),
@@ -2470,6 +2483,11 @@ impl Forward {
         cmd: vk::CommandBuffer,
         shader_id: ShaderId,
         weights: vk::Buffer,
+        // Sprint B Phase 2 — bucket sub-range for the weight binding.
+        // Same contract as `run_gemv`: `(0, 0)` for legacy WHOLE_SIZE
+        // binding; `(byte_offset, byte_size)` for bucketed weight.
+        weight_offset: u64,
+        weight_range: u64,
         activations_q8: vk::Buffer,
         output: vk::Buffer,
         m: u32,
@@ -2481,7 +2499,7 @@ impl Forward {
         let set = self.alloc_or_get_set(
             dev, kernel.descriptor_set_layout,
             &[
-                (0, weights, 0, 0),
+                (0, weights, weight_offset, weight_range),
                 (1, activations_q8, 0, 0),
                 (2, output, 0, 0),
             ],
@@ -2627,6 +2645,9 @@ impl Forward {
         cmd: vk::CommandBuffer,
         shader_id: ShaderId,
         weights: vk::Buffer,
+        // Sprint B Phase 2 — bucket sub-range for the weight binding.
+        weight_offset: u64,
+        weight_range: u64,
         acts_f32: vk::Buffer,
         output: vk::Buffer,
         m: u32,
@@ -2640,7 +2661,7 @@ impl Forward {
         let set = self.alloc_or_get_set(
             dev, kernel.descriptor_set_layout,
             &[
-                (0, weights, 0, 0),
+                (0, weights, weight_offset, weight_range),
                 (1, acts_f32, 0, 0),
                 (2, output, 0, 0),
             ],
@@ -2763,7 +2784,7 @@ impl Forward {
             self.run_gemv(
                 dev, registry, cmd,
                 ShaderId::MulMatVecF32,
-                proj_buf, normed_buf, logits_buf,
+                proj_buf, 0, 0, normed_buf, logits_buf,
                 hidden_size, n_experts, inv_sqrt_h, "moe_router_gemv_opt",
             );
             compute_barrier(dev, cmd);

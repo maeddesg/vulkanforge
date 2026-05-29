@@ -13,8 +13,9 @@ use super::{
 };
 use super::super::arch::{
     GemmKind, compute_barrier, is_f32_layer_weight, is_fp8_layer_weight, layer_weight,
-    layer_weight_scale_block, layer_weight_scale_buf, layer_weight_scale_scalar,
-    layer_weight_shader, layer_weight_shader_gemm, transfer_to_compute_barrier,
+    layer_weight_with_offset, layer_weight_scale_block, layer_weight_scale_buf,
+    layer_weight_scale_scalar, layer_weight_shader, layer_weight_shader_gemm,
+    transfer_to_compute_barrier,
 };
 use super::super::state::Forward;
 use super::super::super::gguf::{GgmlType, ModelConfig};
@@ -43,7 +44,8 @@ impl DecodeExec {
 
         // (1) gate = per_layer_input_gate @ output  — F32 GEMV (1536 → 256).
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[output]);
-        let w_gate = layer_weight(ctx.model, ctx.layer, "per_layer_input_gate.weight");
+        let (w_gate, w_gate_off, w_gate_sz) =
+            layer_weight_with_offset(ctx.model, ctx.layer, "per_layer_input_gate.weight");
         let s_gate = layer_weight_shader(
             ctx.model, ctx.layer, "per_layer_input_gate.weight",
             fwd.mul_mat_vec_subgroup_enabled,
@@ -53,7 +55,7 @@ impl DecodeExec {
         );
         fwd.run_gemv(
             ctx.dev, ctx.registry, ctx.cmd, s_gate, w_gate,
-            output, gate_buf,
+            w_gate_off, w_gate_sz, output, gate_buf,
             cfg.hidden_dim, hps, scale_gate, "ple_gemv_gate",
         );
         fwd.mark_written(&[gate_buf]);
@@ -94,7 +96,8 @@ impl DecodeExec {
         fwd.force_internal_barrier(ctx.dev, ctx.cmd, &[gate_buf]);
 
         // (3) proj = per_layer_projection @ gate  — F32 GEMV (256 → 1536).
-        let w_proj = layer_weight(ctx.model, ctx.layer, "per_layer_projection.weight");
+        let (w_proj, w_proj_off, w_proj_sz) =
+            layer_weight_with_offset(ctx.model, ctx.layer, "per_layer_projection.weight");
         let s_proj = layer_weight_shader(
             ctx.model, ctx.layer, "per_layer_projection.weight",
             fwd.mul_mat_vec_subgroup_enabled,
@@ -104,7 +107,7 @@ impl DecodeExec {
         );
         fwd.run_gemv(
             ctx.dev, ctx.registry, ctx.cmd, s_proj, w_proj,
-            gate_buf, o_buf,
+            w_proj_off, w_proj_sz, gate_buf, o_buf,
             hps, cfg.hidden_dim, scale_proj, "ple_gemv_proj",
         );
         fwd.mark_written(&[o_buf]);
@@ -163,7 +166,8 @@ impl DecodeExec {
         let hps = self.ple_hps(fwd, ctx);
         let (_, output) = decode_io(ctx);
         let gate_buf = fwd.cur().gate_buf.handle;
-        let w_gate = layer_weight(ctx.model, layer, "per_layer_input_gate.weight");
+        let (w_gate, w_gate_off, w_gate_sz) =
+            layer_weight_with_offset(ctx.model, layer, "per_layer_input_gate.weight");
         let s_gate = layer_weight_shader(
             ctx.model, layer, "per_layer_input_gate.weight",
             fwd.mul_mat_vec_subgroup_enabled,
@@ -173,7 +177,7 @@ impl DecodeExec {
         );
         fwd.run_gemv(
             ctx.dev, ctx.registry, ctx.cmd, s_gate, w_gate,
-            output, gate_buf,
+            w_gate_off, w_gate_sz, output, gate_buf,
             cfg.hidden_dim, hps, scale, "ple_gemv_gate",
         );
     }
@@ -217,7 +221,8 @@ impl DecodeExec {
         let hps = self.ple_hps(fwd, ctx);
         let gate_buf = fwd.cur().gate_buf.handle;
         let o_buf = fwd.cur().o_buf.handle;
-        let w_proj = layer_weight(ctx.model, layer, "per_layer_projection.weight");
+        let (w_proj, w_proj_off, w_proj_sz) =
+            layer_weight_with_offset(ctx.model, layer, "per_layer_projection.weight");
         let s_proj = layer_weight_shader(
             ctx.model, layer, "per_layer_projection.weight",
             fwd.mul_mat_vec_subgroup_enabled,
@@ -227,7 +232,7 @@ impl DecodeExec {
         );
         fwd.run_gemv(
             ctx.dev, ctx.registry, ctx.cmd, s_proj, w_proj,
-            gate_buf, o_buf,
+            w_proj_off, w_proj_sz, gate_buf, o_buf,
             hps, cfg.hidden_dim, scale, "ple_gemv_proj",
         );
     }
@@ -593,7 +598,14 @@ impl BatchExec {
         quantize_input: bool,
     ) {
         let _ = cfg;
-        let weight = layer_weight(ctx.model, ctx.layer, suffix);
+        // Sprint B Phase 2 — bucket-aware weight binding. For non-bucketed
+        // tensors `(w_off, w_sz) == (0, 0)` → legacy WHOLE_SIZE behaviour.
+        // For bucketed tensors (`VF_BUCKET_ALLOC=1` on Gemma-4-26B etc.)
+        // the per-tensor sub-range is threaded through to `run_gemm` /
+        // `run_gemm_coopmat_q4k`. FP8 GEMM paths are not bucketed (FP8
+        // models live outside the Sprint-B Gemma-4 GGUF scope) and keep
+        // the legacy single-tensor binding via the `weight` handle alone.
+        let (weight, w_off, w_sz) = layer_weight_with_offset(ctx.model, ctx.layer, suffix);
 
         // Sprint 46C — F32 weights (Gemma-4 SafeTensors) take the
         // dedicated `mul_mm_f32{,_aligned}.spv` lane (Sprint 46B). No
@@ -661,7 +673,7 @@ impl BatchExec {
                 (ShaderId::MulCoopmatQ4KFwdBn64, 64u32, 64u32)
             };
             fwd.run_gemm_coopmat_q4k(
-                ctx.dev, ctx.registry, ctx.cmd, shader, weight,
+                ctx.dev, ctx.registry, ctx.cmd, shader, weight, w_off, w_sz,
                 input_fp32, output,
                 m, n_padded, k, bm, bn, label,
             );
@@ -709,7 +721,7 @@ impl BatchExec {
             fwd.mul_mm_coopmat_enabled, fwd.mul_mm_coopmat_f16acc_enabled,
         );
         fwd.run_gemm(
-            ctx.dev, ctx.registry, ctx.cmd, shader, weight,
+            ctx.dev, ctx.registry, ctx.cmd, shader, weight, w_off, w_sz,
             gemm_input, output,
             m, n, k, label,
         );

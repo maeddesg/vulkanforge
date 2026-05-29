@@ -13,7 +13,7 @@ use super::{
     n_kv_heads_for, quantize_input_after_q, BatchExec, DecodeExec, ExecCtx,
 };
 use super::super::arch::{
-    compute_barrier, layer_weight,
+    compute_barrier, layer_weight, layer_weight_with_offset,
     layer_weight_opt, layer_weight_scale_block, layer_weight_scale_buf,
     layer_weight_scale_scalar, layer_weight_shader,
     transfer_to_compute_barrier,
@@ -70,7 +70,7 @@ impl DecodeExec {
         let q_dim = cfg.n_heads * head_dim;
         let hidden_norm = fwd.cur().hidden_norm.handle;
         let q_buf = fwd.cur().q_buf.handle;
-        let wq = layer_weight(ctx.model, ctx.layer, "attn_q.weight");
+        let (wq, wq_off, wq_sz) = layer_weight_with_offset(ctx.model, ctx.layer, "attn_q.weight");
         let sq = layer_weight_shader(
             ctx.model, ctx.layer, "attn_q.weight", fwd.mul_mat_vec_subgroup_enabled,
         );
@@ -84,7 +84,7 @@ impl DecodeExec {
             );
         } else {
             fwd.run_gemv(
-                ctx.dev, ctx.registry, ctx.cmd, sq, wq, hidden_norm, q_buf,
+                ctx.dev, ctx.registry, ctx.cmd, sq, wq, wq_off, wq_sz, hidden_norm, q_buf,
                 cfg.hidden_dim, q_dim, scale_q, "gemv_q",
             );
         }
@@ -106,7 +106,7 @@ impl DecodeExec {
         let out_dim = q_dim * 2;
         let hidden_norm = fwd.cur().hidden_norm.handle;
         let q_buf = fwd.cur().q_buf.handle;
-        let wq = layer_weight(ctx.model, ctx.layer, "attn_q.weight");
+        let (wq, wq_off, wq_sz) = layer_weight_with_offset(ctx.model, ctx.layer, "attn_q.weight");
         let sq = layer_weight_shader(
             ctx.model, ctx.layer, "attn_q.weight", fwd.mul_mat_vec_subgroup_enabled,
         );
@@ -120,7 +120,7 @@ impl DecodeExec {
             );
         } else {
             fwd.run_gemv(
-                ctx.dev, ctx.registry, ctx.cmd, sq, wq, hidden_norm, q_buf,
+                ctx.dev, ctx.registry, ctx.cmd, sq, wq, wq_off, wq_sz, hidden_norm, q_buf,
                 cfg.hidden_dim, out_dim, scale_q, "gemv_q_gate",
             );
         }
@@ -219,7 +219,7 @@ impl DecodeExec {
         let kv_dim = n_kv_heads_for(cfg, ctx.layer) * head_dim;
         let hidden_norm = fwd.cur().hidden_norm.handle;
         let k_buf = fwd.cur().k_buf.handle;
-        let wk = layer_weight(ctx.model, ctx.layer, "attn_k.weight");
+        let (wk, wk_off, wk_sz) = layer_weight_with_offset(ctx.model, ctx.layer, "attn_k.weight");
         let sk = layer_weight_shader(
             ctx.model, ctx.layer, "attn_k.weight", fwd.mul_mat_vec_subgroup_enabled,
         );
@@ -233,7 +233,7 @@ impl DecodeExec {
             );
         } else {
             fwd.run_gemv(
-                ctx.dev, ctx.registry, ctx.cmd, sk, wk, hidden_norm, k_buf,
+                ctx.dev, ctx.registry, ctx.cmd, sk, wk, wk_off, wk_sz, hidden_norm, k_buf,
                 cfg.hidden_dim, kv_dim, scale_k, "gemv_k",
             );
         }
@@ -298,7 +298,7 @@ impl DecodeExec {
         let kv_dim = n_kv_heads_for(cfg, ctx.layer) * head_dim;
         let hidden_norm = fwd.cur().hidden_norm.handle;
         let v_buf = fwd.cur().v_buf.handle;
-        let wv = layer_weight(ctx.model, ctx.layer, "attn_v.weight");
+        let (wv, wv_off, wv_sz) = layer_weight_with_offset(ctx.model, ctx.layer, "attn_v.weight");
         let sv = layer_weight_shader(
             ctx.model, ctx.layer, "attn_v.weight", fwd.mul_mat_vec_subgroup_enabled,
         );
@@ -312,7 +312,7 @@ impl DecodeExec {
             );
         } else {
             fwd.run_gemv(
-                ctx.dev, ctx.registry, ctx.cmd, sv, wv, hidden_norm, v_buf,
+                ctx.dev, ctx.registry, ctx.cmd, sv, wv, wv_off, wv_sz, hidden_norm, v_buf,
                 cfg.hidden_dim, kv_dim, scale_v, "gemv_v",
             );
         }
@@ -650,7 +650,7 @@ impl DecodeExec {
         let q_dim = cfg.n_heads * head_dim;
         let attn_out = fwd.cur().attn_out.handle;
         let o_buf = fwd.cur().o_buf.handle;
-        let wo = layer_weight(ctx.model, ctx.layer, "attn_output.weight");
+        let (wo, wo_off, wo_sz) = layer_weight_with_offset(ctx.model, ctx.layer, "attn_output.weight");
         let so = layer_weight_shader(
             ctx.model, ctx.layer, "attn_output.weight", fwd.mul_mat_vec_subgroup_enabled,
         );
@@ -664,7 +664,7 @@ impl DecodeExec {
             );
         } else {
             fwd.run_gemv(
-                ctx.dev, ctx.registry, ctx.cmd, so, wo, attn_out, o_buf,
+                ctx.dev, ctx.registry, ctx.cmd, so, wo, wo_off, wo_sz, attn_out, o_buf,
                 q_dim, cfg.hidden_dim, scale_o, "gemv_o",
             );
         }
@@ -865,7 +865,7 @@ impl DecodeExec {
         );
         let hidden_norm = fwd.cur().hidden_norm.handle;
         let qkv_buf = fwd.ssm_qkv_buf.as_ref().unwrap().handle;
-        let w = layer_weight(ctx.model, layer, "attn_qkv.weight");
+        let (w, w_off, w_sz) = layer_weight_with_offset(ctx.model, layer, "attn_qkv.weight");
         let s = layer_weight_shader(
             ctx.model, layer, "attn_qkv.weight",
             fwd.mul_mat_vec_subgroup_enabled,
@@ -873,7 +873,7 @@ impl DecodeExec {
         let scale = layer_weight_scale_scalar(ctx.model, layer, "attn_qkv.weight");
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[hidden_norm]);
         fwd.run_gemv(
-            ctx.dev, ctx.registry, ctx.cmd, s, w, hidden_norm, qkv_buf,
+            ctx.dev, ctx.registry, ctx.cmd, s, w, w_off, w_sz, hidden_norm, qkv_buf,
             cfg.hidden_dim, spec.conv_channels(), scale, "gemv_ssm_qkv",
         );
         fwd.mark_written(&[qkv_buf]);
@@ -893,7 +893,7 @@ impl DecodeExec {
         );
         let hidden_norm = fwd.cur().hidden_norm.handle;
         let z_buf = fwd.ssm_z_buf.as_ref().unwrap().handle;
-        let w = layer_weight(ctx.model, layer, "attn_gate.weight");
+        let (w, w_off, w_sz) = layer_weight_with_offset(ctx.model, layer, "attn_gate.weight");
         let s = layer_weight_shader(
             ctx.model, layer, "attn_gate.weight",
             fwd.mul_mat_vec_subgroup_enabled,
@@ -901,7 +901,7 @@ impl DecodeExec {
         let scale = layer_weight_scale_scalar(ctx.model, layer, "attn_gate.weight");
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[hidden_norm]);
         fwd.run_gemv(
-            ctx.dev, ctx.registry, ctx.cmd, s, w, hidden_norm, z_buf,
+            ctx.dev, ctx.registry, ctx.cmd, s, w, w_off, w_sz, hidden_norm, z_buf,
             cfg.hidden_dim, spec.ssm_d_inner, scale, "gemv_ssm_z",
         );
         fwd.mark_written(&[z_buf]);
@@ -920,7 +920,7 @@ impl DecodeExec {
         );
         let hidden_norm = fwd.cur().hidden_norm.handle;
         let beta_buf = fwd.ssm_beta_buf.as_ref().unwrap().handle;
-        let w = layer_weight(ctx.model, layer, "ssm_beta.weight");
+        let (w, w_off, w_sz) = layer_weight_with_offset(ctx.model, layer, "ssm_beta.weight");
         let s = layer_weight_shader(
             ctx.model, layer, "ssm_beta.weight",
             fwd.mul_mat_vec_subgroup_enabled,
@@ -928,7 +928,7 @@ impl DecodeExec {
         let scale = layer_weight_scale_scalar(ctx.model, layer, "ssm_beta.weight");
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[hidden_norm]);
         fwd.run_gemv(
-            ctx.dev, ctx.registry, ctx.cmd, s, w, hidden_norm, beta_buf,
+            ctx.dev, ctx.registry, ctx.cmd, s, w, w_off, w_sz, hidden_norm, beta_buf,
             cfg.hidden_dim, spec.num_v_heads(), scale, "gemv_ssm_beta",
         );
         fwd.mark_written(&[beta_buf]);
@@ -962,7 +962,8 @@ impl DecodeExec {
         let n_heads   = spec.num_v_heads();
 
         // 1. alpha = ssm_alpha.weight @ hidden_norm
-        let w_alpha = layer_weight(ctx.model, layer, "ssm_alpha.weight");
+        let (w_alpha, w_alpha_off, w_alpha_sz) =
+            layer_weight_with_offset(ctx.model, layer, "ssm_alpha.weight");
         let s_alpha = layer_weight_shader(
             ctx.model, layer, "ssm_alpha.weight",
             fwd.mul_mat_vec_subgroup_enabled,
@@ -970,7 +971,8 @@ impl DecodeExec {
         let scale = layer_weight_scale_scalar(ctx.model, layer, "ssm_alpha.weight");
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[hidden_norm]);
         fwd.run_gemv(
-            ctx.dev, ctx.registry, ctx.cmd, s_alpha, w_alpha, hidden_norm, alpha_buf,
+            ctx.dev, ctx.registry, ctx.cmd, s_alpha, w_alpha,
+            w_alpha_off, w_alpha_sz, hidden_norm, alpha_buf,
             cfg.hidden_dim, n_heads, scale, "gemv_ssm_alpha",
         );
         fwd.mark_written(&[alpha_buf]);
@@ -1315,7 +1317,7 @@ impl DecodeExec {
         );
         let norm_out = fwd.ssm_norm_out_buf.as_ref().unwrap().handle;
         let o_buf    = fwd.cur().o_buf.handle;
-        let w = layer_weight(ctx.model, layer, "ssm_out.weight");
+        let (w, w_off, w_sz) = layer_weight_with_offset(ctx.model, layer, "ssm_out.weight");
         let s = layer_weight_shader(
             ctx.model, layer, "ssm_out.weight",
             fwd.mul_mat_vec_subgroup_enabled,
@@ -1323,7 +1325,7 @@ impl DecodeExec {
         let scale = layer_weight_scale_scalar(ctx.model, layer, "ssm_out.weight");
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[norm_out]);
         fwd.run_gemv(
-            ctx.dev, ctx.registry, ctx.cmd, s, w, norm_out, o_buf,
+            ctx.dev, ctx.registry, ctx.cmd, s, w, w_off, w_sz, norm_out, o_buf,
             spec.ssm_d_inner, cfg.hidden_dim, scale, "gemv_ssm_out",
         );
         fwd.mark_written(&[o_buf]);
@@ -1405,14 +1407,16 @@ impl DecodeExec {
         );
         let hidden_norm = fwd.cur().hidden_norm.handle;
         let alpha_buf   = fwd.ssm_alpha_buf.as_ref().unwrap().handle;
-        let w_alpha = layer_weight(ctx.model, layer, "ssm_alpha.weight");
+        let (w_alpha, w_alpha_off, w_alpha_sz) =
+            layer_weight_with_offset(ctx.model, layer, "ssm_alpha.weight");
         let s_alpha = layer_weight_shader(
             ctx.model, layer, "ssm_alpha.weight",
             fwd.mul_mat_vec_subgroup_enabled,
         );
         let scale = layer_weight_scale_scalar(ctx.model, layer, "ssm_alpha.weight");
         fwd.run_gemv(
-            ctx.dev, ctx.registry, ctx.cmd, s_alpha, w_alpha, hidden_norm, alpha_buf,
+            ctx.dev, ctx.registry, ctx.cmd, s_alpha, w_alpha,
+            w_alpha_off, w_alpha_sz, hidden_norm, alpha_buf,
             cfg.hidden_dim, spec.num_v_heads(), scale, "gemv_ssm_alpha",
         );
     }
@@ -1525,14 +1529,14 @@ impl DecodeExec {
         );
         let hidden_norm = fwd.cur().hidden_norm.handle;
         let beta_buf = fwd.ssm_beta_buf.as_ref().unwrap().handle;
-        let w = layer_weight(ctx.model, layer, "ssm_beta.weight");
+        let (w, w_off, w_sz) = layer_weight_with_offset(ctx.model, layer, "ssm_beta.weight");
         let s = layer_weight_shader(
             ctx.model, layer, "ssm_beta.weight",
             fwd.mul_mat_vec_subgroup_enabled,
         );
         let scale = layer_weight_scale_scalar(ctx.model, layer, "ssm_beta.weight");
         fwd.run_gemv(
-            ctx.dev, ctx.registry, ctx.cmd, s, w, hidden_norm, beta_buf,
+            ctx.dev, ctx.registry, ctx.cmd, s, w, w_off, w_sz, hidden_norm, beta_buf,
             cfg.hidden_dim, spec.num_v_heads(), scale, "gemv_ssm_beta",
         );
     }
@@ -2383,7 +2387,7 @@ impl BatchExec {
         );
         let input = fwd.batch_norm.handle;
         let qkv_buf = fwd.ssm_qkv_buf.as_ref().unwrap().handle;
-        let w = layer_weight(ctx.model, layer, "attn_qkv.weight");
+        let (w, w_off, w_sz) = layer_weight_with_offset(ctx.model, layer, "attn_qkv.weight");
         let s = layer_weight_shader(
             ctx.model, layer, "attn_qkv.weight",
             fwd.mul_mat_vec_subgroup_enabled,
@@ -2391,7 +2395,7 @@ impl BatchExec {
         let scale = layer_weight_scale_scalar(ctx.model, layer, "attn_qkv.weight");
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[input]);
         fwd.run_gemv(
-            ctx.dev, ctx.registry, ctx.cmd, s, w, input, qkv_buf,
+            ctx.dev, ctx.registry, ctx.cmd, s, w, w_off, w_sz, input, qkv_buf,
             cfg.hidden_dim, spec.conv_channels(), scale, "b_gemv_ssm_qkv",
         );
         fwd.mark_written(&[qkv_buf]);
@@ -2408,7 +2412,7 @@ impl BatchExec {
         );
         let input = fwd.batch_norm.handle;
         let z_buf = fwd.ssm_z_buf.as_ref().unwrap().handle;
-        let w = layer_weight(ctx.model, layer, "attn_gate.weight");
+        let (w, w_off, w_sz) = layer_weight_with_offset(ctx.model, layer, "attn_gate.weight");
         let s = layer_weight_shader(
             ctx.model, layer, "attn_gate.weight",
             fwd.mul_mat_vec_subgroup_enabled,
@@ -2416,7 +2420,7 @@ impl BatchExec {
         let scale = layer_weight_scale_scalar(ctx.model, layer, "attn_gate.weight");
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[input]);
         fwd.run_gemv(
-            ctx.dev, ctx.registry, ctx.cmd, s, w, input, z_buf,
+            ctx.dev, ctx.registry, ctx.cmd, s, w, w_off, w_sz, input, z_buf,
             cfg.hidden_dim, spec.ssm_d_inner, scale, "b_gemv_ssm_z",
         );
         fwd.mark_written(&[z_buf]);
@@ -2433,7 +2437,7 @@ impl BatchExec {
         );
         let input = fwd.batch_norm.handle;
         let beta_buf = fwd.ssm_beta_buf.as_ref().unwrap().handle;
-        let w = layer_weight(ctx.model, layer, "ssm_beta.weight");
+        let (w, w_off, w_sz) = layer_weight_with_offset(ctx.model, layer, "ssm_beta.weight");
         let s = layer_weight_shader(
             ctx.model, layer, "ssm_beta.weight",
             fwd.mul_mat_vec_subgroup_enabled,
@@ -2441,7 +2445,7 @@ impl BatchExec {
         let scale = layer_weight_scale_scalar(ctx.model, layer, "ssm_beta.weight");
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[input]);
         fwd.run_gemv(
-            ctx.dev, ctx.registry, ctx.cmd, s, w, input, beta_buf,
+            ctx.dev, ctx.registry, ctx.cmd, s, w, w_off, w_sz, input, beta_buf,
             cfg.hidden_dim, spec.num_v_heads(), scale, "b_gemv_ssm_beta",
         );
         fwd.mark_written(&[beta_buf]);
@@ -2467,7 +2471,8 @@ impl BatchExec {
         let gate_buf  = fwd.ssm_gate_buf.as_ref().unwrap().handle;
         let n_heads   = spec.num_v_heads();
 
-        let w_alpha = layer_weight(ctx.model, layer, "ssm_alpha.weight");
+        let (w_alpha, w_alpha_off, w_alpha_sz) =
+            layer_weight_with_offset(ctx.model, layer, "ssm_alpha.weight");
         let s_alpha = layer_weight_shader(
             ctx.model, layer, "ssm_alpha.weight",
             fwd.mul_mat_vec_subgroup_enabled,
@@ -2475,7 +2480,8 @@ impl BatchExec {
         let scale = layer_weight_scale_scalar(ctx.model, layer, "ssm_alpha.weight");
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[input]);
         fwd.run_gemv(
-            ctx.dev, ctx.registry, ctx.cmd, s_alpha, w_alpha, input, alpha_buf,
+            ctx.dev, ctx.registry, ctx.cmd, s_alpha, w_alpha,
+            w_alpha_off, w_alpha_sz, input, alpha_buf,
             cfg.hidden_dim, n_heads, scale, "b_gemv_ssm_alpha",
         );
         fwd.mark_written(&[alpha_buf]);
@@ -2711,7 +2717,7 @@ impl BatchExec {
         );
         let norm_out = fwd.ssm_norm_out_buf.as_ref().unwrap().handle;
         let batch_o  = fwd.batch_o.handle;
-        let w = layer_weight(ctx.model, layer, "ssm_out.weight");
+        let (w, w_off, w_sz) = layer_weight_with_offset(ctx.model, layer, "ssm_out.weight");
         let s = layer_weight_shader(
             ctx.model, layer, "ssm_out.weight",
             fwd.mul_mat_vec_subgroup_enabled,
@@ -2719,7 +2725,7 @@ impl BatchExec {
         let scale = layer_weight_scale_scalar(ctx.model, layer, "ssm_out.weight");
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[norm_out]);
         fwd.run_gemv(
-            ctx.dev, ctx.registry, ctx.cmd, s, w, norm_out, batch_o,
+            ctx.dev, ctx.registry, ctx.cmd, s, w, w_off, w_sz, norm_out, batch_o,
             spec.ssm_d_inner, cfg.hidden_dim, scale, "b_gemv_ssm_out",
         );
         fwd.mark_written(&[batch_o]);

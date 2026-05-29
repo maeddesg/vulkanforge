@@ -352,6 +352,45 @@ impl Forward {
         set: vk::DescriptorSet,
         bindings: &[(u32, vk::Buffer, vk::DeviceSize, vk::DeviceSize)],
     ) {
+        // Sprint B Phase 2 — safety net against forgotten bucket-aware
+        // call sites. When a Sprint-B bucket handle (`bucketed_handles`)
+        // is bound with `range == 0` (the WHOLE_SIZE sentinel) the shader
+        // would read the bucket start (= some other tensor's bytes)
+        // instead of the per-tensor slice the caller intended.
+        // `layer_weight_with_offset` / `named_weight_with_offset` return
+        // the correct `(handle, byte_offset, byte_size)` for bucketed
+        // tensors — every GEMV / GEMM helper that consumes them must
+        // thread the triple through. Phase 1 hit this bug in the prefill
+        // path of `b_step_moe_expert_ffn_gpu_direct`; this assert turns
+        // that class of regression into an immediate test-time panic
+        // instead of corrupt-logits-at-layer-≥1.
+        //
+        // Debug-only: `#[cfg(debug_assertions)]` so the release / bench
+        // path pays nothing. The set is empty in legacy 1-VkBuffer-per-
+        // tensor builds (no `register_buckets` call or empty buckets)
+        // so the assert is a no-op even in debug builds without
+        // `VF_BUCKET_POC` / `VF_BUCKET_ALLOC`.
+        #[cfg(debug_assertions)]
+        {
+            use ash::vk::Handle as _;
+            if !self.bucketed_handles.is_empty() {
+                for &(binding, buf, off, range) in bindings {
+                    if range == 0
+                        && self.bucketed_handles.contains(&buf.as_raw())
+                    {
+                        panic!(
+                            "Sprint B Phase 2 safety: bucketed VkBuffer 0x{:x} \
+                             bound to descriptor binding {} with WHOLE_SIZE \
+                             (offset=0x{:x}). Missing `layer_weight_with_offset` / \
+                             `named_weight_with_offset` conversion on a \
+                             `run_gemv` / `run_gemm` call site.",
+                            buf.as_raw(), binding, off,
+                        );
+                    }
+                }
+            }
+        }
+
         let infos: Vec<vk::DescriptorBufferInfo> = bindings
             .iter()
             .map(|&(_, buf, off, range)| vk::DescriptorBufferInfo {

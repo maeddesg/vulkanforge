@@ -26,9 +26,9 @@ use super::super::loader::LoadedModel;
 use super::super::pipeline_registry::PipelineRegistry;
 
 use super::arch::{
-    compute_barrier, layer_weight, layer_weight_opt, layer_weight_scale_block,
-    layer_weight_scale_buf, layer_weight_scale_scalar, layer_weight_shader,
-    n_kv_heads_for,
+    compute_barrier, layer_weight, layer_weight_with_offset, layer_weight_opt,
+    layer_weight_scale_block, layer_weight_scale_buf, layer_weight_scale_scalar,
+    layer_weight_shader, n_kv_heads_for,
 };
 use super::state::{DebugTarget, Forward};
 
@@ -148,9 +148,9 @@ impl Forward {
         compute_barrier(dev, cmd);
 
         // Q/K/V projections
-        let wq = layer_weight(model, layer, "attn_q.weight");
-        let wk = layer_weight(model, layer, "attn_k.weight");
-        let wv = layer_weight(model, layer, "attn_v.weight");
+        let (wq, wq_off, wq_sz) = layer_weight_with_offset(model, layer, "attn_q.weight");
+        let (wk, wk_off, wk_sz) = layer_weight_with_offset(model, layer, "attn_k.weight");
+        let (wv, wv_off, wv_sz) = layer_weight_with_offset(model, layer, "attn_v.weight");
         // attn_v.weight is Q6_K in Q4_K_M (mixed-quant) — pick the
         // matching GEMV pipeline per tensor's actual ggml_type.
         let sq = layer_weight_shader(model, layer, "attn_q.weight", self.mul_mat_vec_subgroup_enabled);
@@ -173,7 +173,7 @@ impl Forward {
                 cfg.hidden_dim, cfg.n_heads * cfg.head_dim,
                 layer_weight_scale_block(model, layer, "attn_q.weight"), "gemv_q");
         } else {
-            self.run_gemv(dev, registry, cmd, sq, wq, in_h, q_h,
+            self.run_gemv(dev, registry, cmd, sq, wq, wq_off, wq_sz, in_h, q_h,
                 cfg.hidden_dim, cfg.n_heads * cfg.head_dim, scale_q, "gemv_q");
         }
         if let Some(s) = sb_k {
@@ -181,7 +181,7 @@ impl Forward {
                 cfg.hidden_dim, n_kv_heads_for(&cfg, layer) * cfg.head_dim,
                 layer_weight_scale_block(model, layer, "attn_k.weight"), "gemv_k");
         } else {
-            self.run_gemv(dev, registry, cmd, sk, wk, in_h, k_h,
+            self.run_gemv(dev, registry, cmd, sk, wk, wk_off, wk_sz, in_h, k_h,
                 cfg.hidden_dim, n_kv_heads_for(&cfg, layer) * cfg.head_dim, scale_k, "gemv_k");
         }
         if let Some(s) = sb_v {
@@ -189,7 +189,7 @@ impl Forward {
                 cfg.hidden_dim, n_kv_heads_for(&cfg, layer) * cfg.head_dim,
                 layer_weight_scale_block(model, layer, "attn_v.weight"), "gemv_v");
         } else {
-            self.run_gemv(dev, registry, cmd, sv, wv, in_h, v_h,
+            self.run_gemv(dev, registry, cmd, sv, wv, wv_off, wv_sz, in_h, v_h,
                 cfg.hidden_dim, n_kv_heads_for(&cfg, layer) * cfg.head_dim, scale_v, "gemv_v");
         }
         if matches!(halt, DebugTarget::QProj | DebugTarget::KProj | DebugTarget::VProj) {

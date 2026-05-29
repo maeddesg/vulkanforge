@@ -311,14 +311,25 @@ pub(crate) fn layer_weight(model: &LoadedModel, layer: u32, suffix: &str) -> vk:
         .handle
 }
 
-/// Sprint B Phase 1 — bucket-aware lookup. Returns
-/// `(buffer_handle, byte_offset, byte_size)`. For the default
-/// 1-VkBuffer-per-tensor path, byte_offset is 0 and the result is
-/// equivalent to `(layer_weight(...), 0, tensor.byte_size)`. For
-/// bucketed MoE-expert tensors under `VF_BUCKET_POC=1`, the handle is
-/// the shared bucket and byte_offset is the per-layer position
-/// within it; callers must bind sub-range `(handle, byte_offset,
-/// byte_size)` instead of `(handle, 0, WHOLE_SIZE)`.
+/// Sprint B Phase 1 / Phase 2 — bucket-aware lookup. Returns
+/// `(buffer_handle, byte_offset, byte_range)`. Two callable contracts:
+///
+/// * **Non-bucketed tensor** (`!buffer.is_shared()` — legacy 1-VkBuffer-
+///   per-tensor path): returns `(handle, 0, 0)`. The trailing zero on
+///   `byte_range` is the "use WHOLE_SIZE" sentinel that `write_bindings`
+///   maps to `vk::WHOLE_SIZE`; the descriptor-set cache key stays
+///   identical to the pre-Sprint-B shape (no per-tensor explosion).
+/// * **Bucketed tensor** (`buffer.is_shared()` — VF_BUCKET_POC / Phase 2
+///   VF_BUCKET_ALLOC paths): returns `(bucket_handle, byte_offset,
+///   byte_size)`. The explicit non-zero range binds the per-tensor
+///   sub-slice; the descriptor-set cache key is unique per tensor.
+///
+/// Callers MUST thread the returned `(off, range)` triple through to
+/// the `run_*` helper they invoke. A forgotten call site that still
+/// binds `(handle, 0, 0)` on a bucketed buffer reads the bucket start
+/// (= some other tensor's bytes) → corrupt activations. The
+/// `Forward::bucketed_handles` set + `write_bindings` `debug_assert!`
+/// safety net (Sprint B Phase 2) panics loudly when that happens.
 pub(crate) fn layer_weight_with_offset(
     model: &LoadedModel, layer: u32, suffix: &str,
 ) -> (vk::Buffer, u64, u64) {
@@ -326,7 +337,29 @@ pub(crate) fn layer_weight_with_offset(
     let t = model
         .tensor(&key)
         .unwrap_or_else(|| panic!("missing tensor '{key}'"));
-    (t.buffer.handle, t.byte_offset, t.byte_size)
+    if t.buffer.is_shared() {
+        (t.buffer.handle, t.byte_offset, t.byte_size)
+    } else {
+        (t.buffer.handle, 0, 0)
+    }
+}
+
+/// Sprint B Phase 2 — same contract as `layer_weight_with_offset` but
+/// for top-level (non-`blk.<i>.<suffix>`) tensors (e.g.
+/// `output.weight` / `token_embd.weight` for lm_head). Returns the
+/// canonical `(handle, 0, 0)` for non-bucketed tensors so the
+/// descriptor-set cache shape doesn't change unless bucketing is on.
+pub(crate) fn named_weight_with_offset(
+    model: &LoadedModel, name: &str,
+) -> (vk::Buffer, u64, u64) {
+    let t = model
+        .tensor(name)
+        .unwrap_or_else(|| panic!("missing tensor '{name}'"));
+    if t.buffer.is_shared() {
+        (t.buffer.handle, t.byte_offset, t.byte_size)
+    } else {
+        (t.buffer.handle, 0, 0)
+    }
 }
 
 /// Sprint 20-M3 — per-tensor dequant scale lookup. Returns 1.0 for

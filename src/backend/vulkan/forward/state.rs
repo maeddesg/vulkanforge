@@ -745,6 +745,17 @@ pub struct Forward {
     pub(super) barrier_stats_checked: u64,
     pub(super) barrier_stats_issued: u64,
 
+    /// Sprint B Phase 2 — set of `VkBuffer` handles (as raw `u64`) that
+    /// back contiguous Sprint-B buckets (`LoadedModel::buckets`). Built
+    /// once in `Forward::new` and consulted by `write_bindings` to fire
+    /// a `debug_assert!` when a bucketed handle is bound with the
+    /// `WHOLE_SIZE` sentinel (`range == 0`) — that means the caller
+    /// forgot `layer_weight_with_offset` and would read the wrong
+    /// tensor's bytes from the bucket. Empty when `VF_BUCKET_POC` /
+    /// `VF_BUCKET_ALLOC` is off so the assert is a no-op on the legacy
+    /// 1-VkBuffer-per-tensor path.
+    pub(super) bucketed_handles: std::collections::HashSet<u64>,
+
     /// Sprint SG-2 — when `BarrierMode::GraphDriven`, both
     /// [`Forward::mark_written`] and [`Forward::maybe_compute_barrier`]
     /// become no-ops; the graph-driven `execute_layer_via_graph` path

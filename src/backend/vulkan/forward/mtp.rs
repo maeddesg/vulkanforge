@@ -197,6 +197,12 @@ impl Forward {
         let ehp = tw(format!("blk.{n_main}.nextn.eh_proj.weight"));
         let ehp_w = ehp.buffer.handle;
         let ehp_scale = ehp.weight_scale.unwrap_or(1.0);
+        // Sprint B Phase 2 — bucket sub-range for MTP eh_proj weight.
+        let (ehp_off, ehp_sz) = if ehp.buffer.is_shared() {
+            (ehp.byte_offset, ehp.byte_size)
+        } else {
+            (0u64, 0u64)
+        };
         // shared_head_norm if present, else output_norm.
         let shn_w = model
             .tensor(&format!("blk.{n_main}.nextn.shared_head_norm.weight"))
@@ -208,8 +214,16 @@ impl Forward {
             .tensor("output.weight")
             .or_else(|| model.tensor("token_embd.weight"))
             .expect("LM head present");
-        let w_lm = lm.buffer.handle;
         let lm_scale = lm.weight_scale.unwrap_or(1.0);
+        // Sprint B Phase 2 — bucket-aware lm_head lookup (same pattern
+        // as decode.rs::dispatch_final): `named_weight_with_offset`
+        // returns `(handle, 0, 0)` on the legacy path or the per-tensor
+        // sub-range when the lm_head is packed in a T0 bucket.
+        let (w_lm, w_lm_off, w_lm_sz) = if model.tensor("output.weight").is_some() {
+            super::arch::named_weight_with_offset(model, "output.weight")
+        } else {
+            super::arch::named_weight_with_offset(model, "token_embd.weight")
+        };
         let sub = self.mul_mat_vec_subgroup_enabled;
         let lm_shader = match (lm.ggml_type, sub) {
             (GgmlType::F8E4M3, _) => ShaderId::MulMatVecFp8,
@@ -290,7 +304,8 @@ impl Forward {
             }
             transfer_to_compute_barrier(dev, cmd);
             // 3. cur = eh_proj @ concat  (2·hidden → hidden) → scratch_a
-            self.run_gemv(dev, registry, cmd, ehp_shader, ehp_w, cat_buf, scratch_a,
+            self.run_gemv(dev, registry, cmd, ehp_shader, ehp_w, ehp_off, ehp_sz,
+                cat_buf, scratch_a,
                 hidden * 2, hidden, ehp_scale, "mtp_eh_proj");
             compute_barrier(dev, cmd);
             // 4. block-64 transformer: scratch_a (inpSA) → scratch_b
@@ -308,7 +323,8 @@ impl Forward {
                 hidden, 1, eps, "mtp_shared_head_norm");
             compute_barrier(dev, cmd);
             // 6. lm_head GEMV → logits_buf ; then readback to logits_staging
-            self.run_gemv(dev, registry, cmd, lm_shader, w_lm, hidden_norm, logits_buf,
+            self.run_gemv(dev, registry, cmd, lm_shader, w_lm, w_lm_off, w_lm_sz,
+                hidden_norm, logits_buf,
                 hidden, vocab, lm_scale, "mtp_lm_head");
             self.record_logits_readback(dev, cmd);
         })?;
