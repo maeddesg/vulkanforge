@@ -78,6 +78,17 @@ impl GpuBuffer {
         Self { handle, size, allocation: None, shared: true }
     }
 
+    /// Sprint v0.5.2 (coalesced backing) — wrap a `vk::Buffer` that the
+    /// caller has already bound to externally-owned `VkDeviceMemory`
+    /// (a shared coalesced backing block, `LoadedModel::bucket_backing`).
+    /// `allocation=None` + `shared=false` so `destroy()` runs
+    /// `vkDestroyBuffer` (this GpuBuffer owns the VkBuffer) but performs
+    /// NO `allocator.free()` (it holds no gpu-allocator allocation; the
+    /// backing memory is freed separately, AFTER all such buffers).
+    pub fn from_bound_buffer(handle: vk::Buffer, size: u64) -> Self {
+        Self { handle, size, allocation: None, shared: false }
+    }
+
     /// Write up to `bytes.len()` host-visible bytes to the buffer.
     /// Errors if the buffer is GPU-only (not host-mappable).
     pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {

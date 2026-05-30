@@ -510,6 +510,79 @@ const JOBS: &[ShaderJob] = &[
             ("MUL_MAT_ID", "1"),
         ],
     },
+    // Sprint v0.5.2 — Path C (`USE_SUBGROUP_ADD_NO_SHMEM`) for the
+    // INDEXED (MUL_MAT_ID) decode expert-GEMV. Faithful port of llama's
+    // gfx1201 decode path: on a single-subgroup workgroup (BLOCK_SIZE ==
+    // subgroup_size == 64) `reduce_result` does a pure `subgroupAdd` with
+    // NO cross-subgroup shmem combine and NO `barrier()`. llama selects
+    // exactly this SPV via `reduc16 = SHADER_REDUCTION_MODE_SUBGROUP`
+    // (ggml-vulkan.cpp:4309, array index 2 = `_subgroup_no_shmem` per
+    // vulkan-shaders-gen.cpp:1125), whereas VF's existing `_id_subgroup`
+    // is `USE_SUBGROUP_ADD` = the HYBRID (subgroup + shmem) reduction
+    // llama reserves for the multi-subgroup LARGE workgroup (NVIDIA/Intel).
+    // Paired with NUM_ROWS=2 (rm_kq) in the registry so the K-loop keeps
+    // two independent load streams in flight (latency hiding). Gated OFF
+    // by default behind `VF_GEMV_ID_NO_SHMEM=1`.
+    ShaderJob {
+        out_name: "mul_mat_vec_q3_k_f32_f32_id_subgroup_no_shmem.spv",
+        entry_source: "mul_mat_vec_q3_k.comp",
+        defines: &[
+            ("DATA_A_Q3_K", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("USE_SUBGROUP_ADD_NO_SHMEM", "1"),
+            ("MUL_MAT_ID", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mat_vec_q4_k_f32_f32_id_subgroup_no_shmem.spv",
+        entry_source: "mul_mat_vec_q4_k.comp",
+        defines: &[
+            ("DATA_A_Q4_K", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("USE_SUBGROUP_ADD_NO_SHMEM", "1"),
+            ("MUL_MAT_ID", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mat_vec_q5_0_f32_f32_id_subgroup_no_shmem.spv",
+        entry_source: "mul_mat_vec.comp",
+        defines: &[
+            ("DATA_A_Q5_0", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("USE_SUBGROUP_ADD_NO_SHMEM", "1"),
+            ("MUL_MAT_ID", "1"),
+        ],
+    },
+    ShaderJob {
+        out_name: "mul_mat_vec_q4_0_f32_f32_id_subgroup_no_shmem.spv",
+        entry_source: "mul_mat_vec.comp",
+        defines: &[
+            ("DATA_A_Q4_0", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("USE_SUBGROUP_ADD_NO_SHMEM", "1"),
+            ("MUL_MAT_ID", "1"),
+        ],
+    },
     // Sprint 56C-1 — Indexed FMA accumulator (out[i] += weights[slot] *
     // in[i]). Pendant to `fma_add.comp`; reads per-expert weight from
     // an SSBO instead of a push-constant scalar. Used by the GPU-direct

@@ -1631,7 +1631,13 @@ impl Forward {
                 cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
             );
             // Sprint G-5 — match the pipeline's NUM_ROWS spec when K-quant.
-            let n_rows = if crate::backend::vulkan::pipeline_registry::shader_is_k_quant_gemv(shader) {
+            // Sprint v0.5.2 — Path-C no_shmem indexed variants carry their
+            // own NUM_ROWS (`id_no_shmem_num_rows`); check first so the
+            // slot-loop / prefill indexed paths dispatch the right groups_x
+            // if `VF_GEMV_ID_NO_SHMEM` is exercised outside the batched path.
+            let n_rows = if crate::backend::vulkan::pipeline_registry::shader_is_id_no_shmem_gemv(shader) {
+                crate::backend::vulkan::pipeline_registry::id_no_shmem_num_rows()
+            } else if crate::backend::vulkan::pipeline_registry::shader_is_k_quant_gemv(shader) {
                 crate::backend::vulkan::pipeline_registry::mmv_num_rows_k()
             } else {
                 crate::backend::vulkan::pipeline_registry::MMV_NUM_ROWS
@@ -1703,7 +1709,12 @@ impl Forward {
         let layout = kernel.pipeline_layout;
         let pipeline = kernel.pipeline;
         // Sprint G-5 — match the pipeline's NUM_ROWS spec when K-quant.
-        let n_rows = if crate::backend::vulkan::pipeline_registry::shader_is_k_quant_gemv(shader) {
+        // Sprint v0.5.2 — the Path-C no_shmem indexed variants carry a
+        // path-specific NUM_ROWS (`id_no_shmem_num_rows`, default 2) that
+        // overrides the K-quant default, so check them first.
+        let n_rows = if crate::backend::vulkan::pipeline_registry::shader_is_id_no_shmem_gemv(shader) {
+            crate::backend::vulkan::pipeline_registry::id_no_shmem_num_rows()
+        } else if crate::backend::vulkan::pipeline_registry::shader_is_k_quant_gemv(shader) {
             crate::backend::vulkan::pipeline_registry::mmv_num_rows_k()
         } else {
             crate::backend::vulkan::pipeline_registry::MMV_NUM_ROWS

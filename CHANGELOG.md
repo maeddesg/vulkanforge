@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.5.2 — Adaptive staging (load-transient eviction fix) + parallel MoE-router top-K (2026-05-30)
+
+Two value-preserving decode wins on the big MoE/GDN models, both shipped as
+the new default; smaller dense models unchanged.
+
+**1. Adaptive staging buffer (the dominant lever).** The fixed 3.5-GiB
+`loader_staging` (a `CpuToGpu`/ReBAR-VRAM buffer) added a load-time VRAM
+transient that pushed the 26B/27B load-peak over the 16-GiB card, so the
+amdgpu/TTM kernel evicted already-loaded weight buckets to GTT (system RAM
+over PCIe) — and never migrated them back, throttling decode. Diagnosed via
+`mem_info_vram_used` + `mem_info_gtt_used` (VRAM+GTT total identical across
+configs, only the split differed → eviction, not allocator waste). The
+staging buffer is now sized to the largest single staged tensor, clamped to
+`[1.0, 3.5]` GiB (`VF_LOADER_STAGING_GIB` overrides). Small-tensor models
+(Gemma-4-26B-A4B, Qwen3.6-27B: all <1 GiB) → 1.0 GiB → **eviction-free load
+out-of-the-box** (GTT-during-decode 2.85 → 0.14 GiB); large-tensor models
+still get a staging that fits (no `TensorTooLarge`). Load is also ~30 %
+*faster* (less eviction churn during upload). KV-envelope flat to ≥16k ctx.
+
+**2. Parallel MoE-router top-K default ON (`VF_TOPK_OPTIMIZED`).** Post-(1),
+the serial thread-0 top-K became the #1 GPU consumer (RGP-ISOLATE 27.5 % of
+gpu_sum). The already-shipped parallel rank-count variant (`MoeRouterSoftmaxTopkPar`,
+C.2, byte-identical) is now default — router −90 % (→2.76 %), bit-identical.
+
+### Result (Gemma-4-26B-A4B Q3_K_M, RX 9070 XT, KV-FP8, n=400)
+
+- **Decode 54.3 → 102.6 tok/s (+89 %)** out-of-the-box; prefill 62 → 109 (+76 %).
+- **102.6 vs llama.cpp 132 = 78 %** of llama on the same GGUF (was 41 %).
+- **Qwen3.6-27B-MTP Q3_K_S: decode 23.4 → 39.7 (+70 %)**, prefill 21 → 33.
+
+### Value-preservation & gates
+- **Logits bit-identical** adaptive-staging vs the old 3.5-GiB default on all
+  5 deterministic release models (Gemma-26B-Q3, Qwen3-14B, Qwen3-8B,
+  Llama-3.1-8B, Gemma-4-E2B) — output is identical to v0.5.1, only faster.
+- Fact-recall correct (capital→Paris / 2+2→4 / largest planet→Jupiter) on all
+  coherent models. 15-prompt: Gemma-26B 14/15 (p12 = pre-existing em-dash-loop,
+  bit-identical to v0.5.1), Qwen3.6-27B effectively 15/15 (2 flags are
+  coherence-checker false-positives on correct numeric/math answers).
+- Dense 8B/14B decode/prefill unchanged (no MoE router, weights fit → no
+  eviction). `cargo test --release --lib` 240/240. Gemma-4-E2B stays the
+  pre-existing (v0.5.0-documented, bit-identical) garbage case — not v0.5.2.
+
+### Gated diagnostic infra (default OFF, honest-negative explorations)
+`VF_GEMV_ID_NO_SHMEM` (faithful llama reduction-path: per-dispatch −13/−17 %
+but wall-hidden by overlap), `VF_BUCKET_COALESCE` (llama-pattern backing:
+perf-preserving but VRAM was never block-count-bound). Both validation-clean,
+kept gated for future use; neither is the lever — the staging transient was.
+
 ## v0.5.0 — Software Graph default ON (2026-05-24)
 
 `VF_USE_GRAPH=1` is now the production default. The software-graph

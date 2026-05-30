@@ -68,6 +68,47 @@ fn print_load_progress(current: usize, total: usize, start: Instant, force_final
 /// doesn't pin the whole slot.
 const STAGING_BYTES: u64 = 3_584 * 1024 * 1024;
 
+/// Sprint v0.5.2 — staging-buffer size, env-tunable via `VF_LOADER_STAGING_GIB`
+/// (default = `STAGING_BYTES` = 3.5 GiB). `loader_staging` is `CpuToGpu` →
+/// ReBAR-mapped VRAM on AMD, so it adds a load-time VRAM transient (~3 GiB)
+/// that pushes the 26B load-peak over the card and triggers TTM eviction of
+/// already-loaded weight buckets to GTT (see
+/// `mess_v052_vram_resident_transient.md`). A smaller staging caps that
+/// transient. NOTE: a single tensor must still fit (largest 26B staged tensor
+/// — `token_embd` FP32-expanded ~2.95 GiB — sets the floor unless chunked).
+fn staging_bytes(gguf: &GgufFile) -> u64 {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    // Explicit env override (escape hatch / experiments).
+    if let Some(g) = std::env::var("VF_LOADER_STAGING_GIB")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|&g| g > 0.0)
+    {
+        return (g * GIB as f64) as u64;
+    }
+    // Sprint v0.5.2 — ADAPTIVE default: size to the largest single STAGED
+    // tensor (BF16 expands to FP32 = 4 B/elem; everything else stages at
+    // byte_size), clamped to [1.0 GiB, STAGING_BYTES (3.5 GiB)]. Removes the
+    // fixed-3.5-GiB load-time VRAM transient that was evicting 26B/27B weights
+    // to GTT (→ slow decode); small-tensor models (Gemma-26B-A4B,
+    // Qwen3.6-27B: all <1 GiB) → 1.0 GiB → eviction-free out-of-the-box,
+    // while large-tensor models (e.g. BF16 token_embd ~2.95 GiB) still get a
+    // staging that fits → no `TensorTooLarge` regression.
+    let max_staged = gguf
+        .tensors
+        .values()
+        .map(|t| {
+            if t.ggml_type == GgmlType::BF16 {
+                t.n_elements() * 4
+            } else {
+                t.byte_size()
+            }
+        })
+        .max()
+        .unwrap_or(STAGING_BYTES);
+    max_staged.clamp(GIB, STAGING_BYTES)
+}
+
 #[derive(Debug)]
 pub enum LoaderError {
     Gguf(super::gguf::GgufError),
@@ -182,6 +223,14 @@ pub struct LoadedModel {
     /// VkDeviceMemory backing those tensors and is freed when
     /// `LoadedModel` is dropped.
     pub buckets: Vec<GpuBuffer>,
+    /// Sprint v0.5.2 (coalesced backing, `VF_BUCKET_COALESCE=1`) — the few
+    /// large `VkDeviceMemory` blocks (each ≤ maxMemoryAllocationSize) that
+    /// back ALL bucket `VkBuffer`s via offset binding (llama-style: many
+    /// small regions in few pools). Empty when coalescing is OFF (default;
+    /// then each bucket owns its own gpu-allocator allocation). Freed in
+    /// `destroy()` AFTER the bucket VkBuffers (Vulkan requires buffers be
+    /// destroyed before the memory they are bound to is freed).
+    pub bucket_backing: Vec<vk::DeviceMemory>,
 }
 
 /// Sprint 43D-3 + 43D-4 — Per-Layer Embeddings runtime state for Gemma-4.
@@ -719,10 +768,16 @@ impl LoadedModel {
         let cmd_ctx = CommandContext::new(&dev.device, dev.queue_family_index)?;
 
         // One persistent staging buffer; rewound at every flush.
+        // Sprint v0.5.2 — size env-tunable to cap the load-time VRAM transient.
+        let staging_max = staging_bytes(gguf);
+        eprintln!(
+            "[VF_STAGING] adaptive staging = {:.2} GiB (env VF_LOADER_STAGING_GIB overrides)",
+            staging_max as f64 / 1_073_741_824.0,
+        );
         let mut staging = GpuBuffer::new(
             &dev.device,
             allocator,
-            STAGING_BYTES,
+            staging_max,
             vk::BufferUsageFlags::TRANSFER_SRC,
             MemoryLocation::CpuToGpu,
             "loader_staging",
@@ -800,6 +855,8 @@ impl LoadedModel {
         // bucket_map: GGUF tensor name → (bucket-vk::Buffer, byte_offset, byte_size)
         let mut bucket_map: HashMap<String, (vk::Buffer, u64, u64)> = HashMap::new();
         let mut buckets: Vec<GpuBuffer> = Vec::new();
+        // Sprint v0.5.2 — coalesced backing blocks (VF_BUCKET_COALESCE=1).
+        let mut bucket_backing: Vec<vk::DeviceMemory> = Vec::new();
 
         // Shared alignment for both PoC and Phase 2 paths.
         let min_align = unsafe {
@@ -897,6 +954,26 @@ impl LoadedModel {
             // worst-case 4-GB-per-VkBuffer alignment cliff some drivers
             // exhibit and stays comfortably above the per-tier totals
             // for 26B Q3_K_M (T4 ≈ 10.5 GB → 3 buckets).
+            //
+            // Sprint v0.5.2 (mess_v052_disambiguator_placement + this
+            // flip-sprint) MEASURED a real but VRAM-gated decode lever:
+            // a *smaller* cap drops the expert-weight per-load latency
+            // (the 26B decode is memory-LATENCY-bound — MC busy 16% vs
+            // llama 40%, not orchestration-bound) and lifts 26B Q3_K_M
+            // decode 54 → 71 t/s (+33%, prefill +50%), value-preserving
+            // (logits bit-identical: only physical placement changes).
+            // BUT the `GpuAllocatorManaged` bucket path wastes shared-pool
+            // space per extra bucket, so the win costs VRAM on a 16 GiB
+            // card (n=300, KV_FP8 peak): gib4 13.98 / gib3 15.12 / gib2
+            // 15.81 GiB. Every cap ≤3 breaches the ~14.5 GiB safety
+            // margin (gib2 = 0.19 GiB headroom → OOM-risk at longer ctx),
+            // so the default STAYS 4. `VF_BUCKET_MAX_GIB=2` is a
+            // value-preserving **opt-in** for +33% decode when headroom
+            // allows. The proper default-flip unlock = make buckets use a
+            // dedicated/tight allocation (remove the ~0.6 GiB/extra-bucket
+            // shared-pool waste); then 4→2 becomes VRAM-free. Dense
+            // (8B/14B) showed no regression at gib2 (decode identical),
+            // so the unlock is purely the allocator, not the cap value.
             const DEFAULT_MAX_BUCKET_GIB: u64 = 4;
             let max_bucket_bytes: u64 = std::env::var("VF_BUCKET_MAX_GIB")
                 .ok()
@@ -948,6 +1025,141 @@ impl LoadedModel {
                 }
             }
 
+            let coalesce = std::env::var("VF_BUCKET_COALESCE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if coalesce {
+                // Sprint v0.5.2 — COALESCED backing (llama-pattern). Keep the
+                // small ≤cap buckets (descriptor sub-ranges = the decode perf
+                // lever) but bind ALL of them into a few large VkDeviceMemory
+                // blocks (each ≤ maxMemoryAllocationSize) instead of one block
+                // each. bucket_map offsets are within-buffer (identical to the
+                // per-bucket path), so this is value-preserving AND descriptor-
+                // transparent — only the backing memory (and its kernel block
+                // count → VRAM) changes. Tests whether the +33% decode is tied
+                // to the small VkBuffer (survives) or the per-bucket
+                // VkDeviceMemory placement (dies). Default OFF.
+                let max_alloc: u64 = {
+                    let mut maint3 = vk::PhysicalDeviceMaintenance3Properties::default();
+                    let mut props2 =
+                        vk::PhysicalDeviceProperties2::default().push_next(&mut maint3);
+                    unsafe {
+                        dev.instance.get_physical_device_properties2(
+                            dev.physical_device, &mut props2,
+                        )
+                    };
+                    drop(props2);
+                    if maint3.max_memory_allocation_size > 0 {
+                        maint3.max_memory_allocation_size
+                    } else {
+                        4u64 * 1024 * 1024 * 1024 - 4096
+                    }
+                };
+
+                // Pass 1 — bucket layout (same grouping as the per-bucket path).
+                let mut layout: Vec<Vec<&str>> = Vec::new();
+                for &tier in &[0i32, 1, 2, 4] {
+                    let names = &tier_tensors[tier as usize];
+                    if names.is_empty() { continue; }
+                    let mut cur: Vec<&str> = Vec::new();
+                    let mut cur_total: u64 = 0;
+                    for n in names {
+                        let aligned = align_up(gguf.tensor(n).expect("name").byte_size());
+                        if cur_total > 0 && cur_total + aligned > max_bucket_bytes {
+                            layout.push(std::mem::take(&mut cur));
+                            cur_total = 0;
+                        }
+                        cur.push(*n);
+                        cur_total += aligned;
+                    }
+                    if !cur.is_empty() { layout.push(cur); }
+                }
+
+                // Pass 2 — create each bucket VkBuffer, get requirements,
+                // build bucket_map (within-buffer offsets). No memory yet.
+                struct Pending { handle: vk::Buffer, total: u64, req: vk::MemoryRequirements }
+                let mut pending: Vec<Pending> = Vec::new();
+                let mut mem_bits_and: u32 = u32::MAX;
+                for names in &layout {
+                    let total: u64 = names.iter()
+                        .map(|n| align_up(gguf.tensor(n).expect("name").byte_size()))
+                        .sum();
+                    let info = vk::BufferCreateInfo::default()
+                        .size(total)
+                        .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+                    let handle = unsafe { dev.device.create_buffer(&info, None) }
+                        .map_err(|e| LoaderError::Buffer(format!("coalesce bucket buffer: {e}")))?;
+                    let req = unsafe { dev.device.get_buffer_memory_requirements(handle) };
+                    mem_bits_and &= req.memory_type_bits;
+                    let mut off: u64 = 0;
+                    for n in names {
+                        let sz = gguf.tensor(n).expect("name").byte_size();
+                        bucket_map.insert(n.to_string(), (handle, off, sz));
+                        off += align_up(sz);
+                    }
+                    pending.push(Pending { handle, total, req });
+                }
+
+                // Pass 3 — DEVICE_LOCAL memory type common to all buckets.
+                let mem_props = unsafe {
+                    dev.instance.get_physical_device_memory_properties(dev.physical_device)
+                };
+                let mem_type = (0..mem_props.memory_type_count).find(|&i| {
+                    (mem_bits_and & (1u32 << i)) != 0
+                        && mem_props.memory_types[i as usize]
+                            .property_flags
+                            .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                }).ok_or_else(|| LoaderError::Buffer(
+                    "coalesce: no DEVICE_LOCAL memory type common to all buckets".into()
+                ))?;
+
+                // Pass 4 — pack buckets into ≤max_alloc backing blocks,
+                // allocate one VkDeviceMemory each, bind every bucket at its
+                // aligned offset.
+                let mut i = 0usize;
+                while i < pending.len() {
+                    let mut block_size: u64 = 0;
+                    let mut group: Vec<(usize, u64)> = Vec::new();
+                    while i < pending.len() {
+                        let a = pending[i].req.alignment.max(1);
+                        let off = ((block_size + a - 1) / a) * a;
+                        let end = off + pending[i].req.size;
+                        if !group.is_empty() && end > max_alloc { break; }
+                        group.push((i, off));
+                        block_size = end;
+                        i += 1;
+                    }
+                    let alloc_info = vk::MemoryAllocateInfo::default()
+                        .allocation_size(block_size)
+                        .memory_type_index(mem_type);
+                    let mem = unsafe { dev.device.allocate_memory(&alloc_info, None) }
+                        .map_err(|e| LoaderError::Buffer(
+                            format!("coalesce backing alloc ({block_size} B): {e}")
+                        ))?;
+                    for &(pidx, off) in &group {
+                        unsafe { dev.device.bind_buffer_memory(pending[pidx].handle, mem, off) }
+                            .map_err(|e| LoaderError::Buffer(format!("coalesce bind: {e}")))?;
+                    }
+                    eprintln!(
+                        "[VF_BUCKET_COALESCE] backing block #{}: {} bytes ({:.2} GiB), {} buckets",
+                        bucket_backing.len(), block_size,
+                        block_size as f64 / 1024.0 / 1024.0 / 1024.0, group.len(),
+                    );
+                    bucket_backing.push(mem);
+                }
+
+                // Pass 5 — bucket GpuBuffers own the VkBuffer; backing memory
+                // is freed separately in destroy().
+                for p in &pending {
+                    buckets.push(GpuBuffer::from_bound_buffer(p.handle, p.total));
+                }
+                eprintln!(
+                    "[VF_BUCKET_COALESCE] {} buckets bound into {} backing blocks (mem_type {}, cap {:.2} GiB)",
+                    pending.len(), bucket_backing.len(), mem_type,
+                    max_alloc as f64 / 1024.0 / 1024.0 / 1024.0,
+                );
+            } else {
             for &tier in &[0i32, 1, 2, 4] {
                 let names = &tier_tensors[tier as usize];
                 if names.is_empty() { continue; }
@@ -1007,6 +1219,7 @@ impl LoadedModel {
                 emit(&mut cur_names, &mut cur_total, &mut sub_idx,
                      &mut bucket_map, &mut buckets)?;
             }
+            } // end else (per-bucket path; coalesced path handled above)
 
             eprintln!(
                 "[VF_BUCKET_ALLOC] total: {} buckets, {} tensors packed (cap={:.1} GiB/bucket)",
@@ -1079,7 +1292,7 @@ impl LoadedModel {
                 Some(b) => b.len() as u64,
                 None => info.byte_size(),
             };
-            if size > STAGING_BYTES {
+            if size > staging_max {
                 // Fail loud; no per-tensor staging fallback today.
                 staging.destroy(&dev.device, allocator);
                 cmd_ctx.destroy(&dev.device);
@@ -1089,12 +1302,12 @@ impl LoadedModel {
                 return Err(LoaderError::TensorTooLarge {
                     name: name.to_string(),
                     size,
-                    max: STAGING_BYTES,
+                    max: staging_max,
                 });
             }
 
             // Flush the batch if this tensor wouldn't fit.
-            if staging_off + size > STAGING_BYTES {
+            if staging_off + size > staging_max {
                 if let Err(e) = Self::flush_batch(dev, &cmd_ctx, &staging, &pending) {
                     staging.destroy(&dev.device, allocator);
                     cmd_ctx.destroy(&dev.device);
@@ -1277,7 +1490,7 @@ impl LoadedModel {
                     // E2B / E4B / 26B all 35 layers × 1024 B = 35 KB,
                     // well under STAGING_BYTES = 3.5 GB; the check is
                     // defensive but mirrors the main loop's pattern.)
-                    if staging_off + synth_size > STAGING_BYTES {
+                    if staging_off + synth_size > staging_max {
                         if let Err(e) =
                             Self::flush_batch(dev, &cmd_ctx, &staging, &pending)
                         {
@@ -1447,6 +1660,7 @@ impl LoadedModel {
             ple_data,
             moe_router_data,
             buckets,
+            bucket_backing,
         })
     }
 
@@ -1494,6 +1708,11 @@ impl LoadedModel {
         // VkBuffer handles (1 per bucket) on shutdown.
         for bk in self.buckets.drain(..) {
             bk.destroy(device, allocator);
+        }
+        // Sprint v0.5.2 — free the coalesced backing blocks AFTER all
+        // bucket VkBuffers above are destroyed (Vulkan ordering rule).
+        for mem in self.bucket_backing.drain(..) {
+            unsafe { device.free_memory(mem, None) };
         }
     }
 
@@ -2450,6 +2669,7 @@ impl LoadedModel {
                 ple_data,
                 moe_router_data,
                 buckets: Vec::new(),
+                bucket_backing: Vec::new(),
             },
             host_embed,
             hf,

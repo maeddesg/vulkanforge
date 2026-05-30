@@ -137,15 +137,22 @@ pub(crate) fn moe_router_optimized_enabled() -> bool {
 /// C.1 isolation re-profile — NOT a timestamp artifact: it persists under
 /// `VF_GPU_TIMER_ISOLATE=1`) with a rank-count selection spread across all
 /// 128 threads. Byte-identical output (same selection, ordering and renorm
-/// accumulation order), so this is a pure-speed change. Default OFF (opt-in)
-/// — a default-flip is a separate owner decision after validation.
+/// accumulation order), so this is a pure-speed change.
+///
+/// **Sprint v0.5.2 — default-flipped ON.** Post-staging-fix (decode ~84 t/s)
+/// the serial top-K became the #1 GPU consumer (RGP-ISOLATE: 3.80 ms/tok,
+/// 27.5 % of gpu_sum); `_par` cuts it to 0.363 ms/tok (−90 %, 2.76 %) →
+/// **26B-A4B decode 84.5 → 102.6 t/s (+21 %)**, BIT-IDENTICAL logits
+/// (verified default==_par), no-op on non-MoE models. Opt-out via
+/// `VF_TOPK_OPTIMIZED=0` (or "false") for regression bisects.
+/// (results/mess_v052_router_diagnosis.md)
 pub(crate) fn moe_topk_optimized_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
         std::env::var("VF_TOPK_OPTIMIZED")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true)
     })
 }
 

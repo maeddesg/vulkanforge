@@ -526,6 +526,19 @@ pub(crate) fn layer_weight_indexed_shader(
 /// supported (Q3_K gate_up on GGUF, Q4_K on SafeTensors, Q5_0 down on
 /// GGUF). Other quants panic to surface dispatch-pick mistakes early.
 pub(crate) fn gemv_indexed_shader_for(ggml_type: GgmlType, subgroup: bool) -> ShaderId {
+    // Sprint v0.5.2 — opt-in Path-C no_shmem indexed decode GEMV
+    // (`VF_GEMV_ID_NO_SHMEM=1`), faithful to llama's gfx1201 decode path
+    // (`_subgroup_no_shmem` + NUM_ROWS=2). Only meaningful with a
+    // subgroup-capable device (the no_shmem reduce is a pure subgroupAdd).
+    if subgroup && crate::backend::vulkan::pipeline_registry::id_no_shmem_enabled() {
+        match ggml_type {
+            GgmlType::Q3K => return ShaderId::MulMatVecQ3KIdSubgroupNoShmem,
+            GgmlType::Q4K => return ShaderId::MulMatVecQ4KIdSubgroupNoShmem,
+            GgmlType::Q5_0 => return ShaderId::MulMatVecQ5_0IdSubgroupNoShmem,
+            GgmlType::Q4_0 => return ShaderId::MulMatVecQ4_0IdSubgroupNoShmem,
+            _ => {} // fall through to the HYBRID/stock variants below
+        }
+    }
     match (ggml_type, subgroup) {
         (GgmlType::Q3K, true ) => ShaderId::MulMatVecQ3KIdSubgroup,
         (GgmlType::Q3K, false) => ShaderId::MulMatVecQ3KId,

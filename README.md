@@ -18,6 +18,11 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
 
 ## Highlights
 
+- **Big-MoE decode +89 % (v0.5.2)** — adaptive load-staging eliminates a
+  fixed-buffer VRAM load-transient that was evicting weights to GTT, plus a
+  parallel MoE-router top-K (both value-preserving, bit-identical to v0.5.1).
+  Gemma-4-26B-A4B Q3_K_M decode **54 → 102.6 tok/s** (78 % of llama.cpp on the
+  same GGUF, was 41 %); Qwen3.6-27B **24 → 39.7**. See `CHANGELOG.md`.
 - **Software Graph dispatch pipeline (v0.5.0, default-on)** — the
   `LayerStep`-based imperative executor is now scheduled through a
   topologically-sorted dependency graph (`SubDispatch` enum, byte-

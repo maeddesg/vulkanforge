@@ -107,6 +107,52 @@ pub fn gemv_no_shmem_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Sprint v0.5.2 — when `VF_GEMV_ID_NO_SHMEM=1`, the MoE decode expert
+/// GEMV (`gemv_indexed_shader_for`) selects the Path-C no_shmem
+/// (`USE_SUBGROUP_ADD_NO_SHMEM`) `_id` variant instead of the HYBRID
+/// `_id_subgroup` (`USE_SUBGROUP_ADD`). This is a *faithful* port of
+/// llama's gfx1201 decode path: `reduc16 = SHADER_REDUCTION_MODE_SUBGROUP`
+/// (ggml-vulkan.cpp:4309) → `_subgroup_no_shmem` SPV (gen.cpp:1125),
+/// paired with NUM_ROWS=`id_no_shmem_num_rows` (= llama's rm_kq=2).
+/// Default OFF. **Unlike** [`gemv_no_shmem_enabled`] (Path C on the plain
+/// NUM_ROWS=1 GEMV, a G-5 wash), this lever's premise is that no_shmem
+/// is what lets NUM_ROWS=2 pay off (two independent K-loop load streams
+/// without the doubled-LDS + cross-subgroup `barrier()` cost). Both
+/// halves alone were washes (G-5 + the v0.5.2 NR=2-on-HYBRID probe);
+/// the combination is llama's measured config.
+pub fn id_no_shmem_enabled() -> bool {
+    std::env::var("VF_GEMV_ID_NO_SHMEM")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Sprint v0.5.2 — NUM_ROWS for the no_shmem `_id` decode GEMV. Faithful
+/// default = 2 (llama `rm_kq`). Env-tunable `VF_GEMV_ID_NR` (clamp 1..=4)
+/// so the no_shmem×{NR1,NR2} factors can be isolated without a rebuild.
+/// Both the pipeline spec-constant (registry) and the dispatch
+/// `groups_x` (`run_gemv_indexed_batched`) read this, keeping them in
+/// lock-step.
+pub fn id_no_shmem_num_rows() -> u32 {
+    std::env::var("VF_GEMV_ID_NR")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&v| (1..=4).contains(&v))
+        .unwrap_or(2)
+}
+
+/// True for the Sprint v0.5.2 Path-C no_shmem indexed (`MUL_MAT_ID`)
+/// decode expert-GEMV pipelines. Callers dispatching these must scale
+/// `groups_x` by [`id_no_shmem_num_rows`] (not [`mmv_num_rows_k`]).
+pub fn shader_is_id_no_shmem_gemv(id: ShaderId) -> bool {
+    matches!(
+        id,
+        ShaderId::MulMatVecQ3KIdSubgroupNoShmem
+            | ShaderId::MulMatVecQ4KIdSubgroupNoShmem
+            | ShaderId::MulMatVecQ5_0IdSubgroupNoShmem
+            | ShaderId::MulMatVecQ4_0IdSubgroupNoShmem
+    )
+}
+
 /// Sprint D.2 — opt-in barrier-free Q6_K subgroup GEMV (`Q6K_MLP`). When
 /// `VF_Q6K_GEMV_OPTIMIZED=1`, `run_gemv` swaps `MulMatVecQ6KSubgroup` for
 /// `MulMatVecQ6KSubgroupMlp` (drops the per-super-block scale barrier;
@@ -271,6 +317,23 @@ impl PipelineRegistry {
                     // _subgroup variants; without it, ACO could pick Wave32,
                     // which would have subgroupAdd reduce over only 32 lanes
                     // instead of 64 and produce half-sums.
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes, Some(64))
+                }
+                // Sprint v0.5.2 — Path-C no_shmem indexed decode GEMVs.
+                // Faithful llama gfx1201 config: BLOCK_SIZE=64 (single
+                // Wave64), NUM_ROWS=`id_no_shmem_num_rows` (rm_kq=2),
+                // NUM_COLS=1, requiredSubgroupSize=64 (REQUIRED — the
+                // no_shmem reduce_result is a pure subgroupAdd that only
+                // covers the whole WG if it is exactly one subgroup).
+                // Same 3-spec-const surface as the other GEMVs but with a
+                // path-specific NUM_ROWS, so it gets its own arm.
+                ShaderId::MulMatVecQ3KIdSubgroupNoShmem
+                | ShaderId::MulMatVecQ4KIdSubgroupNoShmem
+                | ShaderId::MulMatVecQ5_0IdSubgroupNoShmem
+                | ShaderId::MulMatVecQ4_0IdSubgroupNoShmem => {
+                    let entries = [entry(0, 0, 4), entry(1, 4, 4), entry(2, 8, 4)];
+                    let spec_data: [u32; 3] = [64, id_no_shmem_num_rows(), 1];
+                    let bytes = bytemuck::bytes_of(&spec_data);
                     ComputeKernel::from_spv_with_spec(device, &words, cache, &entries, bytes, Some(64))
                 }
                 ShaderId::RmsNorm | ShaderId::RmsNormMulRope => {
