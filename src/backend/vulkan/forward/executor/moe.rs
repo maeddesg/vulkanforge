@@ -2123,11 +2123,16 @@ impl BatchExec {
         let gate_up_shader = layer_weight_mmq_id_shader(
             ctx.model, ctx.layer, "moe_experts.gate_up_proj", subgroup,
         );
-        let gate_up_w = layer_weight(ctx.model, ctx.layer, "moe_experts.gate_up_proj");
+        // Sprint v0.5.3 — bucket-aware lookup (was layer_weight → offset 0,
+        // which read the start of the shared bucket under default-ON bucket
+        // allocation = garbage). Mirrors the gpu_direct GEMV path.
+        let (gate_up_w, gate_up_off, gate_up_sz) =
+            layer_weight_with_offset(ctx.model, ctx.layer, "moe_experts.gate_up_proj");
         fwd.run_mmq_id_grouped(
             ctx.dev, ctx.registry, ctx.cmd,
             gate_up_shader,
             gate_up_w,
+            gate_up_off, gate_up_sz,
             grouped_input_q8,
             grouped_gate_up_out,
             grouped_data_ids,
@@ -2344,11 +2349,14 @@ impl BatchExec {
         let down_shader = layer_weight_mmq_id_shader(
             ctx.model, ctx.layer, "moe_experts.down_proj", subgroup,
         );
-        let down_w = layer_weight(ctx.model, ctx.layer, "moe_experts.down_proj");
+        // Sprint v0.5.3 — bucket-aware lookup (see gate_up note above).
+        let (down_w, down_off, down_sz) =
+            layer_weight_with_offset(ctx.model, ctx.layer, "moe_experts.down_proj");
         fwd.run_mmq_id_grouped(
             ctx.dev, ctx.registry, ctx.cmd,
             down_shader,
             down_w,
+            down_off, down_sz,
             grouped_glu_q8,
             grouped_down_out,
             grouped_data_ids,

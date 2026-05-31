@@ -1824,6 +1824,15 @@ impl Forward {
         cmd: vk::CommandBuffer,
         shader_id: ShaderId,
         weights: vk::Buffer,
+        // Sprint v0.5.3 — bucket sub-range start + size (0 = WHOLE_SIZE).
+        // The grouped MMQ_ID shader's A-offset (mul_mmq.comp:196) is
+        // RELATIVE to the bound buffer base; under bucket allocation the
+        // expert weights sit at `byte_offset` inside a shared bucket, so
+        // the descriptor MUST bind at that offset (same fix as the
+        // gpu_direct GEMV path got in Sprint B Phase 1). Binding at 0
+        // read the start of the bucket = a different tensor = garbage.
+        weights_offset: u64,
+        weights_range: u64,
         input_q8: vk::Buffer,
         output: vk::Buffer,
         data_ids: vk::Buffer,
@@ -1847,7 +1856,7 @@ impl Forward {
         let set = self.alloc_or_get_set(
             dev, kernel.descriptor_set_layout,
             &[
-                (0, weights,     0, 0),
+                (0, weights,     weights_offset, weights_range),
                 (1, input_q8,    0, 0),
                 (2, output,      0, 0),
                 (3, data_ids,    0, 0),
