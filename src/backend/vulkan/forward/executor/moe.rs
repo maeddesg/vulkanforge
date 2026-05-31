@@ -2502,8 +2502,13 @@ impl BatchExec {
                 // (wrong sums, not <pad> garbage), non-deterministic per run.
                 // A/B verified (results/sprint_v053_compute_barrier_test.md):
                 // with barrier 10/10 Paris/391/Jupiter, without 0/10 (varying
-                // wrong answers). NOTE: Khronos sync-validation does NOT flag
-                // this compute→compute RMW hazard — confirmed empirically only.
+                // wrong answers). Do NOT remove based on Vulkan sync-validation
+                // being silent: on this RADV/Mesa build it could not be made to
+                // report even a positive control — a deliberately-removed, known
+                // gate_up→GLU RAW barrier that provably corrupts output flagged
+                // 0 SYNC-HAZARD across three enablement methods. So sync-val's
+                // silence here proves nothing; the necessity rests on the A/B.
+                // (results/sprint_v053_compute_barrier_syncval.md)
                 compute_barrier(ctx.dev, ctx.cmd);
             }
         }
