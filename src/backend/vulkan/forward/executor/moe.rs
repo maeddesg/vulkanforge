@@ -2491,15 +2491,19 @@ impl BatchExec {
                         "moe_fma_add_grouped",
                     );
                 }
-                // Sprint 61G — Per-FMA barrier confirmed necessary.
-                // Single-expert mode (top_k=1, no FMA chain) produces
-                // "Paris." correctly; multi-expert (top_k=8) without
-                // this barrier produces coherent-irrelevant output
-                // because the 8 FMAs for each token race on
-                // `batch_out[t*h..(t+1)*h]`. The bisect-side equivalent
-                // is `maybe_compute_barrier(&[batch_out])` after each
-                // `run_fma_add_indexed`. Emitting the same Vulkan
-                // primitive directly here.
+                // REQUIRED — real accumulation read-modify-write edge (NOT a
+                // "race" in the mislabeled 61G/FMA-race sense; that diagnosis
+                // predated the actual GROUPED bug, the bucket-offset fixed in
+                // 555bd39). For a fixed token `t`, all `top_k` FMAs target the
+                // SAME region `batch_out[t*h..(t+1)*h]` (out_off = t*h_bytes,
+                // k-independent) and accumulate (`d[i] += a[i]*w`), so each
+                // depends on the previous one's write. Without this barrier the
+                // dispatches overlap → lost updates → coherent-but-WRONG output
+                // (wrong sums, not <pad> garbage), non-deterministic per run.
+                // A/B verified (results/sprint_v053_compute_barrier_test.md):
+                // with barrier 10/10 Paris/391/Jupiter, without 0/10 (varying
+                // wrong answers). NOTE: Khronos sync-validation does NOT flag
+                // this compute→compute RMW hazard — confirmed empirically only.
                 compute_barrier(ctx.dev, ctx.cmd);
             }
         }
