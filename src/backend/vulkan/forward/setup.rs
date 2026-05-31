@@ -1099,6 +1099,16 @@ impl Forward {
         // `VF_MOE_BATCHED_DECODE=0`.
         let batched_decode_active =
             crate::backend::vulkan::forward::executor::batched_decode_moe_enabled();
+        // Sprint A1.5 — right-size the grouped scratch to ONE prefill chunk
+        // (`max_prefill_tokens`), NOT the full context. `prefill_batch`
+        // hard-errors on `seq_len > max_prefill_tokens` (prefill.rs:71) and the
+        // chunked prefill loop caps each chunk at `max_prefill_tokens`
+        // (decode.rs:563), so the grouped dispatch never sees more than that.
+        // Was `max_seq` (= max_context) → scaled the persistent scratch with
+        // context length and eroded the 26B decode VRAM envelope at long ctx
+        // (A1 gate: 14,83 GiB @ctx4096). `min` also covers short contexts where
+        // max_prefill_tokens > max_context. Sizing-only; no compute change.
+        let grouped_seq = max_seq.min(self.max_prefill_tokens.max(1));
         let (
             input_q8_bytes,
             gate_up_out_bytes,
@@ -1109,12 +1119,12 @@ impl Forward {
             data_counts_bytes,
         ) = if grouped_path_active {
             (
-                q8_1_bytes((max_seq as u64) * (hidden_size as u64)),
-                (max_seq as u64) * (top_k as u64) * 2 * (mi as u64) * 4,
-                (max_seq as u64) * (top_k as u64) * (mi as u64) * 4,
-                q8_1_bytes((max_seq as u64) * (top_k as u64) * (mi as u64)),
-                (max_seq as u64) * (top_k as u64) * (hidden_size as u64) * 4,
-                (max_seq as u64) * (top_k as u64) * 4,
+                q8_1_bytes((grouped_seq as u64) * (hidden_size as u64)),
+                (grouped_seq as u64) * (top_k as u64) * 2 * (mi as u64) * 4,
+                (grouped_seq as u64) * (top_k as u64) * (mi as u64) * 4,
+                q8_1_bytes((grouped_seq as u64) * (top_k as u64) * (mi as u64)),
+                (grouped_seq as u64) * (top_k as u64) * (hidden_size as u64) * 4,
+                (grouped_seq as u64) * (top_k as u64) * 4,
                 (n_experts as u64) * 4,
             )
         } else if batched_decode_active {
