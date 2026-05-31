@@ -946,10 +946,17 @@ impl LoadedModel {
             // MUST use `layer_weight_with_offset` / `named_weight_with_offset`
             // and bind the bucket sub-range — binding at offset 0 reads the
             // wrong tensor from the bucket start (this was the GROUPED `<pad>`
-            // drift). Tier 3/5 are NOT bucketed, so their offset-0
-            // `layer_weight` binds are correct; if a future change buckets a
-            // Tier 3/5 tensor, every binding of it must switch to the
-            // with-offset path or the offset-0 bug-class reopens.
+            // drift). Tier 3/5 are NOT bucketed, so their ~45 offset-0
+            // `layer_weight()` binds (norms / scales / SSM / gate_inp in
+            // attention.rs / ffn.rs / control.rs / moe.rs) are correct ONLY
+            // because each owns its own VkBuffer (byte_offset=0). If a future
+            // change buckets a Tier 3/5 tensor, those offset-0 binds read from
+            // the bucket start = WRONG tensor = <pad>-garbage, with NO compile
+            // error and no visible bucketing link — the bug-class that took
+            // 2-3 sprints to diagnose on the grouped path.
+            // REGEL: before bucketing ANY Tier 3/5 tensor, first migrate its
+            // `layer_weight()` site(s) to `layer_weight_with_offset()` (the
+            // offset-aware sub-range bind).
             //
             // Sub-bucketing: when a tier's total exceeds
             // `MAX_BUCKET_BYTES`, the tier is split across multiple
@@ -1010,6 +1017,13 @@ impl LoadedModel {
                 {
                     4
                 } else {
+                    // -1 = not bucketed (Tier 3/5: norms / scales / SSM /
+                    // gate_inp / everything else). MUST stay -1 — see the
+                    // INVARIANT in the tier doc-block above: the offset-0
+                    // `layer_weight()` binds of these tensors depend on each
+                    // owning its own VkBuffer. Adding a tier here without first
+                    // migrating its binds to `layer_weight_with_offset()`
+                    // reopens the bucket-offset bug-class.
                     -1
                 }
             }
@@ -1068,6 +1082,11 @@ impl LoadedModel {
 
                 // Pass 1 — bucket layout (same grouping as the per-bucket path).
                 let mut layout: Vec<Vec<&str>> = Vec::new();
+                // INVARIANT: bucket ONLY T0/T1/T2/T4. Do NOT add 3 or 5 here
+                // without first migrating those tensors' `layer_weight()` binds
+                // to `layer_weight_with_offset()` — else the bucket-offset
+                // bug-class reopens silently (see tier doc-block above +
+                // results/audit_v053_bucket_offset_class.md).
                 for &tier in &[0i32, 1, 2, 4] {
                     let names = &tier_tensors[tier as usize];
                     if names.is_empty() { continue; }
@@ -1170,6 +1189,11 @@ impl LoadedModel {
                     max_alloc as f64 / 1024.0 / 1024.0 / 1024.0,
                 );
             } else {
+            // INVARIANT: bucket ONLY T0/T1/T2/T4. Do NOT add 3 or 5 here without
+            // first migrating those tensors' `layer_weight()` binds to
+            // `layer_weight_with_offset()` — else the bucket-offset bug-class
+            // reopens silently (see tier doc-block above +
+            // results/audit_v053_bucket_offset_class.md).
             for &tier in &[0i32, 1, 2, 4] {
                 let names = &tier_tensors[tier as usize];
                 if names.is_empty() { continue; }
