@@ -484,8 +484,14 @@ impl DecodeExec {
             "moe_experts.down_proj",
             fwd.mul_mat_vec_subgroup_enabled,
         );
-        let gate_up_w = layer_weight(ctx.model, ctx.layer, "moe_experts.gate_up_proj");
-        let down_w    = layer_weight(ctx.model, ctx.layer, "moe_experts.down_proj");
+        // Sprint v0.5.3 audit — bucket-aware lookup. `layer_weight()` binds at
+        // offset 0, but under bucket allocation (default-ON) the experts live
+        // at `byte_offset` inside a shared bucket; the per-expert offset below
+        // folds in that base (matches the gpu_direct + grouped fixes).
+        let (gate_up_w, gate_up_base, _) =
+            layer_weight_with_offset(ctx.model, ctx.layer, "moe_experts.gate_up_proj");
+        let (down_w, down_base, _) =
+            layer_weight_with_offset(ctx.model, ctx.layer, "moe_experts.down_proj");
 
         // Zero the accumulator before the per-expert loop. Replaces a
         // dedicated "zero buffer" shader; the COMPUTE→TRANSFER barrier
@@ -501,7 +507,7 @@ impl DecodeExec {
 
         for &(expert_idx, weight) in &routing {
             // (a) gate_up GEMV: scratch_b × experts.gate_up_proj[e] → gate_buf [2*mi].
-            let gate_up_off = (expert_idx as u64) * gate_up_bytes_per_expert;
+            let gate_up_off = gate_up_base + (expert_idx as u64) * gate_up_bytes_per_expert;
             fwd.run_gemv_q4k_at_offset(
                 ctx.dev, ctx.registry, ctx.cmd,
                 gate_up_w, gate_up_off,
@@ -549,7 +555,7 @@ impl DecodeExec {
             //     extends past `mi` valid floats but the corresponding
             //     padded weight columns are quantized zeros so the
             //     extra contributions are exactly 0.
-            let down_off = (expert_idx as u64) * down_bytes_per_expert;
+            let down_off = down_base + (expert_idx as u64) * down_bytes_per_expert;
             // Sprint 52P — loader-aware K. GGUF and SafeTensors store
             // the 3-D MoE tensor with mirrored axis order:
             //   GGUF:        shape = [K, M, n_experts]
@@ -1649,8 +1655,11 @@ impl BatchExec {
             "moe_experts.down_proj",
             fwd.mul_mat_vec_subgroup_enabled,
         );
-        let gate_up_w = layer_weight(ctx.model, ctx.layer, "moe_experts.gate_up_proj");
-        let down_w    = layer_weight(ctx.model, ctx.layer, "moe_experts.down_proj");
+        // Sprint v0.5.3 audit — bucket-aware lookup (see step_moe_expert_ffn).
+        let (gate_up_w, gate_up_base, _) =
+            layer_weight_with_offset(ctx.model, ctx.layer, "moe_experts.gate_up_proj");
+        let (down_w, down_base, _) =
+            layer_weight_with_offset(ctx.model, ctx.layer, "moe_experts.down_proj");
         let batch_in = fwd.batch_o.handle;
         let batch_out = fwd.batch_ffn_hidden.handle;
 
@@ -1674,8 +1683,8 @@ impl BatchExec {
             let out_off = (t as u64) * h_bytes;
             let routing = &routing_batch[t];
             for &(expert_idx, weight) in routing {
-                let gate_up_off = (expert_idx as u64) * gate_up_bytes_per_expert;
-                let down_off    = (expert_idx as u64) * down_bytes_per_expert;
+                let gate_up_off = gate_up_base + (expert_idx as u64) * gate_up_bytes_per_expert;
+                let down_off    = down_base + (expert_idx as u64) * down_bytes_per_expert;
 
                 // (a) gate_up GEMV: batch_in[t] × experts.gate_up_proj[e] → gate_buf [2*mi].
                 fwd.run_gemv_q4k_at_offset_inout(
