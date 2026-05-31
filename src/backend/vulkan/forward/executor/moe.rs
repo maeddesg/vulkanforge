@@ -41,6 +41,39 @@ pub(crate) fn moe_grouped_enabled() -> bool {
     })
 }
 
+/// Sprint v0.5.3 (Prefill-Diagnose, perf-only) — `VF_PREFILL_SKIP_EXPERT_FFN=1`
+/// makes the BAT (prefill) Expert-FFN step early-return WITHOUT dispatching any
+/// expert GEMV/GEMM. Produces GARBAGE output by design (MoeBranchAdd adds the
+/// stale `batch_ffn_hidden` slab); used solely to measure the Expert-FFN-free
+/// prefill ceiling, because `VF_GPU_TIMER` is decode-only and the prefill
+/// expert share is otherwise unobservable headless. Default OFF, never shipped
+/// as a feature. Cached after first read.
+pub(crate) fn prefill_skip_expert_ffn() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("VF_PREFILL_SKIP_EXPERT_FFN")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Sprint v0.5.3 (GROUPED-Drift-Bisect, diagnostic) — `VF_MOE_GROUPED_MAX_LAYER=N`
+/// routes the prefill Expert-FFN through the grouped MMQ_ID path for layers
+/// `[0, N)` and the (correct) GPU-direct GEMV slot-loop for `[N, ..]`,
+/// overriding the normal `moe_grouped_enabled()` gate. Sweeping N localises the
+/// layer at which the GROUPED path's drift first corrupts the output. `None`
+/// (unset) leaves normal gating untouched. Cached after first read.
+pub(crate) fn moe_grouped_max_layer() -> Option<u32> {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<Option<u32>> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("VF_MOE_GROUPED_MAX_LAYER")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+    })
+}
+
 /// Sprint 61C — Subgroup-ballot vs scalar IDS-scan toggle for the
 /// MMQ_ID kernels. `VF_MOE_GROUPED_SUBGROUP=0` falls back to the
 /// stock variant; default ON since the subgroup build proved to load
@@ -1535,11 +1568,26 @@ impl BatchExec {
         &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx,
         n_experts: u32, top_k: u32, moe_intermediate: u32,
     ) {
+        // Sprint v0.5.3 (Prefill-Diagnose, perf-only) — measure the
+        // Expert-FFN-free prefill ceiling. Skips ALL expert dispatch;
+        // MoeBranchAdd then adds the stale `batch_ffn_hidden` slab →
+        // garbage output by design. Default OFF.
+        if prefill_skip_expert_ffn() {
+            return;
+        }
+        // Sprint v0.5.3 (GROUPED-Drift-Bisect) — VF_MOE_GROUPED_MAX_LAYER=N
+        // routes layers [0,N) through the grouped MMQ_ID path and [N,..]
+        // through the correct GPU-direct slot-loop, overriding the normal
+        // moe_grouped_enabled() gate to localise the drift onset.
+        let use_grouped = match moe_grouped_max_layer() {
+            Some(n) => ctx.layer < n,
+            None => moe_grouped_enabled(),
+        };
         // Sprint 61C — Phase 2' Expert-Grouped MMQ_ID branch.
         // Requires the GPU router so we can read indices_scratch /
         // weights_scratch for the CPU counting-sort. Skipped if the
         // env-gate is off (default).
-        if moe_grouped_enabled() && fwd.moe_router_gpu.is_some() {
+        if use_grouped && fwd.moe_router_gpu.is_some() {
             self.b_step_moe_expert_ffn_grouped(
                 fwd, cfg, ctx, n_experts, top_k, moe_intermediate,
             );

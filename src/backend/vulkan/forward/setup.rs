@@ -1083,7 +1083,12 @@ impl Forward {
         // env-gate, so it never reaches a stub buffer.
         let grouped_path_active = std::env::var("VF_MOE_GROUPED")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+            .unwrap_or(false)
+            // Sprint v0.5.3 — the per-layer GROUPED drift-bisect gate
+            // (VF_MOE_GROUPED_MAX_LAYER=N) drives the grouped MMQ_ID dispatch
+            // for layers [0,N); allocate the full grouped scratch when it is
+            // set so the bisect runs without needing VF_MOE_GROUPED=1.
+            || std::env::var("VF_MOE_GROUPED_MAX_LAYER").is_ok();
         // Sprint P4-1 — decode-batched GEMV reuses `grouped_gate_up_out`
         // / `grouped_glu_out` / `grouped_down_out` but at decode-scale
         // (seq_len=1 × top_k × per-slot), ~155 KiB for 26B vs ~640 MiB
