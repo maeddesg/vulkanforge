@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.5.3 — GROUPED MoE-expert prefill default-ON + bucket-offset bug-class closed (2026-05-31)
+
+The Expert-Grouped MMQ_ID prefill path (`VF_MOE_GROUPED`) is now the **default**
+for MoE models, value-preserving. Bundles the drift fix that made it correct,
+the bucket-offset bug-class audit, and a VRAM right-sizing that made the flip
+safe on the 16-GiB envelope.
+
+**1. GROUPED gate_up/down MMQ_ID drift fixed (value-preserving).** The grouped
+expert FFN previously produced `<pad>` garbage on 26B-Q3_K_M (the long-standing
+"61C/61E/61G drift"). Root cause was **not** the shader (byte-identical to
+llama.cpp's `mul_mmq`) but a host bug: the grouped weight descriptor was bound
+at offset 0, while under bucket allocation (default since v0.5.1) the expert
+weights live at a `byte_offset` inside a shared bucket → it read the wrong
+tensor from the bucket start. Fixed by binding the bucket sub-range
+(`layer_weight_with_offset`), the same fix the GPU-direct path got in Sprint B.
+Bisected with a new per-layer gate (`VF_MOE_GROUPED_MAX_LAYER`): clean flip at
+layer 0; correctness ladder (Paris/391/Jupiter) green at every layer count.
+
+**2. Bucket-offset bug-class closed (audit).** Enumerated every weight-matrix
+binding: only tiers T0 (lm_head), T1 (attn-proj), T2 (dense FFN), T4 (MoE
+experts) are bucketed; Tier 3/5 (norms, scales, ssm_*, PLE) are
+one-buffer-per-tensor (offset 0 correct). The two remaining latent danger sites
+— the non-GPU-direct CPU-readback expert FFN fallbacks (`VF_GPU_DIRECT_MOE=0`)
+— were also binding at offset 0; fixed. No remaining bucketed-matrix offset-0
+bindings.
+
+**3. Scratch right-sized (`max_context` → `max_prefill_tokens`).** The grouped
+scratch was sized by `max_context` and persistent, so it scaled with context
+length and breached the VRAM warn threshold at ctx ≥ 4096 (14.83 GiB). Since
+prefill is chunked at `max_prefill_tokens` (and `prefill_batch` hard-errors
+above it), the scratch only needs one chunk: now a fixed ~265 MB
+(`max_prefill 1024`), context-independent.
+
+**4. Default flip (`VF_MOE_GROUPED` OFF → ON).** `VF_MOE_GROUPED=0` is the
+escape-hatch back to the legacy GPU-direct GEMV slot-loop prefill.
+
+### Result (Gemma-4-26B-A4B Q3_K_M, RX 9070 XT, KV-FP8)
+
+- **Prefill +33–39 %** out-of-the-box: 146 → ~199 t/s @pp512, +29/37/35/32 % at
+  pp128/512/1024/2048. Value-preserving (Paris/391/Jupiter, 15-prompt coherent).
+- **Decode unchanged (~103 t/s)** — GROUPED gates only the prefill path; decode
+  stays on GPU-direct.
+- **VRAM footprint +~265 MB** for MoE models (dense/GDN models unaffected — no
+  MoE experts → grouped path never taken). 26B under budget: ctx2048 13.87,
+  ctx4096 14.12 GiB (both < 14.5), no GTT eviction.
+- Escape-hatch: `VF_MOE_GROUPED=0` → legacy prefill (146 t/s), bit-identical to
+  the pre-flip default.
+
 ## v0.5.2 — Adaptive staging (load-transient eviction fix) + parallel MoE-router top-K (2026-05-30)
 
 Two value-preserving decode wins on the big MoE/GDN models, both shipped as

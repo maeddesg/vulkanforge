@@ -297,6 +297,21 @@ If < 40 % → bottleneck is elsewhere (e.g. attention KV stride);
    `gpu_direct_moe_enabled()` — needs OR-arm for the grouped path).
 3. Update `docs/p1_batch_prefill_plan.md` Phase 2' status row.
 
+> **STATUS — SHIPPED v0.5.3 (default ON).** The 61C grouped path had a
+> long-standing `<pad>`-garbage drift; root cause was NOT the shader
+> (byte-identical to llama.cpp `mul_mmq`) but a host bug — the grouped weight
+> descriptor was bound at offset 0 while bucket allocation (default since
+> v0.5.1) places expert weights at a `byte_offset` inside a shared bucket.
+> Fixed by binding the bucket sub-range (`layer_weight_with_offset`); the
+> bucket-offset bug-class was then audited and closed across all weight tiers
+> (incl. the `VF_GPU_DIRECT_MOE=0` CPU-readback fallbacks). The grouped scratch
+> was right-sized from `max_context` to `max_prefill_tokens` (one prefill chunk,
+> ~265 MB fixed) so the default-ON VRAM footprint stays under the 16-GiB
+> envelope at long context. **Default ON; `VF_MOE_GROUPED=0` = legacy
+> GPU-direct GEMV prefill escape-hatch.** Result: Gemma-4-26B-A4B Q3_K_M
+> prefill +33–39 % (146 → ~199 t/s @pp512), value-preserving, decode-neutral
+> (~103 t/s), +~265 MB VRAM (MoE models only).
+
 ### Sprint 61E — Option B GPU Histogram (1 day, optional)
 1. `vk_shaders/moe_expert_count.comp` (~20 LOC).
 2. `ShaderId::MoeExpertCount`, registry, runs helper.

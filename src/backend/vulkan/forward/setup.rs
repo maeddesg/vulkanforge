@@ -1075,19 +1075,19 @@ impl Forward {
             // (n + 127) / 128 * 144
             ((n_elems + 127) / 128) * 144
         };
-        // Sprint [vram-budget]: allocate the grouped buffers full-size
-        // only when VF_MOE_GROUPED=1 is set. Otherwise allocate 16-byte
-        // stubs so the MoeRouterGpu struct stays uniform (saves
-        // ~200-500 MiB VRAM for the default GPU-direct path that never
-        // touches these buffers). The grouped step `unwrap`s on the
-        // env-gate, so it never reaches a stub buffer.
+        // Sprint A2 (v0.5.3) — grouped prefill is **default ON**, so allocate
+        // the grouped scratch full-size by default (right-sized to ONE prefill
+        // chunk in A1.5 → ~265 MB @ max_prefill 1024, context-independent).
+        // `VF_MOE_GROUPED=0` (escape-hatch) drops to 16-byte stubs for the
+        // legacy GPU-direct prefill path. MUST stay in sync with
+        // `moe_grouped_enabled()` (executor::moe) — coupled: the grouped
+        // dispatch reads these buffers; stub-sized buffers would corrupt.
         let grouped_path_active = std::env::var("VF_MOE_GROUPED")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-            // Sprint v0.5.3 — the per-layer GROUPED drift-bisect gate
-            // (VF_MOE_GROUPED_MAX_LAYER=N) drives the grouped MMQ_ID dispatch
-            // for layers [0,N); allocate the full grouped scratch when it is
-            // set so the bisect runs without needing VF_MOE_GROUPED=1.
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true)
+            // The per-layer GROUPED drift-bisect gate (VF_MOE_GROUPED_MAX_LAYER=N)
+            // also drives the grouped dispatch; allocate the scratch when set
+            // (redundant under default-ON but keeps GROUPED=0 + MAX_LAYER working).
             || std::env::var("VF_MOE_GROUPED_MAX_LAYER").is_ok();
         // Sprint P4-1 — decode-batched GEMV reuses `grouped_gate_up_out`
         // / `grouped_glu_out` / `grouped_down_out` but at decode-scale

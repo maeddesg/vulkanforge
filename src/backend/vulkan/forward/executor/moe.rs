@@ -27,17 +27,23 @@ use ash::vk;
 
 use super::super::gpu_direct_moe_enabled;
 
-/// Sprint 61C — Phase 2' env-gate. `VF_MOE_GROUPED=1` activates the
-/// MMQ_ID Expert-Grouped batched dispatch in `b_step_moe_expert_ffn`;
-/// any other value (including unset) keeps the GPU-direct GEMV slot
-/// loop from Sprint 56C-3 as the default. Cached after first read.
+/// Sprint A2 (v0.5.3) — Phase 2' env-gate, **default ON**. The MMQ_ID
+/// Expert-Grouped batched prefill dispatch (`b_step_moe_expert_ffn_grouped`)
+/// is now the default for MoE models: Gemma-4-26B prefill +33-39 %
+/// (value-preserving, decode-neutral). `VF_MOE_GROUPED=0` (or "false") is the
+/// escape-hatch back to the legacy GPU-direct GEMV slot-loop (Sprint 56C-3).
+/// Value-preserving since the bucket-offset drift fix (555bd39) + class audit
+/// (f6ead17) + scratch right-sizing (A1.5). Cached after first read.
+/// NOTE: the scratch-allocation gate `grouped_path_active` (setup.rs) MUST use
+/// the same default-ON semantics — they are coupled (grouped dispatch reads the
+/// scratch buffers; stub-sized buffers would corrupt).
 pub(crate) fn moe_grouped_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
         std::env::var("VF_MOE_GROUPED")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true)
     })
 }
 

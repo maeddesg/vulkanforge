@@ -941,6 +941,16 @@ impl LoadedModel {
             // they are small and bucketing them would only add bucket
             // count without changing placement behaviour.
             //
+            // INVARIANT (v0.5.3 bucket-offset audit, results/audit_v053_*):
+            // every dispatch that binds a BUCKETED weight matrix (T0/T1/T2/T4)
+            // MUST use `layer_weight_with_offset` / `named_weight_with_offset`
+            // and bind the bucket sub-range — binding at offset 0 reads the
+            // wrong tensor from the bucket start (this was the GROUPED `<pad>`
+            // drift). Tier 3/5 are NOT bucketed, so their offset-0
+            // `layer_weight` binds are correct; if a future change buckets a
+            // Tier 3/5 tensor, every binding of it must switch to the
+            // with-offset path or the offset-0 bug-class reopens.
+            //
             // Sub-bucketing: when a tier's total exceeds
             // `MAX_BUCKET_BYTES`, the tier is split across multiple
             // contiguous buffers (each ≤ cap). This mirrors llama.cpp's
