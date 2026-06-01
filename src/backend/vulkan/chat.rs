@@ -207,8 +207,15 @@ impl ChatSession {
         // deinterleave fix. Per-token-prefill stays default for Qwen3.6
         // until G-4+ locates the divergence (deferred — speed work
         // focuses on decode where the win is bigger).
-        let force_pt_prefill = cfg.qwen35.is_some()
-            || std::env::var("VF_FORCE_PER_TOKEN_PREFILL").is_ok();
+        // Diagnose-Override (gated, default-off): VF_QWEN35_FORCE_BATCH=1
+        // drives the known-broken (G-2i) BatchExec qwen35 prefill ON
+        // PURPOSE to localize the divergence. Production stays per-token
+        // (the workaround); this only flips qwen35 back onto prefill_batch.
+        let qwen35_force_batch = cfg.qwen35.is_some()
+            && std::env::var("VF_QWEN35_FORCE_BATCH").as_deref() == Ok("1");
+        let force_pt_prefill = (cfg.qwen35.is_some()
+            || std::env::var("VF_FORCE_PER_TOKEN_PREFILL").is_ok())
+            && !qwen35_force_batch;
         let result = generate_from_tokens(
             &mut self.forward,
             dev, registry, cmd_ctx, model,

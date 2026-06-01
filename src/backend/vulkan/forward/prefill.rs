@@ -332,7 +332,17 @@ impl Forward {
         seq_len: u32,
         hidden_bytes: u64,
     ) {
-        let last_off = ((seq_len - 1) as u64) * hidden_bytes;
+        // Diagnostic (gated, default-off): VF_BATCH_DUMP_POS=<p> exposes
+        // position p's logits (final-norm + lm_head on batch_residual[p])
+        // instead of the last token. Lets us diff BatchExec's per-position
+        // output against the per-token DECODE oracle (which dumps logits
+        // for every position via VF_LOGIT_DUMP). Default = last position.
+        let row = std::env::var("VF_BATCH_DUMP_POS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&p| p < seq_len)
+            .unwrap_or(seq_len - 1);
+        let last_off = (row as u64) * hidden_bytes;
         self.copy_batch_row(
             dev, cmd, self.batch_residual.handle, last_off,
             self.cur().scratch_a.handle, hidden_bytes,

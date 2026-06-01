@@ -550,9 +550,26 @@ pub fn generate_from_tokens(
             // the per-token GEMV path. That's slow at long pp but
             // proves the end-to-end pipeline; an FP8 GEMM port is
             // future work (Sprint 19A-style coopmat coverage).
+            // Diagnostic (gated, default-off): dump the per-token DECODE
+            // oracle's logits at every prefill position so they can be
+            // diffed against BatchExec's per-position output (VF_BATCH_DUMP_POS).
+            let per_tok_logits =
+                std::env::var("VF_PREFILL_PER_TOKEN_LOGITS").as_deref() == Ok("1");
             for (i, &tid) in prefill_tokens.iter().enumerate() {
                 let embd = embed_lookup(&embed_src, cfg, tid)?;
                 let stats = forward.forward_token(dev, registry, cmd_ctx, model, &embd, pos, tid)?;
+                if per_tok_logits {
+                    if let Ok(l) = forward.logits() {
+                        let mut amax = 0usize;
+                        let mut mv = f32::NEG_INFINITY;
+                        for (j, &v) in l.iter().enumerate() {
+                            if v > mv { mv = v; amax = j; }
+                        }
+                        eprintln!(
+                            "[ORACLE_PREFILL] pos={i} argmax_idx={amax} max={mv:.4}",
+                        );
+                    }
+                }
                 if gpu_timer {
                     for (k, (d, n)) in stats.per_shader {
                         let e = acc_per_shader.entry(k).or_insert((Duration::ZERO, 0));
