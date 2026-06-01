@@ -379,8 +379,11 @@ impl Forward {
     ///   `batch_norm` with `rms_norm(...) * w` for the *next* layer.
     /// * `next_attn_norm_weight = None` (last layer) emits a plain
     ///   `add_res2_b` and leaves `batch_norm` untouched.
+    // pub(super) so the gated `forward_layer_batch_debug` de-risk helper in
+    // debug.rs can drive ONE batched layer in isolation. Visibility-only
+    // widening; no behaviour change.
     #[allow(clippy::too_many_arguments)]
-    fn dispatch_layer_batch(
+    pub(super) fn dispatch_layer_batch(
         &mut self,
         dev: &VulkanDevice,
         registry: &PipelineRegistry,

@@ -409,6 +409,144 @@ impl Forward {
         )
         .to_vec())
     }
+
+    /// De-risk helper (gated diagnostic) — run ONE BatchExec layer on a
+    /// synthetic `[seq_len × hidden]` input and return the post-layer
+    /// residual stream `[seq_len × hidden]`. Used to validate the batched
+    /// NON-GDN Full-Attention path in isolation against the per-token
+    /// `forward_layer_debug` oracle (qwen35 G-2i residual de-risk).
+    ///
+    /// Seeds `batch_norm` with THIS layer's `attn_norm.weight` (the
+    /// cross-layer-fusion contract `dispatch_layer_batch` expects on
+    /// entry — `b_step_attn_norm` is a no-op), resets the KV cache, runs
+    /// at `base_pos=0` with `next_attn_norm_weight=None` (last-layer plain
+    /// residual add, no fusion to a next layer). Reads `batch_residual`
+    /// back one position at a time through the host-visible `scratch_a`.
+    pub fn forward_layer_batch_debug(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd_ctx: &CommandContext,
+        model: &LoadedModel,
+        layer: u32,
+        seq_len: u32,
+        input: &[f32],
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let cfg = self.config.clone();
+        let hidden = cfg.hidden_dim;
+        let hidden_bytes = (hidden as u64) * 4;
+        assert_eq!(
+            input.len() as u32,
+            seq_len * hidden,
+            "forward_layer_batch_debug: input must be seq_len*hidden",
+        );
+        let positions: Vec<u32> = (0..seq_len).collect();
+        self.cur_mut()
+            .rope_pos_buf
+            .write_bytes(bytemuck::cast_slice(&positions))?;
+        self.batch_input.write_bytes(bytemuck::cast_slice(input))?;
+        self.reset_descriptor_pool_and_cache(dev)?;
+        self.kv_cache.reset();
+
+        let total_bytes = (seq_len as u64) * hidden_bytes;
+        cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
+            // Seed: batch_residual = batch_input.
+            let copy = vk::BufferCopy::default()
+                .src_offset(0)
+                .dst_offset(0)
+                .size(total_bytes);
+            unsafe {
+                dev.device.cmd_copy_buffer(
+                    cmd,
+                    self.batch_input.handle,
+                    self.batch_residual.handle,
+                    std::slice::from_ref(&copy),
+                );
+            }
+            let bar = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            unsafe {
+                dev.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    std::slice::from_ref(&bar),
+                    &[],
+                    &[],
+                );
+            }
+            // Seed batch_norm = rms_norm(batch_residual) * layer.attn_norm.weight
+            // (the contract dispatch_layer_batch expects on entry).
+            let w = layer_weight(model, layer, "attn_norm.weight");
+            self.run_rms_norm(
+                dev, registry, cmd,
+                self.batch_residual.handle, w, self.batch_norm.handle,
+                hidden, seq_len, cfg.rms_norm_eps, "rms_norm_batch_debug_seed",
+            );
+            compute_barrier(dev, cmd);
+            // Run the batched layer (no fusion into a next layer).
+            self.dispatch_layer_batch(
+                dev, registry, cmd, model, layer, seq_len, 0, None,
+            );
+        })?;
+
+        // Read batch_residual position-by-position through scratch_a.
+        let mut out = vec![0f32; (seq_len * hidden) as usize];
+        for p in 0..seq_len {
+            let off = (p as u64) * hidden_bytes;
+            cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
+                let pre = vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(self.batch_residual.handle)
+                    .offset(0)
+                    .size(vk::WHOLE_SIZE);
+                unsafe {
+                    dev.device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        std::slice::from_ref(&pre),
+                        &[],
+                    );
+                }
+                self.copy_batch_row(
+                    dev, cmd, self.batch_residual.handle, off,
+                    self.cur().scratch_a.handle, hidden_bytes,
+                );
+                let post = vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(self.cur().scratch_a.handle)
+                    .offset(0)
+                    .size(vk::WHOLE_SIZE);
+                unsafe {
+                    dev.device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::HOST,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        std::slice::from_ref(&post),
+                        &[],
+                    );
+                }
+            })?;
+            let bytes = self.cur().scratch_a.read_bytes()?;
+            let row = bytemuck::cast_slice::<u8, f32>(&bytes[..(hidden as usize) * 4]);
+            out[(p * hidden) as usize..((p + 1) * hidden) as usize]
+                .copy_from_slice(row);
+        }
+        Ok(out)
+    }
 }
 
 /// Sprint 43D-1 diagnose helper — env-gated logit-distribution dump.

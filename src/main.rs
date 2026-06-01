@@ -352,6 +352,107 @@ struct ChatArgs {
     gamma_from: Option<PathBuf>,
 }
 
+/// Gated de-risk (VF_QWEN35_LAYER_DERISK=1): validate the batched NON-GDN
+/// Full-Attention path of one or more qwen35 layers IN ISOLATION against
+/// the per-token decode oracle. Drives a synthetic `[N × hidden]` input
+/// through (a) the per-token decode layer path (`forward_layer_debug`,
+/// KV accumulated in order) and (b) the batched single-layer path
+/// (`forward_layer_batch_debug`), then diffs the post-layer residual
+/// position-by-position. Retires the one residual uncertainty from the
+/// G-2i localization (GDN garbage-in prevented observing the batched
+/// Full-Attn layers @pos>=1 in a full forward).
+fn run_qwen35_layer_derisk(
+    dev: &VulkanDevice,
+    registry: &PipelineRegistry,
+    cmd_ctx: &CommandContext,
+    model: &LoadedModel,
+    cfg: &ModelConfig,
+    forward: &mut Forward,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // qwen35 → label Full vs GDN layers; for a dense control model
+    // (e.g. Qwen3-8B, which DOES run batched full-attn prefill) every
+    // layer is full-attention — used to calibrate the gemv-vs-gemm
+    // numerical baseline.
+    let qwen35 = cfg.qwen35.as_ref();
+    let hidden = cfg.hidden_dim as usize;
+    let n: u32 = std::env::var("VF_DERISK_N").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+
+    // Synthetic input: position- AND dim-varied so attention scores are
+    // non-trivial (causal masking matters). Bounded ~hidden-state magnitude.
+    let mut x = vec![0f32; n as usize * hidden];
+    for p in 0..n as usize {
+        for i in 0..hidden {
+            let pp = p as f32;
+            let ii = i as f32;
+            x[p * hidden + i] = 0.20 * (0.31 * pp + 0.017 * ii).sin()
+                + 0.08 * (0.005 * ii).cos()
+                + 0.02 * (((p * 7 + i) % 13) as f32)
+                - 0.13;
+        }
+    }
+
+    // Test the first full-attention layer (3) + a spot-check full-attn
+    // layer (7). full_attention_interval=4 → layers 3,7 are Full-Attn.
+    let test_layers: Vec<u32> = vec![3, 7];
+    println!("\n=== qwen35 batched Full-Attention de-risk (N={n}, hidden={hidden}) ===");
+    let mut all_match = true;
+    for &layer in &test_layers {
+        let is_full = qwen35.map(|s| s.is_full_attention_layer(layer)).unwrap_or(true);
+
+        // Oracle: per-token decode, KV reset then in-order (p attends 0..=p).
+        forward.kv_cache.reset();
+        let mut oracle = vec![0f32; n as usize * hidden];
+        for p in 0..n {
+            let row = &x[(p as usize) * hidden..((p as usize) + 1) * hidden];
+            let y = forward.forward_layer_debug(dev, registry, cmd_ctx, model, layer, p, row)?;
+            oracle[(p as usize) * hidden..((p as usize) + 1) * hidden].copy_from_slice(&y);
+        }
+
+        // Batched single-layer path.
+        let batched = forward.forward_layer_batch_debug(dev, registry, cmd_ctx, model, layer, n, &x)?;
+
+        println!("--- Layer {layer} (full_attention={is_full}) ---");
+        let mut worst_cos = 1.0f64;
+        let mut worst_rel = 0.0f64;
+        for p in 0..n as usize {
+            let o = &oracle[p * hidden..(p + 1) * hidden];
+            let b = &batched[p * hidden..(p + 1) * hidden];
+            let (mut dot, mut no, mut nb, mut maxabs, mut omax) = (0f64, 0f64, 0f64, 0f64, 0f64);
+            for i in 0..hidden {
+                let (oi, bi) = (o[i] as f64, b[i] as f64);
+                dot += oi * bi;
+                no += oi * oi;
+                nb += bi * bi;
+                let d = (oi - bi).abs();
+                if d > maxabs { maxabs = d; }
+                if oi.abs() > omax { omax = oi.abs(); }
+            }
+            let cos = if no > 0.0 && nb > 0.0 { dot / (no.sqrt() * nb.sqrt()) } else { 0.0 };
+            let rel = if omax > 0.0 { maxabs / omax } else { maxabs };
+            if cos < worst_cos { worst_cos = cos; }
+            if rel > worst_rel { worst_rel = rel; }
+            if p < 3 || p == n as usize - 1 {
+                println!("  pos {p:2}: cos={cos:.6} max_abs={maxabs:.4e} rel_to_omax={rel:.4e}");
+            }
+        }
+        let matched = worst_cos > 0.999 && worst_rel < 0.02;
+        all_match &= matched;
+        println!(
+            "  => Layer {layer}: worst_cos={worst_cos:.6} worst_rel={worst_rel:.4e} -> {}",
+            if matched { "MATCH" } else { "MISMATCH" },
+        );
+    }
+    println!(
+        "=== VERDICT: {} ===",
+        if all_match {
+            "MATCH — batched NON-GDN Full-Attn path correct @pos>=1 → Phase 1 GO (GDN-only)"
+        } else {
+            "MISMATCH — second bug in batched Full-Attn machinery → NOT GDN-only"
+        },
+    );
+    Ok(())
+}
+
 fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Sprint 20-M3 — SafeTensors directory routing. When `--model`
     // points at a directory, treat it as a HuggingFace SafeTensors
@@ -520,6 +621,15 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
     forward.register_buckets(&model);
     // Sprint 56B — GPU-side MoE router init. No-op for non-MoE models.
     forward.init_moe_router_gpu(&dev, &mut allocator, &model, max_context)?;
+
+    // Gated de-risk (default-off, diagnostic): validate the batched
+    // NON-GDN Full-Attention path of a qwen35 layer in isolation against
+    // the per-token decode oracle, then exit. No production behavior.
+    if std::env::var("VF_QWEN35_LAYER_DERISK").as_deref() == Ok("1") {
+        run_qwen35_layer_derisk(&dev, &registry, &cmd_ctx, &model, &cfg, &mut forward)?;
+        forward.destroy(&dev.device, &mut allocator);
+        return Ok(());
+    }
 
     // Sprint G.9-spike — VF_BALLAST_MB env-gated, post-load read-never
     // VRAM ballast. Reserves headroom to test whether the ≥12 GB BW cliff
