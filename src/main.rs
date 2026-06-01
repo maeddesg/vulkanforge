@@ -352,6 +352,24 @@ struct ChatArgs {
     gamma_from: Option<PathBuf>,
 }
 
+/// Cosine similarity + max-abs-error-relative-to-oracle-max between two
+/// equal-length f32 vectors (de-risk diff metric).
+fn cos_rel(o: &[f32], b: &[f32]) -> (f64, f64) {
+    let (mut dot, mut no, mut nb, mut maxabs, mut omax) = (0f64, 0f64, 0f64, 0f64, 0f64);
+    for i in 0..o.len().min(b.len()) {
+        let (oi, bi) = (o[i] as f64, b[i] as f64);
+        dot += oi * bi;
+        no += oi * oi;
+        nb += bi * bi;
+        let d = (oi - bi).abs();
+        if d > maxabs { maxabs = d; }
+        if oi.abs() > omax { omax = oi.abs(); }
+    }
+    let cos = if no > 0.0 && nb > 0.0 { dot / (no.sqrt() * nb.sqrt()) } else { 0.0 };
+    let rel = if omax > 0.0 { maxabs / omax } else { maxabs };
+    (cos, rel)
+}
+
 /// Gated de-risk (VF_QWEN35_LAYER_DERISK=1): validate the batched NON-GDN
 /// Full-Attention path of one or more qwen35 layers IN ISOLATION against
 /// the per-token decode oracle. Drives a synthetic `[N × hidden]` input
@@ -408,38 +426,43 @@ fn run_qwen35_layer_derisk(
             oracle[(p as usize) * hidden..((p as usize) + 1) * hidden].copy_from_slice(&y);
         }
 
-        // Batched single-layer path.
-        let batched = forward.forward_layer_batch_debug(dev, registry, cmd_ctx, model, layer, n, &x)?;
+        // Batched single-layer path (also returns N=1-unambiguous k/v rows).
+        let (batched, _bk_n, _bv_n) =
+            forward.forward_layer_batch_debug(dev, registry, cmd_ctx, model, layer, n, &x)?;
 
         println!("--- Layer {layer} (full_attention={is_full}) ---");
         let mut worst_cos = 1.0f64;
         let mut worst_rel = 0.0f64;
         for p in 0..n as usize {
-            let o = &oracle[p * hidden..(p + 1) * hidden];
-            let b = &batched[p * hidden..(p + 1) * hidden];
-            let (mut dot, mut no, mut nb, mut maxabs, mut omax) = (0f64, 0f64, 0f64, 0f64, 0f64);
-            for i in 0..hidden {
-                let (oi, bi) = (o[i] as f64, b[i] as f64);
-                dot += oi * bi;
-                no += oi * oi;
-                nb += bi * bi;
-                let d = (oi - bi).abs();
-                if d > maxabs { maxabs = d; }
-                if oi.abs() > omax { omax = oi.abs(); }
-            }
-            let cos = if no > 0.0 && nb > 0.0 { dot / (no.sqrt() * nb.sqrt()) } else { 0.0 };
-            let rel = if omax > 0.0 { maxabs / omax } else { maxabs };
+            let (cos, rel) = cos_rel(&oracle[p * hidden..(p + 1) * hidden], &batched[p * hidden..(p + 1) * hidden]);
             if cos < worst_cos { worst_cos = cos; }
             if rel > worst_rel { worst_rel = rel; }
             if p < 3 || p == n as usize - 1 {
-                println!("  pos {p:2}: cos={cos:.6} max_abs={maxabs:.4e} rel_to_omax={rel:.4e}");
+                println!("  pos {p:2}: cos={cos:.6} rel_to_omax={rel:.4e}");
             }
         }
         let matched = worst_cos > 0.999 && worst_rel < 0.02;
         all_match &= matched;
         println!(
-            "  => Layer {layer}: worst_cos={worst_cos:.6} worst_rel={worst_rel:.4e} -> {}",
+            "  => Layer {layer} (full output): worst_cos={worst_cos:.6} worst_rel={worst_rel:.4e} -> {}",
             if matched { "MATCH" } else { "MISMATCH" },
+        );
+
+        // Substep pin @N=1 (clean: 1 position → batch_k/v rows unambiguous).
+        // v = pure proj GEMM (no norm, no rope); k = proj + k-norm + rope.
+        // v diverges → proj-GEMM @256; v matches but k diverges → k-norm/rope @256.
+        forward.kv_cache.reset();
+        let (k_dec, v_dec) = forward.forward_layer_debug_kv(
+            dev, registry, cmd_ctx, model, layer, 0, &x[0..hidden],
+        )?;
+        let (_lo, k_bat, v_bat) =
+            forward.forward_layer_batch_debug(dev, registry, cmd_ctx, model, layer, 1, &x[0..hidden])?;
+        let (vcos, vrel) = cos_rel(&v_dec, &v_bat);
+        let (kcos, krel) = cos_rel(&k_dec, &k_bat);
+        println!(
+            "  substep@N=1: v_proj(no-norm/rope) cos={vcos:.6} rel={vrel:.4e} {} | k(proj+norm+rope) cos={kcos:.6} rel={krel:.4e} {}",
+            if vcos > 0.999 && vrel < 0.02 { "MATCH" } else { "DIVERGE" },
+            if kcos > 0.999 && krel < 0.02 { "MATCH" } else { "DIVERGE" },
         );
     }
     println!(

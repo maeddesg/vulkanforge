@@ -410,6 +410,93 @@ impl Forward {
         .to_vec())
     }
 
+    /// De-risk substep helper — stage the first `count` floats of a
+    /// GpuOnly buffer into the host-visible `scratch_a` and read them.
+    /// `count` must be <= scratch_a capacity (hidden_dim). Used to read
+    /// k/v rows (kv_dim <= hidden) for the qwen35 Full-Attn substep diff.
+    fn stage_buf_prefix(
+        &self,
+        dev: &VulkanDevice,
+        cmd_ctx: &CommandContext,
+        src: vk::Buffer,
+        count: u32,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let bytes = (count as u64) * 4;
+        cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| unsafe {
+            let pre = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(src)
+                .offset(0)
+                .size(vk::WHOLE_SIZE);
+            dev.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                std::slice::from_ref(&pre),
+                &[],
+            );
+            let copy = vk::BufferCopy::default().src_offset(0).dst_offset(0).size(bytes);
+            dev.device.cmd_copy_buffer(
+                cmd, src, self.cur().scratch_a.handle, std::slice::from_ref(&copy),
+            );
+            let post = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.cur().scratch_a.handle)
+                .offset(0)
+                .size(vk::WHOLE_SIZE);
+            dev.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[],
+                std::slice::from_ref(&post),
+                &[],
+            );
+        })?;
+        let raw = self.cur().scratch_a.read_bytes()?;
+        Ok(bytemuck::cast_slice::<u8, f32>(&raw[..(count as usize) * 4]).to_vec())
+    }
+
+    /// De-risk substep oracle — run ONE real DECODE layer (`dispatch_layer`,
+    /// the same path `forward_token` uses) at `position` and return its
+    /// post-layer `(k_buf, v_buf)` rows (each `kv_dim`). At N=1/pos 0 these
+    /// are the post-k-norm-post-rope k and the v-proj v. KV-cache state is
+    /// the caller's responsibility (reset + in-order for multi-token).
+    pub fn forward_layer_debug_kv(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd_ctx: &CommandContext,
+        model: &LoadedModel,
+        layer: u32,
+        position: u32,
+        input_data: &[f32],
+    ) -> Result<(Vec<f32>, Vec<f32>), Box<dyn std::error::Error>> {
+        let cfg = self.config.clone();
+        let kv_dim = n_kv_heads_for(&cfg, layer) * cfg.head_dim;
+        self.cur_mut().scratch_a.write_bytes(bytemuck::cast_slice(input_data))?;
+        self.cur_mut().rope_pos_buf.write_bytes(bytemuck::bytes_of(&position))?;
+        self.reset_descriptor_pool_and_cache(dev)?;
+        cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
+            self.dispatch_layer(
+                dev, registry, cmd, model, layer, position,
+                self.cur().scratch_a.handle, self.cur().scratch_b.handle,
+            );
+        })?;
+        let k = self.stage_buf_prefix(dev, cmd_ctx, self.cur().k_buf.handle, kv_dim)?;
+        let v = self.stage_buf_prefix(dev, cmd_ctx, self.cur().v_buf.handle, kv_dim)?;
+        Ok((k, v))
+    }
+
     /// De-risk helper (gated diagnostic) — run ONE BatchExec layer on a
     /// synthetic `[seq_len × hidden]` input and return the post-layer
     /// residual stream `[seq_len × hidden]`. Used to validate the batched
@@ -422,6 +509,11 @@ impl Forward {
     /// at `base_pos=0` with `next_attn_norm_weight=None` (last-layer plain
     /// residual add, no fusion to a next layer). Reads `batch_residual`
     /// back one position at a time through the host-visible `scratch_a`.
+    /// Returns `(layer_out [seq_len×hidden], k_row0 [kv_dim], v_row0 [kv_dim])`.
+    /// `k_row0`/`v_row0` are the first kv_dim floats of `batch_k`/`batch_v`
+    /// after the layer; at N=1 that is unambiguously position 0's
+    /// post-k-norm-rope k and v-proj v (no batch-layout stride to reason
+    /// about), used for the substep diff vs `forward_layer_debug_kv`.
     pub fn forward_layer_batch_debug(
         &mut self,
         dev: &VulkanDevice,
@@ -431,7 +523,7 @@ impl Forward {
         layer: u32,
         seq_len: u32,
         input: &[f32],
-    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), Box<dyn std::error::Error>> {
         let cfg = self.config.clone();
         let hidden = cfg.hidden_dim;
         let hidden_bytes = (hidden as u64) * 4;
@@ -492,6 +584,12 @@ impl Forward {
             );
         })?;
 
+        // Substep capture: batch_k / batch_v rows (kv_dim, fit scratch_a).
+        // Captured BEFORE the layer-output loop (both reuse scratch_a).
+        let kv_dim = n_kv_heads_for(&cfg, layer) * cfg.head_dim;
+        let k_row0 = self.stage_buf_prefix(dev, cmd_ctx, self.batch_k.handle, kv_dim)?;
+        let v_row0 = self.stage_buf_prefix(dev, cmd_ctx, self.batch_v.handle, kv_dim)?;
+
         // Read batch_residual position-by-position through scratch_a.
         let mut out = vec![0f32; (seq_len * hidden) as usize];
         for p in 0..seq_len {
@@ -545,7 +643,7 @@ impl Forward {
             out[(p * hidden) as usize..((p + 1) * hidden) as usize]
                 .copy_from_slice(row);
         }
-        Ok(out)
+        Ok((out, k_row0, v_row0))
     }
 }
 

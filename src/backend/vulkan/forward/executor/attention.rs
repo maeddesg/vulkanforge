@@ -449,23 +449,32 @@ impl DecodeExec {
         // Sprint G-2j — Qwen3.6 uses split RMSNorm + RoPE dispatches
         // (see step_q_norm_rope for rationale).
         if cfg.qwen35.is_some() {
-            fwd.run_rms_norm(
-                ctx.dev, ctx.registry, ctx.cmd,
-                k_buf, wkn, k_buf,
-                head_dim, n_kv,
-                cfg.rms_norm_eps, "rms_norm_k_split",
-            );
-            fwd.mark_written(&[k_buf]);
-            super::super::arch::compute_barrier(ctx.dev, ctx.cmd);
-            fwd.run_rope_neox_with_pos_offset(
-                ctx.dev, ctx.registry, ctx.cmd, k_buf, k_buf,
-                head_dim, rotary_dim, freq_base, theta_scale,
-                n_kv,
-                /* position = */ 0,
-                /* pos_buf_offset = */ 0,
-                "rope_neox_k_split",
-            );
-            fwd.mark_written(&[k_buf]);
+            // De-risk (gated, default-off): VF_DERISK_SKIP_KNORM skips the
+            // k-norm in BOTH decode and batch to isolate proj-vs-norm.
+            if std::env::var("VF_DERISK_SKIP_KNORM").as_deref() != Ok("1") {
+                fwd.run_rms_norm(
+                    ctx.dev, ctx.registry, ctx.cmd,
+                    k_buf, wkn, k_buf,
+                    head_dim, n_kv,
+                    cfg.rms_norm_eps, "rms_norm_k_split",
+                );
+                fwd.mark_written(&[k_buf]);
+                super::super::arch::compute_barrier(ctx.dev, ctx.cmd);
+            }
+            // De-risk (gated, default-off): VF_DERISK_SKIP_KROPE skips the
+            // k-rope in BOTH decode and batch k-norm-rope so the substep
+            // harness can isolate norm-vs-rope as the head_dim=256 diff.
+            if std::env::var("VF_DERISK_SKIP_KROPE").as_deref() != Ok("1") {
+                fwd.run_rope_neox_with_pos_offset(
+                    ctx.dev, ctx.registry, ctx.cmd, k_buf, k_buf,
+                    head_dim, rotary_dim, freq_base, theta_scale,
+                    n_kv,
+                    /* position = */ 0,
+                    /* pos_buf_offset = */ 0,
+                    "rope_neox_k_split",
+                );
+                fwd.mark_written(&[k_buf]);
+            }
         } else {
             fwd.run_rms_norm_mul_rope(
                 ctx.dev, ctx.registry, ctx.cmd,
@@ -1949,6 +1958,13 @@ impl BatchExec {
         // coherence on the standard chat template, fused gives garbage.
         let split = cfg.qwen35.is_some();
         if split {
+            // Sprint (de-risk pin): the batched in-place q-norm raced the
+            // upstream q-proj GEMM write to batch_q (RAW hazard) — the
+            // decode step_q_norm_rope has this barrier (att.rs:448) but the
+            // batch counterpart lacked it. head_dim=256 widens the write
+            // window enough to manifest (confirmed: barrier → k substep
+            // cos 0.99→1.0 vs the per-token decode oracle). Mirrors decode.
+            super::super::arch::compute_barrier(ctx.dev, ctx.cmd);
             fwd.run_rms_norm(
                 ctx.dev, ctx.registry, ctx.cmd,
                 fwd.batch_q.handle, wqn, fwd.batch_q.handle,
@@ -1999,20 +2015,30 @@ impl BatchExec {
         let n_kv = n_kv_heads_for(cfg, ctx.layer);
         let split = cfg.qwen35.is_some();
         if split {
-            fwd.run_rms_norm(
-                ctx.dev, ctx.registry, ctx.cmd,
-                fwd.batch_k.handle, wkn, fwd.batch_k.handle,
-                head_dim, n_kv * seq_len,
-                cfg.rms_norm_eps, "rms_norm_k_b_split",
-            );
-            super::super::arch::compute_barrier(ctx.dev, ctx.cmd);
-            fwd.run_rope_batch(
-                ctx.dev, ctx.registry, ctx.cmd,
-                fwd.batch_k.handle, fwd.batch_k.handle,
-                head_dim, rotary_dim, freq_base, theta_scale,
-                n_kv, seq_len,
-                "rope_neox_k_b_split",
-            );
+            // De-risk (gated, default-off): see step_k_norm_rope (SKIP_KNORM).
+            if std::env::var("VF_DERISK_SKIP_KNORM").as_deref() != Ok("1") {
+                // RAW-hazard fix: batched in-place k-norm raced the k-proj
+                // GEMM write to batch_k. Mirrors decode (att.rs:448).
+                // Confirmed via the substep harness (k cos 0.99→1.0).
+                super::super::arch::compute_barrier(ctx.dev, ctx.cmd);
+                fwd.run_rms_norm(
+                    ctx.dev, ctx.registry, ctx.cmd,
+                    fwd.batch_k.handle, wkn, fwd.batch_k.handle,
+                    head_dim, n_kv * seq_len,
+                    cfg.rms_norm_eps, "rms_norm_k_b_split",
+                );
+                super::super::arch::compute_barrier(ctx.dev, ctx.cmd);
+            }
+            // De-risk (gated, default-off): see step_k_norm_rope.
+            if std::env::var("VF_DERISK_SKIP_KROPE").as_deref() != Ok("1") {
+                fwd.run_rope_batch(
+                    ctx.dev, ctx.registry, ctx.cmd,
+                    fwd.batch_k.handle, fwd.batch_k.handle,
+                    head_dim, rotary_dim, freq_base, theta_scale,
+                    n_kv, seq_len,
+                    "rope_neox_k_b_split",
+                );
+            }
         } else {
             fwd.run_rms_norm_mul_rope(
                 ctx.dev, ctx.registry, ctx.cmd,
