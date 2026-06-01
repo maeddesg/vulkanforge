@@ -527,7 +527,23 @@ pub fn generate_from_tokens(
         // decode positions. Otherwise the decode-phase match-rate is
         // confounded by missing prompt-position block-64 KV (§1b / Phase 2).
         let mtp_shadow = std::env::var("VF_MTP_DRAFT").as_deref() == Ok("1");
+        // Probe (gated, default-off, zero production cost): log which
+        // prefill dispatch path this run takes. Resolves the qwen35
+        // "BatchExec vs per-token decode" routing question empirically —
+        // chat.rs forces `force_per_token_prefill=true` for qwen35, so
+        // qwen35 prefill takes the per-token forward_token loop here and
+        // never reaches prefill_batch/BatchExec (the b_step_* token-0
+        // stubs are dormant for this path).
+        let dbg_prefill_path =
+            std::env::var("VF_DEBUG_PREFILL_PATH").as_deref() == Ok("1");
         if force_per_token_prefill {
+            if dbg_prefill_path {
+                eprintln!(
+                    "[VF_DEBUG_PREFILL_PATH] per-token DECODE prefill loop \
+                     (force_per_token_prefill=true): {prefill_len} tokens via \
+                     forward_token — prefill_batch/BatchExec/b_step_* bypassed",
+                );
+            }
             // Sprint 20-M3 — SafeTensors FP8 models reach this branch:
             // batched prefill would hit the (FP16) `mul_mm.comp` GEMM
             // which has no `DATA_A_FP8` variant, so we fall back to
@@ -561,6 +577,12 @@ pub fn generate_from_tokens(
             }
         } else {
             let chunk_size = forward.max_prefill_tokens.max(1) as usize;
+            if dbg_prefill_path {
+                eprintln!(
+                    "[VF_DEBUG_PREFILL_PATH] batched prefill_batch/BatchExec \
+                     path: {prefill_len} tokens in chunks of {chunk_size}",
+                );
+            }
             for chunk in prefill_tokens.chunks(chunk_size) {
                 let chunk_len = chunk.len() as u32;
                 let mut chunk_embeds: Vec<f32> =
