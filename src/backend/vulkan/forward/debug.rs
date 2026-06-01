@@ -466,6 +466,106 @@ impl Forward {
         Ok(bytemuck::cast_slice::<u8, f32>(&raw[..(count as usize) * 4]).to_vec())
     }
 
+    /// De-risk substep helper — stage `count` floats from `src` starting at
+    /// float offset `src_off`, chunked through `scratch_a` (≤ hidden per
+    /// pass) so buffers larger than scratch_a (q_dim=6144, 2·q_dim=12288)
+    /// can be read for the gated-output input bisect.
+    fn stage_buf_region(
+        &self,
+        dev: &VulkanDevice,
+        cmd_ctx: &CommandContext,
+        src: vk::Buffer,
+        src_off: u32,
+        count: u32,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let hidden = self.config.hidden_dim;
+        let mut out = vec![0f32; count as usize];
+        let mut done = 0u32;
+        while done < count {
+            let chunk = (count - done).min(hidden);
+            let src_byte_off = ((src_off + done) as u64) * 4;
+            let bytes = (chunk as u64) * 4;
+            cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| unsafe {
+                let pre = vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(src).offset(0).size(vk::WHOLE_SIZE);
+                dev.device.cmd_pipeline_barrier(
+                    cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(), &[], std::slice::from_ref(&pre), &[],
+                );
+                let copy = vk::BufferCopy::default()
+                    .src_offset(src_byte_off).dst_offset(0).size(bytes);
+                dev.device.cmd_copy_buffer(
+                    cmd, src, self.cur().scratch_a.handle, std::slice::from_ref(&copy),
+                );
+                let post = vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(self.cur().scratch_a.handle).offset(0).size(vk::WHOLE_SIZE);
+                dev.device.cmd_pipeline_barrier(
+                    cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(), &[], std::slice::from_ref(&post), &[],
+                );
+            })?;
+            let raw = self.cur().scratch_a.read_bytes()?;
+            out[done as usize..(done + chunk) as usize]
+                .copy_from_slice(bytemuck::cast_slice::<u8, f32>(&raw[..(chunk as usize) * 4]));
+            done += chunk;
+        }
+        Ok(out)
+    }
+
+    /// De-risk gated-output bisect — run ONE real DECODE layer and return
+    /// `q_buf` (2·q_dim: the concat [Q(q_dim), G(q_dim)] after the Q-Gate
+    /// deinterleave; the gate G half is the sigmoid_mul gate source).
+    pub fn forward_layer_debug_qbuf(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd_ctx: &CommandContext,
+        model: &LoadedModel,
+        layer: u32,
+        position: u32,
+        input_data: &[f32],
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let cfg = self.config.clone();
+        let q_total = cfg.n_heads * cfg.head_dim * 2;
+        self.cur_mut().scratch_a.write_bytes(bytemuck::cast_slice(input_data))?;
+        self.cur_mut().rope_pos_buf.write_bytes(bytemuck::bytes_of(&position))?;
+        self.reset_descriptor_pool_and_cache(dev)?;
+        cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
+            self.dispatch_layer(
+                dev, registry, cmd, model, layer, position,
+                self.cur().scratch_a.handle, self.cur().scratch_b.handle,
+            );
+        })?;
+        self.stage_buf_region(dev, cmd_ctx, self.cur().q_buf.handle, 0, q_total)
+    }
+
+    /// De-risk gated-output bisect — return `batch_qgate` (2·q_dim) after a
+    /// batched single layer (the interleaved [Q_h0,G_h0,…] gate source).
+    pub fn forward_layer_batch_qgate(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd_ctx: &CommandContext,
+        model: &LoadedModel,
+        layer: u32,
+        input: &[f32],
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let _ = self.forward_layer_batch_debug(dev, registry, cmd_ctx, model, layer, 1, input)?;
+        let q_total = self.config.n_heads * self.config.head_dim * 2;
+        let qgate = self.batch_qgate.as_ref()
+            .ok_or("batch_qgate not allocated (not qwen35)")?
+            .handle;
+        self.stage_buf_region(dev, cmd_ctx, qgate, 0, q_total)
+    }
+
     /// De-risk substep oracle — run ONE real DECODE layer (`dispatch_layer`,
     /// the same path `forward_token` uses) at `position` and return its
     /// post-layer `(k_buf, v_buf)` rows (each `kv_dim`). At N=1/pos 0 these

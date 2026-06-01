@@ -464,6 +464,34 @@ fn run_qwen35_layer_derisk(
             if vcos > 0.999 && vrel < 0.02 { "MATCH" } else { "DIVERGE" },
             if kcos > 0.999 && krel < 0.02 { "MATCH" } else { "DIVERGE" },
         );
+
+        // Gated-output input bisect @N=1: compare the GATE-as-applied
+        // (head order G_0..G_23) between decode (q_buf concat, gate at
+        // +q_dim) and batch (batch_qgate interleaved, gate at h*2*hd+hd).
+        // Decisive: gate diverges -> gate layout/value; gate matches ->
+        // the residual is in attn_out (data) ordering.
+        if qwen35.is_some() {
+            let n_heads = cfg.n_heads as usize;
+            let head_dim = cfg.head_dim as usize;
+            let q_dim = n_heads * head_dim;
+            let qbuf_dec = forward.forward_layer_debug_qbuf(dev, registry, cmd_ctx, model, layer, 0, &x[0..hidden])?;
+            let qgate_bat = forward.forward_layer_batch_qgate(dev, registry, cmd_ctx, model, layer, &x[0..hidden])?;
+            let mut gate_dec = vec![0f32; q_dim];
+            let mut gate_bat = vec![0f32; q_dim];
+            for h in 0..n_heads {
+                for d in 0..head_dim {
+                    gate_dec[h * head_dim + d] = qbuf_dec[q_dim + h * head_dim + d];
+                    gate_bat[h * head_dim + d] = qgate_bat[h * 2 * head_dim + head_dim + d];
+                }
+            }
+            let (gcos, grel) = cos_rel(&gate_dec, &gate_bat);
+            // Also: is batch_qgate's Q half the same as decode's? (decode
+            // q_buf[0..q_dim] is normed/roped, so compare only RAW gate.)
+            println!(
+                "  gate-bisect@N=1: gate-as-applied(decode-concat vs batch-interleaved) cos={gcos:.6} rel={grel:.4e} {}",
+                if gcos > 0.999 && grel < 0.02 { "MATCH (gate ok → residual in attn_out)" } else { "DIVERGE (gate layout/value)" },
+            );
+        }
     }
     println!(
         "=== VERDICT: {} ===",
