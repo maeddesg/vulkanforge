@@ -642,16 +642,22 @@ impl DecodeExec {
         // → attn_out, Q-Gate proj → q_buf). Flush both before the
         // sigmoid-mul reads the gate and writes the in-place result.
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[attn_out, q_buf]);
-        fwd.run_sigmoid_mul(
-            ctx.dev, ctx.registry, ctx.cmd,
-            q_buf, attn_out,
-            q_dim,        // ne
-            q_dim,        // chunk
-            q_dim,        // stride (single token: 1 chunk per stride)
-            q_dim,        // gate_offset (Gate starts after Q in q_buf)
-            "sigmoid_mul_gated_out",
-        );
-        fwd.mark_written(&[attn_out]);
+        // De-risk (gated, default-off): VF_DERISK_SKIP_GATE skips the
+        // output gate in BOTH decode and batch to test whether the
+        // qwen35-only gated-output (interleaved-vs-concat gate layout) is
+        // the residual batched-vs-decode divergence.
+        if std::env::var("VF_DERISK_SKIP_GATE").as_deref() != Ok("1") {
+            fwd.run_sigmoid_mul(
+                ctx.dev, ctx.registry, ctx.cmd,
+                q_buf, attn_out,
+                q_dim,        // ne
+                q_dim,        // chunk
+                q_dim,        // stride (single token: 1 chunk per stride)
+                q_dim,        // gate_offset (Gate starts after Q in q_buf)
+                "sigmoid_mul_gated_out",
+            );
+            fwd.mark_written(&[attn_out]);
+        }
     }
 
     pub(super) fn step_o_proj(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
@@ -2249,18 +2255,29 @@ impl BatchExec {
             .handle;
         let ne = seq_len * q_dim;
         let head_dim = cfg.head_dim;
+        // Sprint (de-risk pin): pre-read barrier mirroring decode
+        // step_attn_gated_output (att.rs:644 maybe_compute_barrier on
+        // [attn_out, q_buf]). The batch gated-output had only a TRAILING
+        // barrier, so the in-place sigmoid_mul raced the upstream writes
+        // to batch_qgate (gate) / batch_attn_out — a non-deterministic
+        // RAW hazard (full-output cos varied 0.96–0.99 run-to-run). The
+        // global compute_barrier flushes both gate + attn_out before read.
+        super::super::arch::compute_barrier(ctx.dev, ctx.cmd);
         // Sprint G-2i — interleaved-per-head gate layout: per (token,
         // head) the gate sits at offset head_dim within a 2 × head_dim
         // slice.
-        fwd.run_sigmoid_mul(
-            ctx.dev, ctx.registry, ctx.cmd,
-            qgate, fwd.batch_attn_out.handle,
-            ne,           // total elements in attn_out (seq × q_dim)
-            head_dim,     // chunk: per-head elements in attn_out
-            2 * head_dim, // stride: per-head elements in batch_qgate (Q+G)
-            head_dim,     // gate_offset within stride (Gate after Q)
-            "sigmoid_mul_gated_out_b",
-        );
+        // De-risk (gated, default-off): see step_attn_gated_output.
+        if std::env::var("VF_DERISK_SKIP_GATE").as_deref() != Ok("1") {
+            fwd.run_sigmoid_mul(
+                ctx.dev, ctx.registry, ctx.cmd,
+                qgate, fwd.batch_attn_out.handle,
+                ne,           // total elements in attn_out (seq × q_dim)
+                head_dim,     // chunk: per-head elements in attn_out
+                2 * head_dim, // stride: per-head elements in batch_qgate (Q+G)
+                head_dim,     // gate_offset within stride (Gate after Q)
+                "sigmoid_mul_gated_out_b",
+            );
+        }
         compute_barrier(ctx.dev, ctx.cmd);
     }
 
