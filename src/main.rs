@@ -836,6 +836,7 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var("VF_QWEN35_GDN_VERIFY").as_deref() == Ok("1") {
         let _ = forward.gdn_conv_verify(&dev, &registry, &cmd_ctx, &mut allocator)?;
         let _ = forward.gdn_recurrence_verify(&dev, &registry, &cmd_ctx, &mut allocator)?;
+        let _ = forward.gdn_proj_verify(&dev, &registry, &cmd_ctx, &model)?;
         forward.destroy(&dev.device, &mut allocator);
         return Ok(());
     }

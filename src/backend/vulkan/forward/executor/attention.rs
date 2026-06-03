@@ -2449,18 +2449,17 @@ impl BatchExec {
         let spec = cfg.qwen35.as_ref().expect(
             "b_step_attn_qkv_proj emitted for non-qwen35 config",
         );
+        // GDN-Completion #3 — batched GEMM (M=N) over seq_len tokens.
+        // Output ssm_qkv_buf is [seq_len × conv_channels] token-major; the
+        // serial conv core consumes per-token slices in order.
+        let seq_len = batch_seq_len(ctx);
         let input = fwd.batch_norm.handle;
         let qkv_buf = fwd.ssm_qkv_buf.as_ref().unwrap().handle;
-        let (w, w_off, w_sz) = layer_weight_with_offset(ctx.model, layer, "attn_qkv.weight");
-        let s = layer_weight_shader(
-            ctx.model, layer, "attn_qkv.weight",
-            fwd.mul_mat_vec_subgroup_enabled,
-        );
-        let scale = layer_weight_scale_scalar(ctx.model, layer, "attn_qkv.weight");
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[input]);
-        fwd.run_gemv(
-            ctx.dev, ctx.registry, ctx.cmd, s, w, w_off, w_sz, input, qkv_buf,
-            cfg.hidden_dim, spec.conv_channels(), scale, "b_gemv_ssm_qkv",
+        self.b_run_proj(
+            fwd, cfg, ctx, "attn_qkv.weight", input, qkv_buf,
+            spec.conv_channels(), cfg.hidden_dim, seq_len, "b_gemm_ssm_qkv",
+            /* quantize_input = */ true,
         );
         fwd.mark_written(&[qkv_buf]);
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[qkv_buf]);
@@ -2474,18 +2473,15 @@ impl BatchExec {
         let spec = cfg.qwen35.as_ref().expect(
             "b_step_attn_gate_z_proj emitted for non-qwen35 config",
         );
+        // GDN-Completion #3 — batched GEMM (M=N). z = [seq_len × ssm_d_inner].
+        let seq_len = batch_seq_len(ctx);
         let input = fwd.batch_norm.handle;
         let z_buf = fwd.ssm_z_buf.as_ref().unwrap().handle;
-        let (w, w_off, w_sz) = layer_weight_with_offset(ctx.model, layer, "attn_gate.weight");
-        let s = layer_weight_shader(
-            ctx.model, layer, "attn_gate.weight",
-            fwd.mul_mat_vec_subgroup_enabled,
-        );
-        let scale = layer_weight_scale_scalar(ctx.model, layer, "attn_gate.weight");
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[input]);
-        fwd.run_gemv(
-            ctx.dev, ctx.registry, ctx.cmd, s, w, w_off, w_sz, input, z_buf,
-            cfg.hidden_dim, spec.ssm_d_inner, scale, "b_gemv_ssm_z",
+        self.b_run_proj(
+            fwd, cfg, ctx, "attn_gate.weight", input, z_buf,
+            spec.ssm_d_inner, cfg.hidden_dim, seq_len, "b_gemm_ssm_z",
+            /* quantize_input = */ true,
         );
         fwd.mark_written(&[z_buf]);
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[z_buf]);
@@ -2499,24 +2495,22 @@ impl BatchExec {
         let spec = cfg.qwen35.as_ref().expect(
             "b_step_ssm_beta_proj emitted for non-qwen35 config",
         );
+        // GDN-Completion #3 — batched GEMM (M=N) → beta [seq_len × H],
+        // then sigmoid over all seq_len×H elements.
+        let seq_len = batch_seq_len(ctx);
         let input = fwd.batch_norm.handle;
         let beta_buf = fwd.ssm_beta_buf.as_ref().unwrap().handle;
-        let (w, w_off, w_sz) = layer_weight_with_offset(ctx.model, layer, "ssm_beta.weight");
-        let s = layer_weight_shader(
-            ctx.model, layer, "ssm_beta.weight",
-            fwd.mul_mat_vec_subgroup_enabled,
-        );
-        let scale = layer_weight_scale_scalar(ctx.model, layer, "ssm_beta.weight");
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[input]);
-        fwd.run_gemv(
-            ctx.dev, ctx.registry, ctx.cmd, s, w, w_off, w_sz, input, beta_buf,
-            cfg.hidden_dim, spec.num_v_heads(), scale, "b_gemv_ssm_beta",
+        self.b_run_proj(
+            fwd, cfg, ctx, "ssm_beta.weight", input, beta_buf,
+            spec.num_v_heads(), cfg.hidden_dim, seq_len, "b_gemm_ssm_beta",
+            /* quantize_input = */ true,
         );
         fwd.mark_written(&[beta_buf]);
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[beta_buf]);
         fwd.run_sigmoid(
             ctx.dev, ctx.registry, ctx.cmd,
-            beta_buf, spec.num_v_heads(), "b_ssm_beta_sigmoid",
+            beta_buf, seq_len * spec.num_v_heads(), "b_ssm_beta_sigmoid",
         );
         fwd.mark_written(&[beta_buf]);
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[beta_buf]);

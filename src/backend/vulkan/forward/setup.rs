@@ -424,13 +424,16 @@ impl Forward {
                 None
             };
 
-            // Per-token scratch (decode-sized). Recurrent layers are
-            // dispatched per-token even in prefill (delta-net state
-            // updates sequentially), so the same scratch is reused
-            // across tokens — no need to scale with seq_len.
-            let qkv_bytes        = conv_channels * 4;            // 10240 * 4 = 40 KB
-            let z_bytes          = (spec.ssm_d_inner as u64) * 4; // 6144 * 4 = 24 KB
-            let beta_bytes       = num_v_heads * 4;              // 48 * 4 = 192 B
+            // GDN-Completion #3 (batched prefill): the input PROJECTION
+            // outputs (qkv/z/beta) are now produced by a batched GEMM over
+            // seq_len=N, so they scale with `max_prefill_tokens`. The serial
+            // core (conv/recurrence) still consumes them per-token in order.
+            // The remaining recurrent scratch (alpha/gate/conv_*/qrep/krep/
+            // gdn_out/norm_out) stays decode-sized until its op is built.
+            let pp = max_prefill_tokens.max(1) as u64;
+            let qkv_bytes        = pp * conv_channels * 4;       // N × 10240
+            let z_bytes          = pp * (spec.ssm_d_inner as u64) * 4; // N × 6144
+            let beta_bytes       = pp * num_v_heads * 4;         // N × 48
             let alpha_bytes      = num_v_heads * 4;              // 48 * 4 = 192 B
             let gate_bytes       = num_v_heads * 4;              // 48 * 4 = 192 B
             let conv_in_bytes    = (spec.ssm_d_conv as u64) * conv_channels * 4; // 4*10240*4 = 160 KB

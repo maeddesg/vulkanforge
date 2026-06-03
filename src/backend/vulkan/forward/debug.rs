@@ -955,6 +955,68 @@ impl Forward {
         Ok(all_ok)
     }
 
+    /// GDN-Completion #3 Step 1 (gated `VF_QWEN35_GDN_VERIFY`): verify the
+    /// batched input PROJECTION (`b_step_attn_qkv_proj`, GEMM M=N) against
+    /// the per-token decode projection (GEMV). qkv = `attn_qkv.weight @
+    /// rms_norm(input)` depends only on the normed layer input (NOT on
+    /// recurrent state), so we compare `ssm_qkv_buf` from one batched
+    /// recurrent-layer run vs N single-token decode runs. GEMM reorders the
+    /// FP accumulation vs GEMV → expect cos→1.0 at the ~1e-5 baseline, NOT
+    /// bit-identical. A divergence ≫1e-5 = projection wiring/sizing bug.
+    pub fn gdn_proj_verify(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd_ctx: &CommandContext,
+        model: &LoadedModel,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let cfg = self.config.clone();
+        let spec = cfg.qwen35.as_ref().expect("gdn_proj_verify: not qwen35");
+        let hidden = cfg.hidden_dim as usize;
+        let cc = spec.conv_channels() as usize;
+        // First recurrent (Linear-Attn) layer.
+        let layer = (0..spec.block_count).find(|&l| spec.is_recurrent_layer(l)).expect("no recurrent layer");
+        let n_max = 8usize;
+        let mut x = vec![0f32; n_max * hidden];
+        for p in 0..n_max { for i in 0..hidden {
+            x[p * hidden + i] = 0.18 * (0.29 * p as f32 + 0.015 * i as f32).sin() + 0.06 * (0.004 * i as f32).cos() - 0.10;
+        }}
+        let cosf = |a: &[f32], b: &[f32]| -> (f64, f64) {
+            let (mut dot, mut na, mut nb, mut mx, mut omax) = (0f64, 0f64, 0f64, 0f64, 0f64);
+            for i in 0..a.len().min(b.len()) {
+                let (u, v) = (a[i] as f64, b[i] as f64);
+                dot += u * v; na += u * u; nb += v * v;
+                let d = (u - v).abs(); if d > mx { mx = d; } if u.abs() > omax { omax = u.abs(); }
+            }
+            (if na > 0.0 && nb > 0.0 { dot / (na.sqrt() * nb.sqrt()) } else { 0.0 }, if omax > 0.0 { mx / omax } else { mx })
+        };
+        println!("\n=== GDN proj verify (qkv GEMM M=N vs decode GEMV ×N), recurrent layer {layer}, cc={cc} ===");
+        let mut all_ok = true;
+        for &n in &[2usize, 4, 8] {
+            let qkv_h = self.ssm_qkv_buf.as_ref().unwrap().handle;
+            // Batch: one recurrent-layer batched run → ssm_qkv_buf [N × cc].
+            let _ = self.forward_layer_batch_debug(dev, registry, cmd_ctx, model, layer, n as u32, &x[..n * hidden])?;
+            let qkv_n = self.stage_buf_region(dev, cmd_ctx, qkv_h, 0, (n * cc) as u32)?;
+            // Decode: per-token GEMV → ssm_qkv_buf [cc] (qkv is state-independent).
+            let mut worst_c = 1f64; let mut worst_r = 0f64; let mut worst_t = 0;
+            for t in 0..n {
+                self.kv_cache.reset();
+                let _ = self.forward_layer_debug(dev, registry, cmd_ctx, model, layer, 0, &x[t * hidden..(t + 1) * hidden])?;
+                let qkv_t = self.stage_buf_region(dev, cmd_ctx, qkv_h, 0, cc as u32)?;
+                let (c, r) = cosf(&qkv_n[t * cc..(t + 1) * cc], &qkv_t);
+                if c < worst_c { worst_c = c; worst_t = t; }
+                if r > worst_r { worst_r = r; }
+            }
+            let ok = worst_c > 0.999 && worst_r < 0.02;
+            all_ok &= ok;
+            println!("  => proj N={n}: worst_cos={worst_c:.6} (pos {worst_t}) worst_rel={worst_r:.3e} -> {}",
+                if ok { "MATCH (@~1e-5 GEMM baseline)" } else { "MISMATCH (>baseline = wiring/sizing)" });
+        }
+        println!("=== GDN PROJ VERDICT: {} ===",
+            if all_ok { "MATCH — batched qkv projection (GEMM M=N) correct @baseline" } else { "MISMATCH — projection wiring/sizing bug" });
+        Ok(all_ok)
+    }
+
     /// De-risk substep oracle — run ONE real DECODE layer (`dispatch_layer`,
     /// the same path `forward_token` uses) at `position` and return its
     /// post-layer `(k_buf, v_buf)` rows (each `kv_dim`). At N=1/pos 0 these
