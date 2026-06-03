@@ -1211,6 +1211,75 @@ impl Forward {
         Ok(all_ok)
     }
 
+    /// GDN-Completion #5 (gated `VF_QWEN35_GDN_VERIFY`) — FULL-LAYER
+    /// integration: the whole batched GDN (Linear-Attn) layer vs the
+    /// per-token decode path, against the deterministic oracle. Resets the
+    /// recurrent state (conv_state/ssm_state via the `ssm_persistent_
+    /// initialized` flag) before each run so both start from scratch; the
+    /// decode oracle carries state across its N single-token calls. The
+    /// pipeline now contains the projection/out-proj GEMMs → ~1e-5 FP-reorder
+    /// baseline (cos→1.0, not bit-identical). Mismatch ≫1e-5 localizes to a
+    /// mechanical op or an inter-mechanical-stage handoff (cores + projections
+    /// + serial loops already verified).
+    pub fn gdn_layer_verify(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd_ctx: &CommandContext,
+        model: &LoadedModel,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let cfg = self.config.clone();
+        let spec = cfg.qwen35.as_ref().expect("gdn_layer_verify: not qwen35");
+        let hidden = cfg.hidden_dim as usize;
+        let layer = (0..spec.block_count).find(|&l| spec.is_recurrent_layer(l)).expect("no recurrent layer");
+        let n_max = 32usize;
+        let mut x = vec![0f32; n_max * hidden];
+        for p in 0..n_max { for i in 0..hidden {
+            x[p * hidden + i] = 0.18 * (0.29 * p as f32 + 0.015 * i as f32).sin() + 0.06 * (0.004 * i as f32).cos() - 0.10;
+        }}
+        let cosf = |a: &[f32], b: &[f32]| -> (f64, f64) {
+            let (mut dot, mut na, mut nb, mut mx, mut omax) = (0f64, 0f64, 0f64, 0f64, 0f64);
+            for i in 0..a.len().min(b.len()) {
+                let (u, v) = (a[i] as f64, b[i] as f64);
+                dot += u * v; na += u * u; nb += v * v;
+                let d = (u - v).abs(); if d > mx { mx = d; } if u.abs() > omax { omax = u.abs(); }
+            }
+            (if na > 0.0 && nb > 0.0 { dot / (na.sqrt() * nb.sqrt()) } else { 0.0 }, if omax > 0.0 { mx / omax } else { mx })
+        };
+        println!("\n=== GDN full-layer integration (batched recurrent layer {layer} vs decode per-token) ===");
+        let mut all_ok = true;
+        for &n in &[2usize, 4, 8, 16, 32] {
+            // Batched: reset recurrent state, run the whole batched layer.
+            self.ssm_persistent_initialized = false;
+            let (batched, _k, _v) = self.forward_layer_batch_debug(dev, registry, cmd_ctx, model, layer, n as u32, &x[..n * hidden])?;
+            // Decode oracle: reset state, per-token with state-carry.
+            self.ssm_persistent_initialized = false;
+            self.kv_cache.reset();
+            let mut oracle = vec![0f32; n * hidden];
+            for t in 0..n {
+                let y = self.forward_layer_debug(dev, registry, cmd_ctx, model, layer, t as u32, &x[t * hidden..(t + 1) * hidden])?;
+                oracle[t * hidden..(t + 1) * hidden].copy_from_slice(&y);
+            }
+            let (mut wc, mut wr, mut wt) = (1f64, 0f64, 0usize);
+            for t in 0..n {
+                let (c, r) = cosf(&oracle[t * hidden..(t + 1) * hidden], &batched[t * hidden..(t + 1) * hidden]);
+                if c < wc { wc = c; wt = t; }
+                if r > wr { wr = r; }
+                if n <= 4 || t == 0 || t == 1 || t == n - 1 { println!("  layer N={n} pos {t:2}: cos={c:.6} rel={r:.3e}"); }
+            }
+            let ok = wc > 0.999 && wr < 0.02;
+            all_ok &= ok;
+            println!("  => layer N={n}: worst_cos={wc:.6} (pos {wt}) worst_rel={wr:.3e} -> {}",
+                if ok { "MATCH @~1e-5" } else { "MISMATCH" });
+        }
+        // Restore clean state for any subsequent use.
+        self.ssm_persistent_initialized = false;
+        self.kv_cache.reset();
+        println!("=== GDN FULL-LAYER VERDICT: {} ===",
+            if all_ok { "MATCH @~1e-5 — batched GDN layer correct → COMPLETE" } else { "MISMATCH — localize op/handoff" });
+        Ok(all_ok)
+    }
+
     /// De-risk substep oracle — run ONE real DECODE layer (`dispatch_layer`,
     /// the same path `forward_token` uses) at `position` and return its
     /// post-layer `(k_buf, v_buf)` rows (each `kv_dim`). At N=1/pos 0 these

@@ -2537,48 +2537,59 @@ impl BatchExec {
         let spec = cfg.qwen35.as_ref().expect(
             "b_step_ssm_alpha_gate emitted for non-qwen35 config",
         );
+        // GDN-Completion #5 — batched alpha-gate over N tokens.
+        // alpha = GEMM(ssm_alpha.weight @ batch_norm) [N×H]; alpha += dt.bias;
+        // alpha = softplus(alpha); gate = alpha * ssm_a. dt.bias / ssm_a are
+        // per-head [H] constants → tiled into gate_buf (the op's own output,
+        // free as scratch until step 4) so run_binary's same-size element-wise
+        // covers the per-token broadcast.
+        let seq_len = batch_seq_len(ctx);
         let input = fwd.batch_norm.handle;
         let alpha_buf = fwd.ssm_alpha_buf.as_ref().unwrap().handle;
         let gate_buf  = fwd.ssm_gate_buf.as_ref().unwrap().handle;
         let n_heads   = spec.num_v_heads();
+        let ne = seq_len * n_heads;
+        let head_bytes = (n_heads as u64) * 4;
 
-        let (w_alpha, w_alpha_off, w_alpha_sz) =
-            layer_weight_with_offset(ctx.model, layer, "ssm_alpha.weight");
-        let s_alpha = layer_weight_shader(
-            ctx.model, layer, "ssm_alpha.weight",
-            fwd.mul_mat_vec_subgroup_enabled,
-        );
-        let scale = layer_weight_scale_scalar(ctx.model, layer, "ssm_alpha.weight");
+        // 1. alpha = ssm_alpha.weight @ batch_norm (GEMM M=N, F32 weight).
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[input]);
-        fwd.run_gemv(
-            ctx.dev, ctx.registry, ctx.cmd, s_alpha, w_alpha,
-            w_alpha_off, w_alpha_sz, input, alpha_buf,
-            cfg.hidden_dim, n_heads, scale, "b_gemv_ssm_alpha",
+        self.b_run_proj(
+            fwd, cfg, ctx, "ssm_alpha.weight", input, alpha_buf,
+            n_heads, cfg.hidden_dim, seq_len, "b_gemm_ssm_alpha",
+            /* quantize_input = */ true,
         );
         fwd.mark_written(&[alpha_buf]);
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[alpha_buf]);
 
+        // 2. alpha += dt.bias (tile [H] → gate_buf [N×H], element-wise add).
         let dt_bias = layer_weight(ctx.model, layer, "ssm_dt.bias");
+        for t in 0..seq_len as u64 {
+            let region = vk::BufferCopy { src_offset: 0, dst_offset: t * head_bytes, size: head_bytes };
+            unsafe { ctx.dev.device.cmd_copy_buffer(ctx.cmd, dt_bias, gate_buf, std::slice::from_ref(&region)); }
+        }
+        transfer_to_compute_barrier(ctx.dev, ctx.cmd);
         fwd.run_binary(
             ctx.dev, ctx.registry, ctx.cmd, ShaderId::Add,
-            alpha_buf, dt_bias, alpha_buf,
-            n_heads, "b_ssm_alpha_add_dt",
+            alpha_buf, gate_buf, alpha_buf, ne, "b_ssm_alpha_add_dt",
         );
         fwd.mark_written(&[alpha_buf]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[alpha_buf]);
+        fwd.force_internal_barrier(ctx.dev, ctx.cmd, &[alpha_buf]);
 
-        fwd.run_softplus(
-            ctx.dev, ctx.registry, ctx.cmd,
-            alpha_buf, n_heads, "b_ssm_alpha_softplus",
-        );
+        // 3. alpha = softplus(alpha) over all N tokens.
+        fwd.run_softplus(ctx.dev, ctx.registry, ctx.cmd, alpha_buf, ne, "b_ssm_alpha_softplus");
         fwd.mark_written(&[alpha_buf]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[alpha_buf]);
+        fwd.force_internal_barrier(ctx.dev, ctx.cmd, &[alpha_buf]);
 
+        // 4. gate = alpha * ssm_a (tile ssm_a → gate_buf, then in-place mul).
         let ssm_a = layer_weight(ctx.model, layer, "ssm_a");
+        for t in 0..seq_len as u64 {
+            let region = vk::BufferCopy { src_offset: 0, dst_offset: t * head_bytes, size: head_bytes };
+            unsafe { ctx.dev.device.cmd_copy_buffer(ctx.cmd, ssm_a, gate_buf, std::slice::from_ref(&region)); }
+        }
+        transfer_to_compute_barrier(ctx.dev, ctx.cmd);
         fwd.run_binary(
             ctx.dev, ctx.registry, ctx.cmd, ShaderId::Mul,
-            alpha_buf, ssm_a, gate_buf,
-            n_heads, "b_ssm_alpha_mul_a",
+            alpha_buf, gate_buf, gate_buf, ne, "b_ssm_alpha_mul_a",
         );
         fwd.mark_written(&[gate_buf]);
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[gate_buf]);
@@ -2593,11 +2604,13 @@ impl BatchExec {
             "b_step_ssm_silu emitted for non-qwen35 config",
         );
         let conv_output = fwd.ssm_conv_output_buf.as_ref().unwrap().handle;
+        let seq_len = batch_seq_len(ctx);
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_output]);
+        // GDN-Completion #5 — elementwise over all N tokens.
         fwd.run_silu(
             ctx.dev, ctx.registry, ctx.cmd,
             conv_output, conv_output,
-            spec.conv_channels(), "b_ssm_silu",
+            seq_len * spec.conv_channels(), "b_ssm_silu",
         );
         fwd.mark_written(&[conv_output]);
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_output]);
@@ -2616,21 +2629,29 @@ impl BatchExec {
         let head_dim = spec.head_k_dim();
         let n_heads  = spec.num_k_heads();
         let qk_floats = head_dim * n_heads;
+        let conv_channels = spec.conv_channels();
+        let seq_len = batch_seq_len(ctx);
         let eps = cfg.rms_norm_eps;
 
+        // GDN-Completion #5 — per-token Q/K L2-norm. conv_output is
+        // [N × conv_channels] token-major; token t's Q-slice is at
+        // t·conv_channels, K-slice at t·conv_channels + qk_floats.
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_output]);
-        fwd.run_l2_norm(
-            ctx.dev, ctx.registry, ctx.cmd,
-            conv_output, conv_output,
-            head_dim, n_heads, 0,
-            eps, "b_ssm_l2_norm_q",
-        );
-        fwd.run_l2_norm(
-            ctx.dev, ctx.registry, ctx.cmd,
-            conv_output, conv_output,
-            head_dim, n_heads, qk_floats,
-            eps, "b_ssm_l2_norm_k",
-        );
+        for t in 0..seq_len {
+            let base = t * conv_channels;
+            fwd.run_l2_norm(
+                ctx.dev, ctx.registry, ctx.cmd,
+                conv_output, conv_output,
+                head_dim, n_heads, base,
+                eps, "b_ssm_l2_norm_q",
+            );
+            fwd.run_l2_norm(
+                ctx.dev, ctx.registry, ctx.cmd,
+                conv_output, conv_output,
+                head_dim, n_heads, base + qk_floats,
+                eps, "b_ssm_l2_norm_k",
+            );
+        }
         fwd.mark_written(&[conv_output]);
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_output]);
     }
@@ -2649,19 +2670,29 @@ impl BatchExec {
         let head_dim    = spec.head_k_dim();
         let n_src_heads = spec.num_k_heads();
         let n_dst_heads = spec.num_v_heads();
+        let conv_channels = spec.conv_channels();
+        let seq_len = batch_seq_len(ctx);
         let slice_bytes = head_dim as u64 * n_src_heads as u64 * 4;
+        let cc_bytes = conv_channels as u64 * 4;            // src token stride
+        let rep_bytes = head_dim as u64 * n_dst_heads as u64 * 4; // dst token stride (head_k·H)
 
+        // GDN-Completion #5 — per-token repeat. src (conv_output) token stride
+        // = conv_channels; dst (qrep/krep) token stride = head_k·n_dst_heads.
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_output]);
-        fwd.run_repeat_interleave(
-            ctx.dev, ctx.registry, ctx.cmd,
-            conv_output, 0, slice_bytes, qrep, 0,
-            head_dim, n_src_heads, n_dst_heads, 1, "b_ssm_repeat_q",
-        );
-        fwd.run_repeat_interleave(
-            ctx.dev, ctx.registry, ctx.cmd,
-            conv_output, slice_bytes, slice_bytes, krep, 0,
-            head_dim, n_src_heads, n_dst_heads, 1, "b_ssm_repeat_k",
-        );
+        for t in 0..seq_len as u64 {
+            let src_q = t * cc_bytes;
+            let dst_t = t * rep_bytes;
+            fwd.run_repeat_interleave(
+                ctx.dev, ctx.registry, ctx.cmd,
+                conv_output, src_q, slice_bytes, qrep, dst_t,
+                head_dim, n_src_heads, n_dst_heads, 1, "b_ssm_repeat_q",
+            );
+            fwd.run_repeat_interleave(
+                ctx.dev, ctx.registry, ctx.cmd,
+                conv_output, src_q + slice_bytes, slice_bytes, krep, dst_t,
+                head_dim, n_src_heads, n_dst_heads, 1, "b_ssm_repeat_k",
+            );
+        }
         fwd.mark_written(&[qrep, krep]);
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[qrep, krep]);
     }
@@ -2763,18 +2794,21 @@ impl BatchExec {
         );
         let h   = spec.num_v_heads();
         let s_v = spec.ssm_d_state;
-        let ne  = h * s_v;
+        let seq_len = batch_seq_len(ctx);
+        let ne  = seq_len * h * s_v;   // all N tokens
 
         let gdn_out  = fwd.ssm_gdn_out_buf.as_ref().unwrap().handle;
         let z        = fwd.ssm_z_buf.as_ref().unwrap().handle;
         let norm_out = fwd.ssm_norm_out_buf.as_ref().unwrap().handle;
         let norm_w   = layer_weight(ctx.model, layer, "ssm_norm.weight");
 
+        // GDN-Completion #5 — RMSNorm over N·H rows (norm_w [s_v] broadcast
+        // per row), SiLU(z) + Mul over all N tokens.
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[gdn_out]);
         fwd.run_rms_norm(
             ctx.dev, ctx.registry, ctx.cmd,
             gdn_out, norm_w, norm_out,
-            s_v, h, cfg.rms_norm_eps, "b_ssm_norm_gated_rms",
+            s_v, seq_len * h, cfg.rms_norm_eps, "b_ssm_norm_gated_rms",
         );
         fwd.mark_written(&[norm_out]);
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[z]);
@@ -2804,18 +2838,16 @@ impl BatchExec {
         let spec = cfg.qwen35.as_ref().expect(
             "b_step_ssm_out_proj emitted for non-qwen35 config",
         );
+        // GDN-Completion #5 — batched GEMM (M=N): norm_out_N [N×ssm_d_inner]
+        // → batch_o [N×hidden]. Feeds AttnResidualAdd (batch_residual += o).
+        let seq_len = batch_seq_len(ctx);
         let norm_out = fwd.ssm_norm_out_buf.as_ref().unwrap().handle;
         let batch_o  = fwd.batch_o.handle;
-        let (w, w_off, w_sz) = layer_weight_with_offset(ctx.model, layer, "ssm_out.weight");
-        let s = layer_weight_shader(
-            ctx.model, layer, "ssm_out.weight",
-            fwd.mul_mat_vec_subgroup_enabled,
-        );
-        let scale = layer_weight_scale_scalar(ctx.model, layer, "ssm_out.weight");
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[norm_out]);
-        fwd.run_gemv(
-            ctx.dev, ctx.registry, ctx.cmd, s, w, w_off, w_sz, norm_out, batch_o,
-            spec.ssm_d_inner, cfg.hidden_dim, scale, "b_gemv_ssm_out",
+        self.b_run_proj(
+            fwd, cfg, ctx, "ssm_out.weight", norm_out, batch_o,
+            cfg.hidden_dim, spec.ssm_d_inner, seq_len, "b_gemm_ssm_out",
+            /* quantize_input = */ true,
         );
         fwd.mark_written(&[batch_o]);
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[batch_o]);

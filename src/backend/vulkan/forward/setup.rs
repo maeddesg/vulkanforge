@@ -434,14 +434,14 @@ impl Forward {
             let qkv_bytes        = pp * conv_channels * 4;       // N × 10240
             let z_bytes          = pp * (spec.ssm_d_inner as u64) * 4; // N × 6144
             let beta_bytes       = pp * num_v_heads * 4;         // N × 48
-            let alpha_bytes      = num_v_heads * 4;              // 48 * 4 = 192 B
-            let gate_bytes       = num_v_heads * 4;              // 48 * 4 = 192 B
+            let alpha_bytes      = pp * num_v_heads * 4;         // N × 48
+            let gate_bytes       = pp * num_v_heads * 4;         // N × 48 (also alpha-gate tile scratch)
             let conv_in_bytes    = (spec.ssm_d_conv as u64) * conv_channels * 4; // 4*10240*4 (1-token scratch, per-token loop)
             // GDN-Completion #4b — conv_output now holds all N tokens (the
             // serial conv loop writes conv_output_N[t] via dst-offset).
             let conv_out_bytes   = pp * conv_channels * 4;       // N × 10240
-            let qrep_bytes       = head_v_dim * num_v_heads * 4; // 128*48*4 = 24 KB
-            let krep_bytes       = head_v_dim * num_v_heads * 4; // 24 KB
+            let qrep_bytes       = pp * head_v_dim * num_v_heads * 4; // N × 6144
+            let krep_bytes       = pp * head_v_dim * num_v_heads * 4; // N × 6144
             // Sprint G-2e — `ssm_gdn_out_buf` holds BOTH the GDN output
             // `[H × S_v × n_tokens × n_seqs]` AND the new persistent
             // state `[H × S_v × S_v × n_seqs]` co-located in a single
@@ -461,7 +461,7 @@ impl Forward {
             let gdn_out_bytes    =
                 (pp * head_v_dim * num_v_heads                     // outputs N × 6144
                  + num_v_heads * head_v_dim * head_v_dim) * 4;     // state  786432
-            let norm_out_bytes   = head_v_dim * num_v_heads * 4; // 24 KB
+            let norm_out_bytes   = pp * head_v_dim * num_v_heads * 4; // N × 6144
 
             let qkv      = Some(mk_storage(qkv_bytes,      MemoryLocation::GpuOnly, "ssm_qkv_buf")?);
             let z        = Some(mk_storage(z_bytes,        MemoryLocation::GpuOnly, "ssm_z_buf")?);
