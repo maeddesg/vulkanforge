@@ -31,6 +31,10 @@ use super::arch::{
     layer_weight_shader, n_kv_heads_for,
 };
 use super::state::{DebugTarget, Forward};
+use super::super::buffers::GpuBuffer;
+use super::super::pipeline::GatedDeltaNetPushConstants;
+use gpu_allocator::MemoryLocation;
+use gpu_allocator::vulkan::Allocator;
 
 impl Forward {
     /// Debug helper — run ONE layer up to a chosen halt point and
@@ -667,6 +671,175 @@ impl Forward {
         let _ = self.forward_layer_batch_debug(dev, registry, cmd_ctx, model, layer, 1, input)?;
         let hidden = self.config.hidden_dim;
         self.stage_buf_prefix(dev, cmd_ctx, self.batch_o.handle, hidden)
+    }
+
+    /// GDN-Completion #1 verification (gated `VF_QWEN35_GDN_VERIFY`): verify
+    /// the `gated_delta_net.comp` recurrence over `n_tokens=N` (register-
+    /// resident state carried across the internal token loop) against the
+    /// per-token decode recurrence (`n_tokens=1` ×N with buffer state-carry,
+    /// mirroring `step_gated_delta_net`'s dst→state copy-back). Identical
+    /// synthetic inputs from a zero initial state → per-position cos for
+    /// N = 2,4,8,16. RECURRENCE-ONLY (the shader does NOT do the causal
+    /// conv; that is a separate wiring-sprint check). Self-contained
+    /// host-visible buffers — the production ssm_* buffers are decode-sized
+    /// (n_tokens=1) and too small for N. No production behavior (BatchExec
+    /// GDN stays stubbed). Pre-check gate before building the GDN wiring.
+    pub fn gdn_recurrence_verify(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd_ctx: &CommandContext,
+        allocator: &mut Allocator,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let spec = self.config.qwen35.clone().expect("gdn_recurrence_verify: not qwen35");
+        let h = spec.num_v_heads();           // 48
+        let s_v = spec.ssm_d_state;           // 128
+        let head_k = spec.head_k_dim();       // 128
+        let scale = 1.0f32 / (s_v as f32).sqrt();
+        let (hu, svu, hku) = (h as usize, s_v as usize, head_k as usize);
+
+        let q_per = hku * hu;                 // 6144  (head_k × H)
+        let v_per = svu * hu;                 // 6144  (S_v × H)
+        let g_per = hu;                       // 48    (scalar per head)
+        let state_floats = hu * svu * svu;    // 786432 (H × S_v × S_v)
+        let n_max = 16usize;
+
+        // Synthetic generators — identical for path-A token-t and path-B
+        // token-t (indexed by GLOBAL token t). g ≤ 0 so exp(g) ∈ (0,1] (decay).
+        let qf = |t: usize, hh: usize, i: usize| 0.15 * (0.30 * t as f32 + 0.020 * i as f32 + 0.05 * hh as f32).sin() + 0.05 * (0.011 * i as f32).cos();
+        let kf = |t: usize, hh: usize, i: usize| 0.12 * (0.25 * t as f32 + 0.017 * i as f32 + 0.03 * hh as f32).cos() + 0.04 * (0.009 * (i * (hh + 1)) as f32).sin();
+        let vf = |t: usize, hh: usize, c: usize| 0.20 * (0.20 * t as f32 + 0.013 * c as f32 + 0.04 * hh as f32).sin();
+        let gf = |t: usize, hh: usize| -0.10 - 0.02 * (((t + hh) % 5) as f32);
+        let bf = |t: usize, hh: usize| 0.5 + 0.1 * (0.4 * t as f32 + 0.2 * hh as f32).sin();
+
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+        let mut mk = |alloc: &mut Allocator, floats: usize, name: &str| {
+            GpuBuffer::new(&dev.device, alloc, (floats as u64) * 4, usage, MemoryLocation::CpuToGpu, name)
+        };
+        // Path A (N_max tokens), shared state, path B (1 token).
+        let mut q_a = mk(allocator, n_max * q_per, "gdnv_qA")?;
+        let mut k_a = mk(allocator, n_max * q_per, "gdnv_kA")?;
+        let mut v_a = mk(allocator, n_max * v_per, "gdnv_vA")?;
+        let mut g_a = mk(allocator, n_max * g_per, "gdnv_gA")?;
+        let mut b_a = mk(allocator, n_max * g_per, "gdnv_bA")?;
+        let mut state = mk(allocator, state_floats, "gdnv_state")?;
+        let dst_a = mk(allocator, n_max * v_per + state_floats, "gdnv_dstA")?;
+        let mut q_1 = mk(allocator, q_per, "gdnv_q1")?;
+        let mut k_1 = mk(allocator, q_per, "gdnv_k1")?;
+        let mut v_1 = mk(allocator, v_per, "gdnv_v1")?;
+        let mut g_1 = mk(allocator, g_per, "gdnv_g1")?;
+        let mut b_1 = mk(allocator, g_per, "gdnv_b1")?;
+        let dst_1 = mk(allocator, v_per + state_floats, "gdnv_dst1")?;
+
+        let cosf = |a: &[f32], b: &[f32]| -> (f64, f64) {
+            let (mut dot, mut na, mut nb, mut mx, mut omax) = (0f64, 0f64, 0f64, 0f64, 0f64);
+            for i in 0..a.len().min(b.len()) {
+                let (x, y) = (a[i] as f64, b[i] as f64);
+                dot += x * y; na += x * x; nb += y * y;
+                let d = (x - y).abs(); if d > mx { mx = d; } if x.abs() > omax { omax = x.abs(); }
+            }
+            let c = if na > 0.0 && nb > 0.0 { dot / (na.sqrt() * nb.sqrt()) } else { 0.0 };
+            (c, if omax > 0.0 { mx / omax } else { mx })
+        };
+        let host_barrier = |dev: &VulkanDevice, cmd: vk::CommandBuffer| {
+            let mb = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ);
+            unsafe { dev.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), std::slice::from_ref(&mb), &[], &[]); }
+        };
+
+        let zero = vec![0f32; state_floats];
+        let st_bytes = (state_floats as u64) * 4;
+        println!("\n=== GDN recurrence verify (shader n_tokens=N vs decode n_tokens=1×N), h={h} s_v={s_v} head_k={head_k} ===");
+        let mut all_ok = true;
+        for &n in &[2usize, 4, 8, 16] {
+            // ---- fill path-A inputs (tokens 0..n) ----
+            let mut qv = vec![0f32; n * q_per]; let mut kv = vec![0f32; n * q_per];
+            let mut vv = vec![0f32; n * v_per]; let mut gv = vec![0f32; n * g_per]; let mut bv = vec![0f32; n * g_per];
+            for t in 0..n {
+                for hh in 0..hu {
+                    for i in 0..hku { qv[t * q_per + hh * hku + i] = qf(t, hh, i); kv[t * q_per + hh * hku + i] = kf(t, hh, i); }
+                    for c in 0..svu { vv[t * v_per + hh * svu + c] = vf(t, hh, c); }
+                    gv[t * g_per + hh] = gf(t, hh); bv[t * g_per + hh] = bf(t, hh);
+                }
+            }
+            q_a.write_bytes(bytemuck::cast_slice(&qv))?; k_a.write_bytes(bytemuck::cast_slice(&kv))?;
+            v_a.write_bytes(bytemuck::cast_slice(&vv))?; g_a.write_bytes(bytemuck::cast_slice(&gv))?;
+            b_a.write_bytes(bytemuck::cast_slice(&bv))?; state.write_bytes(bytemuck::cast_slice(&zero))?;
+
+            // ---- Path A: ONE dispatch n_tokens=N ----
+            let push_a = GatedDeltaNetPushConstants {
+                h, n_tokens: n as u32, n_seqs: 1, s_off: (s_v * h) * (n as u32),
+                sq1: head_k, sq2: head_k * h, sq3: head_k * h,
+                sv1: s_v, sv2: s_v * h, sv3: s_v * h, sb1: 1, sb2: h, sb3: h,
+                neq1: h, rq3: 1, scale, k: 1,
+            };
+            self.reset_descriptor_pool_and_cache(dev)?;
+            let (qh, kh, vh, gh, bh, sh, dh) = (q_a.handle, k_a.handle, v_a.handle, g_a.handle, b_a.handle, state.handle, dst_a.handle);
+            let v_bytes_a = (n * v_per) as u64 * 4;
+            cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
+                self.run_gated_delta_net(dev, registry, cmd, qh, kh, vh, 0, v_bytes_a, gh, bh, sh, 0, st_bytes, dh, s_v, 2, &push_a, "gdnv_a");
+                host_barrier(dev, cmd);
+            })?;
+            let out_a = bytemuck::cast_slice::<u8, f32>(&dst_a.read_bytes()?[..(n * v_per) * 4]).to_vec();
+
+            // ---- Path B: n_tokens=1 ×N with buffer state-carry ----
+            state.write_bytes(bytemuck::cast_slice(&zero))?;
+            let push_b = GatedDeltaNetPushConstants {
+                h, n_tokens: 1, n_seqs: 1, s_off: s_v * h,
+                sq1: head_k, sq2: head_k * h, sq3: head_k * h,
+                sv1: s_v, sv2: s_v * h, sv3: s_v * h, sb1: 1, sb2: h, sb3: h,
+                neq1: h, rq3: 1, scale, k: 1,
+            };
+            let mut out_b = vec![0f32; n * v_per];
+            let (q1h, k1h, v1h, g1h, b1h, d1h) = (q_1.handle, k_1.handle, v_1.handle, g_1.handle, b_1.handle, dst_1.handle);
+            let s_off_b = (s_v * h) as usize;
+            for t in 0..n {
+                let mut q1 = vec![0f32; q_per]; let mut k1 = vec![0f32; q_per];
+                let mut v1 = vec![0f32; v_per]; let mut g1 = vec![0f32; g_per]; let mut b1 = vec![0f32; g_per];
+                for hh in 0..hu {
+                    for i in 0..hku { q1[hh * hku + i] = qf(t, hh, i); k1[hh * hku + i] = kf(t, hh, i); }
+                    for c in 0..svu { v1[hh * svu + c] = vf(t, hh, c); }
+                    g1[hh] = gf(t, hh); b1[hh] = bf(t, hh);
+                }
+                q_1.write_bytes(bytemuck::cast_slice(&q1))?; k_1.write_bytes(bytemuck::cast_slice(&k1))?;
+                v_1.write_bytes(bytemuck::cast_slice(&v1))?; g_1.write_bytes(bytemuck::cast_slice(&g1))?;
+                b_1.write_bytes(bytemuck::cast_slice(&b1))?;
+                let sh2 = state.handle;
+                self.reset_descriptor_pool_and_cache(dev)?;
+                cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
+                    self.run_gated_delta_net(dev, registry, cmd, q1h, k1h, v1h, 0, (v_per as u64) * 4, g1h, b1h, sh2, 0, st_bytes, d1h, s_v, 2, &push_b, "gdnv_b");
+                    host_barrier(dev, cmd);
+                })?;
+                let db = dst_1.read_bytes()?;
+                out_b[t * v_per..(t + 1) * v_per].copy_from_slice(bytemuck::cast_slice::<u8, f32>(&db[..v_per * 4]));
+                // carry: dst1[s_off .. s_off+state] → state buffer (mirrors decode copy-back)
+                let new_state = bytemuck::cast_slice::<u8, f32>(&db[s_off_b * 4..(s_off_b + state_floats) * 4]).to_vec();
+                state.write_bytes(bytemuck::cast_slice(&new_state))?;
+            }
+
+            // ---- per-position cos ----
+            let (mut worst_c, mut worst_r, mut worst_t) = (1f64, 0f64, 0usize);
+            for t in 0..n {
+                let (c, r) = cosf(&out_a[t * v_per..(t + 1) * v_per], &out_b[t * v_per..(t + 1) * v_per]);
+                if c < worst_c { worst_c = c; worst_t = t; }
+                if r > worst_r { worst_r = r; }
+                if n <= 4 || t == 0 || t == 1 || t == n - 1 { println!("  N={n} pos {t:2}: cos={c:.6} rel={r:.3e}"); }
+            }
+            let ok = worst_c > 0.999 && worst_r < 0.02;
+            all_ok &= ok;
+            println!("  => N={n}: worst_cos={worst_c:.6} (pos {worst_t}) worst_rel={worst_r:.3e} -> {}",
+                if ok { "MATCH" } else { "MISMATCH" });
+        }
+        println!("=== GDN VERDICT: {} ===",
+            if all_ok { "MATCH — recurrence over n_tokens=N verified → GO wiring" }
+            else { "MISMATCH — shader n_tokens=N loop drift (see position pattern)" });
+
+        for buf in [q_a, k_a, v_a, g_a, b_a, state, dst_a, q_1, k_1, v_1, g_1, b_1, dst_1] {
+            buf.destroy(&dev.device, allocator);
+        }
+        Ok(all_ok)
     }
 
     /// De-risk substep oracle — run ONE real DECODE layer (`dispatch_layer`,

@@ -829,6 +829,16 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // GDN-Completion #1 (VF_QWEN35_GDN_VERIFY=1, gated, diagnostic): verify
+    // the gated_delta_net.comp recurrence over n_tokens=N in isolation
+    // against the per-token decode recurrence, then exit. No production
+    // behavior. Pre-check gate before building the GDN wiring.
+    if std::env::var("VF_QWEN35_GDN_VERIFY").as_deref() == Ok("1") {
+        let _ = forward.gdn_recurrence_verify(&dev, &registry, &cmd_ctx, &mut allocator)?;
+        forward.destroy(&dev.device, &mut allocator);
+        return Ok(());
+    }
+
     // Sprint G.9-spike — VF_BALLAST_MB env-gated, post-load read-never
     // VRAM ballast. Reserves headroom to test whether the ≥12 GB BW cliff
     // is pressure-driven or offset-fixed. Default unset → 0 effect; on
