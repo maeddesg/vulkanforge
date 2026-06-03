@@ -1338,6 +1338,50 @@ impl Forward {
         }
         let od = distinct(&hh[stages.len()]);
         println!("  recurrent layer-output: {od} distinct/{runs} -> {}", if od == 1 { "det" } else { "NON-DET" });
+
+        // CLEAN multi-layer probe: run K trunk layers in ONE command buffer
+        // (NO per-layer wait_idle — the production cross-layer pipelining the
+        // single-layer probe lacks) and hash the RAW batch_residual (NOT the
+        // argmax token → no near-tie noise). Min-K with raw non-determinism
+        // pins the cross-layer race cleanly.
+        let hidden_bytes = (cfg.hidden_dim as u64) * 4;
+        let nl_total = cfg.trunk_layers();
+        println!("  -- multi-layer (K layers, ONE CB, raw batch_residual hash) --");
+        let mlruns = 12;
+        for &k in &[1u32, 2, 3, 4, 8, 16] {
+            if k > nl_total { break; }
+            let mut hs: Vec<u64> = Vec::new();
+            for _ in 0..mlruns {
+                self.ssm_persistent_initialized = false;
+                self.kv_cache.reset();
+                self.batch_input.write_bytes(bytemuck::cast_slice(&x[..nn * hidden]))?;
+                self.reset_descriptor_pool_and_cache(dev)?;
+                let w0 = layer_weight(model, 0, "attn_norm.weight");
+                cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
+                    // Inline seed (record_prefill_seed is private): batch_residual
+                    // = batch_input; batch_norm = rms_norm(batch_residual)·attn_norm[0].
+                    let copy = vk::BufferCopy::default().src_offset(0).dst_offset(0).size((n as u64) * hidden_bytes);
+                    unsafe { dev.device.cmd_copy_buffer(cmd, self.batch_input.handle, self.batch_residual.handle, std::slice::from_ref(&copy)); }
+                    let bar = vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
+                    unsafe { dev.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), std::slice::from_ref(&bar), &[], &[]); }
+                    self.run_rms_norm(dev, registry, cmd, self.batch_residual.handle, w0, self.batch_norm.handle, cfg.hidden_dim, n, cfg.rms_norm_eps, "mldet_seed");
+                    compute_barrier(dev, cmd);
+                    for layer in 0..k {
+                        let next_w = if layer + 1 < k {
+                            Some(layer_weight(model, layer + 1, "attn_norm.weight"))
+                        } else { None };
+                        self.dispatch_layer_batch(dev, registry, cmd, model, layer, n, 0, next_w);
+                    }
+                })?;
+                let res = self.stage_buf_region(dev, cmd_ctx, self.batch_residual.handle, 0, n * cfg.hidden_dim)?;
+                hs.push(fnv(&res));
+            }
+            let d = distinct(&hs);
+            println!("    K={k:2}: {d} distinct/{mlruns} -> {}", if d == 1 { "det" } else { "NON-DET <<<" });
+        }
+        self.ssm_persistent_initialized = false;
+        self.kv_cache.reset();
         // Also test the FULL-ATTN batched layer at N>1 (the v0.5.4 determinism
         // probe only ran N=1 → never exercised the multi-token full-attn path).
         let fa = (0..spec.block_count).find(|&l| spec.is_full_attention_layer(l) && !spec.is_mtp_block(l));

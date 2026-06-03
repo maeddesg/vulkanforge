@@ -179,7 +179,13 @@ impl Forward {
                 self.record_prefill_seed(dev, registry, cmd, model, &cfg, seq_len, hidden, hidden_bytes);
                 // F.1-fix — trunk = trunk_layers() (n_main for qwen35), so
                 // the MTP block never runs in the batched prefill trunk.
-                let nl = cfg.trunk_layers();
+                // Diagnostic (VF_PREFILL_MAX_LAYERS=K, gated): truncate the
+                // trunk to K layers to layer-count-bisect the cross-layer
+                // elision race (run-to-run determinism vs K). NOT for
+                // production correctness — only the determinism signal matters.
+                let nl = cfg.trunk_layers().min(
+                    std::env::var("VF_PREFILL_MAX_LAYERS").ok()
+                        .and_then(|v| v.parse::<u32>().ok()).unwrap_or(u32::MAX));
                 for layer in 0..nl {
                     let next_w = if layer + 1 < nl {
                         Some(layer_weight(model, layer + 1, "attn_norm.weight"))
