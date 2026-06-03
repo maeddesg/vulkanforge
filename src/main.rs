@@ -412,6 +412,87 @@ fn run_qwen35_layer_derisk(
     // Test the first full-attention layer (3) + a spot-check full-attn
     // layer (7). full_attention_interval=4 → layers 3,7 are Full-Attn.
     let test_layers: Vec<u32> = vec![3, 7];
+
+    // Sprint (determinism probe, VF_QWEN35_DETERMINISM=1): definitively
+    // settle RACE-vs-DETERMINISTIC for the batched gated-output residual.
+    // Run the batched layer @N (default 1) R times back-to-back in ONE
+    // process. `forward_layer_batch_debug` drains the FULL layer dispatch
+    // sequence inside one_shot (submit+wait-idle) BEFORE any readback, so
+    // the per-call output staging does NOT interleave with — and thus does
+    // not mask — an intra-layer race. State is clean each run (KV reset +
+    // descriptor-pool reset + identical synthetic input), so absent a race
+    // the raw-f32 output MUST be bit-identical. Hash each run:
+    //   1 distinct hash over R runs  => DETERMINISTIC (race thesis refuted)
+    //   >1 distinct hashes           => RACE confirmed.
+    if std::env::var("VF_QWEN35_DETERMINISM").as_deref() == Ok("1") {
+        let runs: u32 = std::env::var("VF_DETERM_RUNS").ok()
+            .and_then(|v| v.parse().ok()).unwrap_or(12);
+        let dn: u32 = std::env::var("VF_DERISK_N").ok()
+            .and_then(|v| v.parse().ok()).unwrap_or(1);
+        println!("\n=== qwen35 batched gated-output DETERMINISM probe (runs={runs}, N={dn}) ===");
+        let fnv = |out: &[f32]| -> u64 {
+            let mut h: u64 = 0xcbf29ce484222325;
+            for f in out {
+                for b in f.to_le_bytes() { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
+            }
+            h
+        };
+        let mut all_det = true;
+        for &layer in &test_layers {
+            // BATCH path (production-disabled prefill executor).
+            let mut hashes: Vec<u64> = Vec::with_capacity(runs as usize);
+            let mut first: Vec<f32> = Vec::new();
+            let mut worst_cos = 1.0f64;
+            for r in 0..runs {
+                let (out, _k, _v) = forward.forward_layer_batch_debug(
+                    dev, registry, cmd_ctx, model, layer, dn,
+                    &x[..(dn as usize) * hidden],
+                )?;
+                let h = fnv(&out);
+                let cos = if r == 0 { first = out.clone(); 1.0 }
+                          else { cos_rel(&first, &out).0 };
+                if cos < worst_cos { worst_cos = cos; }
+                hashes.push(h);
+                println!("  BAT L{layer} run {r:2}: hash={h:016x} cos_vs_run0={cos:.6}");
+            }
+            let distinct = { let mut s = hashes.clone(); s.sort(); s.dedup(); s.len() };
+            let det = distinct == 1;
+            all_det &= det;
+            println!(
+                "  => BAT L{layer}: {distinct} distinct hash(es)/{runs} runs, worst_cos_vs_run0={worst_cos:.6} -> {}",
+                if det { "DETERMINISTIC (bit-identical)" } else { "NON-DETERMINISTIC (RACE)" },
+            );
+
+            // DECODE oracle (production single-token path) — same probe.
+            // The full-output cos compares BAT vs this oracle, so if the
+            // oracle varies, the cos varies even when BAT is bit-identical.
+            let mut ohashes: Vec<u64> = Vec::with_capacity(runs as usize);
+            let zerofill = std::env::var("VF_DERISK_KV_ZEROFILL").as_deref() == Ok("1");
+            for r in 0..runs {
+                forward.kv_cache.reset();
+                if zerofill { forward.kv_cache.zero_fill(dev)?; }
+                let y = forward.forward_layer_debug(dev, registry, cmd_ctx, model, layer, 0, &x[0..hidden])?;
+                let h = fnv(&y);
+                ohashes.push(h);
+                println!("  DEC L{layer} run {r:2}: hash={h:016x}");
+            }
+            let odistinct = { let mut s = ohashes.clone(); s.sort(); s.dedup(); s.len() };
+            println!(
+                "  => DEC L{layer}: {odistinct} distinct hash(es)/{runs} runs -> {}",
+                if odistinct == 1 { "DETERMINISTIC" } else { "NON-DETERMINISTIC (oracle noise — harness isolation)" },
+            );
+        }
+        println!(
+            "=== DETERMINISM VERDICT: {} ===",
+            if all_det {
+                "DETERMINISTIC — race thesis REFUTED, residual is a fixed math/layout diff (bisect-both-match was a capture artifact)"
+            } else {
+                "NON-DETERMINISTIC — RACE confirmed, proceed to edge/barrier-mask audit"
+            },
+        );
+        return Ok(());
+    }
+
     println!("\n=== qwen35 batched Full-Attention de-risk (N={n}, hidden={hidden}) ===");
     let mut all_match = true;
     for &layer in &test_layers {
@@ -490,6 +571,44 @@ fn run_qwen35_layer_derisk(
             println!(
                 "  gate-bisect@N=1: gate-as-applied(decode-concat vs batch-interleaved) cos={gcos:.6} rel={grel:.4e} {}",
                 if gcos > 0.999 && grel < 0.02 { "MATCH (gate ok → residual in attn_out)" } else { "DIVERGE (gate layout/value)" },
+            );
+
+            // Post-gate attn_out localization @N=1: decode vs batch,
+            // element-wise + per-head. attn_out is the ONLY buffer the
+            // gated-output touches; skip-gate matches (pre-gate equal), so
+            // any post-gate divergence here pins the gate-APPLICATION
+            // misalignment to specific heads/dims. Respects VF_DERISK_SKIP_GATE
+            // (run with =1 to capture the PRE-gate attn_out as a control —
+            // expect bad_heads=0).
+            forward.kv_cache.reset();
+            let ao_dec = forward.forward_layer_debug_attn_out(dev, registry, cmd_ctx, model, layer, 0, &x[0..hidden])?;
+            let ao_bat = forward.forward_layer_batch_attn_out(dev, registry, cmd_ctx, model, layer, &x[0..hidden])?;
+            let (acos, arel) = cos_rel(&ao_dec, &ao_bat);
+            let mut bad_heads = 0usize;
+            let mut worst_h = (0usize, 1.0f64);
+            for h in 0..n_heads {
+                let (hc, _) = cos_rel(&ao_dec[h * head_dim..(h + 1) * head_dim], &ao_bat[h * head_dim..(h + 1) * head_dim]);
+                if hc < 0.999 { bad_heads += 1; }
+                if hc < worst_h.1 { worst_h = (h, hc); }
+            }
+            println!(
+                "  attn_out(post-gate) decode-vs-batch: cos={acos:.6} rel={arel:.4e} | bad_heads(<0.999)={bad_heads}/{n_heads} worst=h{}({:.6})",
+                worst_h.0, worst_h.1,
+            );
+
+            // o-proj output localization @N=1: decode (gemv, FP32 act) vs
+            // batch (gemm, quantized-input act). attn_out matches; if o_buf
+            // diverges to ~the full-output level, o-proj input-quantization
+            // is the amplifier (gate compresses attn_out's range → batch's
+            // input-quant loses relatively more precision). Run with/without
+            // VF_DERISK_SKIP_GATE to confirm the gate-range coupling.
+            forward.kv_cache.reset();
+            let ob_dec = forward.forward_layer_debug_o_buf(dev, registry, cmd_ctx, model, layer, 0, &x[0..hidden])?;
+            let ob_bat = forward.forward_layer_batch_o(dev, registry, cmd_ctx, model, layer, &x[0..hidden])?;
+            let (ocos, orel) = cos_rel(&ob_dec, &ob_bat);
+            println!(
+                "  o-proj-out decode(gemv)-vs-batch(gemm-quant) cos={ocos:.6} rel={orel:.4e} {}",
+                if ocos > 0.999 { "MATCH" } else { "DIVERGE (o-proj input-quant amplifier)" },
             );
         }
     }

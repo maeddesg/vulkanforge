@@ -566,6 +566,109 @@ impl Forward {
         self.stage_buf_region(dev, cmd_ctx, qgate, 0, q_total)
     }
 
+    /// De-risk gated-output localization — run ONE real DECODE layer and
+    /// return `attn_out` (q_dim, head-major [head0(hd)..head_{nh-1}(hd)]).
+    /// For a qwen35 full-attn layer this is the buffer the gated-output
+    /// `sigmoid_mul` writes IN PLACE; OProj reads it (doesn't write) and
+    /// AttnResidualAdd reads `o_buf` (not attn_out) and qwen35 emits no
+    /// PostAttnNorm, so the gated attention output survives to the layer
+    /// boundary. Compared against `forward_layer_batch_attn_out` to localize
+    /// the deterministic gate-application divergence per head. KV reset so
+    /// pos 0 attends only to itself (matches the batched single-token path).
+    pub fn forward_layer_debug_attn_out(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd_ctx: &CommandContext,
+        model: &LoadedModel,
+        layer: u32,
+        position: u32,
+        input_data: &[f32],
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let cfg = self.config.clone();
+        let q_dim = cfg.n_heads * cfg.head_dim;
+        self.cur_mut().scratch_a.write_bytes(bytemuck::cast_slice(input_data))?;
+        self.cur_mut().rope_pos_buf.write_bytes(bytemuck::bytes_of(&position))?;
+        self.reset_descriptor_pool_and_cache(dev)?;
+        self.kv_cache.reset();
+        cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
+            self.dispatch_layer(
+                dev, registry, cmd, model, layer, position,
+                self.cur().scratch_a.handle, self.cur().scratch_b.handle,
+            );
+        })?;
+        self.stage_buf_region(dev, cmd_ctx, self.cur().attn_out.handle, 0, q_dim)
+    }
+
+    /// De-risk gated-output localization — run ONE BatchExec layer @N=1 and
+    /// return `batch_attn_out` (q_dim). qwen35 emits no PostAttnNorm and
+    /// AttnResidualAdd reads `batch_o`, so `batch_attn_out` holds the
+    /// post-gate attention output at the layer boundary (its in-place
+    /// `sigmoid_mul` result). Element-wise/per-head diff vs the decode
+    /// sibling pins the gate-application misalignment.
+    pub fn forward_layer_batch_attn_out(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd_ctx: &CommandContext,
+        model: &LoadedModel,
+        layer: u32,
+        input: &[f32],
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let _ = self.forward_layer_batch_debug(dev, registry, cmd_ctx, model, layer, 1, input)?;
+        let q_dim = self.config.n_heads * self.config.head_dim;
+        self.stage_buf_region(dev, cmd_ctx, self.batch_attn_out.handle, 0, q_dim)
+    }
+
+    /// De-risk gated-output localization — run ONE DECODE layer and return
+    /// the o-proj output `o_buf` (hidden_dim). qwen35 emits no PostAttnNorm
+    /// and AttnResidualAdd only reads o_buf, so it survives to the boundary.
+    /// Decode o-proj is a `gemv` (reads the FP32 attn_out activation
+    /// directly); the batch sibling is a `gemm` that QUANTIZES its input —
+    /// comparing the two outputs tests whether o-proj input-quantization is
+    /// the amplifier of the gate-range-compressed attn_out difference.
+    pub fn forward_layer_debug_o_buf(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd_ctx: &CommandContext,
+        model: &LoadedModel,
+        layer: u32,
+        position: u32,
+        input_data: &[f32],
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let cfg = self.config.clone();
+        let hidden = cfg.hidden_dim;
+        self.cur_mut().scratch_a.write_bytes(bytemuck::cast_slice(input_data))?;
+        self.cur_mut().rope_pos_buf.write_bytes(bytemuck::bytes_of(&position))?;
+        self.reset_descriptor_pool_and_cache(dev)?;
+        self.kv_cache.reset();
+        cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
+            self.dispatch_layer(
+                dev, registry, cmd, model, layer, position,
+                self.cur().scratch_a.handle, self.cur().scratch_b.handle,
+            );
+        })?;
+        self.stage_buf_prefix(dev, cmd_ctx, self.cur().o_buf.handle, hidden)
+    }
+
+    /// De-risk gated-output localization — run ONE BatchExec layer @N=1 and
+    /// return the o-proj output `batch_o` (hidden_dim). The FFN does not
+    /// reuse batch_o, so it survives to the boundary.
+    pub fn forward_layer_batch_o(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd_ctx: &CommandContext,
+        model: &LoadedModel,
+        layer: u32,
+        input: &[f32],
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let _ = self.forward_layer_batch_debug(dev, registry, cmd_ctx, model, layer, 1, input)?;
+        let hidden = self.config.hidden_dim;
+        self.stage_buf_prefix(dev, cmd_ctx, self.batch_o.handle, hidden)
+    }
+
     /// De-risk substep oracle — run ONE real DECODE layer (`dispatch_layer`,
     /// the same path `forward_token` uses) at `position` and return its
     /// post-layer `(k_buf, v_buf)` rows (each `kv_dim`). At N=1/pos 0 these
