@@ -2433,8 +2433,18 @@ impl BatchExec {
                 d_conv, d_conv, conv_channels, 1, 1, "b_ssm_conv",
             );
             fwd.mark_written(&[conv_output]);
-            // conv_state slide + conv_input must be visible before token t+1.
-            fwd.force_internal_barrier(ctx.dev, ctx.cmd, &[conv_state_buf, conv_input]);
+            // GDN-Completion race fix: UNCONDITIONAL barrier. The 1-token
+            // conv_input scratch is reused every iteration, so conv(t)'s read
+            // must be ordered before setup(t+1)'s write (a WAR the dirty-flag
+            // tracker doesn't model — it only tracks writes). The previous
+            // elision-aware force_internal_barrier did NOT fire (conv_input was
+            // cleared by the pre-conv barrier's fire) → unsynced WAR that
+            // raced probabilistically across ~8 recurrent layers (full-attn
+            // has no conv → clean; single recurrent layer = too little overlap
+            // to trigger). compute_barrier is unconditional so it always
+            // orders it; the conv loop is per-token serial regardless, so this
+            // does not touch the batched-GEMM-projection speedup.
+            compute_barrier(ctx.dev, ctx.cmd);
         }
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_output]);
     }

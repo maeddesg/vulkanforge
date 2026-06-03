@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.5.6 — qwen35 batched prefill is now the DEFAULT (conv-loop race fixed) (2026-06-03)
+
+Makes the batched prefill path the **default** for **Qwen3.6-27B-MTP (qwen35)**
+after fixing the race that blocked it, and gives the 4–11× prefill speedup to
+everyone (no flag). `VF_QWEN35_BATCHED=0` (or `VF_FORCE_PER_TOKEN_PREFILL`) is
+the escape-hatch back to per-token prefill.
+
+**The race (correction to v0.5.5).** The v0.5.5 opt-in was described as
+"value-preserving / byte-identical" — that was true on a single run, but the
+batched prefill was in fact **non-deterministic run-to-run on near-tie prompts**:
+a barrier-elision race flipped the first token on some prompts. This release
+fixes it and verifies determinism properly (multi-run).
+
+**Root cause + fix.** Localized via a layer-**type** bisect (raw `batch_residual`
+determinism hash, elision on, no per-layer wait_idle, 24 runs): the race is
+**recurrent-only** (full-attn layers were clean at every depth). The edge is a
+**write-after-read on the 1-token `conv_input` scratch** reused across the
+per-token conv loop — `conv(t)` reads it, `setup(t+1)` overwrites it, and the
+elision dirty-flag tracker models only writes (RAW), not WAR, so the
+elision-aware end-of-iteration barrier didn't fire. Fix: make that one barrier
+**unconditional** (`b_step_ssm_conv1d`). Targeted — not a global elision-disable
+(which the measurement showed would erase the entire speedup, since the elision
+carries 100% of it). The conv loop is per-token serial regardless, so the
+speedup is unaffected.
+
+**Verification.** recurrent K=8 went 21/24-non-det → 1/24-deterministic;
+batched vs per-token byte-identical across the full 15-prompt suite + boundary
++ 3-chunk prompts (multi-run); id9/id12 (the prior triggers) now byte-identical
++ deterministic; full-layer integration still cos→1.0 @~1e-5; fact-recall
+(Paris / 17×23=391 / Jupiter) correct; **prefill speedup held** (218 tok
+331 t/s, 1098 tok 358 t/s — unchanged by the fix); decode neutral;
+`cargo test --release --lib` = 240/240.
+
 ## v0.5.5 — qwen35 batched prefill (opt-in): 4–11× prefill speedup, value-preserving (2026-06-03)
 
 Adds an **opt-in batched prefill path** for **Qwen3.6-27B-MTP (qwen35)**, the

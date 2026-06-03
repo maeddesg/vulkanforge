@@ -371,8 +371,15 @@ pub enum LayerStep {
 - **Recurrent State Layout-Match**: llama.cpp's `ssm_state` ist `[head_v_dim, head_v_dim, num_v_heads, n_seqs]` mit Konvention "head_v_dim×head_v_dim matrix per V-head". VF hat keine entsprechende Buffer-Layout-Konvention — sauberes Mapping nötig.
 - **mRoPE vs. Partial-RoPE**: Wenn wir Phase 1 mit `n_rot=32` Partial-RoPE simplifizieren und HF/llama.cpp mit echtem mRoPE rechnet, könnten **bei längeren Sequenzen Drift entstehen** (mRoPE-Sektionen sind für mm gedacht, aber das frequency-Layout der ersten 32 dims sollte bei Text identisch sein — verifizierungspflichtig).
 - **conv_state-Update unter async-decode**: Sprint 52Q's `feedback_async_decode_dump_hazard.md` ist relevant. Recurrent buffers werden in jedem Token gelesen+geschrieben — Barrier-Disziplin ist kritisch (siehe Sprint 61G: nicht-isolierte FMAs vs. compute_barrier).
-- **Batched Prefill (GEBAUT, opt-in v0.5.5)**: der batched-Prefill-Pfad (BatchExec) ist für qwen35 komplett gebaut
-  und verifiziert (`VF_QWEN35_BATCHED=1`, default-OFF). Architektur = **per-Token-Reuse**: die seriellen Cross-Token-
+- **Batched Prefill (DEFAULT seit v0.5.6, opt-out `VF_QWEN35_BATCHED=0`)**: der batched-Prefill-Pfad (BatchExec) ist
+  für qwen35 komplett gebaut, verifiziert und seit v0.5.6 Default (v0.5.5 shippte ihn opt-in; v0.5.6 fixte eine
+  barrier-elision-Race). **Race-Fix:** der per-Token-conv-loop (`b_step_ssm_conv1d`) reuste einen 1-token-`conv_input`-
+  Scratch über die N Token-Iterationen → `conv(t)`-Read ↔ `setup(t+1)`-Write = WAR; der elision-Dirty-Flag-Tracker
+  modelliert nur Writes (RAW), nicht WAR → die elision-aware end-of-iteration-Barriere feuerte nicht → probabilistische
+  run-to-run-Non-Determinismus auf near-tie-Prompts (NUR recurrent-Layer; full-attn kein conv → clean; via Layer-TYP-
+  Bisect gepinnt). Fix = die eine end-of-iter-Barriere unkonditional (`compute_barrier`); targeted, KEIN global
+  elision-disable (gemessen: Elision trägt 100% des Prefill-Speedups). Architektur = **per-Token-Reuse**: die
+  seriellen Cross-Token-
   Cores (SSM-Conv `ssm_conv.comp` + GDN-Recurrence `gated_delta_net.comp`) laufen als N sequentielle Single-Token-
   Dispatches mit State-Carry (conv_state/ssm_state, wiederverwenden die verifizierten Decode-Bodies); die Projektionen
   (qkv/gate-z/beta/ssm_alpha/out-proj) werden batched GEMM (M=N) — dort sitzt der Speedup (4–11×, wächst mit Länge),

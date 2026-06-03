@@ -202,18 +202,16 @@ impl ChatSession {
 
         // Sprint G-2i — Qwen3.6 BatchExec prefill has unidentified
         // barrier/layout bugs that DecodeExec path doesn't share.
-        // GDN-Completion E2E — the qwen35 batched prefill path (GDN + Full-Attn
-        // over seq_len=N) is now component-verified end-to-end (cores bit-ident,
-        // full-layer integration cos=1.0 @~1e-5, N=2..32). `VF_QWEN35_BATCHED=1`
-        // (opt-in, default-OFF) flips qwen35 onto the batched `prefill_batch`
-        // path; unset = per-token prefill — the unchanged production default
-        // and escape-hatch. Decode is unaffected either way. The default-flip
-        // is a separate owner call, informed by the measured speedup + broader
-        // real-world validation. `VF_QWEN35_FORCE_BATCH` kept as a back-compat
-        // alias (the earlier diagnostic name).
+        // qwen35 batched prefill is now the DEFAULT (since v0.5.6): the GDN +
+        // Full-Attn batched path over seq_len=N is verified byte-identical to
+        // per-token (greedy temp 0) and 4–11× faster, after the conv-loop WAR
+        // barrier fix made it deterministic (the elision-race that blocked the
+        // flip). `VF_QWEN35_BATCHED=0` (or `VF_FORCE_PER_TOKEN_PREFILL`) is the
+        // escape-hatch back to the per-token prefill path. Decode is unaffected
+        // either way.
         let qwen35_batched = cfg.qwen35.is_some()
-            && (std::env::var("VF_QWEN35_BATCHED").as_deref() == Ok("1")
-                || std::env::var("VF_QWEN35_FORCE_BATCH").as_deref() == Ok("1"));
+            && std::env::var("VF_QWEN35_BATCHED").as_deref() != Ok("0")
+            && std::env::var("VF_FORCE_PER_TOKEN_PREFILL").is_err();
         let force_pt_prefill = (cfg.qwen35.is_some()
             || std::env::var("VF_FORCE_PER_TOKEN_PREFILL").is_ok())
             && !qwen35_batched;

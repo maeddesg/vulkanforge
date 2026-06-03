@@ -842,6 +842,9 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
         if std::env::var("VF_QWEN35_GDN_DETERM").as_deref() == Ok("1") {
             forward.gdn_determinism_localize(&dev, &registry, &cmd_ctx, &model)?;
         }
+        if std::env::var("VF_QWEN35_GDN_TYPEBISECT").as_deref() == Ok("1") {
+            forward.gdn_type_bisect(&dev, &registry, &cmd_ctx, &model)?;
+        }
         forward.destroy(&dev.device, &mut allocator);
         return Ok(());
     }

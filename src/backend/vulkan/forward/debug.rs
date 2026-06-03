@@ -1399,6 +1399,102 @@ impl Forward {
         Ok(())
     }
 
+    /// Run an arbitrary LIST of trunk layers in ONE command buffer (no
+    /// per-layer wait_idle, elision ON), `runs` times with state reset, and
+    /// return the distinct-hash count of the raw `batch_residual`. Used by
+    /// the layer-TYPE bisect to isolate which layer type drives the race.
+    fn run_layer_list_det(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd_ctx: &CommandContext,
+        model: &LoadedModel,
+        layers: &[u32],
+        x: &[f32],
+        n: u32,
+        runs: u32,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let cfg = self.config.clone();
+        let hidden = cfg.hidden_dim;
+        let hidden_bytes = (hidden as u64) * 4;
+        let fnv = |v: &[f32]| -> u64 {
+            let mut h: u64 = 0xcbf29ce484222325;
+            for f in v { for b in f.to_le_bytes() { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); } }
+            h
+        };
+        let layers_v = layers.to_vec();
+        let mut hs: Vec<u64> = Vec::new();
+        for _ in 0..runs {
+            self.ssm_persistent_initialized = false;
+            self.kv_cache.reset();
+            self.batch_input.write_bytes(bytemuck::cast_slice(&x[..(n as usize) * (hidden as usize)]))?;
+            self.reset_descriptor_pool_and_cache(dev)?;
+            let w0 = layer_weight(model, layers_v[0], "attn_norm.weight");
+            cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
+                let copy = vk::BufferCopy::default().src_offset(0).dst_offset(0).size((n as u64) * hidden_bytes);
+                unsafe { dev.device.cmd_copy_buffer(cmd, self.batch_input.handle, self.batch_residual.handle, std::slice::from_ref(&copy)); }
+                let bar = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
+                unsafe { dev.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), std::slice::from_ref(&bar), &[], &[]); }
+                self.run_rms_norm(dev, registry, cmd, self.batch_residual.handle, w0, self.batch_norm.handle, hidden, n, cfg.rms_norm_eps, "tb_seed");
+                compute_barrier(dev, cmd);
+                for (i, &l) in layers_v.iter().enumerate() {
+                    let next_w = if i + 1 < layers_v.len() {
+                        Some(layer_weight(model, layers_v[i + 1], "attn_norm.weight"))
+                    } else { None };
+                    self.dispatch_layer_batch(dev, registry, cmd, model, l, n, 0, next_w);
+                }
+            })?;
+            let res = self.stage_buf_region(dev, cmd_ctx, self.batch_residual.handle, 0, n * hidden)?;
+            hs.push(fnv(&res));
+        }
+        let mut s = hs.clone(); s.sort(); s.dedup();
+        Ok(s.len())
+    }
+
+    /// GDN race layer-TYPE bisect (gated `VF_QWEN35_GDN_TYPEBISECT`): run
+    /// recurrent-ONLY and full-attn-ONLY layer subsets (raw batch_residual
+    /// determinism, elision ON, no wait_idle, R=24) to pin which layer TYPE
+    /// drives the probabilistic multi-layer race.
+    pub fn gdn_type_bisect(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd_ctx: &CommandContext,
+        model: &LoadedModel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cfg = self.config.clone();
+        let spec = cfg.qwen35.as_ref().expect("gdn_type_bisect: not qwen35");
+        let hidden = cfg.hidden_dim as usize;
+        let nl = spec.n_main();
+        let n = 8u32; let nn = n as usize; let runs = 24u32;
+        let mut x = vec![0f32; nn * hidden];
+        for p in 0..nn { for i in 0..hidden {
+            x[p * hidden + i] = 0.18 * (0.29 * p as f32 + 0.015 * i as f32).sin() + 0.06 * (0.004 * i as f32).cos() - 0.10;
+        }}
+        let recurrent: Vec<u32> = (0..nl).filter(|&l| spec.is_recurrent_layer(l)).collect();
+        let fullattn: Vec<u32> = (0..nl).filter(|&l| spec.is_full_attention_layer(l) && !spec.is_mtp_block(l)).collect();
+        println!("\n=== GDN layer-TYPE bisect (raw batch_residual, ELISION ON, no wait_idle, R={runs}) ===");
+        println!("  ({} recurrent, {} full-attn trunk layers)", recurrent.len(), fullattn.len());
+        for &k in &[2usize, 4, 8, 12] {
+            if k <= recurrent.len() {
+                let d = self.run_layer_list_det(dev, registry, cmd_ctx, model, &recurrent[..k], &x, n, runs)?;
+                println!("  recurrent-only K_r={k:2}: {d} distinct/{runs} -> {}", if d == 1 { "det" } else { "NON-DET <<<" });
+            }
+        }
+        for &k in &[2usize, 4, 8, 16] {
+            if k <= fullattn.len() {
+                let d = self.run_layer_list_det(dev, registry, cmd_ctx, model, &fullattn[..k], &x, n, runs)?;
+                println!("  full-attn-only K_a={k:2}: {d} distinct/{runs} -> {}", if d == 1 { "det" } else { "NON-DET <<<" });
+            }
+        }
+        let mix: Vec<u32> = (0..8u32).collect();
+        let dm = self.run_layer_list_det(dev, registry, cmd_ctx, model, &mix, &x, n, runs)?;
+        println!("  mix (0..8, natural):   {dm} distinct/{runs} -> {}", if dm == 1 { "det" } else { "NON-DET <<<" });
+        self.ssm_persistent_initialized = false;
+        self.kv_cache.reset();
+        Ok(())
+    }
+
     /// De-risk substep oracle — run ONE real DECODE layer (`dispatch_layer`,
     /// the same path `forward_token` uses) at `position` and return its
     /// post-layer `(k_buf, v_buf)` rows (each `kv_dim`). At N=1/pos 0 these
