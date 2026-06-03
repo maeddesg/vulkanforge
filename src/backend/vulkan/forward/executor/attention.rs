@@ -845,7 +845,7 @@ impl DecodeExec {
         fwd.run_ssm_conv_setup(
             ctx.dev, ctx.registry, ctx.cmd,
             conv_state_buf, state_offset_bytes, state_bytes_per_layer,
-            qkv_buf, conv_input,
+            qkv_buf, /* qkv_offset_bytes = */ 0, conv_input,
             conv_channels, "ssm_conv_setup",
         );
         fwd.mark_written(&[conv_input, conv_state_buf]);
@@ -859,7 +859,7 @@ impl DecodeExec {
         let conv_weight = layer_weight(ctx.model, layer, "ssm_conv1d.weight");
         fwd.run_ssm_conv(
             ctx.dev, ctx.registry, ctx.cmd,
-            conv_input, conv_weight, conv_output,
+            conv_input, conv_weight, conv_output, /* dst_offset_bytes = */ 0,
             d_conv, d_conv, conv_channels, 1, 1, "ssm_conv",
         );
         fwd.mark_written(&[conv_output]);
@@ -1133,13 +1133,13 @@ impl DecodeExec {
         // Q at offset 0.
         fwd.run_repeat_interleave(
             ctx.dev, ctx.registry, ctx.cmd,
-            conv_output, /* src_offset_bytes = */ 0, slice_bytes, qrep,
+            conv_output, /* src_offset_bytes = */ 0, slice_bytes, qrep, /* dst_off = */ 0,
             head_dim, n_src_heads, n_dst_heads, n_tokens, "ssm_repeat_q",
         );
         // K at offset 2048 floats = 8192 bytes.
         fwd.run_repeat_interleave(
             ctx.dev, ctx.registry, ctx.cmd,
-            conv_output, slice_bytes, slice_bytes, krep,
+            conv_output, slice_bytes, slice_bytes, krep, /* dst_off = */ 0,
             head_dim, n_src_heads, n_dst_heads, n_tokens, "ssm_repeat_k",
         );
         fwd.mark_written(&[qrep, krep]);
@@ -1225,11 +1225,11 @@ impl DecodeExec {
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[q, k, v, g, beta]);
         fwd.run_gated_delta_net(
             ctx.dev, ctx.registry, ctx.cmd,
-            q, k,
+            q, 0, k, 0,
             v, v_offset_bytes, v_bytes,
-            g, beta,
+            g, 0, beta, 0,
             state, state_offset_bytes, state_bytes_per_layer,
-            dst,
+            dst, 0,
             s_v, /* cols_per_wg = SUBGROUP_SIZE/LANES_PER_COLUMN */ 2,
             &push, "gdn",
         );
@@ -1527,7 +1527,7 @@ impl DecodeExec {
         fwd.run_ssm_conv_setup(
             ctx.dev, ctx.registry, ctx.cmd,
             conv_state_buf, state_offset_bytes, state_bytes_per_layer,
-            qkv_buf, conv_input,
+            qkv_buf, 0, conv_input,
             conv_channels, "ssm_conv_setup",
         );
     }
@@ -1547,7 +1547,7 @@ impl DecodeExec {
 
         fwd.run_ssm_conv(
             ctx.dev, ctx.registry, ctx.cmd,
-            conv_input, conv_weight, conv_output,
+            conv_input, conv_weight, conv_output, 0,
             d_conv, d_conv, conv_channels, 1, 1, "ssm_conv",
         );
     }
@@ -1631,11 +1631,11 @@ impl DecodeExec {
 
         fwd.run_gated_delta_net(
             ctx.dev, ctx.registry, ctx.cmd,
-            q, k,
+            q, 0, k, 0,
             v, v_offset_bytes, v_bytes,
-            g, beta,
+            g, 0, beta, 0,
             state, state_offset_bytes, state_bytes_per_layer,
-            dst,
+            dst, 0,
             s_v, /* cols_per_wg */ 2,
             &push, "gdn",
         );
@@ -2410,7 +2410,7 @@ impl BatchExec {
         fwd.run_ssm_conv_setup(
             ctx.dev, ctx.registry, ctx.cmd,
             conv_state_buf, state_offset_bytes, state_bytes_per_layer,
-            qkv_buf, conv_input,
+            qkv_buf, 0, conv_input,
             conv_channels, "b_ssm_conv_setup",
         );
         fwd.mark_written(&[conv_input, conv_state_buf]);
@@ -2419,7 +2419,7 @@ impl BatchExec {
         let conv_weight = layer_weight(ctx.model, layer, "ssm_conv1d.weight");
         fwd.run_ssm_conv(
             ctx.dev, ctx.registry, ctx.cmd,
-            conv_input, conv_weight, conv_output,
+            conv_input, conv_weight, conv_output, 0,
             d_conv, d_conv, conv_channels, 1, 1, "b_ssm_conv",
         );
         fwd.mark_written(&[conv_output]);
@@ -2641,12 +2641,12 @@ impl BatchExec {
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_output]);
         fwd.run_repeat_interleave(
             ctx.dev, ctx.registry, ctx.cmd,
-            conv_output, 0, slice_bytes, qrep,
+            conv_output, 0, slice_bytes, qrep, 0,
             head_dim, n_src_heads, n_dst_heads, 1, "b_ssm_repeat_q",
         );
         fwd.run_repeat_interleave(
             ctx.dev, ctx.registry, ctx.cmd,
-            conv_output, slice_bytes, slice_bytes, krep,
+            conv_output, slice_bytes, slice_bytes, krep, 0,
             head_dim, n_src_heads, n_dst_heads, 1, "b_ssm_repeat_k",
         );
         fwd.mark_written(&[qrep, krep]);
@@ -2697,11 +2697,11 @@ impl BatchExec {
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[q, k, v, g, beta]);
         fwd.run_gated_delta_net(
             ctx.dev, ctx.registry, ctx.cmd,
-            q, k,
+            q, 0, k, 0,
             v, v_offset_bytes, v_bytes,
-            g, beta,
+            g, 0, beta, 0,
             state, state_offset_bytes, state_bytes_per_layer,
-            dst,
+            dst, 0,
             s_v, 2,
             &push, "b_gdn",
         );

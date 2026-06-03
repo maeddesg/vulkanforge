@@ -779,7 +779,7 @@ impl Forward {
             let (qh, kh, vh, gh, bh, sh, dh) = (q_a.handle, k_a.handle, v_a.handle, g_a.handle, b_a.handle, state.handle, dst_a.handle);
             let v_bytes_a = (n * v_per) as u64 * 4;
             cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
-                self.run_gated_delta_net(dev, registry, cmd, qh, kh, vh, 0, v_bytes_a, gh, bh, sh, 0, st_bytes, dh, s_v, 2, &push_a, "gdnv_a");
+                self.run_gated_delta_net(dev, registry, cmd, qh, 0, kh, 0, vh, 0, v_bytes_a, gh, 0, bh, 0, sh, 0, st_bytes, dh, 0, s_v, 2, &push_a, "gdnv_a");
                 host_barrier(dev, cmd);
             })?;
             let out_a = bytemuck::cast_slice::<u8, f32>(&dst_a.read_bytes()?[..(n * v_per) * 4]).to_vec();
@@ -809,7 +809,7 @@ impl Forward {
                 let sh2 = state.handle;
                 self.reset_descriptor_pool_and_cache(dev)?;
                 cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
-                    self.run_gated_delta_net(dev, registry, cmd, q1h, k1h, v1h, 0, (v_per as u64) * 4, g1h, b1h, sh2, 0, st_bytes, d1h, s_v, 2, &push_b, "gdnv_b");
+                    self.run_gated_delta_net(dev, registry, cmd, q1h, 0, k1h, 0, v1h, 0, (v_per as u64) * 4, g1h, 0, b1h, 0, sh2, 0, st_bytes, d1h, 0, s_v, 2, &push_b, "gdnv_b");
                     host_barrier(dev, cmd);
                 })?;
                 let db = dst_1.read_bytes()?;
@@ -908,7 +908,7 @@ impl Forward {
             in_a.write_bytes(bytemuck::cast_slice(&iva))?;
             self.reset_descriptor_pool_and_cache(dev)?;
             cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
-                self.run_ssm_conv(dev, registry, cmd, iah, wh, dah, nc as u32, ncs_a as u32, nr as u32, n as u32, 1, "convv_a");
+                self.run_ssm_conv(dev, registry, cmd, iah, wh, dah, 0, nc as u32, ncs_a as u32, nr as u32, n as u32, 1, "convv_a");
                 host_barrier(dev, cmd);
             })?;
             let out_a = bytemuck::cast_slice::<u8, f32>(&dst_a.read_bytes()?[..(nr * n) * 4]).to_vec();
@@ -925,7 +925,7 @@ impl Forward {
                 in_b.write_bytes(bytemuck::cast_slice(&ivb))?;
                 self.reset_descriptor_pool_and_cache(dev)?;
                 cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
-                    self.run_ssm_conv(dev, registry, cmd, ibh, wh, dbh, nc as u32, nc as u32, nr as u32, 1, 1, "convv_b");
+                    self.run_ssm_conv(dev, registry, cmd, ibh, wh, dbh, 0, nc as u32, nc as u32, nr as u32, 1, 1, "convv_b");
                     host_barrier(dev, cmd);
                 })?;
                 let db = dst_b.read_bytes()?;

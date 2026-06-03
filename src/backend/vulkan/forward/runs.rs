@@ -2968,16 +2968,20 @@ impl Forward {
         state_offset_bytes: u64,
         state_bytes: u64,
         qkv: vk::Buffer,
+        qkv_offset_bytes: u64,
         conv_input: vk::Buffer,
         conv_channels: u32,
         label: &str,
     ) {
         let kernel = registry.get(ShaderId::SsmConvSetupF32);
+        // GDN-Completion #4 — `qkv_offset_bytes` selects token t's slot of a
+        // batched [N × conv_channels] qkv buffer (0 for decode / single-token).
+        let qkv_bytes = if qkv_offset_bytes > 0 { (conv_channels as u64) * 4 } else { 0 };
         let set = self.alloc_or_get_set(
             dev, kernel.descriptor_set_layout,
             &[
                 (0, state, state_offset_bytes, state_bytes),
-                (1, qkv, 0, 0),
+                (1, qkv, qkv_offset_bytes, qkv_bytes),
                 (2, conv_input, 0, 0),
             ],
         );
@@ -3010,6 +3014,7 @@ impl Forward {
         conv_input: vk::Buffer,
         conv_weight: vk::Buffer,
         dst: vk::Buffer,
+        dst_offset_bytes: u64,   // token-t slot of batched conv_output (0 for decode)
         nc: u32,            // ssm_d_conv (4)
         ncs: u32,           // conv-input time slots (= nc-1+n_t)
         nr: u32,            // conv_channels (10240)
@@ -3018,9 +3023,10 @@ impl Forward {
         label: &str,
     ) {
         let kernel = registry.get(ShaderId::SsmConvF32);
+        let dst_bytes = if dst_offset_bytes > 0 { (nr as u64) * (n_t as u64) * 4 } else { 0 };
         let set = self.alloc_or_get_set(
             dev, kernel.descriptor_set_layout,
-            &[(0, conv_input, 0, 0), (1, conv_weight, 0, 0), (2, dst, 0, 0)],
+            &[(0, conv_input, 0, 0), (1, conv_weight, 0, 0), (2, dst, dst_offset_bytes, dst_bytes)],
         );
         // Strides in BYTES (shader divides by 4 to convert to float idx).
         let nb01 = ncs * 4;             // per channel row in conv_input
@@ -3170,6 +3176,7 @@ impl Forward {
         src_offset_bytes: u64,
         src_bytes: u64,
         dst: vk::Buffer,
+        dst_offset_bytes: u64,   // token-t slot of batched qrep/krep (0 for decode)
         head_dim: u32,
         n_src_heads: u32,
         n_dst_heads: u32,
@@ -3177,9 +3184,10 @@ impl Forward {
         label: &str,
     ) {
         let kernel = registry.get(ShaderId::RepeatInterleaveF32);
+        let dst_bytes = if dst_offset_bytes > 0 { (head_dim as u64) * (n_dst_heads as u64) * (n_tokens as u64) * 4 } else { 0 };
         let set = self.alloc_or_get_set(
             dev, kernel.descriptor_set_layout,
-            &[(0, src, src_offset_bytes, src_bytes), (1, dst, 0, 0)],
+            &[(0, src, src_offset_bytes, src_bytes), (1, dst, dst_offset_bytes, dst_bytes)],
         );
         let pc = RepeatInterleavePushConstants {
             head_dim, n_src_heads, n_dst_heads, n_tokens,
@@ -3225,32 +3233,40 @@ impl Forward {
         registry: &PipelineRegistry,
         cmd: vk::CommandBuffer,
         q: vk::Buffer,
+        q_offset_bytes: u64,
         k: vk::Buffer,
+        k_offset_bytes: u64,
         v: vk::Buffer,
         v_offset_bytes: u64,
         v_bytes: u64,
         g: vk::Buffer,
+        g_offset_bytes: u64,
         beta: vk::Buffer,
+        beta_offset_bytes: u64,
         state: vk::Buffer,
         state_offset_bytes: u64,
         state_bytes: u64,
         dst: vk::Buffer,
+        dst_offset_bytes: u64,
         s_v: u32,           // ssm_d_state (128 for Qwen3.6) — pinned by spec const
         cols_per_wg: u32,   // SUBGROUP_SIZE / LANES_PER_COLUMN (2 for our spec)
         push: &GatedDeltaNetPushConstants,
         label: &str,
     ) {
         let kernel = registry.get(ShaderId::GatedDeltaNetF32);
+        // GDN-Completion #4 — per-token q/k/g/beta/dst offsets (0 for decode/
+        // single-token) select token t's slot of the batched scratch buffers
+        // for the serial recurrence loop. `range==0` → WHOLE_SIZE from offset.
         let set = self.alloc_or_get_set(
             dev, kernel.descriptor_set_layout,
             &[
-                (0, q, 0, 0),
-                (1, k, 0, 0),
+                (0, q, q_offset_bytes, 0),
+                (1, k, k_offset_bytes, 0),
                 (2, v, v_offset_bytes, v_bytes),
-                (3, g, 0, 0),
-                (4, beta, 0, 0),
+                (3, g, g_offset_bytes, 0),
+                (4, beta, beta_offset_bytes, 0),
                 (5, state, state_offset_bytes, state_bytes),
-                (6, dst, 0, 0),
+                (6, dst, dst_offset_bytes, 0),
             ],
         );
         let layout = kernel.pipeline_layout;
