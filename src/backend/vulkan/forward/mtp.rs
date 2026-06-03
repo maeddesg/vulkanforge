@@ -108,6 +108,181 @@ impl Forward {
         Ok(h)
     }
 
+    /// FNV-1a hash of the **entire** contents of a GpuOnly buffer, read
+    /// back in `moe_route_staging`-sized chunks via GpuOnly→GpuToCpu
+    /// copies. Unlike `mtp_debug_ssm_hash` (which hashes only a leading
+    /// sample bounded by the staging size) this covers every byte, so a
+    /// pair `(ssm_hash, conv_hash)` is a rigorous bit-identity witness for
+    /// the MTP reconciliation gate (Sprint MTP-Orch S3).
+    fn fnv_buf_full(
+        &mut self,
+        dev: &VulkanDevice,
+        cmd_ctx: &CommandContext,
+        src: vk::Buffer,
+        size: u64,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        let chunk = self.moe_route_staging.size;
+        let dst = self.moe_route_staging.handle;
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut off = 0u64;
+        while off < size {
+            let n = chunk.min(size - off);
+            cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
+                let region = vk::BufferCopy::default()
+                    .src_offset(off)
+                    .dst_offset(0)
+                    .size(n);
+                unsafe {
+                    dev.device
+                        .cmd_copy_buffer(cmd, src, dst, std::slice::from_ref(&region));
+                }
+            })?;
+            let bytes = self.moe_route_staging.read_bytes()?;
+            for &b in &bytes[..n as usize] {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            off += n;
+        }
+        Ok(h)
+    }
+
+    /// Sprint MTP-Orch S3 — full-buffer hashes of the two persistent
+    /// recurrent buffers `(ssm_state, conv_state)`. The reconciliation
+    /// gate asserts these (plus the KV-len counter) are bit-identical
+    /// (`rel=0`) between an MTP partial-accept commit and a plain decode
+    /// of the same accepted tokens. Returns `(0, 0)` when the recurrent
+    /// buffers were not allocated (non-qwen35).
+    pub(crate) fn mtp_state_hashes(
+        &mut self,
+        dev: &VulkanDevice,
+        cmd_ctx: &CommandContext,
+    ) -> Result<(u64, u64), Box<dyn std::error::Error>> {
+        let ssm = match self.ssm_state_buf.as_ref() {
+            Some(b) => (b.handle, b.size),
+            None => return Ok((0, 0)),
+        };
+        let conv = self.conv_state_buf.as_ref().map(|b| (b.handle, b.size));
+        let hs = self.fnv_buf_full(dev, cmd_ctx, ssm.0, ssm.1)?;
+        let hc = match conv {
+            Some((h, sz)) if sz > 0 => self.fnv_buf_full(dev, cmd_ctx, h, sz)?,
+            _ => 0,
+        };
+        Ok((hs, hc))
+    }
+
+    /// Sprint MTP-Orch S1 — per-position verify argmax. Assumes a batched
+    /// verify forward (`prefill_batch` over `[x, d_1..]`) was JUST run so
+    /// `batch_residual` holds the pre-final-norm hidden of every position.
+    /// For each of the `seq_len` rows it runs the SAME final-norm + lm_head
+    /// that `record_prefill_finalize` runs for the last row (= the trunk's
+    /// decode logits at that position) and returns the per-position argmax
+    /// `a_0..a_{seq_len-1}`. These are the verify outputs the MTP accept
+    /// step compares the drafts against (`d_i == a_{i-1}`). One standalone
+    /// submit per row; reuses `cur().scratch_a` + `logits_buf`.
+    pub(crate) fn mtp_verify_argmax(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd_ctx: &CommandContext,
+        model: &LoadedModel,
+        seq_len: u32,
+    ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+        let hidden = self.config.hidden_dim;
+        let hidden_bytes = (hidden as u64) * 4;
+        let src = self.batch_residual.handle;
+        let mut out = Vec::with_capacity(seq_len as usize);
+        for row in 0..seq_len {
+            let off = (row as u64) * hidden_bytes;
+            let scratch_a = self.cur().scratch_a.handle;
+            self.reset_barrier_state();
+            cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
+                self.copy_batch_row(dev, cmd, src, off, scratch_a, hidden_bytes);
+                // TRANSFER write (row copy) → SHADER read (final norm).
+                let bar = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ);
+                unsafe {
+                    dev.device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        std::slice::from_ref(&bar),
+                        &[],
+                        &[],
+                    );
+                }
+                self.dispatch_final(dev, registry, cmd, model, scratch_a);
+                self.record_logits_readback(dev, cmd);
+            })?;
+            let logits = self.logits()?;
+            let mut amax = 0u32;
+            let mut mv = f32::NEG_INFINITY;
+            for (j, &v) in logits.iter().enumerate() {
+                if v > mv {
+                    mv = v;
+                    amax = j as u32;
+                }
+            }
+            out.push(amax);
+        }
+        Ok(out)
+    }
+
+    /// Sprint MTP-Orch S2 — chain hook. Copy the draft head's OWN
+    /// pre-final-norm hidden (`scratch_b`, the block-64 output left by the
+    /// last `mtp_draft_logits`) into `mtp_h_buf`, so the NEXT draft in the
+    /// chain reads it as its `h_t` (EAGLE-style self-propagation: draft i →
+    /// its hidden → draft i+1). No-op when `mtp_h_buf` was not allocated.
+    pub(crate) fn mtp_chain_capture_hidden(
+        &mut self,
+        dev: &VulkanDevice,
+        cmd_ctx: &CommandContext,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let dst = match self.mtp_h_buf.as_ref() {
+            Some(b) => b.handle,
+            None => return Ok(()),
+        };
+        let src = self.cur().scratch_b.handle;
+        let bytes = (self.config.hidden_dim as u64) * 4;
+        cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
+            let r = vk::BufferCopy::default().src_offset(0).dst_offset(0).size(bytes);
+            unsafe {
+                dev.device.cmd_copy_buffer(cmd, src, dst, std::slice::from_ref(&r));
+            }
+        })?;
+        Ok(())
+    }
+
+    /// Sprint MTP-Orch S4 — set `mtp_h_buf` from a row of `batch_residual`
+    /// (the per-position pre-final-norm hidden left by the batched verify).
+    /// Used after a FULL accept commits via the kept verify state (no replay
+    /// forward_token ran the decode-path `mtp_h_buf` hook), so the next
+    /// iteration's first draft still reads the correct trunk `h_t` =
+    /// hidden of the last committed position. No-op when not allocated.
+    pub(crate) fn mtp_set_h_from_batch_row(
+        &mut self,
+        dev: &VulkanDevice,
+        cmd_ctx: &CommandContext,
+        row: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let dst = match self.mtp_h_buf.as_ref() {
+            Some(b) => b.handle,
+            None => return Ok(()),
+        };
+        let src = self.batch_residual.handle;
+        let bytes = (self.config.hidden_dim as u64) * 4;
+        let off = (row as u64) * bytes;
+        cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
+            let r = vk::BufferCopy::default().src_offset(off).dst_offset(0).size(bytes);
+            unsafe {
+                dev.device.cmd_copy_buffer(cmd, src, dst, std::slice::from_ref(&r));
+            }
+        })?;
+        Ok(())
+    }
+
     /// Whole-buffer GPU→GPU copy of the two persistent recurrent
     /// buffers. `to_snapshot = true` saves (live → snapshot), `false`
     /// restores (snapshot → live). No-op when the snapshot buffers were

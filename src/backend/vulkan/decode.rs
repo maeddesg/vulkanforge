@@ -618,6 +618,69 @@ pub fn generate_from_tokens(
     let mut last_logits = forward.logits()?;
     let prefill_time = prefill_start.elapsed();
 
+    // ---- Sprint MTP-Orch S3 GATE: partial-accept reconciliation bit-ident ----
+    // Risk-front-loaded proof (VF_MTP_RECONCILE_TEST=1; needs VF_MTP=1 for the
+    // recurrent-state snapshot buffers). Forces M=0 (full reject), M=1 (PARTIAL
+    // accept — the bug-class trigger) and M=2 (full accept) for an n=2 verify
+    // and asserts the post-reconcile recurrent state (ssm_state + conv_state)
+    // AND the KV-len counter are bit-identical (rel=0) to a plain decode of
+    // exactly the accepted tokens. Reconcile method = snapshot-pre-verify +
+    // restore + replay-accepted via the verified decode path (the brief's
+    // sanctioned "restore-pre-draft + d_1..d_M nachfahren"; the per-position
+    // hidden the next draft needs is re-derived by the replay's mtp_h_buf hook).
+    // Diagnostic only: runs once after prefill, then early-returns.
+    if std::env::var("VF_MTP_RECONCILE_TEST").as_deref() == Ok("1") {
+        let ok = run_mtp_reconcile_gate(
+            forward, dev, registry, cmd_ctx, model, &embed_src, cfg, &last_logits, pos,
+        )?;
+        eprintln!(
+            "[MTP_RECONCILE] VERDICT: {}",
+            if ok {
+                "PASS — partial-accept reconciliation bit-ident (rel=0) → S3 gate cleared"
+            } else {
+                "FAIL — reconciliation NOT bit-ident → STOP, do not build the loop on this glue"
+            }
+        );
+        return Ok(GenerateResult {
+            prompt_tokens: prefill_tokens.len(),
+            generated_tokens: 0,
+            generated_text: String::new(),
+            visible_text: String::new(),
+            stopped_on_eos: true,
+            prefill_time,
+            decode_time: Duration::ZERO,
+        });
+    }
+
+    // ---- Sprint MTP-Orch S4: self-speculative decode loop (gated VF_MTP) ----
+    // Draft n tokens with the nextn head → verify in ONE batched forward
+    // (the v0.5.6 deterministic batched-prefill) → accept the longest
+    // argmax-matching prefix +1 → reconcile recurrent state. Output is
+    // byte-identical to plain greedy decode by construction (accept only
+    // tokens equal to the verify argmax). Default-off; the bit-ident S3
+    // gate (VF_MTP_RECONCILE_TEST) proved the partial-accept reconciliation.
+    let mtp_enabled = cfg.qwen35.is_some()
+        && std::env::var("VF_MTP").as_deref() == Ok("1")
+        && std::env::var("VF_MTP_RECONCILE_TEST").as_deref() != Ok("1")
+        && forward.mtp_snapshot_ready();
+    if mtp_enabled {
+        let decode_start = Instant::now();
+        let (generated, stopped_on_eos, gen_text, visible) = run_mtp_decode_loop(
+            forward, dev, registry, cmd_ctx, model, &embed_src, cfg, tokenizer,
+            config, &last_logits, pos, on_token,
+        )?;
+        let decode_time = decode_start.elapsed();
+        return Ok(GenerateResult {
+            prompt_tokens: prefill_tokens.len(),
+            generated_tokens: generated.len(),
+            generated_text: gen_text,
+            visible_text: visible,
+            stopped_on_eos,
+            prefill_time,
+            decode_time,
+        });
+    }
+
     // ---- Decode ----
     let decode_start = Instant::now();
     let mut generated: Vec<u32> = Vec::new();
@@ -1101,6 +1164,393 @@ fn argmax(v: &[f32]) -> usize {
         }
     }
     best_i
+}
+
+/// Sprint MTP-Orch S3 GATE — prove the MTP partial-accept rollback
+/// reconciliation is bit-identical to a plain decode of the accepted
+/// tokens. This is the make-or-break correctness risk: a reconcile that
+/// restores the pre-draft state but fails to re-advance to `S_{t+M}`
+/// leaks a stale recurrent state on partial accept — INVISIBLE to full
+/// accept (M=n, no restore) and full reject (M=0, trivial), so it MUST be
+/// demonstrated at `0 < M < n`.
+///
+/// Method (the brief's sanctioned "restore-pre-draft + replay accepted"):
+///   1. snapshot `S_p` (the pre-verify recurrent state).
+///   2. reference = plain decode of `x, a_0, a_1` from `S_p`, hashing the
+///      recurrent state after each step → `S_{p+1}, S_{p+2}, S_{p+3}`.
+///   3. for each forced M ∈ {0,1,2}: construct drafts that yield exactly
+///      that M, restore `S_p`, run the batched verify (`prefill_batch` over
+///      `[x,d_1,d_2]` — the v0.5.6 deterministic path), read per-position
+///      argmax (`mtp_verify_argmax`), accept (`d_i == v_{i-1}`), then
+///      reconcile = restore `S_p` + replay the M+1 accepted real tokens via
+///      the decode path, and assert the resulting `(ssm,conv)` hashes + KV
+///      counter equal the matching reference.
+///   4. "teeth" control on M=1: the BUGGY reconcile (restore `S_p`, rewind
+///      counter to `p+2`, NO replay) MUST mismatch `S_{p+2}` — proving the
+///      gate would catch the bug-class.
+#[allow(clippy::too_many_arguments)]
+fn run_mtp_reconcile_gate(
+    forward: &mut Forward,
+    dev: &VulkanDevice,
+    registry: &PipelineRegistry,
+    cmd_ctx: &CommandContext,
+    model: &LoadedModel,
+    embed_src: &EmbeddingSource<'_>,
+    cfg: &ModelConfig,
+    last_logits: &[f32],
+    p: u32,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if !forward.mtp_snapshot_ready() {
+        eprintln!(
+            "[MTP_RECONCILE] SKIP: recurrent-state snapshot buffers not allocated. \
+             Re-run with VF_MTP=1 (qwen35 only)."
+        );
+        return Ok(false);
+    }
+    let vocab = cfg.vocab_size;
+    let other = |t: u32| -> u32 { if vocab > 1 { (t + 1) % vocab } else { 0 } };
+    let x = argmax(last_logits) as u32;
+    eprintln!(
+        "\n=== MTP partial-accept reconciliation gate (n=2, start pos p={p}, x={x}) ==="
+    );
+
+    let decode_one = |fwd: &mut Forward, tok: u32, pos: u32|
+        -> Result<u32, Box<dyn std::error::Error>> {
+        let e = embed_lookup(embed_src, cfg, tok)?;
+        fwd.forward_token(dev, registry, cmd_ctx, model, &e, pos, tok)?;
+        Ok(argmax(&fwd.logits()?) as u32)
+    };
+
+    // --- Reference: plain decode x, a0, a1 from S_p, hashing each state. ---
+    forward.snapshot_recurrent_state(dev, cmd_ctx)?; // snapshot buffers ← S_p
+    let h_sp = forward.mtp_state_hashes(dev, cmd_ctx)?;
+    let a0 = decode_one(forward, x, p)?;
+    let ref1 = forward.mtp_state_hashes(dev, cmd_ctx)?; // S_{p+1}
+    let ref1_kv = forward.kv_seq_len();
+    let a1 = decode_one(forward, a0, p + 1)?;
+    let ref2 = forward.mtp_state_hashes(dev, cmd_ctx)?; // S_{p+2}
+    let ref2_kv = forward.kv_seq_len();
+    let a2 = decode_one(forward, a1, p + 2)?;
+    let ref3 = forward.mtp_state_hashes(dev, cmd_ctx)?; // S_{p+3}
+    let ref3_kv = forward.kv_seq_len();
+    eprintln!(
+        "  reference decode: a0={a0} a1={a1} a2={a2}; \
+         S_p ssm={:#018x} conv={:#018x}",
+        h_sp.0, h_sp.1
+    );
+
+    let replay_toks = [x, a0, a1];
+    let mut all_ok = true;
+    for target in 0u32..=2 {
+        // Construct drafts (d1,d2) that yield exactly this M.
+        let (d1, d2) = match target {
+            0 => (other(a0), other(a1)),         // d1 != a0 → reject immediately
+            1 => (a0, other(a1)),                // d1 matches, d2 rejected
+            _ => (a0, a1),                        // both match
+        };
+        // Restore S_p, run batched verify of [x, d1, d2].
+        forward.restore_recurrent_state(dev, cmd_ctx)?;
+        forward.set_kv_seq_len(p);
+        let mut embeds: Vec<f32> = Vec::with_capacity(3 * cfg.hidden_dim as usize);
+        for &t in &[x, d1, d2] {
+            embeds.extend(embed_lookup(embed_src, cfg, t)?);
+        }
+        forward.prefill_batch(dev, registry, cmd_ctx, model, &embeds, 3, p, &[x, d1, d2])?;
+        let v = forward.mtp_verify_argmax(dev, registry, cmd_ctx, model, 3)?;
+        // Accept: longest matching prefix of d_i == v_{i-1}.
+        let mut m = 0u32;
+        if d1 == v[0] {
+            m = 1;
+            if d2 == v[1] {
+                m = 2;
+            }
+        }
+        // Reconcile: restore S_p + replay the M+1 accepted real tokens.
+        forward.restore_recurrent_state(dev, cmd_ctx)?;
+        forward.set_kv_seq_len(p);
+        for i in 0..=(m as usize) {
+            let t = replay_toks[i];
+            let e = embed_lookup(embed_src, cfg, t)?;
+            forward.forward_token(dev, registry, cmd_ctx, model, &e, p + i as u32, t)?;
+        }
+        let got = forward.mtp_state_hashes(dev, cmd_ctx)?;
+        let got_kv = forward.kv_seq_len();
+        let (ref_h, ref_kv) = match m {
+            0 => (ref1, ref1_kv),
+            1 => (ref2, ref2_kv),
+            _ => (ref3, ref3_kv),
+        };
+        // Sanity: verify argmax must match the decode oracle (v0.5.6
+        // byte-ident) — but ONLY at positions whose verify INPUT matches the
+        // reference decode's input. Position 0's input is `x` in both, so
+        // v[0]==a0 always. Position 1's input is d1, which equals a0 only
+        // when the first draft was accepted (target>=1); position 2's input
+        // is d2==a1 only at full accept (target==2). Comparing at mismatched
+        // inputs is meaningless (different token → different next-token).
+        let v_ok = v[0] == a0
+            && (target < 1 || v[1] == a1)
+            && (target < 2 || v[2] == a2);
+        let m_ok = m == target;
+        let state_ok = got == ref_h && got_kv == ref_kv;
+        let ok = v_ok && m_ok && state_ok;
+        all_ok &= ok;
+        let kind = match target {
+            0 => "M=0 full-reject ",
+            1 => "M=1 PARTIAL    ",
+            _ => "M=2 full-accept",
+        };
+        eprintln!(
+            "  {kind}: drafts=[{d1},{d2}] verify=[{},{},{}] M={m} \
+             | committed ssm={:#018x} conv={:#018x} kv={got_kv} \
+             | ref ssm={:#018x} conv={:#018x} kv={ref_kv} \
+             | v_ok={v_ok} M_ok={m_ok} state_bit_ident={state_ok} -> {}",
+            v[0], v[1], v[2], got.0, got.1, ref_h.0, ref_h.1,
+            if ok { "PASS (rel=0)" } else { "FAIL" },
+        );
+        // Teeth on the PARTIAL case: a buggy "restore-without-replay" must
+        // be DETECTABLY wrong (state stays at S_p, ≠ S_{p+2}).
+        if target == 1 {
+            forward.restore_recurrent_state(dev, cmd_ctx)?;
+            forward.set_kv_seq_len(p + 2);
+            let buggy = forward.mtp_state_hashes(dev, cmd_ctx)?;
+            let teeth = buggy != ref2; // must MISMATCH the M=1 reference
+            all_ok &= teeth;
+            eprintln!(
+                "  teeth (buggy restore-no-replay): committed ssm={:#018x} (= S_p) vs ref \
+                 ssm={:#018x} (S_p+2) -> {} (gate {} detect the bug-class)",
+                buggy.0, ref2.0,
+                if teeth { "MISMATCH" } else { "MATCH" },
+                if teeth { "DOES" } else { "FAILS to" },
+            );
+        }
+    }
+    // Leave a clean recurrent state for process teardown.
+    forward.restore_recurrent_state(dev, cmd_ctx)?;
+    forward.set_kv_seq_len(p);
+    eprintln!(
+        "=== MTP RECONCILE GATE: {} ===",
+        if all_ok {
+            "ALL PASS — accept selects M correctly, reconcile lands at S_{t+M} bit-ident, teeth detect the bug"
+        } else {
+            "FAIL — see rows above"
+        }
+    );
+    Ok(all_ok)
+}
+
+/// Sprint MTP-Orch S4 — the self-speculative decode loop (gated `VF_MTP`).
+///
+/// Each iteration, from committed state `S_pos` with the next real token
+/// `cur` (= the previous bonus, not yet emitted/processed):
+///   1. draft `d_1..d_n` with the nextn head, chaining each draft's own
+///      hidden into the next (`mtp_chain_capture_hidden`).
+///   2. snapshot `S_pos`, then run the batched verify of `[cur, d_1..d_n]`
+///      (`prefill_batch`, the v0.5.6 deterministic path) and read the
+///      per-position argmax `v_0..v_n` (`mtp_verify_argmax`).
+///   3. accept M = longest prefix with `d_{i+1} == v_i`; bonus = `v_M`.
+///   4. reconcile: FULL accept (M==n) keeps the verify's already-computed
+///      live state (the speedup case, no replay); PARTIAL/reject restores
+///      `S_pos` and replays `cur, d_1..d_M` via the decode path (the
+///      S3-proven byte-ident glue). Both land at `S_{pos+M+1}`.
+///   5. emit `cur` + accepted drafts; carry `bonus` as next `cur`.
+/// The emitted token stream is byte-identical to plain greedy decode
+/// (accept admits only tokens equal to the verify argmax).
+///
+/// Returns `(generated_ids, stopped_on_eos, generated_text, visible_text)`
+/// and prints an `[MTP]` acceptance/throughput summary to stderr.
+#[allow(clippy::too_many_arguments)]
+fn run_mtp_decode_loop(
+    forward: &mut Forward,
+    dev: &VulkanDevice,
+    registry: &PipelineRegistry,
+    cmd_ctx: &CommandContext,
+    model: &LoadedModel,
+    embed_src: &EmbeddingSource<'_>,
+    cfg: &ModelConfig,
+    tokenizer: &Tokenizer,
+    config: &GenerateConfig,
+    last_logits: &[f32],
+    start_pos: u32,
+    on_token: &mut dyn FnMut(u32, &str),
+) -> Result<(Vec<u32>, bool, String, String), Box<dyn std::error::Error>> {
+    let n = std::env::var("VF_MTP_N")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| (1..=8).contains(&v))
+        .unwrap_or(3);
+    let max_seq = forward.kv_cache.config.max_seq_len;
+    let max_tokens = config.max_tokens as usize;
+    let mut generated: Vec<u32> = Vec::new();
+    let mut text_bytes: Vec<u8> = Vec::new();
+    let mut stopped_on_eos = false;
+    let mut pos = start_pos;
+
+    // Acceptance / iteration stats.
+    let mut iters: u64 = 0;
+    let mut accepted_sum: u64 = 0; // Σ M (accepted drafts)
+    let mut drafted_sum: u64 = 0; // Σ n
+    let mut full_accepts: u64 = 0;
+
+    // Push + stream one committed token; returns true when generation must
+    // stop after it (EOS → not emitted, matching plain greedy; or cap hit).
+    macro_rules! commit {
+        ($id:expr) => {{
+            let id = $id;
+            if tokenizer.is_eos(id) {
+                stopped_on_eos = true;
+                true
+            } else if generated.len() >= max_tokens {
+                true
+            } else {
+                let b = tokenizer.decode_token_bytes(id);
+                let s = String::from_utf8_lossy(&b);
+                on_token(id, &s);
+                text_bytes.extend_from_slice(&b);
+                generated.push(id);
+                generated.len() >= max_tokens || pos >= max_seq
+            }
+        }};
+    }
+
+    // --- Seed: plain-decode the first token (establishes mtp_h_buf = the
+    // trunk hidden the first draft needs; prefill's batched path does not
+    // run the decode-only hook). ---
+    let x0 = argmax(last_logits) as u32;
+    if commit!(x0) {
+        let text = String::from_utf8_lossy(&text_bytes).into_owned();
+        return Ok((generated, stopped_on_eos, text.clone(), text));
+    }
+    let e0 = embed_lookup(embed_src, cfg, x0)?;
+    forward.forward_token(dev, registry, cmd_ctx, model, &e0, pos, x0)?;
+    let next_logits = forward.logits()?;
+    pos += 1;
+    let mut cur = argmax(&next_logits) as u32; // token@pos, not yet emitted
+
+    loop {
+        if generated.len() >= max_tokens || pos >= max_seq {
+            break;
+        }
+        if config
+            .cancel_token
+            .as_ref()
+            .is_some_and(|t| t.load(std::sync::atomic::Ordering::Acquire))
+        {
+            stopped_on_eos = true;
+            break;
+        }
+        // Guard: an n-draft verify needs positions pos..pos+n in range.
+        if pos as u64 + n as u64 >= max_seq as u64 {
+            // Tail: plain-decode `cur` and finish next loop turn.
+            if commit!(cur) {
+                break;
+            }
+            let e = embed_lookup(embed_src, cfg, cur)?;
+            forward.forward_token(dev, registry, cmd_ctx, model, &e, pos, cur)?;
+            cur = argmax(&forward.logits()?) as u32;
+            pos += 1;
+            continue;
+        }
+
+        // 1. Draft chain d_1..d_n from (mtp_h_buf = hidden@(pos-1), cur@pos).
+        let mut drafts: Vec<u32> = Vec::with_capacity(n);
+        let mut e = embed_lookup(embed_src, cfg, cur)?;
+        let mut dpos = pos;
+        for i in 0..n {
+            let dl = forward.mtp_draft_logits(dev, registry, cmd_ctx, model, &e, dpos)?;
+            let d = argmax(&dl) as u32;
+            drafts.push(d);
+            if i + 1 < n {
+                forward.mtp_chain_capture_hidden(dev, cmd_ctx)?;
+                e = embed_lookup(embed_src, cfg, d)?;
+                dpos += 1;
+            }
+        }
+
+        // 2. Snapshot S_pos, batched verify of [cur, d_1..d_n], per-pos argmax.
+        forward.snapshot_recurrent_state(dev, cmd_ctx)?;
+        let mut verify_toks: Vec<u32> = Vec::with_capacity(n + 1);
+        verify_toks.push(cur);
+        verify_toks.extend_from_slice(&drafts);
+        let mut embeds: Vec<f32> = Vec::with_capacity((n + 1) * cfg.hidden_dim as usize);
+        for &t in &verify_toks {
+            embeds.extend(embed_lookup(embed_src, cfg, t)?);
+        }
+        forward.prefill_batch(
+            dev, registry, cmd_ctx, model, &embeds, (n + 1) as u32, pos, &verify_toks,
+        )?;
+        let v = forward.mtp_verify_argmax(dev, registry, cmd_ctx, model, (n + 1) as u32)?;
+
+        // 3. Accept: longest prefix d_{i+1} == v_i.
+        let mut m = 0usize;
+        while m < n && drafts[m] == v[m] {
+            m += 1;
+        }
+        let bonus = v[m];
+        iters += 1;
+        accepted_sum += m as u64;
+        drafted_sum += n as u64;
+
+        // 4. Reconcile to S_{pos+m+1}.
+        if m == n {
+            full_accepts += 1;
+            // Keep the verify's live state (= committed; prefill_batch
+            // already set kv = pos+n+1 = pos+m+1). Refresh the draft h_t
+            // from the last committed row of batch_residual (= hidden@pos+m).
+            forward.set_kv_seq_len(pos + m as u32 + 1);
+            forward.mtp_set_h_from_batch_row(dev, cmd_ctx, m as u32)?;
+        } else {
+            forward.restore_recurrent_state(dev, cmd_ctx)?;
+            forward.set_kv_seq_len(pos);
+            // Replay cur, d_1..d_M via the verified decode path.
+            let mut rp = pos;
+            let replay: Vec<u32> = std::iter::once(cur)
+                .chain(drafts[..m].iter().copied())
+                .collect();
+            for t in replay {
+                let e = embed_lookup(embed_src, cfg, t)?;
+                forward.forward_token(dev, registry, cmd_ctx, model, &e, rp, t)?;
+                rp += 1;
+            }
+            // last forward_token left mtp_h_buf = hidden@(pos+m). ✓
+        }
+
+        // 5. Emit cur + accepted drafts; carry bonus as next cur.
+        let mut stop = commit!(cur);
+        if !stop {
+            for &d in &drafts[..m] {
+                if commit!(d) {
+                    stop = true;
+                    break;
+                }
+            }
+        }
+        cur = bonus;
+        pos += m as u32 + 1;
+        if stop {
+            break;
+        }
+    }
+
+    let rate = if drafted_sum > 0 {
+        100.0 * accepted_sum as f64 / drafted_sum as f64
+    } else {
+        0.0
+    };
+    let mean_commit = if iters > 0 {
+        // tokens committed per spec iteration = M+2 (cur + M drafts + bonus),
+        // but cur/bonus chain across iters → net new = M+1 per iter.
+        1.0 + accepted_sum as f64 / iters as f64
+    } else {
+        0.0
+    };
+    eprintln!(
+        "[MTP] n={n} iters={iters} accept={accepted_sum}/{drafted_sum}={rate:.1}% \
+         full_accepts={full_accepts}/{iters} mean_new_tokens/iter={mean_commit:.2} \
+         gen={} (byte-ident to plain greedy by construction)",
+        generated.len()
+    );
+    let text = String::from_utf8_lossy(&text_bytes).into_owned();
+    Ok((generated, stopped_on_eos, text.clone(), text))
 }
 
 /// CPU dequant of one row of `token_embd.weight` straight out of the
