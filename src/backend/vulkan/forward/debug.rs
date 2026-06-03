@@ -1017,6 +1017,200 @@ impl Forward {
         Ok(all_ok)
     }
 
+    /// GDN-Completion #4b Step 1 FLOOR (gated `VF_QWEN35_GDN_VERIFY`): verify
+    /// the SERIAL state-carry cores' per-token loop (offsets + state-carry)
+    /// BIT-IDENTICALLY against the genuine decode single-token path. The
+    /// batched loop reuses the identical single-token body (no GEMM reorder)
+    /// → rel must be 0.000e0, the sharpest carry/offset check. Drives the
+    /// same run_ssm_conv_setup/run_ssm_conv/run_gated_delta_net primitives the
+    /// b_step bodies use: batched reads token-t slots via offsets, decode
+    /// copies token t into a 1-token slot (offset 0). Mismatch pattern:
+    /// pos0-ok/from-pos1 = state-carry bug; wrong-position = offset bug.
+    pub fn gdn_serial_verify(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd_ctx: &CommandContext,
+        allocator: &mut Allocator,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let spec = self.config.qwen35.clone().expect("gdn_serial_verify: not qwen35");
+        let cc = spec.conv_channels() as usize;     // 10240
+        let nc = spec.ssm_d_conv as usize;          // 4
+        let pad = nc - 1;
+        let h = spec.num_v_heads() as usize;         // 48
+        let s_v = spec.ssm_d_state as usize;         // 128
+        let head_k = spec.head_k_dim() as usize;     // 128
+        let n_max = 16usize;
+        let scale = 1.0f32 / (s_v as f32).sqrt();
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+        let mut mk = |a: &mut Allocator, floats: usize, name: &str| {
+            GpuBuffer::new(&dev.device, a, (floats as u64) * 4, usage, MemoryLocation::CpuToGpu, name)
+        };
+        let cosf = |a: &[f32], b: &[f32]| -> (f64, f64) {
+            let (mut dot, mut na, mut nb, mut mx, mut omax) = (0f64, 0f64, 0f64, 0f64, 0f64);
+            for i in 0..a.len().min(b.len()) {
+                let (u, v) = (a[i] as f64, b[i] as f64);
+                dot += u * v; na += u * u; nb += v * v;
+                let d = (u - v).abs(); if d > mx { mx = d; } if u.abs() > omax { omax = u.abs(); }
+            }
+            (if na > 0.0 && nb > 0.0 { dot / (na.sqrt() * nb.sqrt()) } else { 0.0 }, if omax > 0.0 { mx / omax } else { mx })
+        };
+        let hbar = |dev: &VulkanDevice, cmd: vk::CommandBuffer| {
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+            unsafe { dev.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), std::slice::from_ref(&mb), &[], &[]); }
+        };
+        let compbar = |dev: &VulkanDevice, cmd: vk::CommandBuffer| {
+            let mb = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
+            unsafe { dev.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), std::slice::from_ref(&mb), &[], &[]); }
+        };
+
+        // ── shared synthetic buffers (host-visible) ──
+        let qpt = head_k * h;                         // qrep/krep per token = 6144
+        let opt = s_v * h;                            // gdn output per token = 6144
+        let state_f = h * s_v * s_v;                  // 786432
+        let mut qkv_n  = mk(allocator, n_max * cc, "sv_qkvN")?;
+        let mut conv_w = mk(allocator, cc * nc, "sv_convw")?;
+        let mut convst = mk(allocator, cc * pad, "sv_convst")?;
+        let conv_in = mk(allocator, cc * nc, "sv_convin")?;
+        let conv_oN = mk(allocator, n_max * cc, "sv_convoN")?;
+        let conv_o1 = mk(allocator, cc, "sv_convo1")?;
+        let mut qN = mk(allocator, n_max * qpt, "sv_qN")?;
+        let mut kN = mk(allocator, n_max * qpt, "sv_kN")?;
+        let mut vN = mk(allocator, n_max * cc, "sv_vN")?;     // V-slice at +4096 per token
+        let mut gN = mk(allocator, n_max * h, "sv_gN")?;
+        let mut bN = mk(allocator, n_max * h, "sv_bN")?;
+        let mut ssmst = mk(allocator, state_f, "sv_ssmst")?;
+        let gdnN = mk(allocator, n_max * opt + state_f, "sv_gdnN")?;
+        let gdn1 = mk(allocator, opt + state_f, "sv_gdn1")?;
+        let mut q1 = mk(allocator, qpt, "sv_q1")?; let mut k1 = mk(allocator, qpt, "sv_k1")?;
+        let mut v1 = mk(allocator, cc, "sv_v1")?; let mut g1 = mk(allocator, h, "sv_g1")?; let mut b1 = mk(allocator, h, "sv_b1")?;
+        let v_slice_off = (head_k * spec.num_k_heads() as usize * 2) as u64 * 4; // 4096*4
+
+        // synthetic fills (bounded; g≤0 → exp∈(0,1])
+        let f1 = |x: usize| 0.12 * (0.013 * x as f32).sin() + 0.04 * (0.0007 * x as f32).cos();
+        let mut convw = vec![0f32; cc * nc]; for i in 0..cc*nc { convw[i] = 0.2 * (0.7 * (i % nc) as f32 + 0.001 * i as f32).cos(); }
+        conv_w.write_bytes(bytemuck::cast_slice(&convw))?;
+        let zeros_cs = vec![0f32; cc * pad]; let zeros_ss = vec![0f32; state_f];
+
+        println!("\n=== GDN serial-core verify (per-token loop vs decode single-token, BIT-IDENT) ===");
+        let mut all_ok = true;
+        for &n in &[2usize, 4, 8, 16] {
+            // fill qkv_n + GDN inputs (global token t)
+            let mut qkvv = vec![0f32; n*cc]; for t in 0..n { for c in 0..cc { qkvv[t*cc+c] = f1(t*131 + c); } }
+            qkv_n.write_bytes(bytemuck::cast_slice(&qkvv))?;
+            let mut qv=vec![0f32;n*qpt]; let mut kv=vec![0f32;n*qpt]; let mut vv=vec![0f32;n*cc]; let mut gv=vec![0f32;n*h]; let mut bv=vec![0f32;n*h];
+            for t in 0..n {
+                for i in 0..qpt { qv[t*qpt+i]=f1(t*17+i); kv[t*qpt+i]=f1(t*19+i+3); }
+                for c in 0..(s_v*h) { vv[t*cc + (v_slice_off as usize/4) + c] = f1(t*23+c+1); }
+                for j in 0..h { gv[t*h+j]= -0.10 - 0.02*(((t+j)%5) as f32); bv[t*h+j]=0.5+0.1*((0.4*t as f32+0.2*j as f32).sin()); }
+            }
+            qN.write_bytes(bytemuck::cast_slice(&qv))?; kN.write_bytes(bytemuck::cast_slice(&kv))?;
+            vN.write_bytes(bytemuck::cast_slice(&vv))?; gN.write_bytes(bytemuck::cast_slice(&gv))?; bN.write_bytes(bytemuck::cast_slice(&bv))?;
+
+            // ── CONV: batched per-token loop (mirrors b_step_ssm_conv1d) ──
+            convst.write_bytes(bytemuck::cast_slice(&zeros_cs))?;
+            let (qkvh, cwh, csh, cih, coNh) = (qkv_n.handle, conv_w.handle, convst.handle, conv_in.handle, conv_oN.handle);
+            cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
+                for t in 0..n as u64 {
+                    let off = t * (cc as u64) * 4;
+                    self.run_ssm_conv_setup(dev, registry, cmd, csh, 0, (cc*pad) as u64*4, qkvh, off, cih, cc as u32, "sv_setup");
+                    compbar(dev, cmd);
+                    self.run_ssm_conv(dev, registry, cmd, cih, cwh, coNh, off, nc as u32, nc as u32, cc as u32, 1, 1, "sv_conv");
+                    compbar(dev, cmd);
+                }
+                hbar(dev, cmd);
+            })?;
+            let conv_a = bytemuck::cast_slice::<u8,f32>(&conv_oN.read_bytes()?[..(n*cc)*4]).to_vec();
+            // ── CONV: decode single-token (offset 0, token copied to slot 0) ──
+            convst.write_bytes(bytemuck::cast_slice(&zeros_cs))?;
+            let mut conv_b = vec![0f32; n*cc];
+            let (q1kvh, co1h) = (qkv_n.handle, conv_o1.handle); // reuse qkv_n offset via setup qkv_off
+            for t in 0..n as u64 {
+                cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
+                    self.run_ssm_conv_setup(dev, registry, cmd, csh, 0, (cc*pad) as u64*4, q1kvh, t*(cc as u64)*4, cih, cc as u32, "sv_setupd");
+                    compbar(dev, cmd);
+                    self.run_ssm_conv(dev, registry, cmd, cih, cwh, co1h, 0, nc as u32, nc as u32, cc as u32, 1, 1, "sv_convd");
+                    hbar(dev, cmd);
+                })?;
+                conv_b[(t as usize)*cc..(t as usize+1)*cc].copy_from_slice(bytemuck::cast_slice::<u8,f32>(&conv_o1.read_bytes()?[..cc*4]));
+            }
+            let (mut wc, mut wr, mut wt) = (1f64, 0f64, 0usize);
+            for t in 0..n { let (c,r)=cosf(&conv_a[t*cc..(t+1)*cc], &conv_b[t*cc..(t+1)*cc]); if c<wc {wc=c; wt=t;} if r>wr {wr=r;} }
+            let conv_ok = wr == 0.0;
+            println!("  conv N={n}: worst_cos={wc:.6} worst_rel={wr:.3e} (pos {wt}) -> {}", if conv_ok {"BIT-IDENT"} else {"MISMATCH"});
+
+            // ── GDN: batched per-token loop (mirrors b_step_gated_delta_net) ──
+            ssmst.write_bytes(bytemuck::cast_slice(&zeros_ss))?;
+            let (qh,kh,vh,gh,bh,sh,dNh) = (qN.handle,kN.handle,vN.handle,gN.handle,bN.handle,ssmst.handle,gdnN.handle);
+            let st_region = (n as u64) * (opt as u64) * 4;
+            cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
+                for t in 0..n as u64 {
+                    let push = GatedDeltaNetPushConstants {
+                        h: h as u32, n_tokens: 1, n_seqs: 1, s_off: (n as u32 - t as u32)*(s_v as u32)*(h as u32),
+                        sq1: head_k as u32, sq2:(head_k*h) as u32, sq3:(head_k*h) as u32,
+                        sv1: s_v as u32, sv2:(s_v*h) as u32, sv3:(s_v*h) as u32, sb1:1, sb2:h as u32, sb3:h as u32,
+                        neq1: h as u32, rq3:1, scale, k:1,
+                    };
+                    self.run_gated_delta_net(dev, registry, cmd,
+                        qh, t*(qpt as u64)*4, kh, t*(qpt as u64)*4,
+                        vh, t*(cc as u64)*4 + v_slice_off, (opt as u64)*4,
+                        gh, t*(h as u64)*4, bh, t*(h as u64)*4,
+                        sh, 0, (state_f as u64)*4, dNh, t*(opt as u64)*4, s_v as u32, 2, &push, "sv_gdn");
+                    compbar(dev, cmd);
+                    let region = vk::BufferCopy { src_offset: st_region, dst_offset: 0, size: (state_f as u64)*4 };
+                    unsafe { dev.device.cmd_copy_buffer(cmd, dNh, sh, std::slice::from_ref(&region)); }
+                    compbar(dev, cmd);
+                }
+                hbar(dev, cmd);
+            })?;
+            let gdn_a = bytemuck::cast_slice::<u8,f32>(&gdnN.read_bytes()?[..(n*opt)*4]).to_vec();
+            // ── GDN: decode single-token (offset 0, ssm_state-carry) ──
+            ssmst.write_bytes(bytemuck::cast_slice(&zeros_ss))?;
+            let mut gdn_b = vec![0f32; n*opt];
+            let d1h = gdn1.handle;
+            for t in 0..n as u64 {
+                // copy token t inputs to 1-tok slots
+                q1.write_bytes(bytemuck::cast_slice(&qv[(t as usize)*qpt..(t as usize+1)*qpt]))?;
+                k1.write_bytes(bytemuck::cast_slice(&kv[(t as usize)*qpt..(t as usize+1)*qpt]))?;
+                v1.write_bytes(bytemuck::cast_slice(&vv[(t as usize)*cc..(t as usize+1)*cc]))?;
+                g1.write_bytes(bytemuck::cast_slice(&gv[(t as usize)*h..(t as usize+1)*h]))?;
+                b1.write_bytes(bytemuck::cast_slice(&bv[(t as usize)*h..(t as usize+1)*h]))?;
+                let push = GatedDeltaNetPushConstants {
+                    h: h as u32, n_tokens: 1, n_seqs: 1, s_off:(s_v*h) as u32,
+                    sq1: head_k as u32, sq2:(head_k*h) as u32, sq3:(head_k*h) as u32,
+                    sv1: s_v as u32, sv2:(s_v*h) as u32, sv3:(s_v*h) as u32, sb1:1, sb2:h as u32, sb3:h as u32,
+                    neq1: h as u32, rq3:1, scale, k:1,
+                };
+                let (q1h,k1h,v1h,g1h,b1h)=(q1.handle,k1.handle,v1.handle,g1.handle,b1.handle);
+                cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
+                    self.run_gated_delta_net(dev, registry, cmd,
+                        q1h, 0, k1h, 0, v1h, v_slice_off, (opt as u64)*4,
+                        g1h, 0, b1h, 0, sh, 0, (state_f as u64)*4, d1h, 0, s_v as u32, 2, &push, "sv_gdnd");
+                    compbar(dev, cmd);
+                    let region = vk::BufferCopy { src_offset: (opt as u64)*4, dst_offset: 0, size: (state_f as u64)*4 };
+                    unsafe { dev.device.cmd_copy_buffer(cmd, d1h, sh, std::slice::from_ref(&region)); }
+                    hbar(dev, cmd);
+                })?;
+                gdn_b[(t as usize)*opt..(t as usize+1)*opt].copy_from_slice(bytemuck::cast_slice::<u8,f32>(&gdn1.read_bytes()?[..opt*4]));
+            }
+            let (mut wc2, mut wr2, mut wt2) = (1f64, 0f64, 0usize);
+            for t in 0..n { let (c,r)=cosf(&gdn_a[t*opt..(t+1)*opt], &gdn_b[t*opt..(t+1)*opt]); if c<wc2 {wc2=c; wt2=t;} if r>wr2 {wr2=r;} }
+            let gdn_ok = wr2 == 0.0;
+            println!("  gdn  N={n}: worst_cos={wc2:.6} worst_rel={wr2:.3e} (pos {wt2}) -> {}", if gdn_ok {"BIT-IDENT"} else {"MISMATCH"});
+            all_ok &= conv_ok && gdn_ok;
+        }
+        println!("=== GDN SERIAL-CORE VERDICT: {} ===",
+            if all_ok { "BIT-IDENT — serial conv + GDN per-token loops (offset+state-carry) correct" }
+            else { "MISMATCH — carry (pos0-ok/from-pos1) or offset (wrong-pos) bug" });
+        for buf in [qkv_n, conv_w, convst, conv_in, conv_oN, conv_o1, qN, kN, vN, gN, bN, ssmst, gdnN, gdn1, q1, k1, v1, g1, b1] {
+            buf.destroy(&dev.device, allocator);
+        }
+        Ok(all_ok)
+    }
+
     /// De-risk substep oracle — run ONE real DECODE layer (`dispatch_layer`,
     /// the same path `forward_token` uses) at `position` and return its
     /// post-layer `(k_buf, v_buf)` rows (each `kv_dim`). At N=1/pos 0 these

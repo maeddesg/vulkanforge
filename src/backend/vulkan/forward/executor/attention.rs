@@ -2405,24 +2405,37 @@ impl BatchExec {
 
         let state_bytes_per_layer = slots as u64 * conv_channels as u64 * 4;
         let state_offset_bytes    = recurrent_idx as u64 * state_bytes_per_layer;
-
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[qkv_buf]);
-        fwd.run_ssm_conv_setup(
-            ctx.dev, ctx.registry, ctx.cmd,
-            conv_state_buf, state_offset_bytes, state_bytes_per_layer,
-            qkv_buf, 0, conv_input,
-            conv_channels, "b_ssm_conv_setup",
-        );
-        fwd.mark_written(&[conv_input, conv_state_buf]);
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_input]);
-
         let conv_weight = layer_weight(ctx.model, layer, "ssm_conv1d.weight");
-        fwd.run_ssm_conv(
-            ctx.dev, ctx.registry, ctx.cmd,
-            conv_input, conv_weight, conv_output, 0,
-            d_conv, d_conv, conv_channels, 1, 1, "b_ssm_conv",
-        );
-        fwd.mark_written(&[conv_output]);
+        let cc_bytes = (conv_channels as u64) * 4;
+        let seq_len = batch_seq_len(ctx);
+
+        // GDN-Completion #4b — serial per-token conv with conv_state-carry.
+        // Mirrors the verified decode `step_ssm_conv1d` exactly, looped over
+        // the N tokens: setup reads token t's qkv slot (qkv_offset) + builds
+        // [state ++ qkv_t] + slides conv_state; conv writes conv_output_N[t]
+        // (dst_offset). conv_state carries across iterations (zero-init from
+        // ensure_ssm_persistent_initialized). A trailing barrier per token
+        // makes the conv_state slide visible to token t+1's setup read.
+        for t in 0..seq_len as u64 {
+            let off = t * cc_bytes;
+            fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[qkv_buf]);
+            fwd.run_ssm_conv_setup(
+                ctx.dev, ctx.registry, ctx.cmd,
+                conv_state_buf, state_offset_bytes, state_bytes_per_layer,
+                qkv_buf, off, conv_input,
+                conv_channels, "b_ssm_conv_setup",
+            );
+            fwd.mark_written(&[conv_input, conv_state_buf]);
+            fwd.force_internal_barrier(ctx.dev, ctx.cmd, &[conv_input]);
+            fwd.run_ssm_conv(
+                ctx.dev, ctx.registry, ctx.cmd,
+                conv_input, conv_weight, conv_output, off,
+                d_conv, d_conv, conv_channels, 1, 1, "b_ssm_conv",
+            );
+            fwd.mark_written(&[conv_output]);
+            // conv_state slide + conv_input must be visible before token t+1.
+            fwd.force_internal_barrier(ctx.dev, ctx.cmd, &[conv_state_buf, conv_input]);
+        }
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[conv_output]);
     }
 
@@ -2678,48 +2691,66 @@ impl BatchExec {
         let state = fwd.ssm_state_buf.as_ref().unwrap().handle;
         let dst   = fwd.ssm_gdn_out_buf.as_ref().unwrap().handle;
 
-        let v_offset_bytes = (head_k as u64) * (num_k_heads as u64) * 2 * 4;
+        let conv_channels = spec.conv_channels();
+        let seq_len = batch_seq_len(ctx);
+        let v_slice_off = (head_k as u64) * (num_k_heads as u64) * 2 * 4; // V after Q+K
         let v_bytes        = (s_v as u64) * (h as u64) * 4;
         let state_bytes_per_layer = (h as u64) * (s_v as u64) * (s_v as u64) * 4;
         let state_offset_bytes    = recurrent_idx as u64 * state_bytes_per_layer;
-        let s_off = s_v * h;
+        // Outputs occupy gdn_out[0 .. N·s_v·h]; every token's transient state
+        // is steered to the FIXED region [N·s_v·h ..] via per-token s_off,
+        // then copied back into ssm_state (carry) — no output/state collision.
+        let out_per_tok = (s_v * h) as u64;        // 6144
+        let state_region_off = (seq_len as u64) * out_per_tok * 4;
 
-        let push = GatedDeltaNetPushConstants {
-            h, n_tokens: 1, n_seqs: 1, s_off,
-            sq1: head_k, sq2: head_k * h, sq3: head_k * h,
-            sv1: s_v,    sv2: s_v * h,    sv3: s_v * h,
-            sb1: 1, sb2: h, sb3: h,
-            neq1: h, rq3: 1,
-            scale: 1.0 / (s_v as f32).sqrt(),
-            k: 1,
-        };
-
-        fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[q, k, v, g, beta]);
-        fwd.run_gated_delta_net(
-            ctx.dev, ctx.registry, ctx.cmd,
-            q, 0, k, 0,
-            v, v_offset_bytes, v_bytes,
-            g, 0, beta, 0,
-            state, state_offset_bytes, state_bytes_per_layer,
-            dst, 0,
-            s_v, 2,
-            &push, "b_gdn",
-        );
-        fwd.mark_written(&[dst]);
-
-        compute_to_transfer_barrier(ctx.dev, ctx.cmd);
-        let region = vk::BufferCopy {
-            src_offset: (s_off as u64) * 4,
-            dst_offset: state_offset_bytes,
-            size:       state_bytes_per_layer,
-        };
-        unsafe {
-            ctx.dev.device.cmd_copy_buffer(
-                ctx.cmd, dst, state, std::slice::from_ref(&region),
+        // GDN-Completion #4b — serial per-token recurrence with ssm_state-carry.
+        // Mirrors the verified decode `step_gated_delta_net`, looped over N:
+        // token t reads its slot of qrep/krep/gate/beta (token stride
+        // head_k·h, h) and conv_output's V-slice (token stride conv_channels,
+        // NOT s_v·h), writes output to gdn_out_N[t·s_v·h], and its new state
+        // (at the fixed region) is copied into ssm_state for token t+1.
+        for t in 0..seq_len as u64 {
+            let qk_off = t * (head_k as u64) * (h as u64) * 4;   // qrep/krep token stride
+            let gb_off = t * (h as u64) * 4;                     // gate/beta token stride
+            let v_off  = t * (conv_channels as u64) * 4 + v_slice_off;
+            let dst_off = t * out_per_tok * 4;
+            let push = GatedDeltaNetPushConstants {
+                h, n_tokens: 1, n_seqs: 1,
+                s_off: (seq_len - t as u32) * s_v * h,            // → fixed state region
+                sq1: head_k, sq2: head_k * h, sq3: head_k * h,
+                sv1: s_v,    sv2: s_v * h,    sv3: s_v * h,
+                sb1: 1, sb2: h, sb3: h,
+                neq1: h, rq3: 1,
+                scale: 1.0 / (s_v as f32).sqrt(),
+                k: 1,
+            };
+            fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[q, k, v, g, beta]);
+            fwd.run_gated_delta_net(
+                ctx.dev, ctx.registry, ctx.cmd,
+                q, qk_off, k, qk_off,
+                v, v_off, v_bytes,
+                g, gb_off, beta, gb_off,
+                state, state_offset_bytes, state_bytes_per_layer,
+                dst, dst_off,
+                s_v, 2,
+                &push, "b_gdn",
             );
+            fwd.mark_written(&[dst]);
+            // Copy the new state (fixed region) back into ssm_state for t+1.
+            compute_to_transfer_barrier(ctx.dev, ctx.cmd);
+            let region = vk::BufferCopy {
+                src_offset: state_region_off,
+                dst_offset: state_offset_bytes,
+                size:       state_bytes_per_layer,
+            };
+            unsafe {
+                ctx.dev.device.cmd_copy_buffer(
+                    ctx.cmd, dst, state, std::slice::from_ref(&region),
+                );
+            }
+            transfer_to_compute_barrier(ctx.dev, ctx.cmd);
+            fwd.mark_written(&[state]);
         }
-        transfer_to_compute_barrier(ctx.dev, ctx.cmd);
-        fwd.mark_written(&[state]);
     }
 
     /// Sprint G-2e (v0.4.6) — batch counterpart of

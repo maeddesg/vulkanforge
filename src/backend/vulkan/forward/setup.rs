@@ -436,8 +436,10 @@ impl Forward {
             let beta_bytes       = pp * num_v_heads * 4;         // N × 48
             let alpha_bytes      = num_v_heads * 4;              // 48 * 4 = 192 B
             let gate_bytes       = num_v_heads * 4;              // 48 * 4 = 192 B
-            let conv_in_bytes    = (spec.ssm_d_conv as u64) * conv_channels * 4; // 4*10240*4 = 160 KB
-            let conv_out_bytes   = conv_channels * 4;            // 10240 * 4 = 40 KB
+            let conv_in_bytes    = (spec.ssm_d_conv as u64) * conv_channels * 4; // 4*10240*4 (1-token scratch, per-token loop)
+            // GDN-Completion #4b — conv_output now holds all N tokens (the
+            // serial conv loop writes conv_output_N[t] via dst-offset).
+            let conv_out_bytes   = pp * conv_channels * 4;       // N × 10240
             let qrep_bytes       = head_v_dim * num_v_heads * 4; // 128*48*4 = 24 KB
             let krep_bytes       = head_v_dim * num_v_heads * 4; // 24 KB
             // Sprint G-2e — `ssm_gdn_out_buf` holds BOTH the GDN output
@@ -451,8 +453,13 @@ impl Forward {
             //   total : 792576 floats                     (~3.02 MB)
             // The executor copies the state portion back into
             // `ssm_state_buf` after each dispatch.
+            // GDN-Completion #4b — gdn_out holds N token outputs + ONE state
+            // region (the serial GDN loop writes output[t] via dst-offset and
+            // a per-token s_off=(N-t)·s_v·h so every token's transient state
+            // lands at the SAME [N·s_v·h ..] region, copied back to ssm_state
+            // each iteration — outputs [0..N·s_v·h] never collide with state).
             let gdn_out_bytes    =
-                (head_v_dim * num_v_heads                          // output 6144
+                (pp * head_v_dim * num_v_heads                     // outputs N × 6144
                  + num_v_heads * head_v_dim * head_v_dim) * 4;     // state  786432
             let norm_out_bytes   = head_v_dim * num_v_heads * 4; // 24 KB
 
