@@ -834,6 +834,7 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
     // against the per-token decode recurrence, then exit. No production
     // behavior. Pre-check gate before building the GDN wiring.
     if std::env::var("VF_QWEN35_GDN_VERIFY").as_deref() == Ok("1") {
+        let _ = forward.gdn_conv_verify(&dev, &registry, &cmd_ctx, &mut allocator)?;
         let _ = forward.gdn_recurrence_verify(&dev, &registry, &cmd_ctx, &mut allocator)?;
         forward.destroy(&dev.device, &mut allocator);
         return Ok(());

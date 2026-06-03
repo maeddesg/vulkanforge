@@ -842,6 +842,119 @@ impl Forward {
         Ok(all_ok)
     }
 
+    /// GDN-Completion #2 Step 0 (gated `VF_QWEN35_GDN_VERIFY`): verify the
+    /// causal conv (`ssm_conv.comp`) over `n_t=N` against the per-token
+    /// decode conv (`n_t=1` ×N with conv-state window carry). The shader
+    /// itself windows over output tokens (grid `i2`, reads `[i2..i2+nc]`);
+    /// correctness over N hinges on the conv_input layout
+    /// `[conv_state(nc-1) ++ N current]` + zero-init prefill padding. We
+    /// build conv_input on the host directly (the decode `ssm_conv_setup`
+    /// is single-token): Path A = `[zero-pad(nc-1) ++ N]` one dispatch;
+    /// Path B = `[state(nc-1) ++ 1]` per token with host state-slide
+    /// (mirrors `step_ssm_conv1d`). Per-position bit-identity, N=2,4,8,16.
+    /// Verification-only; no production behavior.
+    pub fn gdn_conv_verify(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd_ctx: &CommandContext,
+        allocator: &mut Allocator,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let spec = self.config.qwen35.clone().expect("gdn_conv_verify: not qwen35");
+        let nr = spec.conv_channels() as usize;   // 10240
+        let nc = spec.ssm_d_conv as usize;        // 4
+        let pad = nc - 1;                          // 3
+        let n_max = 16usize;
+        // Synthetic per-(channel,token) input and per-(channel,tap) kernel.
+        let inf = |ch: usize, t: usize| 0.10 * (0.020 * ch as f32 + 0.50 * t as f32).sin() + 0.05 * (0.30 * t as f32).cos();
+        let wf = |ch: usize, j: usize| 0.20 * (0.70 * j as f32 + 0.001 * ch as f32).cos();
+
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+        let mut mk = |alloc: &mut Allocator, floats: usize, name: &str| {
+            GpuBuffer::new(&dev.device, alloc, (floats as u64) * 4, usage, MemoryLocation::CpuToGpu, name)
+        };
+        let mut w_b = mk(allocator, nr * nc, "convv_w")?;
+        let mut wv = vec![0f32; nr * nc];
+        for ch in 0..nr { for j in 0..nc { wv[ch * nc + j] = wf(ch, j); } }
+        w_b.write_bytes(bytemuck::cast_slice(&wv))?;
+        let mut in_a = mk(allocator, nr * (pad + n_max), "convv_inA")?;
+        let dst_a = mk(allocator, nr * n_max, "convv_dstA")?;
+        let mut in_b = mk(allocator, nr * nc, "convv_inB")?;
+        let dst_b = mk(allocator, nr, "convv_dstB")?;
+
+        let cosf = |a: &[f32], b: &[f32]| -> (f64, f64) {
+            let (mut dot, mut na, mut nb, mut mx, mut omax) = (0f64, 0f64, 0f64, 0f64, 0f64);
+            for i in 0..a.len().min(b.len()) {
+                let (x, y) = (a[i] as f64, b[i] as f64);
+                dot += x * y; na += x * x; nb += y * y;
+                let d = (x - y).abs(); if d > mx { mx = d; } if x.abs() > omax { omax = x.abs(); }
+            }
+            (if na > 0.0 && nb > 0.0 { dot / (na.sqrt() * nb.sqrt()) } else { 0.0 }, if omax > 0.0 { mx / omax } else { mx })
+        };
+        let host_barrier = |dev: &VulkanDevice, cmd: vk::CommandBuffer| {
+            let mb = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+            unsafe { dev.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), std::slice::from_ref(&mb), &[], &[]); }
+        };
+        let (wh, iah, dah, ibh, dbh) = (w_b.handle, in_a.handle, dst_a.handle, in_b.handle, dst_b.handle);
+        println!("\n=== GDN conv verify (ssm_conv n_t=N vs decode n_t=1×N), nr={nr} nc={nc} ===");
+        let mut all_ok = true;
+        for &n in &[2usize, 4, 8, 16] {
+            let ncs_a = pad + n;
+            // Path A: conv_input = [zero(pad) ++ input[ch][0..n]] per channel.
+            let mut iva = vec![0f32; nr * ncs_a];
+            for ch in 0..nr { for t in 0..n { iva[ch * ncs_a + pad + t] = inf(ch, t); } }
+            in_a.write_bytes(bytemuck::cast_slice(&iva))?;
+            self.reset_descriptor_pool_and_cache(dev)?;
+            cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
+                self.run_ssm_conv(dev, registry, cmd, iah, wh, dah, nc as u32, ncs_a as u32, nr as u32, n as u32, 1, "convv_a");
+                host_barrier(dev, cmd);
+            })?;
+            let out_a = bytemuck::cast_slice::<u8, f32>(&dst_a.read_bytes()?[..(nr * n) * 4]).to_vec();
+
+            // Path B: zero conv-state, n_t=1 ×N with host window slide.
+            let mut state = vec![0f32; nr * pad];
+            let mut out_b = vec![0f32; nr * n];
+            for t in 0..n {
+                let mut ivb = vec![0f32; nr * nc];
+                for ch in 0..nr {
+                    for s in 0..pad { ivb[ch * nc + s] = state[ch * pad + s]; }
+                    ivb[ch * nc + pad] = inf(ch, t);
+                }
+                in_b.write_bytes(bytemuck::cast_slice(&ivb))?;
+                self.reset_descriptor_pool_and_cache(dev)?;
+                cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| {
+                    self.run_ssm_conv(dev, registry, cmd, ibh, wh, dbh, nc as u32, nc as u32, nr as u32, 1, 1, "convv_b");
+                    host_barrier(dev, cmd);
+                })?;
+                let db = dst_b.read_bytes()?;
+                out_b[t * nr..(t + 1) * nr].copy_from_slice(bytemuck::cast_slice::<u8, f32>(&db[..nr * 4]));
+                // slide window: new state = [state[1..], input_t]
+                for ch in 0..nr {
+                    for s in 0..pad - 1 { state[ch * pad + s] = state[ch * pad + s + 1]; }
+                    state[ch * pad + pad - 1] = inf(ch, t);
+                }
+            }
+
+            let (mut worst_c, mut worst_r, mut worst_t) = (1f64, 0f64, 0usize);
+            for t in 0..n {
+                let (c, r) = cosf(&out_a[t * nr..(t + 1) * nr], &out_b[t * nr..(t + 1) * nr]);
+                if c < worst_c { worst_c = c; worst_t = t; }
+                if r > worst_r { worst_r = r; }
+                if n <= 4 || t == 0 || t == 1 || t == n - 1 { println!("  conv N={n} pos {t:2}: cos={c:.6} rel={r:.3e}"); }
+            }
+            let ok = worst_c > 0.999 && worst_r < 1e-4;
+            all_ok &= ok;
+            println!("  => conv N={n}: worst_cos={worst_c:.6} (pos {worst_t}) worst_rel={worst_r:.3e} -> {}",
+                if ok { "MATCH" } else { "MISMATCH" });
+        }
+        println!("=== GDN CONV VERDICT: {} ===",
+            if all_ok { "MATCH — conv over n_t=N verified" } else { "MISMATCH — conv n_t=N layout/window/state drift" });
+        for buf in [w_b, in_a, dst_a, in_b, dst_b] { buf.destroy(&dev.device, allocator); }
+        Ok(all_ok)
+    }
+
     /// De-risk substep oracle — run ONE real DECODE layer (`dispatch_layer`,
     /// the same path `forward_token` uses) at `position` and return its
     /// post-layer `(k_buf, v_buf)` rows (each `kv_dim`). At N=1/pos 0 these
