@@ -481,6 +481,34 @@ fn run_qwen35_layer_derisk(
                 "  => DEC L{layer}: {odistinct} distinct hash(es)/{runs} runs -> {}",
                 if odistinct == 1 { "DETERMINISTIC" } else { "NON-DETERMINISTIC (oracle noise — harness isolation)" },
             );
+
+            // Stage-localize the DEC non-determinism: hash each decode
+            // sub-buffer's final value over N runs. The FIRST stage that
+            // shows >1 distinct hash is where the uninitialized read enters.
+            if std::env::var("VF_QWEN35_DEC_LOCALIZE").as_deref() == Ok("1") {
+                let q_total = (cfg.n_heads * cfg.head_dim * 2) as usize;
+                let kv_dim = (cfg.n_kv_heads * cfg.head_dim) as usize;
+                let mut hq = vec![]; let mut hk = vec![]; let mut hao = vec![]; let mut ho = vec![];
+                for _ in 0..runs {
+                    forward.kv_cache.reset(); forward.kv_cache.zero_fill(dev)?;
+                    let qb = forward.forward_layer_debug_qbuf(dev, registry, cmd_ctx, model, layer, 0, &x[0..hidden])?;
+                    hq.push(fnv(&qb[..q_total.min(qb.len())]));
+                    forward.kv_cache.reset(); forward.kv_cache.zero_fill(dev)?;
+                    let (kk, _vv) = forward.forward_layer_debug_kv(dev, registry, cmd_ctx, model, layer, 0, &x[0..hidden])?;
+                    hk.push(fnv(&kk[..kv_dim.min(kk.len())]));
+                    forward.kv_cache.reset(); forward.kv_cache.zero_fill(dev)?;
+                    let ao = forward.forward_layer_debug_attn_out(dev, registry, cmd_ctx, model, layer, 0, &x[0..hidden])?;
+                    hao.push(fnv(&ao));
+                    forward.kv_cache.reset(); forward.kv_cache.zero_fill(dev)?;
+                    let ob = forward.forward_layer_debug_o_buf(dev, registry, cmd_ctx, model, layer, 0, &x[0..hidden])?;
+                    ho.push(fnv(&ob));
+                }
+                let d = |v: &Vec<u64>| { let mut s = v.clone(); s.sort(); s.dedup(); s.len() };
+                println!(
+                    "  DEC-LOCALIZE L{layer}: q_buf={} k={} attn_out={} o_buf={} (distinct/{runs}; 1=det)",
+                    d(&hq), d(&hk), d(&hao), d(&ho),
+                );
+            }
         }
         println!(
             "=== DETERMINISM VERDICT: {} ===",

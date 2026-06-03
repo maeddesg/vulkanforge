@@ -658,6 +658,20 @@ impl DecodeExec {
             );
             fwd.mark_written(&[attn_out]);
         }
+        // Trailing barrier mirroring the batch path (b_step_attn_gated_output,
+        // attention.rs:2281). step_o_proj reads attn_out via gemv but does NOT
+        // maybe_compute_barrier on it, so the in-place sigmoid_mul write above
+        // was unsynced before that read — a real RAW race in qwen35 decode
+        // (Imperative mode + elision = the default), widened by head_dim=256.
+        // This is the source of the "q36 pre-existing non-determinism". Gated
+        // default-off this sprint (VF_QWEN35_DEC_GATE_BARRIER) to keep the
+        // production default byte-identical pending the coherence non-regression
+        // gate; the value-preserving flip to default-on is the correctness fix.
+        // qwen35-only (this step is only in the qwen35 full-attn plan) → zero
+        // effect on Llama / Qwen3 / Gemma decode.
+        if std::env::var("VF_QWEN35_DEC_GATE_BARRIER").as_deref() == Ok("1") {
+            fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[attn_out]);
+        }
     }
 
     pub(super) fn step_o_proj(&self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx) {
@@ -2287,13 +2301,17 @@ impl BatchExec {
         let q_dim = cfg.n_heads * head_dim;
         // O-proj reads attn_out (seq_len × q_dim) and writes (seq_len × hidden).
         // Stage of one — always quantizes its own input.
+        // Diagnostic toggle (gated, default-true=production): VF_BO_PROJ_NOQUANT=1
+        // forces FP activation (quantize_input=false) to measure how much the
+        // gemm input-quant contributes to the batch-vs-decode o-proj residual.
+        let quant_in = std::env::var("VF_BO_PROJ_NOQUANT").as_deref() != Ok("1");
         self.b_run_proj(
             fwd, cfg, ctx,
             "attn_output.weight",
             fwd.batch_attn_out.handle,
             fwd.batch_o.handle,
             cfg.hidden_dim, q_dim, seq_len, "gemm_o",
-            /* quantize_input = */ true,
+            quant_in,
         );
         compute_barrier(ctx.dev, ctx.cmd);
     }
