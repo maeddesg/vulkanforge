@@ -663,13 +663,16 @@ impl DecodeExec {
         // maybe_compute_barrier on it, so the in-place sigmoid_mul write above
         // was unsynced before that read — a real RAW race in qwen35 decode
         // (Imperative mode + elision = the default), widened by head_dim=256.
-        // This is the source of the "q36 pre-existing non-determinism". Gated
-        // default-off this sprint (VF_QWEN35_DEC_GATE_BARRIER) to keep the
-        // production default byte-identical pending the coherence non-regression
-        // gate; the value-preserving flip to default-on is the correctness fix.
+        // This was the source of the "q36 pre-existing non-determinism": the
+        // racy read returned a partially-gated attn_out, so greedy decode was
+        // bit-non-deterministic (verified: OFF diverges across runs, ON is
+        // bit-identical). The barrier makes o_proj read the fully-gated value —
+        // the *intended* result — so this is a correctness fix, not a speed
+        // trade-off (decode t/s neutral). DEFAULT-ON since v0.5.4;
+        // VF_QWEN35_DEC_GATE_BARRIER=0 is a non-destructive escape-hatch.
         // qwen35-only (this step is only in the qwen35 full-attn plan) → zero
-        // effect on Llama / Qwen3 / Gemma decode.
-        if std::env::var("VF_QWEN35_DEC_GATE_BARRIER").as_deref() == Ok("1") {
+        // effect on Llama / Qwen3 / Gemma decode (verified byte-identical).
+        if std::env::var("VF_QWEN35_DEC_GATE_BARRIER").as_deref() != Ok("0") {
             fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[attn_out]);
         }
     }

@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.5.4 — qwen35 decode correctness/determinism fix (gated-output → o-proj RAW race) (2026-06-03)
+
+Fixes a real data race in the **Qwen3.6-27B-MTP (qwen35)** decode path that made
+greedy (temperature 0) decoding **bit-non-deterministic** — the source of the
+long-standing "q36 differs run-to-run" observation. **Correctness fix, not a
+speed trade-off; decode throughput is neutral.**
+
+**Root cause.** The qwen35 Full-Attention gated output (`step_attn_gated_output`)
+runs an in-place `sigmoid_mul` on `attn_out` (gating the attention output by
+`sigmoid(gate)`), then `step_o_proj` reads `attn_out` via its gemv. But o-proj
+never issued a `maybe_compute_barrier(&[attn_out])`, and the gate step had no
+trailing barrier — so under the default `Imperative` barrier mode with elision,
+**o-proj read `attn_out` while the gate's write was still in flight (RAW
+hazard)**. The race is qwen35-specific and is widened by qwen35's unusual
+`head_dim=256`. The batch (prefill) path already had this barrier
+(`b_step_attn_gated_output`); only the decode path was missing it.
+
+**Effect of the bug.** o-proj read a partially-gated `attn_out`, so the produced
+logits — and therefore the greedy argmax — varied run-to-run. Verified: with the
+fix OFF, the same prompt produces **divergent** token sequences across runs; with
+the fix ON it is **bit-identical**. The output stayed coherent (hence "benign"),
+but it was not reproducible.
+
+**Fix.** A trailing `maybe_compute_barrier(&[attn_out])` in the decode
+`step_attn_gated_output`, mirroring the batch path. o-proj now reads the
+fully-gated `attn_out` — the *intended* value. **Default-ON**;
+`VF_QWEN35_DEC_GATE_BARRIER=0` is a non-destructive escape-hatch.
+
+**Validation.** Production greedy decode bit-identical across runs (fix ON) and
+divergent (fix OFF); fact-recall (Paris / 17×23=391 / Jupiter) correct; 5-prompt
+smoke (greeting, prime-check, mutex, binary-search, arithmetic) coherent, decode
+~39.5 t/s (neutral). Non-regression: `cargo test --release --lib` = 240/240;
+Qwen3-8B and Llama-3.1-8B byte-identical with the fix ON vs OFF (the barrier is
+qwen35-only). This also gives the GDN-validation work a clean deterministic
+single-layer oracle to bisect against.
+
 ## v0.5.3 — GROUPED MoE-expert prefill default-ON + bucket-offset bug-class closed (2026-05-31)
 
 The Expert-Grouped MMQ_ID prefill path (`VF_MOE_GROUPED`) is now the **default**
