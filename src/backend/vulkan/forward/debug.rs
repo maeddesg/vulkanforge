@@ -1280,6 +1280,81 @@ impl Forward {
         Ok(all_ok)
     }
 
+    /// GDN race localization (gated `VF_QWEN35_GDN_DETERM`) — run ONE batched
+    /// recurrent layer R times IN THE PRODUCTION BARRIER CONFIG (elision ON,
+    /// via forward_layer_batch_debug → the real b_step bodies, NOT the
+    /// over-barriered verify harness) and hash each intermediate buffer in
+    /// pipeline order. The FIRST non-deterministic stage is where the
+    /// elision-dropped barrier lives. This is the decode-race determinism
+    /// probe applied INSIDE the batched layer.
+    pub fn gdn_determinism_localize(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd_ctx: &CommandContext,
+        model: &LoadedModel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cfg = self.config.clone();
+        let spec = cfg.qwen35.as_ref().expect("gdn_determinism_localize: not qwen35");
+        let hidden = cfg.hidden_dim as usize;
+        let cc = spec.conv_channels() as usize;
+        let h = spec.num_v_heads() as usize;
+        let s_v = spec.ssm_d_state as usize;
+        let head_k = spec.head_k_dim() as usize;
+        let layer = (0..spec.block_count).find(|&l| spec.is_recurrent_layer(l)).expect("no recurrent layer");
+        let n = 8u32; let nn = n as usize; let runs = 4;
+        let mut x = vec![0f32; nn * hidden];
+        for p in 0..nn { for i in 0..hidden {
+            x[p * hidden + i] = 0.18 * (0.29 * p as f32 + 0.015 * i as f32).sin() + 0.06 * (0.004 * i as f32).cos() - 0.10;
+        }}
+        let fnv = |v: &[f32]| -> u64 {
+            let mut hsh: u64 = 0xcbf29ce484222325;
+            for f in v { for b in f.to_le_bytes() { hsh ^= b as u64; hsh = hsh.wrapping_mul(0x100000001b3); } }
+            hsh
+        };
+        let stages: [(&str, vk::Buffer, usize); 6] = [
+            ("qkv  (proj GEMM)",        self.ssm_qkv_buf.as_ref().unwrap().handle,        nn * cc),
+            ("gate (alpha-gate)",       self.ssm_gate_buf.as_ref().unwrap().handle,       nn * h),
+            ("conv_out(conv+silu+l2)",  self.ssm_conv_output_buf.as_ref().unwrap().handle, nn * cc),
+            ("qrep (repeat-qk)",        self.ssm_qrep_buf.as_ref().unwrap().handle,       nn * head_k * h),
+            ("gdn_out (GDN loop)",      self.ssm_gdn_out_buf.as_ref().unwrap().handle,    nn * s_v * h),
+            ("norm_out(norm-gated)",    self.ssm_norm_out_buf.as_ref().unwrap().handle,   nn * s_v * h),
+        ];
+        println!("\n=== GDN determinism localize (recurrent layer {layer}, ELISION ON, {runs} runs, N={n}) ===");
+        let mut hh: Vec<Vec<u64>> = vec![Vec::new(); stages.len() + 1];
+        for _ in 0..runs {
+            self.ssm_persistent_initialized = false;
+            let (out, _k, _v) = self.forward_layer_batch_debug(dev, registry, cmd_ctx, model, layer, n, &x[..nn * hidden])?;
+            for (si, (_, buf, sz)) in stages.iter().enumerate() {
+                let data = self.stage_buf_region(dev, cmd_ctx, *buf, 0, *sz as u32)?;
+                hh[si].push(fnv(&data));
+            }
+            hh[stages.len()].push(fnv(&out));
+        }
+        let distinct = |v: &Vec<u64>| { let mut s = v.clone(); s.sort(); s.dedup(); s.len() };
+        for (si, (name, _, _)) in stages.iter().enumerate() {
+            let d = distinct(&hh[si]);
+            println!("  {name}: {d} distinct/{runs} -> {}", if d == 1 { "det" } else { "NON-DET <<<" });
+        }
+        let od = distinct(&hh[stages.len()]);
+        println!("  recurrent layer-output: {od} distinct/{runs} -> {}", if od == 1 { "det" } else { "NON-DET" });
+        // Also test the FULL-ATTN batched layer at N>1 (the v0.5.4 determinism
+        // probe only ran N=1 → never exercised the multi-token full-attn path).
+        let fa = (0..spec.block_count).find(|&l| spec.is_full_attention_layer(l) && !spec.is_mtp_block(l));
+        if let Some(fl) = fa {
+            let mut fo: Vec<u64> = Vec::new();
+            for _ in 0..runs {
+                self.ssm_persistent_initialized = false;
+                let (out, _k, _v) = self.forward_layer_batch_debug(dev, registry, cmd_ctx, model, fl, n, &x[..nn * hidden])?;
+                fo.push(fnv(&out));
+            }
+            let fd = distinct(&fo);
+            println!("  FULL-ATTN layer {fl} output @N={n}: {fd} distinct/{runs} -> {}", if fd == 1 { "det" } else { "NON-DET <<<" });
+        }
+        self.ssm_persistent_initialized = false;
+        Ok(())
+    }
+
     /// De-risk substep oracle — run ONE real DECODE layer (`dispatch_layer`,
     /// the same path `forward_token` uses) at `position` and return its
     /// post-layer `(k_buf, v_buf)` rows (each `kv_dim`). At N=1/pos 0 these
