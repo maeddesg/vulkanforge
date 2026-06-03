@@ -2540,16 +2540,14 @@ impl BatchExec {
         // GDN-Completion #5 — batched alpha-gate over N tokens.
         // alpha = GEMM(ssm_alpha.weight @ batch_norm) [N×H]; alpha += dt.bias;
         // alpha = softplus(alpha); gate = alpha * ssm_a. dt.bias / ssm_a are
-        // per-head [H] constants → tiled into gate_buf (the op's own output,
-        // free as scratch until step 4) so run_binary's same-size element-wise
-        // covers the per-token broadcast.
+        // per-head [H] constants → broadcast over the token axis via
+        // run_binary_bcast (NOT copied: weight buffers lack TRANSFER_SRC).
         let seq_len = batch_seq_len(ctx);
         let input = fwd.batch_norm.handle;
         let alpha_buf = fwd.ssm_alpha_buf.as_ref().unwrap().handle;
         let gate_buf  = fwd.ssm_gate_buf.as_ref().unwrap().handle;
         let n_heads   = spec.num_v_heads();
         let ne = seq_len * n_heads;
-        let head_bytes = (n_heads as u64) * 4;
 
         // 1. alpha = ssm_alpha.weight @ batch_norm (GEMM M=N, F32 weight).
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[input]);
@@ -2561,16 +2559,11 @@ impl BatchExec {
         fwd.mark_written(&[alpha_buf]);
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[alpha_buf]);
 
-        // 2. alpha += dt.bias (tile [H] → gate_buf [N×H], element-wise add).
+        // 2. alpha += dt.bias (broadcast [H] over N tokens).
         let dt_bias = layer_weight(ctx.model, layer, "ssm_dt.bias");
-        for t in 0..seq_len as u64 {
-            let region = vk::BufferCopy { src_offset: 0, dst_offset: t * head_bytes, size: head_bytes };
-            unsafe { ctx.dev.device.cmd_copy_buffer(ctx.cmd, dt_bias, gate_buf, std::slice::from_ref(&region)); }
-        }
-        transfer_to_compute_barrier(ctx.dev, ctx.cmd);
-        fwd.run_binary(
+        fwd.run_binary_bcast(
             ctx.dev, ctx.registry, ctx.cmd, ShaderId::Add,
-            alpha_buf, gate_buf, alpha_buf, ne, "b_ssm_alpha_add_dt",
+            alpha_buf, dt_bias, alpha_buf, seq_len, n_heads, "b_ssm_alpha_add_dt",
         );
         fwd.mark_written(&[alpha_buf]);
         fwd.force_internal_barrier(ctx.dev, ctx.cmd, &[alpha_buf]);
@@ -2580,16 +2573,11 @@ impl BatchExec {
         fwd.mark_written(&[alpha_buf]);
         fwd.force_internal_barrier(ctx.dev, ctx.cmd, &[alpha_buf]);
 
-        // 4. gate = alpha * ssm_a (tile ssm_a → gate_buf, then in-place mul).
+        // 4. gate = alpha * ssm_a (broadcast [H] over N tokens).
         let ssm_a = layer_weight(ctx.model, layer, "ssm_a");
-        for t in 0..seq_len as u64 {
-            let region = vk::BufferCopy { src_offset: 0, dst_offset: t * head_bytes, size: head_bytes };
-            unsafe { ctx.dev.device.cmd_copy_buffer(ctx.cmd, ssm_a, gate_buf, std::slice::from_ref(&region)); }
-        }
-        transfer_to_compute_barrier(ctx.dev, ctx.cmd);
-        fwd.run_binary(
+        fwd.run_binary_bcast(
             ctx.dev, ctx.registry, ctx.cmd, ShaderId::Mul,
-            alpha_buf, gate_buf, gate_buf, ne, "b_ssm_alpha_mul_a",
+            alpha_buf, ssm_a, gate_buf, seq_len, n_heads, "b_ssm_alpha_mul_a",
         );
         fwd.mark_written(&[gate_buf]);
         fwd.maybe_compute_barrier(ctx.dev, ctx.cmd, &[gate_buf]);

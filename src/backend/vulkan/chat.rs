@@ -202,20 +202,21 @@ impl ChatSession {
 
         // Sprint G-2i — Qwen3.6 BatchExec prefill has unidentified
         // barrier/layout bugs that DecodeExec path doesn't share.
-        // Sprint G-3 Phase 4 re-confirmed: BatchExec emits empty/single-
-        // token gibberish for default chat prompts even after the G-2i
-        // deinterleave fix. Per-token-prefill stays default for Qwen3.6
-        // until G-4+ locates the divergence (deferred — speed work
-        // focuses on decode where the win is bigger).
-        // Diagnose-Override (gated, default-off): VF_QWEN35_FORCE_BATCH=1
-        // drives the known-broken (G-2i) BatchExec qwen35 prefill ON
-        // PURPOSE to localize the divergence. Production stays per-token
-        // (the workaround); this only flips qwen35 back onto prefill_batch.
-        let qwen35_force_batch = cfg.qwen35.is_some()
-            && std::env::var("VF_QWEN35_FORCE_BATCH").as_deref() == Ok("1");
+        // GDN-Completion E2E — the qwen35 batched prefill path (GDN + Full-Attn
+        // over seq_len=N) is now component-verified end-to-end (cores bit-ident,
+        // full-layer integration cos=1.0 @~1e-5, N=2..32). `VF_QWEN35_BATCHED=1`
+        // (opt-in, default-OFF) flips qwen35 onto the batched `prefill_batch`
+        // path; unset = per-token prefill — the unchanged production default
+        // and escape-hatch. Decode is unaffected either way. The default-flip
+        // is a separate owner call, informed by the measured speedup + broader
+        // real-world validation. `VF_QWEN35_FORCE_BATCH` kept as a back-compat
+        // alias (the earlier diagnostic name).
+        let qwen35_batched = cfg.qwen35.is_some()
+            && (std::env::var("VF_QWEN35_BATCHED").as_deref() == Ok("1")
+                || std::env::var("VF_QWEN35_FORCE_BATCH").as_deref() == Ok("1"));
         let force_pt_prefill = (cfg.qwen35.is_some()
             || std::env::var("VF_FORCE_PER_TOKEN_PREFILL").is_ok())
-            && !qwen35_force_batch;
+            && !qwen35_batched;
         let result = generate_from_tokens(
             &mut self.forward,
             dev, registry, cmd_ctx, model,

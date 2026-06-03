@@ -1302,6 +1302,55 @@ impl Forward {
         });
     }
 
+    /// GDN-Completion #5 fix — broadcasting binary op: `d[t,h] = a[t,h] OP
+    /// b[h]` for a row-major `[n_outer × n_inner]` `a`/`d` and a per-inner
+    /// `[n_inner]` `b` (broadcast across the outer/token axis). Uses the
+    /// generic-binary shader's `src1_idx` broadcast: with `nb11=0` the outer
+    /// index drops out, so `b` is read at the inner index only. Replaces the
+    /// invalid "tile the weight via cmd_copy" path (weights lack TRANSFER_SRC).
+    pub(super) fn run_binary_bcast(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        shader: ShaderId,
+        a: vk::Buffer,
+        b: vk::Buffer,
+        d: vk::Buffer,
+        n_outer: u32,
+        n_inner: u32,
+        label: &str,
+    ) {
+        let kernel = registry.get(shader);
+        let set = self.alloc_or_get_set(
+            dev, kernel.descriptor_set_layout,
+            &[(0, a, 0, 0), (1, b, 0, 0), (2, d, 0, 0)],
+        );
+        let ne = n_outer * n_inner;
+        let pc = GenericBinaryPushConstants {
+            ne,
+            // a / d: row-major [n_outer][n_inner].
+            ne00: n_inner, ne01: n_outer, ne02: 1, ne03: 1,
+            nb00: 1, nb01: n_inner, nb02: ne, nb03: ne,
+            // b: [n_inner], broadcast over the outer axis (nb11 = 0).
+            ne10: n_inner, ne11: n_outer, ne12: 1, ne13: 1,
+            nb10: 1, nb11: 0, nb12: 0, nb13: 0,
+            ne20: n_inner, ne21: n_outer, ne22: 1, ne23: 1,
+            nb20: 1, nb21: n_inner, nb22: ne, nb23: ne,
+            misalign_offsets: 0,
+            param1: 0.0, param2: 0.0, param3: 0,
+        };
+        let dispatch_y = (ne + 511) / 512;
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+            dev.device.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc));
+            dev.device.cmd_dispatch(cmd, 1, dispatch_y, 1);
+        });
+    }
+
     pub(super) fn run_binary(
         &mut self,
         dev: &VulkanDevice,

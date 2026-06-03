@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.5.5 — qwen35 batched prefill (opt-in): 4–11× prefill speedup, value-preserving (2026-06-03)
+
+Adds an **opt-in batched prefill path** for **Qwen3.6-27B-MTP (qwen35)**, the
+hybrid Linear-Attn (Gated-Delta-Net) + Full-Attention model. Set
+`VF_QWEN35_BATCHED=1` to route qwen35 prefill through the batched
+`prefill_batch` executor instead of the per-token decode loop. **Default-OFF**
+— unset is the unchanged per-token production path (the escape-hatch). Decode
+is unaffected either way.
+
+**Speedup (warm, RX 9070 XT, Q3_K_S, KV-FP8).** Prefill throughput vs the
+per-token path, growing with prompt length (the batched projections amortize):
+
+| prompt length | per-token | batched | speedup |
+|---------------|-----------|---------|---------|
+| ~24 tokens    | 32 t/s    | 130 t/s | 4.1×    |
+| 218 tokens    | 33 t/s    | 338 t/s | 10.2×   |
+| 1098 tokens   | 32 t/s    | 358 t/s | 11.2×   |
+
+**Value-preserving.** Greedy (temperature 0) output is byte-identical to the
+per-token path; fact-recall (Paris / 17×23=391 / Jupiter) and a 5-prompt
+coherence smoke all pass; prompts beyond `max_prefill_tokens` chunk correctly
+(recurrent conv/ssm state + KV carry across chunks). Decode throughput neutral.
+
+**How it works.** The serial cross-token cores (the SSM causal conv and the
+Gated-Delta-Net recurrence) run as N sequential single-token dispatches with
+state-carry, reusing the verified decode bodies; the projections (qkv / gate-z /
+beta / ssm_alpha / out-proj) become batched GEMM (M=N) — that's where the
+speedup lives, since the cross-token cores are inherently serial. Each stage was
+verified against the deterministic decode oracle: the cores bit-identically, the
+full layer at the ~1e-5 gemv-vs-gemm baseline (cos→1.0, N=2..32).
+
+The default-flip (making batched prefill the qwen35 default) is a separate
+decision pending broader real-world validation; v0.5.5 ships it opt-in.
+
 ## v0.5.4 — qwen35 decode correctness/determinism fix (gated-output → o-proj RAW race) (2026-06-03)
 
 Fixes a real data race in the **Qwen3.6-27B-MTP (qwen35)** decode path that made
