@@ -1378,6 +1378,28 @@ fn run_mtp_decode_loop(
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&v| (1..=8).contains(&v))
         .unwrap_or(3);
+
+    // Sprint MTP Phase-Flip S1/S2 — gated per-phase wall-clock + submit
+    // breakdown. Every MTP phase is a standalone submit+wait (the verify
+    // is `prefill_batch`), so a phase's CPU wall delta IS its
+    // submit→GPU→readback roundtrip cost. The chain-capture / set-h
+    // copies are ~20 KB single-copy submits → they double as the fixed
+    // per-submit roundtrip-latency probe (Bucket A). Zero overhead and no
+    // behaviour change when `VF_MTP_TIMER` is unset.
+    let mtp_timer = std::env::var("VF_MTP_TIMER").as_deref() == Ok("1");
+    let mut t_draft = Duration::ZERO; // n× mtp_draft_logits (block-64 fwd + lm_head + readback)
+    let mut t_chain = Duration::ZERO; // (n-1)× mtp_chain_capture_hidden (tiny copy = fixed-latency probe)
+    let mut t_snapshot = Duration::ZERO; // snapshot_recurrent_state (~150 MB copy)
+    let mut t_verify = Duration::ZERO; // prefill_batch (batched verify of n+1 tokens)
+    let mut t_argmax = Duration::ZERO; // (n+1)× per-position final-norm + lm_head + readback
+    let mut t_recon_full = Duration::ZERO; // full-accept: set_h_from_batch_row (tiny copy)
+    let mut t_recon_partial = Duration::ZERO; // partial: restore (~150 MB) + (m+1)× forward_token
+    let mut n_draft: u64 = 0;
+    let mut n_chain: u64 = 0;
+    let mut n_argmax: u64 = 0;
+    let mut n_replay: u64 = 0;
+    let loop_start = Instant::now();
+
     let max_seq = forward.kv_cache.config.max_seq_len;
     let max_tokens = config.max_tokens as usize;
     let mut generated: Vec<u32> = Vec::new();
@@ -1456,18 +1478,32 @@ fn run_mtp_decode_loop(
         let mut e = embed_lookup(embed_src, cfg, cur)?;
         let mut dpos = pos;
         for i in 0..n {
+            let tf = Instant::now();
             let dl = forward.mtp_draft_logits(dev, registry, cmd_ctx, model, &e, dpos)?;
+            if mtp_timer {
+                t_draft += tf.elapsed();
+                n_draft += 1;
+            }
             let d = argmax(&dl) as u32;
             drafts.push(d);
             if i + 1 < n {
+                let tc = Instant::now();
                 forward.mtp_chain_capture_hidden(dev, cmd_ctx)?;
+                if mtp_timer {
+                    t_chain += tc.elapsed();
+                    n_chain += 1;
+                }
                 e = embed_lookup(embed_src, cfg, d)?;
                 dpos += 1;
             }
         }
 
         // 2. Snapshot S_pos, batched verify of [cur, d_1..d_n], per-pos argmax.
+        let ts = Instant::now();
         forward.snapshot_recurrent_state(dev, cmd_ctx)?;
+        if mtp_timer {
+            t_snapshot += ts.elapsed();
+        }
         let mut verify_toks: Vec<u32> = Vec::with_capacity(n + 1);
         verify_toks.push(cur);
         verify_toks.extend_from_slice(&drafts);
@@ -1475,10 +1511,19 @@ fn run_mtp_decode_loop(
         for &t in &verify_toks {
             embeds.extend(embed_lookup(embed_src, cfg, t)?);
         }
+        let tv = Instant::now();
         forward.prefill_batch(
             dev, registry, cmd_ctx, model, &embeds, (n + 1) as u32, pos, &verify_toks,
         )?;
+        if mtp_timer {
+            t_verify += tv.elapsed();
+        }
+        let ta = Instant::now();
         let v = forward.mtp_verify_argmax(dev, registry, cmd_ctx, model, (n + 1) as u32)?;
+        if mtp_timer {
+            t_argmax += ta.elapsed();
+            n_argmax += (n + 1) as u64;
+        }
 
         // 3. Accept: longest prefix d_{i+1} == v_i.
         let mut m = 0usize;
@@ -1496,9 +1541,14 @@ fn run_mtp_decode_loop(
             // Keep the verify's live state (= committed; prefill_batch
             // already set kv = pos+n+1 = pos+m+1). Refresh the draft h_t
             // from the last committed row of batch_residual (= hidden@pos+m).
+            let tr = Instant::now();
             forward.set_kv_seq_len(pos + m as u32 + 1);
             forward.mtp_set_h_from_batch_row(dev, cmd_ctx, m as u32)?;
+            if mtp_timer {
+                t_recon_full += tr.elapsed();
+            }
         } else {
+            let tr = Instant::now();
             forward.restore_recurrent_state(dev, cmd_ctx)?;
             forward.set_kv_seq_len(pos);
             // Replay cur, d_1..d_M via the verified decode path.
@@ -1512,6 +1562,10 @@ fn run_mtp_decode_loop(
                 rp += 1;
             }
             // last forward_token left mtp_h_buf = hidden@(pos+m). ✓
+            if mtp_timer {
+                t_recon_partial += tr.elapsed();
+                n_replay += (m as u64) + 1;
+            }
         }
 
         // 5. Emit cur + accepted drafts; carry bonus as next cur.
@@ -1549,6 +1603,63 @@ fn run_mtp_decode_loop(
          gen={} (byte-ident to plain greedy by construction)",
         generated.len()
     );
+
+    // Sprint MTP Phase-Flip S1/S2 — per-phase wall-clock + submit breakdown.
+    if mtp_timer && iters > 0 {
+        let total = loop_start.elapsed();
+        let measured = t_draft + t_chain + t_snapshot + t_verify + t_argmax
+            + t_recon_full + t_recon_partial;
+        let other = total.saturating_sub(measured);
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        let pc = |d: Duration| {
+            if total.as_nanos() > 0 {
+                100.0 * d.as_secs_f64() / total.as_secs_f64()
+            } else {
+                0.0
+            }
+        };
+        let pi = |d: Duration| ms(d) / iters as f64;
+        // Loop-level standalone submits per iter: n draft + (n-1) chain +
+        // 1 snapshot + (n+1) argmax + reconcile (1 full | 1 restore +
+        // (m+1) replay). The verify's prefill_batch issues `verify_subs`
+        // more internally.
+        let verify_subs = forward.prefill_submit_count();
+        let loop_subs = n_draft + n_chain + iters /*snapshot*/ + n_argmax
+            + full_accepts /*set_h*/
+            + (iters - full_accepts) /*restore*/ + n_replay;
+        let fixed_lat_ms = if n_chain + full_accepts > 0 {
+            // chain-capture + set-h are ~20 KB single-copy submits → the
+            // fixed submit→wait roundtrip latency.
+            ms(t_chain + t_recon_full) / (n_chain + full_accepts) as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[MTP_TIMER] n={n} iters={iters} total_loop={:.1}ms ms/iter={:.2}\n  \
+             draft       {:8.1}ms {:5.1}%  {:6.2}ms/iter ({} calls, {:.2}ms/call)\n  \
+             chain-copy  {:8.1}ms {:5.1}%  {:6.2}ms/iter ({} calls, {:.3}ms/call=FIXED-LAT)\n  \
+             snapshot    {:8.1}ms {:5.1}%  {:6.2}ms/iter (~150MB copy)\n  \
+             verify      {:8.1}ms {:5.1}%  {:6.2}ms/iter (prefill_batch, {} submits each)\n  \
+             argmax-extr {:8.1}ms {:5.1}%  {:6.2}ms/iter ({} calls)\n  \
+             recon_full  {:8.1}ms {:5.1}%  {:6.2}ms/iter ({} full-accepts)\n  \
+             recon_part  {:8.1}ms {:5.1}%  {:6.2}ms/iter (restore+replay, {} replays)\n  \
+             other/cpu   {:8.1}ms {:5.1}%\n  \
+             loop-level submits/iter={:.1} (+{} verify-internal) ; fixed roundtrip-lat≈{:.3}ms",
+            ms(total), ms(total) / iters as f64,
+            ms(t_draft), pc(t_draft), pi(t_draft), n_draft,
+            if n_draft > 0 { ms(t_draft) / n_draft as f64 } else { 0.0 },
+            ms(t_chain), pc(t_chain), pi(t_chain), n_chain,
+            if n_chain > 0 { ms(t_chain) / n_chain as f64 } else { 0.0 },
+            ms(t_snapshot), pc(t_snapshot), pi(t_snapshot),
+            ms(t_verify), pc(t_verify), pi(t_verify), verify_subs,
+            ms(t_argmax), pc(t_argmax), pi(t_argmax), n_argmax,
+            ms(t_recon_full), pc(t_recon_full), pi(t_recon_full), full_accepts,
+            ms(t_recon_partial), pc(t_recon_partial), pi(t_recon_partial), n_replay,
+            ms(other), pc(other),
+            loop_subs as f64 / iters as f64, verify_subs, fixed_lat_ms,
+        );
+    }
+
     let text = String::from_utf8_lossy(&text_bytes).into_owned();
     Ok((generated, stopped_on_eos, text.clone(), text))
 }

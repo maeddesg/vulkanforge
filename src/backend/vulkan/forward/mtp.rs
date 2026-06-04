@@ -47,6 +47,21 @@ impl Forward {
         self.kv_cache.current_seq_len
     }
 
+    /// Sprint MTP Phase-Flip (measurement) — how many vkQueueSubmits a
+    /// `prefill_batch` (the MTP verify) issues internally:
+    /// `ceil(n_layers / layers_per_submit)` on the chunked multi-submit
+    /// path, else 1. Lets the verify-phase submit count be reported
+    /// alongside the loop-level standalone-submit count without exposing
+    /// `layers_per_submit` outside the `forward` module.
+    pub(crate) fn prefill_submit_count(&self) -> u32 {
+        let lps = self.layers_per_submit;
+        if lps > 0 && lps < self.config.n_layers {
+            self.config.n_layers.div_ceil(lps)
+        } else {
+            1
+        }
+    }
+
     /// Rewind/advance the KV write position. Used by the rollback path
     /// to undo a throwaway forward's `current_seq_len += 1`; the stale
     /// KV slot itself is overwritten by the next real forward.
