@@ -34,9 +34,42 @@ Pflicht-Endpoints in v0.4:
 
 | Path | Methode | Funktion |
 |---|---|---|
-| `POST /v1/chat/completions` | POST | Streaming + Non-Streaming Chat |
+| `POST /v1/chat/completions` | POST | Streaming + Non-Streaming Chat; **Function/Tool-Calling** (Qwen3/Hermes) |
+| `POST /v1/completions` | POST | Legacy Text-Completion (roher Prompt, KEIN Chat-Template); Streaming + Non-Streaming |
 | `GET /v1/models` | GET | Geladenes Modell enumerieren |
 | `GET /health` | GET | Liveness-Probe |
+
+> **`/v1/completions` (post-v0.5.6, additiv).** Maximale Wiederverwendung
+> des chat-Pfads: identischer Generierungskern (`generate_from_tokens`),
+> Sampling-Mapping (`SamplingParams::from_parts`, geteilt), Permit, KV-Reset,
+> max_tokens-Clamp, ThinkFilter, SSE-Transport (`StreamKind`-Diskriminator),
+> Usage. EINZIGER Unterschied: roher `prompt`-String → `Tokenizer::encode_with_special`
+> (parse_special, kein Auto-BOS) statt `template.render_full_history` — KEIN
+> Chat-Template. Response = `text_completion`-Form (`cmpl-…`, `choices[].text`).
+> Byte-identisch zu `/v1/chat/completions`, wenn der von chat intern gerenderte
+> Prompt-String roh durch `/v1/completions` geschickt wird (Korrektheits-Gate).
+> `prompt` = ein String (Array/Token-ID = Folge-Sprint). Akzeptiert-aber-ignoriert
+> (warn): `suffix`, `best_of`, `n>1`, `logprobs`, `logit_bias`, `echo`, `presence_penalty`.
+
+> **Function/Tool-Calling (OpenAI-kompatibel, Qwen3/Hermes; post-completions).** `tools`/`tool_choice`(auto|none) +
+> `role:tool` + `assistant.tool_calls`. VF ist **hand-rolled** (KEINE Jinja-Engine) → die Tool-Logik liegt in
+> `server/tools.rs` + dem chat-Handler, NICHT im Template: Tool-Defs rendern als `<tools>`-Section in die system-Message,
+> `role:tool` → user-`<tool_response>`-Turn, `assistant.tool_calls` → `<tool_call>`-Blöcke — alles als ChatML-Text durch
+> den UNVERÄNDERTEN Renderer. Output-Parsing: `<tool_call>{json}</tool_call>` (post-ThinkFilter) → `message.tool_calls` +
+> `finish_reason:tool_calls` (mehrere/Text+Call/malformed graceful). Streaming: kompletter Block als EIN
+> `delta.tool_calls` (v1, kein char-arg-stream). **Inert ohne `tools`** (kein Gate; no-tools-Pfad byte-ident). Am echten
+> Qwen3-8B verifiziert (E2E-Round-Trip). v1 = Qwen3/Hermes + auto/none; andere Familien / required+named /
+> char-arg-stream = Folge-Sprints.
+
+> **KV-Prefix-Reuse (post-completions, gegatet `VF_KV_PREFIX_REUSE`, default OFF).** Statt jeden Request voll zu
+> prefillen (v0.4-Default), behält der Server die KV des letzten Requests, findet den **längsten gemeinsamen Token-Prefix**
+> `k` (exakter id-Vergleich), wiederverwendet KV `[0..k)` und prefillt nur den Suffix `[k..)` (RoPE-Positionen ab k) →
+> Multi-Turn/agentisch (wachsender Kontext) überspringt das Re-Prefill der geteilten History. Liegt im **geteilten**
+> `ServerSession::generate_reuse` → chat + completions profitieren. **Wert-bewahrend:** reused KV `[0..k)` ist byte-ident
+> zu einem frischen Prefill derselben k Tokens (gleiche ids/RoPE-Positionen/deterministische FP8-Quant); Output byte-ident
+> zu full-reprefill @temp0. `k = min(lcp, len-1)` (immer ≥1 Token prefillen → fresh seed-logits); `k=0` → reset+voll;
+> Error/Cancel → invalidieren. EINE retained Session (letzter Request); Multi-Slot = Folge-Sprint. **OFF-Pfad bit-ident
+> zu v0.4** (reset-per-request unverändert). Default-Flip = Owner-Call nach byte-ident-Gate.
 
 ### 1.2 Scope (v0.4 Out)
 

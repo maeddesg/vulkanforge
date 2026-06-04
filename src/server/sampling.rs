@@ -12,7 +12,7 @@
 //! mapping in its own module means the math is unit-testable without
 //! pulling in the GPU stack.
 
-use super::types::request::ChatCompletionRequest;
+use super::types::request::{ChatCompletionRequest, CompletionRequest, StopSequence};
 
 /// Resolved sampling parameters. Mirrors VF's existing
 /// `crate::backend::vulkan::decode::Sampling` shape but lives in its
@@ -44,29 +44,56 @@ impl SamplingParams {
     /// the loaded model's `max_seq_len` and resolves `seed = None`
     /// to a clock-derived value.
     pub fn from_request(req: &ChatCompletionRequest) -> Self {
-        let temperature = req.temperature.unwrap_or(1.0).clamp(0.0, 2.0);
+        Self::from_parts(
+            req.temperature, req.top_p, req.top_k, req.repetition_penalty,
+            req.frequency_penalty, req.max_tokens, req.stop.clone(), req.seed,
+        )
+    }
+
+    /// Same OpenAI→VF mapping for the legacy `/v1/completions` body.
+    /// Reuses [`from_parts`] verbatim — the sampling semantics are
+    /// identical to chat; only the prompt-shaping differs.
+    pub fn from_completion_request(req: &CompletionRequest) -> Self {
+        Self::from_parts(
+            req.temperature, req.top_p, req.top_k, req.repetition_penalty,
+            req.frequency_penalty, req.max_tokens, req.stop.clone(), req.seed,
+        )
+    }
+
+    /// The single source of truth for the OpenAI→VF sampling mapping,
+    /// shared by chat and completions (§7.1/§7.2). Pure; no GPU state.
+    #[allow(clippy::too_many_arguments)]
+    fn from_parts(
+        temperature: Option<f32>,
+        top_p: Option<f32>,
+        top_k: Option<u32>,
+        repetition_penalty: Option<f32>,
+        frequency_penalty: Option<f32>,
+        max_tokens: Option<u32>,
+        stop: Option<StopSequence>,
+        seed: Option<u64>,
+    ) -> Self {
+        let temperature = temperature.unwrap_or(1.0).clamp(0.0, 2.0);
 
         // OpenAI documents top_p in (0, 1]; we accept the full
         // closed interval [0, 1] and let the downstream sampler
         // treat 0 as "filter everything except argmax" if it ever
         // matters. Clamp `> 1` defensively.
-        let top_p = req.top_p.unwrap_or(1.0).clamp(0.0, 1.0);
+        let top_p = top_p.unwrap_or(1.0).clamp(0.0, 1.0);
 
         // VF extension wins when both repetition_penalty and
         // frequency_penalty are present (§7.1).
-        let repetition_penalty = if let Some(r) = req.repetition_penalty {
+        let repetition_penalty = if let Some(r) = repetition_penalty {
             r.max(1.0)
         } else {
-            map_frequency_penalty(req.frequency_penalty)
+            map_frequency_penalty(frequency_penalty)
         };
 
         // §7.1: `top_k = 0` means disabled. We model that as `None`
         // here so the handler can pick a sensible default per model.
-        let top_k = req.top_k.and_then(|k| if k == 0 { None } else { Some(k) });
+        let top_k = top_k.and_then(|k| if k == 0 { None } else { Some(k) });
 
-        let stop_sequences = req
-            .stop
-            .clone()
+        let stop_sequences = stop
             .map(|s| {
                 let mut v = s.into_vec();
                 // OpenAI-spec hard limit. Excess silently dropped
@@ -86,9 +113,9 @@ impl SamplingParams {
             top_p,
             top_k,
             repetition_penalty,
-            max_tokens: req.max_tokens,
+            max_tokens,
             stop_sequences,
-            seed: req.seed,
+            seed,
         }
     }
 

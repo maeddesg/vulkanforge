@@ -15,4 +15,5 @@ pub mod sampling;
 pub mod serve;
 pub mod state;
 pub mod stream;
+pub mod tools;
 pub mod types;

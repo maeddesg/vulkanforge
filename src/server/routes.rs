@@ -30,9 +30,11 @@ pub fn build_router(state: Arc<AppState>, cors_enabled: bool) -> Router {
     Router::new()
         // Primary OpenAI-standard paths
         .route("/v1/chat/completions", post(handlers::chat::completions))
+        .route("/v1/completions", post(handlers::completions::completions))
         .route("/v1/models", get(handlers::models::list))
         // Alias paths without the /v1/ prefix
         .route("/chat/completions", post(handlers::chat::completions))
+        .route("/completions", post(handlers::completions::completions))
         .route("/models", get(handlers::models::list))
         // Operations
         .route("/health", get(handlers::health::check))

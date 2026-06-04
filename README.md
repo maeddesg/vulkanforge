@@ -204,6 +204,7 @@ flag is a default-on candidate for 14B FP8 on Zen 4.
 | CPU `lm_head` offload| `VF_CPU_LM_HEAD=1`         | AVX-512F + BW + VL (Zen 4 / Ice Lake+) | −970 MB VRAM, 14B +32 % decode |
 | On-the-fly Q4_K      | `VF_QUANTIZE_ON_LOAD=1`    | SafeTensors model with FP32 / BF16 weights | Quantize 2D weights to Q4_K_M at load; ~7× VRAM compression on quantized tensors, routes through the Q4_K shader pipeline. Gemma-4-E2B: decode +54 %, power −41 %, tok/s/W 1.39 |
 | FP8 KV-cache         | `VULKANFORGE_KV_FP8=1`     | Mesa 26.1+ (heterogeneous head_dim auto-handled) | −50 % KV-cache VRAM. Gemma-4-26B-A4B: 880 → 440 MB. |
+| KV prefix-reuse (API server, **default OFF**) | `VF_KV_PREFIX_REUSE=1` | `vulkanforge serve` (chat + completions) | Cross-request KV reuse: keeps the last request's KV and re-prefills only the suffix after the longest common token prefix → multi-turn / agentic (growing context) skips re-prefilling the shared history. Value-preserving (byte-identical to full re-prefill @temp 0). Single retained session (last request); errors/cancel invalidate. OFF = v0.4 stateless behavior, bit-identical. |
 | Expert-Grouped MoE prefill (**default ON** since v0.5.3) | (auto); opt-out `VF_MOE_GROUPED=0` | MoE model (Gemma-4-26B-A4B et al.) | +33–39 % prefill on Gemma-4-26B-A4B Q3_K_M (146 → ~199 t/s @pp512), value-preserving, decode-neutral. +~265 MB VRAM (MoE models only; dense/GDN unaffected). `VF_MOE_GROUPED=0` = legacy GPU-direct GEMV prefill. |
 | qwen35 decode determinism fix (**default ON** since v0.5.4) | (auto); opt-out `VF_QWEN35_DEC_GATE_BARRIER=0` | Qwen3.6-27B-MTP (qwen35) | Correctness fix: adds the missing gated-output → o-proj barrier so decode reads the fully-gated `attn_out`. Makes greedy decode bit-deterministic (was a RAW race, widened by `head_dim=256`). Decode-neutral, qwen35-only (no effect on other models). |
 | qwen35 batched prefill (**default ON** since v0.5.6) | (auto); opt-out `VF_QWEN35_BATCHED=0` | Qwen3.6-27B-MTP (qwen35) | qwen35 prefill runs through the batched executor (GDN + Full-Attn over seq_len=N; cross-token cores serial with state-carry, projections batched GEMM). **4–11× prefill speedup** (grows with prompt length; e.g. 1098-tok 32 → 358 t/s), deterministic + byte-identical to per-token (greedy), decode-neutral. `VF_QWEN35_BATCHED=0` = per-token prefill. (v0.5.5 shipped this opt-in; v0.5.6 fixed a conv-loop barrier-elision race that made it non-deterministic on near-tie prompts, and flipped it on by default.) |
@@ -291,12 +292,24 @@ vulkanforge serve --model ~/models/Qwen3-8B-Q4_K_M.gguf --port 8080
 
 | Path                         | Method | Description                          |
 |------------------------------|--------|--------------------------------------|
-| `/v1/chat/completions`       | POST   | Chat (streaming via SSE + sync JSON) |
+| `/v1/chat/completions`       | POST   | Chat (streaming via SSE + sync JSON); **function/tool calling** (Qwen3/Hermes) |
+| `/v1/completions`            | POST   | Legacy text-completion (raw prompt, no chat template; SSE + sync JSON) |
 | `/v1/models`                 | GET    | List loaded model                    |
 | `/health`                    | GET    | Liveness + KV-cache status           |
 
-The non-prefixed aliases `/chat/completions` and `/models` are also
-routed for clients that omit the `/v1/` prefix.
+The non-prefixed aliases `/chat/completions`, `/completions` and
+`/models` are also routed for clients that omit the `/v1/` prefix.
+
+**`/v1/completions`** generates from a **raw `prompt` string** with **no
+chat template applied** (the only difference from `/v1/chat/completions`;
+the sampling surface, streaming, stop, and usage are identical). The
+prompt is tokenized with special-token parsing, so a pre-rendered
+chat-template string round-trips to the same tokens the chat endpoint
+would produce. `prompt` is a single string in v0.5 (array-of-strings and
+token-id-array prompts are planned). Accepted-but-**ignored** (warn-logged)
+fields: `suffix`, `best_of`, `n>1`, `logprobs`, `logit_bias`, `echo`,
+`presence_penalty`. Responses use the `text_completion` object with a
+`cmpl-…` id and `choices[].text`.
 
 ### Examples
 
@@ -320,7 +333,52 @@ curl -N http://localhost:8080/v1/chat/completions \
     "stream_options": {"include_usage": true},
     "max_tokens": 50
   }'
+
+# Legacy text-completion — raw prompt, no chat template (non-streaming)
+curl http://localhost:8080/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-8b-q4_k_m",
+    "prompt": "The capital of France is",
+    "max_tokens": 16,
+    "temperature": 0
+  }'
+
+# Legacy text-completion (streaming SSE)
+curl -N http://localhost:8080/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "17 * 23 =",
+    "max_tokens": 16,
+    "temperature": 0,
+    "stream": true,
+    "stream_options": {"include_usage": true}
+  }'
+
+# Function/tool calling (OpenAI-compatible, Qwen3/Hermes models)
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-8b-q4_k_m",
+    "messages": [{"role": "user", "content": "What is the weather in Paris?"}],
+    "tools": [{"type":"function","function":{
+      "name":"get_weather",
+      "description":"Get current weather for a location",
+      "parameters":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}
+    }}],
+    "max_tokens": 128, "temperature": 0
+  }'
+# → choices[0].message.tool_calls:[{id,"type":"function","function":{"name":"get_weather","arguments":"{\"location\":\"Paris\"}"}}], finish_reason:"tool_calls"
+# Send the result back as {"role":"tool","tool_call_id":"<id>","content":"15C sunny"} for the final answer.
 ```
+
+**Function/tool calling** (`/v1/chat/completions`) is OpenAI-compatible for
+**Qwen3/Hermes** models: pass `tools` + optional `tool_choice` (`"auto"`/`"none"`);
+calls come back as `message.tool_calls` + `finish_reason:"tool_calls"`; send
+results back via `role:"tool"` messages. v1 covers the Qwen3/Hermes
+`<tool_call>` format; Llama-3.1/Mistral formats, `tool_choice:"required"`/named
+forcing, and char-incremental argument streaming are planned. Requests **without**
+`tools` are unaffected.
 
 ### Options
 

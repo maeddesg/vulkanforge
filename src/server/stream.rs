@@ -25,8 +25,10 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::server::cancel::CancelToken;
 use crate::server::error::ApiError;
-use crate::server::types::response::{FinishReason, Usage};
-use crate::server::types::streaming::ChatCompletionChunk;
+use crate::server::types::response::{FinishReason, ToolCall, Usage};
+use crate::server::types::streaming::{
+    ChatCompletionChunk, CompletionChunk, DeltaToolCall, DeltaToolCallFunction,
+};
 
 /// One unit of SSE output the GPU-side spawn_blocking task sends to
 /// the SSE adapter. The adapter is responsible for shaping each into
@@ -48,18 +50,34 @@ pub enum StreamEvent {
         /// `stream_options.include_usage`).
         include_usage: bool,
     },
+    /// Tool calls parsed from the (completed) generation. v1 emits the
+    /// whole block as a single delta (no char-incremental arguments).
+    /// Chat-only — the legacy completion endpoint ignores it.
+    ToolCalls(Vec<ToolCall>),
     /// Mid-stream error (GPU crash, tokenizer failure, etc.).
     /// Per §8.3 we surface this as a JSON event with `event: error`.
     Error(ApiError),
 }
 
+/// Which wire format the SSE adapter shapes its chunks into. The
+/// transport (channel, drop-guard cancel, keep-alive, `[DONE]`) is
+/// identical; only `events_for` branches on this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamKind {
+    /// `chat.completion.chunk` — `delta.role`/`delta.content`.
+    Chat,
+    /// `text_completion` — flat `choices[].text`, no header chunk.
+    Completion,
+}
+
 /// Metadata that is constant across every chunk of one streamed
-/// response. Filled in by the chat handler once before spawning
-/// the blocking task.
+/// response. Filled in by the handler once before spawning the
+/// blocking task.
 #[derive(Clone, Debug)]
 pub struct ChunkMeta {
     pub id: String,
     pub model: String,
+    pub kind: StreamKind,
 }
 
 /// Build the axum [`Sse`] response from a receiver of [`StreamEvent`]s.
@@ -142,6 +160,32 @@ impl<S> Drop for CancelOnDrop<S> {
 /// `Final` events with `include_usage = true` expand into two events
 /// (final-chunk + usage-only-chunk).
 fn events_for(meta: &ChunkMeta, ev: StreamEvent) -> Vec<Result<Event, Infallible>> {
+    // Completion (`text_completion`) shaping — flat `choices[].text`,
+    // no header chunk. Reuses the identical transport; only the JSON
+    // body differs from chat.
+    if meta.kind == StreamKind::Completion {
+        return match ev {
+            // text_completion streams have no role-announcing header.
+            StreamEvent::Header => Vec::new(),
+            StreamEvent::Delta(text) => {
+                let c = CompletionChunk::delta(meta.id.clone(), meta.model.clone(), text);
+                vec![Ok(json_event_str(&serde_json::to_string(&c).unwrap_or_default()))]
+            }
+            StreamEvent::Final { finish, usage, include_usage } => {
+                let mut events = Vec::with_capacity(2);
+                let fc = CompletionChunk::final_chunk(meta.id.clone(), meta.model.clone(), finish);
+                events.push(Ok(json_event_str(&serde_json::to_string(&fc).unwrap_or_default())));
+                if include_usage {
+                    let uc = CompletionChunk::usage_only(meta.id.clone(), meta.model.clone(), usage);
+                    events.push(Ok(json_event_str(&serde_json::to_string(&uc).unwrap_or_default())));
+                }
+                events
+            }
+            // Legacy /v1/completions has no tool-calls shape — drop.
+            StreamEvent::ToolCalls(_) => Vec::new(),
+            StreamEvent::Error(e) => error_events(e),
+        };
+    }
     match ev {
         StreamEvent::Header => {
             let chunk = ChatCompletionChunk::header(meta.id.clone(), meta.model.clone());
@@ -162,21 +206,41 @@ fn events_for(meta: &ChunkMeta, ev: StreamEvent) -> Vec<Result<Event, Infallible
             }
             events
         }
-        StreamEvent::Error(e) => {
-            // SSE convention: an event named `error` with the
-            // OpenAI error-body as the JSON data. Some clients
-            // ignore the event-type and parse data as a chunk;
-            // they'll see a JSON they don't recognise and stop,
-            // which is fine — the connection is going away.
-            let body = e.to_response_body();
-            let json = serde_json::to_string(&body).unwrap_or_else(|_| String::from("{}"));
-            vec![Ok(Event::default().event("error").data(json))]
+        StreamEvent::ToolCalls(calls) => {
+            let deltas: Vec<DeltaToolCall> = calls
+                .into_iter()
+                .enumerate()
+                .map(|(i, c)| DeltaToolCall {
+                    index: i as u32,
+                    id: c.id,
+                    kind: "function",
+                    function: DeltaToolCallFunction {
+                        name: c.function.name,
+                        arguments: c.function.arguments,
+                    },
+                })
+                .collect();
+            let chunk = ChatCompletionChunk::tool_calls(meta.id.clone(), meta.model.clone(), deltas);
+            vec![Ok(json_event(&chunk))]
         }
+        StreamEvent::Error(e) => error_events(e),
     }
+}
+
+/// SSE convention: an event named `error` with the OpenAI error-body
+/// as the JSON data. Shared by both chat and completion shaping.
+fn error_events(e: ApiError) -> Vec<Result<Event, Infallible>> {
+    let body = e.to_response_body();
+    let json = serde_json::to_string(&body).unwrap_or_else(|_| String::from("{}"));
+    vec![Ok(Event::default().event("error").data(json))]
 }
 
 fn json_event(chunk: &ChatCompletionChunk) -> Event {
     let s = serde_json::to_string(chunk).unwrap_or_else(|_| String::from("{}"));
+    Event::default().data(s)
+}
+
+fn json_event_str(s: &str) -> Event {
     Event::default().data(s)
 }
 
@@ -188,6 +252,15 @@ mod tests {
         ChunkMeta {
             id: "chatcmpl-test".into(),
             model: "qwen3-8b".into(),
+            kind: StreamKind::Chat,
+        }
+    }
+
+    fn cmpl_meta() -> ChunkMeta {
+        ChunkMeta {
+            id: "cmpl-test".into(),
+            model: "qwen3-8b".into(),
+            kind: StreamKind::Completion,
         }
     }
 
@@ -247,5 +320,32 @@ mod tests {
             StreamEvent::Error(ApiError::internal("boom", "gpu_error")),
         );
         assert_eq!(evs.len(), 1);
+    }
+
+    #[test]
+    fn completion_header_yields_no_event() {
+        // text_completion streams have no role header.
+        let evs = events_for(&cmpl_meta(), StreamEvent::Header);
+        assert_eq!(evs.len(), 0);
+    }
+
+    #[test]
+    fn completion_delta_yields_one_text_completion_event() {
+        let evs = events_for(&cmpl_meta(), StreamEvent::Delta("Paris".into()));
+        assert_eq!(evs.len(), 1);
+        assert!(evs[0].is_ok());
+    }
+
+    #[test]
+    fn completion_final_with_usage_yields_two_events() {
+        let evs = events_for(
+            &cmpl_meta(),
+            StreamEvent::Final {
+                finish: FinishReason::Stop,
+                usage: Usage::new(7, 3),
+                include_usage: true,
+            },
+        );
+        assert_eq!(evs.len(), 2);
     }
 }

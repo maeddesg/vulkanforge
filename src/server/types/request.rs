@@ -71,10 +71,19 @@ pub struct ChatCompletionRequest {
     pub top_logprobs: Option<u32>,
     #[serde(default)]
     pub response_format: Option<serde_json::Value>,
+    /// Function/tool definitions (OpenAI `tools`). When present, the
+    /// handler renders them into the prompt (Qwen3/Hermes `<tools>`
+    /// section) and parses `<tool_call>` blocks out of the output. v1
+    /// = Qwen3/Hermes format only.
     #[serde(default)]
-    pub tools: Option<serde_json::Value>,
+    pub tools: Option<Vec<ChatTool>>,
+    /// `"auto"` (default) or `"none"`. `"required"` / named-function
+    /// forcing are documented follow-ups (parsed leniently — unknown
+    /// values fall back to auto).
     #[serde(default)]
-    pub tool_choice: Option<serde_json::Value>,
+    pub tool_choice: Option<ToolChoice>,
+    /// Parsed for forward-compat; v1 emits at most the calls the model
+    /// produces (no server-side parallelism control).
     #[serde(default)]
     pub parallel_tool_calls: Option<bool>,
 
@@ -89,6 +98,78 @@ pub struct ChatCompletionRequest {
     pub repetition_penalty: Option<f32>,
     /// VF-extension, parsed for forward-compat. v0.4 doesn't honour
     /// it (no min-p sampler path yet); v0.5+ will (§7.1).
+    #[serde(default)]
+    pub min_p: Option<f32>,
+}
+
+/// Top-level JSON body of a legacy text-completion request
+/// (`POST /v1/completions`). Identical sampling surface to
+/// [`ChatCompletionRequest`]; the ONLY semantic difference is `prompt`
+/// (a raw string) in place of `messages` + the skipped chat-template
+/// step. `deny_unknown_fields` is deliberately NOT applied (same
+/// rationale as chat).
+///
+/// `prompt` is a single string in this sprint; array-of-strings and
+/// token-id-array prompts are documented follow-ups.
+#[derive(Debug, Deserialize)]
+pub struct CompletionRequest {
+    /// Single-Model server: accepted but ignored (mirrors chat).
+    #[serde(default)]
+    pub model: Option<String>,
+
+    /// The raw prompt. Tokenized with special-token parsing (so a
+    /// pre-rendered chat-template string round-trips), but NOT wrapped
+    /// in any chat template.
+    pub prompt: String,
+
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
+
+    // ---- OpenAI sampling fields (shared with chat, §7.1) ----
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    /// Accepted, logged, ignored (no presence path).
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub stop: Option<StopSequence>,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Only `n = 1` supported (rejected otherwise, like chat).
+    #[serde(default)]
+    pub n: Option<u32>,
+
+    // ---- Accepted-but-ignored legacy-completion fields (warn-logged) ----
+    /// Text inserted after the completion — no fill-in-middle path.
+    #[serde(default)]
+    pub suffix: Option<String>,
+    /// Server-side candidate generation; we only ever produce one.
+    #[serde(default)]
+    pub best_of: Option<u32>,
+    /// Per-token logprobs — not emitted.
+    #[serde(default)]
+    pub logprobs: Option<u32>,
+    /// Prepend the prompt to the completion — not implemented.
+    #[serde(default)]
+    pub echo: Option<bool>,
+    #[serde(default)]
+    pub logit_bias: Option<serde_json::Value>,
+
+    // ---- VF extensions (shared with chat) ----
+    #[serde(default)]
+    pub top_k: Option<u32>,
+    #[serde(default)]
+    pub repetition_penalty: Option<f32>,
     #[serde(default)]
     pub min_p: Option<f32>,
 }
@@ -142,7 +223,78 @@ impl StopSequence {
 #[derive(Debug, Deserialize)]
 pub struct Message {
     pub role: Role,
-    pub content: MessageContent,
+    /// Optional: an `assistant` message that ONLY makes tool calls has
+    /// `content: null`; a `tool` message carries the result here.
+    #[serde(default)]
+    pub content: Option<MessageContent>,
+    /// Present on `role:"tool"` messages — echoes the id of the
+    /// `assistant.tool_calls[*].id` this result answers.
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    /// Present on `assistant` history messages that called tools — the
+    /// prior turn's calls, rendered back into the prompt as
+    /// `<tool_call>…</tool_call>` so multi-turn round-trips work.
+    #[serde(default)]
+    pub tool_calls: Option<Vec<ToolCallSpec>>,
+}
+
+/// One entry of the OpenAI `tools` array (v1: only `type:"function"`).
+#[derive(Debug, Deserialize, Clone)]
+pub struct ChatTool {
+    #[serde(rename = "type", default = "default_function_type")]
+    pub kind: String,
+    pub function: ToolFunctionDef,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ToolFunctionDef {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// JSON-Schema for the arguments. Passed through verbatim into the
+    /// rendered `<tools>` section (the model reads it as documentation).
+    #[serde(default)]
+    pub parameters: Option<serde_json::Value>,
+}
+
+fn default_function_type() -> String {
+    "function".to_string()
+}
+
+/// OpenAI `tool_choice`. v1 honours the string forms `"auto"` / `"none"`;
+/// an object (named-function forcing) parses but is treated as `auto`
+/// (documented follow-up).
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    Mode(String),
+    Named(serde_json::Value),
+}
+
+impl ToolChoice {
+    /// `true` when the client explicitly disabled tools (`"none"`).
+    pub fn is_none_mode(&self) -> bool {
+        matches!(self, ToolChoice::Mode(s) if s == "none")
+    }
+}
+
+/// A tool call as it appears in `assistant.tool_calls` history (same
+/// wire shape as the response `ToolCall`).
+#[derive(Debug, Deserialize, Clone)]
+pub struct ToolCallSpec {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+    pub function: ToolCallFunctionSpec,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ToolCallFunctionSpec {
+    pub name: String,
+    /// Arguments as a JSON **string** (OpenAI convention).
+    #[serde(default)]
+    pub arguments: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -195,7 +347,7 @@ mod tests {
         assert_eq!(req.model, "qwen3-8b");
         assert_eq!(req.messages.len(), 1);
         assert!(matches!(req.messages[0].role, Role::User));
-        assert!(matches!(&req.messages[0].content, MessageContent::Text(t) if t == "Hi"));
+        assert!(matches!(&req.messages[0].content, Some(MessageContent::Text(t)) if t == "Hi"));
         assert!(!req.stream);
         assert!(req.stream_options.is_none());
         assert!(req.temperature.is_none());
@@ -307,7 +459,7 @@ mod tests {
         ]}"#;
         let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
         match &req.messages[0].content {
-            MessageContent::Parts(parts) => {
+            Some(MessageContent::Parts(parts)) => {
                 assert_eq!(parts.len(), 1);
                 assert!(matches!(&parts[0], ContentPart::Text { text } if text == "Hello"));
             }
@@ -324,7 +476,7 @@ mod tests {
         ]}"#;
         let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
         match &req.messages[0].content {
-            MessageContent::Parts(parts) => {
+            Some(MessageContent::Parts(parts)) => {
                 assert!(matches!(&parts[0], ContentPart::ImageUrl { .. }));
             }
             _ => panic!("expected Parts"),

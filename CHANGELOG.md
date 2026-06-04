@@ -1,5 +1,89 @@
 # Changelog
 
+## Unreleased — Function/Tool calling (OpenAI-compatible, Qwen3/Hermes) (2026-06-04)
+
+Adds OpenAI-compatible function/tool calling to `POST /v1/chat/completions`
+— VF becomes an agent backend (OpenCode/clients that drive tools).
+
+- **Request:** typed `tools: [{type:"function", function:{name, description,
+  parameters}}]` + `tool_choice: "auto"|"none"`; `messages` gains
+  `role:"tool"` (results) and `assistant` with `tool_calls` (history).
+- **Prompt rendering (Qwen3/Hermes):** tool defs render into the system
+  message as the `<tools>…</tools>` section; `role:tool` → a user
+  `<tool_response>` turn; assistant `tool_calls` → `<tool_call>` blocks.
+  All synthesised as plain ChatML text → the hand-rolled template is
+  **untouched** (no Jinja engine; the tool logic lives in `server/tools.rs`
+  + the chat handler).
+- **Output parsing:** `<tool_call>{json}</tool_call>` blocks (post-think-
+  filter) → `choices[0].message.tool_calls:[{id, type:"function",
+  function:{name, arguments(JSON-string)}}]`, `finish_reason:"tool_calls"`.
+  Robust to multiple calls, text+call mix, malformed JSON (best-effort,
+  never panics), no-call → normal content.
+- **Streaming:** the completed `<tool_call>` block is emitted as one
+  `delta.tool_calls` chunk (v1: **no** char-incremental argument streaming
+  — documented follow-up). ThinkFilter-safe.
+- **Inert without `tools`** — the no-tools path is byte-identical to before
+  (no env gate). Verified at the real Qwen3-8B model (E2E round-trip:
+  `get_weather` call → tool result → final answer).
+- **Scope (v1):** Qwen3/Hermes format, `tool_choice` auto/none. Llama-3.1/
+  Mistral/functionary formats, `required`/named-forcing, char-arg-streaming
+  = follow-ups.
+
+## Unreleased — cross-request KV prefix-reuse (API server, gated) (2026-06-04)
+
+Adds gated cross-request KV-cache prefix reuse to `vulkanforge serve`
+(`VF_KV_PREFIX_REUSE=1`, **default OFF**). Instead of re-prefilling every
+request from scratch (v0.4 stateless default), the server keeps the last
+request's KV, finds the **longest common token prefix** `k` with the new
+request, reuses KV `[0..k)`, and re-prefills only the suffix `[k..)` →
+multi-turn / agentic workloads (growing context) skip re-prefilling the
+shared history.
+
+- **Value-preserving:** the reused KV `[0..k)` is byte-identical to a
+  fresh prefill of the same `k` tokens at the same positions (same ids,
+  same RoPE positions, deterministic FP8 quant). Output is **byte-identical
+  to full re-prefill** at temp 0 (proven token- and output-level over a
+  multi-turn sequence + edge cases + a teeth test).
+- Lands in the **shared** `ServerSession::generate_reuse` → both
+  `/v1/chat/completions` **and** `/v1/completions` benefit.
+- `k = min(lcp, len-1)` always re-prefills ≥1 token so decode seeds from
+  fresh logits (handles the exact-prompt-repeat edge). `k = 0` → reset +
+  full prefill (today's path). Error/cancel mid-decode → KV + cache
+  invalidated (a partial KV is never reused).
+- **Scope:** ONE retained session (the last request); multi-slot =
+  follow-up. **OFF path is bit-identical** to v0.4 (the `reset()`-per-request
+  behavior is unchanged when the flag is off). Single-request permit model
+  unchanged.
+
+## Unreleased — `/v1/completions` legacy text-completion endpoint (2026-06-04)
+
+Adds `POST /v1/completions` (+ `/completions` alias), the OpenAI legacy
+text-completion endpoint, with streaming (SSE) and non-streaming support.
+
+**Maximal reuse of the chat path.** The endpoint shares the exact
+generation core (`generate_from_tokens`), sampling mapping
+(`SamplingParams`, refactored to a shared `from_parts`), concurrency
+permit, KV reset, `max_tokens` clamping, ThinkFilter, SSE transport, and
+usage computation with `/v1/chat/completions`. The **only** difference is
+the prompt: a raw `prompt` **string** tokenized directly with **no chat
+template applied**. Response uses the `text_completion` object (`cmpl-…`
+id, `choices[].text`).
+
+- **Tokenization:** new `Tokenizer::encode_with_special` parses special
+  tokens (llama.cpp `parse_special` semantics) so a pre-rendered
+  chat-template string round-trips to the same ids the template produces
+  — the basis for the chat↔completions byte-identity guarantee. No
+  auto-BOS (matches the templates, which prepend their own boundary).
+- **Streaming** reuses the chat SSE adapter via a `StreamKind`
+  discriminator on `ChunkMeta`; `text_completion` has no role-header
+  chunk (a `Header` event maps to zero output for the completion kind).
+- **Scope:** `prompt` is a single string; array-of-strings and
+  token-id-array prompts are follow-ups. Accepted-but-ignored
+  (warn-logged): `suffix`, `best_of`, `n>1`, `logprobs`, `logit_bias`,
+  `echo`, `presence_penalty`.
+- `chat/completions` path **unchanged**; output byte-identical to chat
+  when given chat's rendered prompt. Lib tests 251/251.
+
 ## v0.5.6 — qwen35 batched prefill is now the DEFAULT (conv-loop race fixed) (2026-06-03)
 
 Makes the batched prefill path the **default** for **Qwen3.6-27B-MTP (qwen35)**

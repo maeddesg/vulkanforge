@@ -50,6 +50,12 @@ impl ChatCompletionChunk {
         Self::base(id, model, vec![ChunkChoice::final_chunk(finish)], None)
     }
 
+    /// Tool-calls delta chunk (v1: the whole block emitted at once, no
+    /// char-incremental argument streaming).
+    pub fn tool_calls(id: String, model: String, calls: Vec<DeltaToolCall>) -> Self {
+        Self::base(id, model, vec![ChunkChoice::tool_calls(calls)], None)
+    }
+
     /// Usage-only chunk: `choices = []`, `usage` populated. Emitted
     /// after the final chunk when `stream_options.include_usage: true`.
     pub fn usage_only(id: String, model: String, usage: Usage) -> Self {
@@ -84,6 +90,7 @@ impl ChunkChoice {
             delta: Delta {
                 role: Some("assistant"),
                 content: None,
+                tool_calls: None,
             },
             finish_reason: None,
         }
@@ -95,6 +102,7 @@ impl ChunkChoice {
             delta: Delta {
                 role: None,
                 content: Some(text),
+                tool_calls: None,
             },
             finish_reason: None,
         }
@@ -107,6 +115,14 @@ impl ChunkChoice {
             finish_reason: Some(finish),
         }
     }
+
+    fn tool_calls(calls: Vec<DeltaToolCall>) -> Self {
+        Self {
+            index: 0,
+            delta: Delta { role: None, content: None, tool_calls: Some(calls) },
+            finish_reason: None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -117,6 +133,91 @@ pub struct Delta {
     /// Populated in mid-stream delta chunks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Populated in the tool-calls delta (v1: complete block at once).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<DeltaToolCall>>,
+}
+
+/// One tool call in a streaming `delta.tool_calls` (v1: `index`, full
+/// `id`/`name`/`arguments` in a single delta — no char-incremental args).
+#[derive(Debug, Serialize, Clone)]
+pub struct DeltaToolCall {
+    pub index: u32,
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str, // "function"
+    pub function: DeltaToolCallFunction,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct DeltaToolCallFunction {
+    pub name: String,
+    pub arguments: String,
+}
+
+// =========================================================================
+// Legacy text-completion streaming chunk (POST /v1/completions, stream)
+// =========================================================================
+
+/// Streaming chunk for `/v1/completions`. Mirrors `ChatCompletionChunk`
+/// but with the `text_completion` object and a flat `choices[].text`
+/// field (no `delta`/`role`). `cmpl-` id.
+#[derive(Debug, Serialize)]
+pub struct CompletionChunk {
+    pub id: String,
+    pub object: &'static str, // always "text_completion"
+    pub created: u64,
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_fingerprint: Option<String>,
+    pub choices: Vec<CompletionChunkChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
+impl CompletionChunk {
+    /// Mid-stream text chunk.
+    pub fn delta(id: String, model: String, text: String) -> Self {
+        Self::base(
+            id, model,
+            vec![CompletionChunkChoice { index: 0, text, finish_reason: None }],
+            None,
+        )
+    }
+
+    /// Final chunk: empty text + finish_reason.
+    pub fn final_chunk(id: String, model: String, finish: FinishReason) -> Self {
+        Self::base(
+            id, model,
+            vec![CompletionChunkChoice { index: 0, text: String::new(), finish_reason: Some(finish) }],
+            None,
+        )
+    }
+
+    /// Usage-only trailing chunk (`stream_options.include_usage`).
+    pub fn usage_only(id: String, model: String, usage: Usage) -> Self {
+        Self::base(id, model, Vec::new(), Some(usage))
+    }
+
+    fn base(id: String, model: String, choices: Vec<CompletionChunkChoice>, usage: Option<Usage>) -> Self {
+        Self {
+            id,
+            object: "text_completion",
+            created: unix_now_secs(),
+            model,
+            system_fingerprint: Some(super::SYSTEM_FINGERPRINT.into()),
+            choices,
+            usage,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompletionChunkChoice {
+    pub index: u32,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<FinishReason>,
 }
 
 fn unix_now_secs() -> u64 {

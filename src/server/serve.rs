@@ -94,7 +94,7 @@ async fn serve_inner(state: Arc<AppState>, args: &ServeArgs) -> Result<(), Box<d
     let app = build_router(state, args.cors);
     let addr = format!("{}:{}", args.host, args.port);
     eprintln!("VulkanForge API server listening on http://{addr}");
-    eprintln!("  endpoints: POST /v1/chat/completions  GET /v1/models  GET /health");
+    eprintln!("  endpoints: POST /v1/chat/completions  POST /v1/completions  GET /v1/models  GET /health");
     eprintln!("  CORS:      {}", if args.cors { "enabled (any origin)" } else { "off (same-origin)" });
     eprintln!("  press Ctrl+C to shut down");
 
@@ -210,6 +210,7 @@ fn load_gguf_session(args: &ServeArgs) -> Result<ServerSession, Box<dyn std::err
         tokenizer,
         template,
         chat,
+        cached_tokens: Vec::new(),
     })
 }
 

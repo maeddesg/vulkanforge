@@ -51,12 +51,45 @@ pub struct Choice {
 #[derive(Debug, Serialize)]
 pub struct AssistantMessage {
     pub role: &'static str, // always "assistant"
-    pub content: String,
+    /// `null` when the assistant only made tool calls (OpenAI emits
+    /// `content: null` in that case).
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 impl AssistantMessage {
     pub fn new(content: String) -> Self {
-        Self { role: "assistant", content }
+        Self { role: "assistant", content: Some(content), tool_calls: None }
+    }
+
+    /// Tool-calling response: `content` is whatever text preceded the
+    /// calls (or `null` if none), plus the parsed `tool_calls`.
+    pub fn with_tool_calls(content: Option<String>, tool_calls: Vec<ToolCall>) -> Self {
+        Self { role: "assistant", content, tool_calls: Some(tool_calls) }
+    }
+}
+
+/// One parsed tool call in the OpenAI response shape.
+#[derive(Debug, Serialize, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str, // always "function"
+    pub function: ToolCallFunction,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct ToolCallFunction {
+    pub name: String,
+    /// Arguments as a JSON **string** (OpenAI convention), even though
+    /// the model emits a JSON object — we re-serialize it to a string.
+    pub arguments: String,
+}
+
+impl ToolCall {
+    pub fn new(id: String, name: String, arguments: String) -> Self {
+        Self { id, kind: "function", function: ToolCallFunction { name, arguments } }
     }
 }
 
@@ -69,7 +102,8 @@ pub enum FinishReason {
     Length,
     /// Reserved for v0.5+ (content-filter integration).
     ContentFilter,
-    // ToolCalls reserved for v0.5+ once tool-calling lands.
+    /// The assistant emitted one or more tool calls.
+    ToolCalls,
 }
 
 #[derive(Debug, Serialize, Clone, Copy, Default)]
@@ -87,6 +121,47 @@ impl Usage {
             total_tokens: prompt + completion,
         }
     }
+}
+
+// =========================================================================
+// Legacy text-completion (POST /v1/completions, non-streaming)
+// =========================================================================
+
+#[derive(Debug, Serialize)]
+pub struct CompletionResponse {
+    /// `cmpl-<uuid_v4_hex_no_dashes>` (NOT chatcmpl).
+    pub id: String,
+    pub object: &'static str, // always "text_completion"
+    pub created: u64,
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_fingerprint: Option<String>,
+    pub choices: Vec<CompletionChoice>,
+    pub usage: Usage,
+}
+
+impl CompletionResponse {
+    pub fn new(id: String, model: String, choice: CompletionChoice, usage: Usage) -> Self {
+        Self {
+            id,
+            object: "text_completion",
+            created: unix_now_secs(),
+            model,
+            system_fingerprint: Some(crate::server::types::SYSTEM_FINGERPRINT.into()),
+            choices: vec![choice],
+            usage,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompletionChoice {
+    /// The generated text (post-ThinkFilter, mirroring chat).
+    pub text: String,
+    pub index: u32,
+    /// Always `null` in v0.4 (logprobs accepted-but-ignored).
+    pub logprobs: Option<serde_json::Value>,
+    pub finish_reason: FinishReason,
 }
 
 // =========================================================================

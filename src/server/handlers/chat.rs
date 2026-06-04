@@ -37,9 +37,7 @@ use tokio::sync::mpsc;
 use tokio::sync::OwnedSemaphorePermit;
 
 use crate::backend::vulkan::chat_template::{HistoryRole, RenderMessage};
-use crate::backend::vulkan::decode::{
-    generate_from_tokens, EmbeddingSource, GenerateConfig, Sampling, ThinkFilter,
-};
+use crate::backend::vulkan::decode::{GenerateConfig, Sampling, ThinkFilter};
 use crate::server::cancel::CancelToken;
 use crate::server::error::ApiError;
 use crate::server::sampling::SamplingParams;
@@ -141,6 +139,11 @@ struct NormalisedRequest {
     /// preserves CLI/Sprint-3 behaviour. `false` disables the
     /// ThinkFilter so `<think>...</think>` blocks reach the client.
     enable_thinking: bool,
+    /// `true` when the request supplied `tools` and `tool_choice` isn't
+    /// `"none"` — the handler then parses `<tool_call>` blocks out of
+    /// the output. Without tools this is `false` and the path is
+    /// byte-identical to the pre-tools behavior.
+    tools_active: bool,
 }
 
 fn validate_and_normalise(req: &ChatCompletionRequest) -> Result<NormalisedRequest, ApiError> {
@@ -164,20 +167,28 @@ fn validate_and_normalise(req: &ChatCompletionRequest) -> Result<NormalisedReque
         ));
     }
 
-    // §8.1 — collect history, reject unsupported roles/content,
-    // enforce single optional leading system + non-empty user list +
-    // user is the last message.
+    // Tool-calling active? `tools` present AND tool_choice != "none".
+    // Without tools this stays false and the whole path is byte-identical
+    // to the pre-tools behavior.
+    let tools_active = req
+        .tools
+        .as_ref()
+        .map(|t| !t.is_empty())
+        .unwrap_or(false)
+        && !req.tool_choice.as_ref().map(|c| c.is_none_mode()).unwrap_or(false);
+
+    // §8.1 — collect history. Tool-calling adds two roles: `tool`
+    // (results, rendered as a user `<tool_response>` turn) and
+    // `assistant` with `tool_calls` (rendered as `<tool_call>` blocks).
     let mut history: Vec<(HistoryRole, String)> = Vec::with_capacity(req.messages.len());
     let mut saw_user = false;
     let mut saw_system = false;
     for (i, msg) in req.messages.iter().enumerate() {
         match msg.role {
             Role::Tool => {
-                return Err(ApiError::invalid_with_param(
-                    "tool role not supported in v0.4",
-                    "unsupported_role",
-                    format!("messages[{i}].role"),
-                ));
+                // Tool result → Qwen3 wraps it in a user `<tool_response>`.
+                let c = require_content(&msg.content, i)?;
+                history.push((HistoryRole::User, crate::server::tools::render_tool_result(&c)));
             }
             Role::System => {
                 if saw_system {
@@ -195,14 +206,24 @@ fn validate_and_normalise(req: &ChatCompletionRequest) -> Result<NormalisedReque
                     ));
                 }
                 saw_system = true;
-                history.push((HistoryRole::System, content_to_string(&msg.content, i)?));
+                history.push((HistoryRole::System, require_content(&msg.content, i)?));
             }
             Role::User => {
                 saw_user = true;
-                history.push((HistoryRole::User, content_to_string(&msg.content, i)?));
+                history.push((HistoryRole::User, require_content(&msg.content, i)?));
             }
             Role::Assistant => {
-                history.push((HistoryRole::Assistant, content_to_string(&msg.content, i)?));
+                let text = optional_content(&msg.content, i)?;
+                if let Some(calls) = &msg.tool_calls {
+                    // Assistant turn that called tools → render the calls
+                    // back as `<tool_call>` blocks for the round-trip.
+                    history.push((
+                        HistoryRole::Assistant,
+                        crate::server::tools::render_assistant_tool_calls(text.as_deref(), calls),
+                    ));
+                } else {
+                    history.push((HistoryRole::Assistant, text.unwrap_or_default()));
+                }
             }
         }
     }
@@ -213,16 +234,28 @@ fn validate_and_normalise(req: &ChatCompletionRequest) -> Result<NormalisedReque
             "messages",
         ));
     }
-    // Last non-system entry must be a user turn — otherwise the
-    // model doesn't know what to answer.
+    // Last entry must be a user turn OR a tool result (a tool result
+    // ends with the model owing an answer). Tool results were pushed as
+    // `User` (the `<tool_response>` wrapping), so this check covers both.
     match history.last() {
         Some((HistoryRole::User, _)) => {}
         _ => {
             return Err(ApiError::invalid_with_param(
-                "last message must be role: \"user\"",
+                "last message must be role: \"user\" or \"tool\"",
                 "last_message_not_user",
                 "messages",
             ));
+        }
+    }
+
+    // Render the tool definitions into (or as) the system message.
+    if tools_active {
+        let section = crate::server::tools::render_tools_section(req.tools.as_ref().unwrap());
+        match history.first_mut() {
+            Some((HistoryRole::System, s)) => {
+                *s = format!("{s}\n\n{section}");
+            }
+            _ => history.insert(0, (HistoryRole::System, section)),
         }
     }
 
@@ -256,12 +289,32 @@ fn validate_and_normalise(req: &ChatCompletionRequest) -> Result<NormalisedReque
         stream: req.stream,
         include_usage,
         enable_thinking,
+        tools_active,
     })
 }
 
-fn content_to_string(content: &MessageContent, msg_idx: usize) -> Result<String, ApiError> {
+/// Extract the text of a message whose content is required (user /
+/// system / tool). `null` content is a 400.
+fn require_content(content: &Option<MessageContent>, msg_idx: usize) -> Result<String, ApiError> {
+    match optional_content(content, msg_idx)? {
+        Some(s) => Ok(s),
+        None => Err(ApiError::invalid_with_param(
+            "message content must not be null for this role",
+            "missing_content",
+            format!("messages[{msg_idx}].content"),
+        )),
+    }
+}
+
+/// Extract the text of a message whose content may be `null` (an
+/// `assistant` message that only made tool calls).
+fn optional_content(
+    content: &Option<MessageContent>,
+    msg_idx: usize,
+) -> Result<Option<String>, ApiError> {
+    let Some(content) = content else { return Ok(None) };
     match content {
-        MessageContent::Text(s) => Ok(s.clone()),
+        MessageContent::Text(s) => Ok(Some(s.clone())),
         MessageContent::Parts(parts) => {
             let mut acc = String::new();
             for (j, part) in parts.iter().enumerate() {
@@ -276,7 +329,7 @@ fn content_to_string(content: &MessageContent, msg_idx: usize) -> Result<String,
                     }
                 }
             }
-            Ok(acc)
+            Ok(Some(acc))
         }
     }
 }
@@ -292,7 +345,7 @@ fn content_to_string(content: &MessageContent, msg_idx: usize) -> Result<String,
 /// `max_tokens: 4096` and grows the chat history unboundedly — a
 /// 4418-token history + 4096 max + 8192 ctx must produce 3774 tokens,
 /// not a user-visible error.
-fn clamp_max_tokens(
+pub(crate) fn clamp_max_tokens(
     prompt_tokens: u32,
     max_tokens: u32,
     context_window: u32,
@@ -324,8 +377,9 @@ fn prepare_generate(
     req: &NormalisedRequest,
     cancel_token: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(Vec<u32>, GenerateConfig, u32), ApiError> {
-    // Stateless per Decision §3: every call wipes the KV cache.
-    session.chat.forward.kv_cache.reset();
+    // KV handling (reset vs prefix-reuse) is decided in
+    // `ServerSession::generate_reuse`; this fn only renders + clamps +
+    // builds the config. (Pre-reuse this reset the KV here.)
 
     let max_tokens = req.sampling.max_tokens.unwrap_or(200).max(1);
 
@@ -369,12 +423,31 @@ fn prepare_generate(
     Ok((prefill_tokens, cfg_g, max_tokens))
 }
 
+/// Shared mapping of a `generate_from_tokens` error string to an
+/// `ApiError` (context-overflow → 400, else 500). Used by both chat and
+/// completions, streaming and non-streaming.
+pub(crate) fn map_gen_err(
+    e: Box<dyn std::error::Error>,
+    prompt_tokens: u32,
+    max_tokens: u32,
+    context_window: u32,
+) -> ApiError {
+    let s = e.to_string();
+    if s.contains("max_seq_len") {
+        ApiError::ContextLengthExceeded { prompt_tokens, max_tokens, context_window }
+    } else {
+        ApiError::internal(format!("generation: {s}"), "gpu_error")
+    }
+}
+
 fn process_request(
     session: &mut ServerSession,
     model_id: &str,
     req: NormalisedRequest,
 ) -> Result<ChatCompletionResponse, ApiError> {
+    let reuse = crate::server::state::kv_prefix_reuse_enabled();
     let (prefill_tokens, cfg_g, _max_tokens) = prepare_generate(session, &req, None)?;
+    let max_seq = session.chat.forward.kv_cache.config.max_seq_len;
 
     // Set up an incremental ThinkFilter so the visible/raw split
     // matches what the streaming path produces. For non-streaming
@@ -391,58 +464,40 @@ fn process_request(
         }
     };
 
-    let ServerSession {
-        dev,
-        registry,
-        cmd_ctx,
-        model,
-        gguf,
-        cfg,
-        tokenizer,
-        chat,
-        ..
-    } = session;
+    // Shared generate core (gated cross-request KV prefix reuse; reuse
+    // OFF = today's full-reprefill, bit-identical).
+    let result = session
+        .generate_reuse(&prefill_tokens, &cfg_g, reuse, &mut on_token)
+        .map_err(|e| map_gen_err(e, prefill_tokens.len() as u32, cfg_g.max_tokens, max_seq))?;
 
-    let result = generate_from_tokens(
-        &mut chat.forward,
-        dev, registry, cmd_ctx, model,
-        EmbeddingSource::Gguf(gguf),
-        cfg, tokenizer,
-        &prefill_tokens, 0, &cfg_g, false, &mut on_token,
-    )
-    .map_err(|e| {
-        // The decode-loop's pre-flight check produces a string error
-        // for the context-overflow case; everything else is a real
-        // 500. Both rare in practice given the pre-check above.
-        let s = e.to_string();
-        if s.contains("max_seq_len") {
-            ApiError::ContextLengthExceeded {
-                prompt_tokens: prefill_tokens.len() as u32,
-                max_tokens: cfg_g.max_tokens,
-                context_window: chat.forward.kv_cache.config.max_seq_len,
-            }
-        } else {
-            ApiError::internal(format!("generation: {s}"), "gpu_error")
-        }
-    })?;
-
-    let finish_reason = if result.stopped_on_eos {
+    // `stop` (EOS) vs `length` (cap) — captured before any move of the
+    // result's text fields.
+    let plain_finish = if result.stopped_on_eos {
         FinishReason::Stop
     } else {
         FinishReason::Length
     };
+    let (prompt_tokens, generated_tokens) =
+        (result.prompt_tokens as u32, result.generated_tokens as u32);
+
+    // Tool-calling: parse `<tool_call>` blocks out of the (post-think-
+    // filter) output. Only when tools were offered — otherwise the
+    // visible text passes through unchanged (a stray `<tool_call>` in a
+    // no-tools chat stays as content).
+    let (message, finish_reason) = if req.tools_active {
+        let (content, calls) = crate::server::tools::parse_tool_calls(&result.visible_text);
+        if calls.is_empty() {
+            (AssistantMessage::new(content.unwrap_or_default()), plain_finish)
+        } else {
+            (AssistantMessage::with_tool_calls(content, calls), FinishReason::ToolCalls)
+        }
+    } else {
+        (AssistantMessage::new(result.visible_text), plain_finish)
+    };
 
     let id = new_chatcmpl_id();
-    let choice = Choice {
-        index: 0,
-        message: AssistantMessage::new(result.visible_text),
-        logprobs: None,
-        finish_reason,
-    };
-    let usage = Usage::new(
-        result.prompt_tokens as u32,
-        result.generated_tokens as u32,
-    );
+    let choice = Choice { index: 0, message, logprobs: None, finish_reason };
+    let usage = Usage::new(prompt_tokens, generated_tokens);
     Ok(ChatCompletionResponse::new(id, model_id.to_string(), choice, usage))
 }
 
@@ -456,7 +511,7 @@ fn new_chatcmpl_id() -> String {
     s
 }
 
-fn seed_from_clock() -> u64 {
+pub(crate) fn seed_from_clock() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -519,6 +574,7 @@ fn start_streaming(
     let meta = ChunkMeta {
         id: chatcmpl_id,
         model: model_id,
+        kind: crate::server::stream::StreamKind::Chat,
     };
     // The SSE adapter takes ownership of a CancelToken clone; its
     // Drop impl flips the flag if the client disconnects mid-stream,
@@ -549,11 +605,15 @@ fn run_streaming_generation(
             }
         };
     let prefill_len = prefill_tokens.len() as u32;
+    let reuse = crate::server::state::kv_prefix_reuse_enabled();
+    let max_seq = session.chat.forward.kv_cache.config.max_seq_len;
 
     // Emit the header chunk first. If the client is already gone
     // (rare but possible), bail out before doing any GPU work.
     if tx.blocking_send(StreamEvent::Header).is_err() {
         cancel.cancel();
+        // Don't trust any KV that a half-started request left behind.
+        session.kv_invalidate();
         return;
     }
 
@@ -568,6 +628,14 @@ fn run_streaming_generation(
         None
     };
 
+    // Tool-calling: when tools are offered we BUFFER the visible text
+    // (v1 — no char-incremental argument streaming) and parse it after
+    // generation, so a `<tool_call>` block is emitted as one tool_calls
+    // delta rather than leaking out as content. Without tools we stream
+    // token deltas live exactly as before.
+    let tools_active = req.tools_active;
+    let buf = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+    let buf_cb = buf.clone();
     let tx_for_cb = tx.clone();
     let cancel_for_cb = cancel.clone();
     let mut on_token = move |_id: u32, raw: &str| {
@@ -585,6 +653,10 @@ fn run_streaming_generation(
         if visible_owned.is_empty() {
             return;
         }
+        if tools_active {
+            buf_cb.borrow_mut().push_str(&visible_owned);
+            return;
+        }
         if tx_for_cb
             .blocking_send(StreamEvent::Delta(visible_owned))
             .is_err()
@@ -595,27 +667,35 @@ fn run_streaming_generation(
         }
     };
 
-    let ServerSession {
-        dev,
-        registry,
-        cmd_ctx,
-        model,
-        gguf,
-        cfg,
-        tokenizer,
-        chat,
-        ..
-    } = session;
+    // Shared generate core (gated cross-request KV prefix reuse).
+    let result = session.generate_reuse(&prefill_tokens, &cfg_g, reuse, &mut on_token);
 
-    let result = generate_from_tokens(
-        &mut chat.forward,
-        dev, registry, cmd_ctx, model,
-        EmbeddingSource::Gguf(gguf),
-        cfg, tokenizer,
-        &prefill_tokens, 0, &cfg_g, false, &mut on_token,
-    );
+    // A stream cancelled mid-decode (client disconnect) leaves a partial
+    // KV that must never be reused — drop it. (generate_reuse can't tell
+    // cancel from clean completion; both return Ok.)
+    if cancel.is_cancelled() {
+        session.kv_invalidate();
+    }
 
     match result {
+        Ok(g) if tools_active => {
+            // Parse the buffered output → leading text + tool calls.
+            let text = buf.borrow().clone();
+            let (content, calls) = crate::server::tools::parse_tool_calls(&text);
+            if let Some(c) = content {
+                if !c.is_empty() {
+                    let _ = tx.blocking_send(StreamEvent::Delta(c));
+                }
+            }
+            let finish = if calls.is_empty() {
+                if g.stopped_on_eos { FinishReason::Stop } else { FinishReason::Length }
+            } else {
+                let _ = tx.blocking_send(StreamEvent::ToolCalls(calls));
+                FinishReason::ToolCalls
+            };
+            let usage = Usage::new(g.prompt_tokens as u32, g.generated_tokens as u32);
+            let _ = tx.blocking_send(StreamEvent::Final { finish, usage, include_usage });
+        }
         Ok(g) => {
             let finish = if g.stopped_on_eos {
                 FinishReason::Stop
@@ -637,7 +717,7 @@ fn run_streaming_generation(
                 ApiError::ContextLengthExceeded {
                     prompt_tokens: prefill_len,
                     max_tokens: cfg_g.max_tokens,
-                    context_window: chat.forward.kv_cache.config.max_seq_len,
+                    context_window: max_seq,
                 }
             } else {
                 ApiError::internal(format!("generation: {s}"), "gpu_error")
@@ -787,16 +867,57 @@ mod tests {
     }
 
     #[test]
-    fn tool_role_rejected() {
+    fn tool_role_now_accepted_as_tool_response() {
+        // Tool-calling sprint: `role:tool` results are now supported —
+        // rendered as a user `<tool_response>` turn (was rejected in v0.4).
         let req = req_from(json!({
             "model": "x",
             "messages": [
-                {"role": "tool", "content": "result"},
-                {"role": "user", "content": "ok"},
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"location\":\"Paris\"}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "15C sunny"},
             ],
         }));
-        let e = validate_and_normalise(&req).unwrap_err();
-        assert_eq!(e.code(), "unsupported_role");
+        let n = validate_and_normalise(&req).unwrap();
+        // last entry (the tool result) was pushed as a User <tool_response>.
+        let last = n.history.last().unwrap();
+        assert_eq!(last.0, HistoryRole::User);
+        assert!(last.1.contains("<tool_response>"));
+        assert!(last.1.contains("15C sunny"));
+        // the assistant turn rendered its tool_calls as <tool_call>.
+        assert!(n.history.iter().any(|(r, s)| *r == HistoryRole::Assistant && s.contains("<tool_call>") && s.contains("get_weather")));
+        assert!(!n.tools_active, "no `tools` in request → tools_active stays false");
+    }
+
+    #[test]
+    fn tools_active_renders_tools_section_into_system() {
+        let req = req_from(json!({
+            "model": "x",
+            "messages": [{"role":"user","content":"weather in Paris?"}],
+            "tools": [{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}],
+        }));
+        let n = validate_and_normalise(&req).unwrap();
+        assert!(n.tools_active);
+        // a system message with the <tools> section was synthesised at [0].
+        assert_eq!(n.history[0].0, HistoryRole::System);
+        assert!(n.history[0].1.contains("<tools>"));
+        assert!(n.history[0].1.contains("get_weather"));
+    }
+
+    #[test]
+    fn tool_choice_none_disables_tools() {
+        let req = req_from(json!({
+            "model": "x",
+            "messages": [{"role":"user","content":"hi"}],
+            "tools": [{"type":"function","function":{"name":"f"}}],
+            "tool_choice": "none",
+        }));
+        let n = validate_and_normalise(&req).unwrap();
+        assert!(!n.tools_active, "tool_choice:none → tools NOT offered");
+        // no tools section injected.
+        assert!(!n.history.iter().any(|(_, s)| s.contains("<tools>")));
     }
 
     #[test]

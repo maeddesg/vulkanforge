@@ -680,6 +680,69 @@ impl Tokenizer {
         }
     }
 
+    /// Encode `text` with **special-token parsing** (llama.cpp
+    /// `parse_special` semantics, used by `POST /v1/completions`):
+    /// registered special-token surface strings (e.g. `<|im_start|>`,
+    /// `<|im_end|>`, `<think>`) are emitted as their single vocab id,
+    /// while the text between them is byte-level encoded via [`encode`].
+    /// No auto-BOS. This lets a pre-rendered chat-template *string*
+    /// round-trip to the same ids the template's own interleaved
+    /// `push(special) + encode(text)` produces — the basis for the
+    /// `/v1/completions` ↔ `/v1/chat/completions` byte-identity gate.
+    ///
+    /// Specials are isolated by surface shape (`<…>` / `<|…|>`): GPT-2
+    /// byte-level BPE pieces never contain a literal `<`+`>` pair, so
+    /// this cleanly picks out the added/special tokens without a
+    /// separate registry. SPM falls back to plain [`encode`] (the
+    /// BPE-only chat templates are the round-trip target).
+    pub fn encode_with_special(&self, text: &str) -> Vec<u32> {
+        let b = match &self.inner {
+            TokenizerInner::Bpe(b) => b,
+            TokenizerInner::Spm(_) => return self.encode(text),
+        };
+        // Longest surface first so `<|im_start|>` wins over any shorter
+        // `<…>` prefix at the same position.
+        let mut specials: Vec<(&str, u32)> = b
+            .token_to_id
+            .iter()
+            .filter(|(k, _)| k.len() >= 3 && k.starts_with('<') && k.ends_with('>'))
+            .map(|(k, &id)| (k.as_str(), id))
+            .collect();
+        specials.sort_by(|a, c| c.0.len().cmp(&a.0.len()));
+
+        let mut out = Vec::new();
+        let bytes = text.as_bytes();
+        let mut i = 0usize;
+        let mut gap_start = 0usize;
+        while i < bytes.len() {
+            let mut hit: Option<(usize, u32)> = None;
+            if text.is_char_boundary(i) {
+                for (surf, id) in &specials {
+                    let s = surf.as_bytes();
+                    if i + s.len() <= bytes.len() && &bytes[i..i + s.len()] == s {
+                        hit = Some((s.len(), *id));
+                        break; // sorted longest-first → first match is longest
+                    }
+                }
+            }
+            match hit {
+                Some((len, id)) => {
+                    if gap_start < i {
+                        out.extend(self.encode(&text[gap_start..i]));
+                    }
+                    out.push(id);
+                    i += len;
+                    gap_start = i;
+                }
+                None => i += 1,
+            }
+        }
+        if gap_start < bytes.len() {
+            out.extend(self.encode(&text[gap_start..]));
+        }
+        out
+    }
+
     /// Decode a token-id slice. Concatenates the byte-level encoded
     /// vocab strings, then maps each char back to its byte (BPE), or
     /// expands `<0xHH>` byte tokens and replaces `▁` with space (SPM).
