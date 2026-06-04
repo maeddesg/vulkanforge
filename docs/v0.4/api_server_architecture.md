@@ -71,21 +71,32 @@ Pflicht-Endpoints in v0.4:
 > Error/Cancel → invalidieren. EINE retained Session (letzter Request); Multi-Slot = Folge-Sprint. **OFF-Pfad bit-ident
 > zu v0.4** (reset-per-request unverändert). Default-Flip = Owner-Call nach byte-ident-Gate.
 
-### 1.2 Scope (v0.4 Out)
+### 1.2 Scope
 
-Folgende werden in v0.4 **NICHT** implementiert; sie sind v0.5+:
+**Implementiert (Stand v0.5.7):** `/v1/chat/completions`, **`/v1/completions`**
+(raw-prompt), **Tool/Function-Calling** (Qwen3/Hermes, im Server-Layer — KEIN
+Jinja), **cross-request KV-Prefix-Reuse** (`VF_KV_PREFIX_REUSE=1`, opt-in),
+`/v1/models`, `/health`.
 
-- `POST /v1/completions` (legacy non-chat — nur falls Use-Case
-  auftaucht, sonst skip)
+**NICHT implementiert (Folge-Sprints):**
 - `POST /v1/embeddings` (VF hat aktuell keinen Embedding-Output-Pfad)
 - `POST /v1/audio/*` (kein ASR/TTS)
 - `POST /v1/responses` (OpenAIs neue Responses-API — instabil,
   noch nicht weit unterstützt)
 - **Multi-Model**: ein Server-Prozess hostet **genau ein** Modell.
   Mehr-Modelle = mehr Prozesse (Port unterschiedlich).
-- **Tool/Function-Calling**: braucht template-getriebene Strukturen
-  und parser-side JSON-Validierung; eigene Feature-Welle.
+- **Tool-Calling jenseits Qwen3/Hermes** (Llama-3.1/Mistral-Formate),
+  `tool_choice` jenseits auto/none (required/named), char-inkrementelles
+  Arg-Streaming.
 - **Vision/Multimodal-Inputs**: VF hat aktuell keinen Vision-Pfad.
+
+> **Bekannte Limitierung (v0.5.7, NICHT optimiert):** agentische Nutzung ist
+> **prefill-gebunden**. Agents hängen jeder Anfrage einen großen (~7,5k-Token)
+> System-Prompt voran, den VF jede Runde neu prefillt → Per-Turn-Latenz im
+> Bereich zehner Sekunden, dominiert vom Prefill (nicht Decode). 8B (Q4_K_M)
+> empfohlen; 27B (Q3_K_S) für Agents impraktikabel. `VF_KV_PREFIX_REUSE=1`
+> mildert Multi-Turn (nicht die erste Runde). `--ctx-size` für Agents erhöhen
+> (Default 2048 zu klein für den ~7,5k-System-Prompt; z.B. `--ctx-size 16384`).
 - **Auth**: kein Bearer-Token Check. v0.4 ist Local-Loopback by
   default (`127.0.0.1`); öffentliche Bindings sind Opt-In via
   `--host 0.0.0.0` mit Owner-Verantwortung.
@@ -97,9 +108,10 @@ Folgende werden in v0.4 **NICHT** implementiert; sie sind v0.5+:
 | Aspekt | llama.cpp | VulkanForge v0.4 |
 |---|---|---|
 | Concurrent Slots | Ja (bis zu N) | Nein (sequentiell, 429) |
-| `/v1/completions` | Ja | Nein |
+| `/v1/completions` | Ja | **Ja (v0.5.7)** |
 | `/v1/embeddings` | Ja | Nein |
-| Tool Calling | Ja (via Jinja) | Nein |
+| Tool Calling | Ja (via Jinja) | **Ja (v0.5.7, Qwen3/Hermes, server-layer; kein Jinja)** |
+| KV-Prefix-Reuse (cross-request) | Ja (slots) | **Ja (v0.5.7, opt-in, single-session)** |
 | `response_format` (JSON-Mode) | Ja (Grammar) | Nein |
 | Built-in Web UI | Ja | Nein (→ Open WebUI) |
 | Think-Filter | Nein | **Ja (VF-Alleinstellung)** |

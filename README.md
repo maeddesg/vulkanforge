@@ -205,6 +205,12 @@ flag is a default-on candidate for 14B FP8 on Zen 4.
 | On-the-fly Q4_K      | `VF_QUANTIZE_ON_LOAD=1`    | SafeTensors model with FP32 / BF16 weights | Quantize 2D weights to Q4_K_M at load; ~7× VRAM compression on quantized tensors, routes through the Q4_K shader pipeline. Gemma-4-E2B: decode +54 %, power −41 %, tok/s/W 1.39 |
 | FP8 KV-cache         | `VULKANFORGE_KV_FP8=1`     | Mesa 26.1+ (heterogeneous head_dim auto-handled) | −50 % KV-cache VRAM. Gemma-4-26B-A4B: 880 → 440 MB. |
 | KV prefix-reuse (API server, **default OFF**) | `VF_KV_PREFIX_REUSE=1` | `vulkanforge serve` (chat + completions) | Cross-request KV reuse: keeps the last request's KV and re-prefills only the suffix after the longest common token prefix → multi-turn / agentic (growing context) skips re-prefilling the shared history. Value-preserving (byte-identical to full re-prefill @temp 0). Single retained session (last request); errors/cancel invalidate. OFF = v0.4 stateless behavior, bit-identical. |
+| MTP timing instrumentation (**default OFF**) | `VF_MTP_TIMER=1` | Qwen3.6-27B-MTP (`VF_MTP=1`) | Per-phase wall-clock + submit breakdown for the (parked, gated-off) MTP self-spec decode loop. Measurement only; MTP itself stays default-OFF. |
+
+> Debug/test-only env flags (never set in production): `VF_KV_REUSE_DEBUG=1`
+> (logs the prefix-reuse `k`/prefill-token count per request) and
+> `VF_KV_REUSE_OVERSHOOT=N` (the byte-ident gate's teeth-test — intentionally
+> over-reuses; do not use outside testing).
 | Expert-Grouped MoE prefill (**default ON** since v0.5.3) | (auto); opt-out `VF_MOE_GROUPED=0` | MoE model (Gemma-4-26B-A4B et al.) | +33–39 % prefill on Gemma-4-26B-A4B Q3_K_M (146 → ~199 t/s @pp512), value-preserving, decode-neutral. +~265 MB VRAM (MoE models only; dense/GDN unaffected). `VF_MOE_GROUPED=0` = legacy GPU-direct GEMV prefill. |
 | qwen35 decode determinism fix (**default ON** since v0.5.4) | (auto); opt-out `VF_QWEN35_DEC_GATE_BARRIER=0` | Qwen3.6-27B-MTP (qwen35) | Correctness fix: adds the missing gated-output → o-proj barrier so decode reads the fully-gated `attn_out`. Makes greedy decode bit-deterministic (was a RAW race, widened by `head_dim=256`). Decode-neutral, qwen35-only (no effect on other models). |
 | qwen35 batched prefill (**default ON** since v0.5.6) | (auto); opt-out `VF_QWEN35_BATCHED=0` | Qwen3.6-27B-MTP (qwen35) | qwen35 prefill runs through the batched executor (GDN + Full-Attn over seq_len=N; cross-token cores serial with state-carry, projections batched GEMM). **4–11× prefill speedup** (grows with prompt length; e.g. 1098-tok 32 → 358 t/s), deterministic + byte-identical to per-token (greedy), decode-neutral. `VF_QWEN35_BATCHED=0` = per-token prefill. (v0.5.5 shipped this opt-in; v0.5.6 fixed a conv-loop barrier-elision race that made it non-deterministic on near-tie prompts, and flipped it on by default.) |
@@ -393,13 +399,54 @@ forcing, and char-incremental argument streaming are planned. Requests **without
 
 ### Scope
 
-- **In:** Streaming + non-streaming chat, `frequency_penalty` →
-  repetition-penalty mapping, `stream_options.include_usage`,
-  `developer` role alias for `system`, `chat_template_kwargs.enable_thinking`
-  toggle for `<think>` filtering.
-- **Out (v0.4):** Multi-turn history (system + user only), tool
-  calling, vision content, embeddings, `/v1/completions`, auth,
-  SafeTensors directory models (use `vulkanforge chat` for those).
+- **In:** Streaming + non-streaming chat, multi-turn history,
+  **`/v1/completions`** (raw-prompt), **OpenAI function/tool calling**
+  (Qwen3/Hermes), **cross-request KV prefix-reuse** (`VF_KV_PREFIX_REUSE=1`,
+  opt-in), `frequency_penalty` → repetition-penalty mapping,
+  `stream_options.include_usage`, `developer` role alias for `system`,
+  `chat_template_kwargs.enable_thinking` toggle for `<think>` filtering.
+- **Out:** Vision content, embeddings, auth, SafeTensors directory models
+  (use `vulkanforge chat` for those); tool-calling beyond the Qwen3/Hermes
+  format and `tool_choice` beyond auto/none (follow-ups).
+
+### Using VulkanForge with OpenCode (and OpenAI-compatible agents)
+
+VulkanForge works as a backend for [OpenCode](https://opencode.ai) and other
+OpenAI-compatible coding agents (function/tool calling). Validated end-to-end on
+**Qwen3-8B Q4_K_M**: real tool calls execute and files are written to disk.
+
+**1. Serve with a raised context** — the 2048 default is too small for an
+agent's large system prompt (~7,500 tokens), so set `--ctx-size`:
+
+```fish
+vulkanforge serve -m ~/models/Qwen3-8B-Q4_K_M.gguf --port 8080 --ctx-size 16384
+```
+
+**2. `~/.config/opencode/opencode.json`:**
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "vulkanforge/qwen3-8b-q4_k_m",
+  "provider": {
+    "vulkanforge": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "VulkanForge (local)",
+      "options": { "baseURL": "http://localhost:8080/v1" },
+      "models": { "qwen3-8b-q4_k_m": { "name": "Qwen3-8B (VF)" } }
+    }
+  }
+}
+```
+
+**Status / Limitations.** Functional: tool calls execute and files are written
+(validated end-to-end on Qwen3-8B Q4_K_M). **Not yet optimized:** per-turn
+latency is high because VulkanForge re-prefills the agent's large system prompt
+each turn — prefill is the current bottleneck (per-turn latency in the tens of
+seconds, dominated by prefill, not generation). Recommended model: **Qwen3-8B
+Q4_K_M**. The 27B (Q3_K_S) is impractical for agentic use today (prefill cost +
+aggressive quantization). Set **`VF_KV_PREFIX_REUSE=1`** to speed up multi-turn
+(opt-in; mitigates later turns, not the first).
 
 ## Limitations
 

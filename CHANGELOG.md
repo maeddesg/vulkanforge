@@ -1,6 +1,34 @@
 # Changelog
 
-## Unreleased — Function/Tool calling (OpenAI-compatible, Qwen3/Hermes) (2026-06-04)
+## v0.5.7 — OpenAI API: tool-calling + /v1/completions + KV prefix-reuse (OpenCode backend) (2026-06-04)
+
+**OpenAI-compatible API — coding-agent backend (OpenCode):**
+- New `POST /v1/completions` — raw-prompt completion (no chat template);
+  byte-identical to the chat path for an equivalently-templated prompt.
+- New KV prefix reuse across requests, opt-in via `VF_KV_PREFIX_REUSE=1` —
+  skips re-prefilling a shared prompt prefix on multi-turn requests
+  (default OFF; bit-identical to full prefill, validated incl. overshoot/teeth test).
+- New OpenAI-style tool/function calling for Qwen3/Hermes-format models —
+  `<tool_call>{json}</tool_call>` synthesized/parsed in the server layer
+  (no Jinja engine touched); inert when the request carries no `tools`.
+- VulkanForge now works as a backend for OpenCode and other OpenAI-compatible
+  coding agents. Validated end-to-end on Qwen3-8B Q4_K_M: real tool calls
+  executed, files written to disk, multi-turn round-trips.
+
+**Known limitation — not yet optimized:**
+- Agentic use is prefill-bound and currently slow. Agents prepend a large
+  (~7,500-token) system prompt to every request, which VF re-prefills each
+  turn; per-turn latency is high (tens of seconds), dominated by prefill, not
+  generation. Use Qwen3-8B Q4_K_M; the 27B (Q3_K_S) is impractical for agents
+  (prefill cost + aggressive-quant degeneration). Prefix reuse (opt-in)
+  mitigates multi-turn but not the first turn. See README → "Using VulkanForge
+  with OpenCode".
+- The server needs `--ctx-size` raised for agents (the 2048 default is too small
+  for a ~7.5k system prompt); use e.g. `--ctx-size 16384`.
+
+The three sub-features below are the detailed notes for this release.
+
+### Function/Tool calling (OpenAI-compatible, Qwen3/Hermes) (2026-06-04)
 
 Adds OpenAI-compatible function/tool calling to `POST /v1/chat/completions`
 — VF becomes an agent backend (OpenCode/clients that drive tools).
@@ -29,7 +57,7 @@ Adds OpenAI-compatible function/tool calling to `POST /v1/chat/completions`
   Mistral/functionary formats, `required`/named-forcing, char-arg-streaming
   = follow-ups.
 
-## Unreleased — cross-request KV prefix-reuse (API server, gated) (2026-06-04)
+### cross-request KV prefix-reuse (API server, gated) (2026-06-04)
 
 Adds gated cross-request KV-cache prefix reuse to `vulkanforge serve`
 (`VF_KV_PREFIX_REUSE=1`, **default OFF**). Instead of re-prefilling every
@@ -55,7 +83,7 @@ shared history.
   behavior is unchanged when the flag is off). Single-request permit model
   unchanged.
 
-## Unreleased — `/v1/completions` legacy text-completion endpoint (2026-06-04)
+### `/v1/completions` legacy text-completion endpoint (2026-06-04)
 
 Adds `POST /v1/completions` (+ `/completions` alias), the OpenAI legacy
 text-completion endpoint, with streaming (SSE) and non-streaming support.

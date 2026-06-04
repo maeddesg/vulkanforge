@@ -1194,7 +1194,7 @@ dependencies = [
 
 [[package]]
 name = "vulkanforge"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "ash",
  "axum",
