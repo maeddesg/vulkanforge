@@ -74,6 +74,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             n_kv_heads: cfg.n_kv_heads,
             head_dim: cfg.head_dim,
             max_seq_len: 1024,
+            // Uniform KV layout (Llama/Qwen FP8 — no Gemma-4 heterogeneous per-layer).
+            per_layer_head_dim: None,
+            per_layer_n_kv_heads: None,
         },
     )?;
     let profiler = ShaderProfiler::new(

@@ -1,0 +1,48 @@
+#version 460
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_float_e4m3 : require
+#extension GL_EXT_scalar_block_layout : enable
+
+// Sprint — does ACO emit GLOBAL_LOAD_TR_B64 for an 8-bit (FP8 e4m3)
+// ColumnMajor-A direct-from-SSBO coopMatLoad under mesa-main? Phase-1
+// proved the 16-bit (f16, b128) case fires; this probes the 8-bit path
+// VF's FP8 GEMM would need. Two FP8 loads → an FP8 fragment converted to
+// f16 → f16 WMMA (mirrors VF's narrow-to-16-bit design; the convert is the
+// register-side equivalent of VF's FP8->bf16 staging).
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Weights {
+    floate4m3_t data[];
+} weights;
+layout(set = 0, binding = 1, std430) writeonly buffer Out {
+    float data[];
+} outbuf;
+layout(push_constant) uniform PC { uint stride; uint offset; } pc;
+
+void main() {
+    coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA_fp8;
+    coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB_fp8;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    // matA ColumnMajor (USE_A flips to RowMajor -> should fire), matB RowMajor.
+    coopMatLoad(matA_fp8, weights.data, pc.offset, pc.stride,
+                gl_CooperativeMatrixLayoutColumnMajor);
+    coopMatLoad(matB_fp8, weights.data, pc.offset, pc.stride,
+                gl_CooperativeMatrixLayoutRowMajor);
+
+    // Register-side FP8 -> f16 conversion (same as VF's staging convert).
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA =
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>(matA_fp8);
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB =
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>(matB_fp8);
+
+    acc = coopMatMulAdd(matA, matB, acc);
+    coopMatStore(acc, outbuf.data, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+}
