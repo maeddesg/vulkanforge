@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.5.8 — Gemma-4 (MoE) coherent on the API/serve path (2026-06-05)
+
+**Fixes Gemma-4 garbage output on `vulkanforge serve` (three stacked defects, all Gemma-4-specific).**
+Previously the serve/API path produced garbage on Gemma-4 (`<|channel>…` spam + word-salad),
+while `vulkanforge chat` was fine — because the CLI ran setup the serve path skipped. Dense models
+(Llama/Qwen, 8B etc.) were never affected.
+
+- **MoE-router init (decode correctness — the dominant fix):** `serve` never called
+  `Forward::init_moe_router_gpu`, so `moe_router_gpu` stayed `None` and Gemma-4 MoE **decode** fell
+  back to a legacy CPU path retained only for non-Gemma-4 / unit tests → garbage *even with a correct
+  prompt*. `serve` now mirrors the CLI setup (`register_buckets` + `init_moe_router_gpu`). Both are
+  no-ops for non-MoE models. **Scope: Gemma-4 MoE is the only architecture that uses this path** —
+  `moe_router_data` is `None` for every other arch, so dense/other MoE-free models are unchanged.
+- **Channel-thought template detection (GGUF path):** `ChatTemplate::detect` (GGUF) now sniffs the
+  embedded `tokenizer.chat_template` for Gemma-4's `<|turn>` + `<|channel>thought\n<channel|>` markers
+  and selects `Gemma4WithThoughtChannel` (mirroring `detect_hf`). Without it the generation prompt
+  omitted the channel block and the model collapsed on `<|channel>` (id 100) from the first token.
+- **Channel-aware output filter:** the streamed/visible-text filter now also strips Gemma-4's
+  `<|channel>…<channel|>` thought-channel scaffolding (matching the model's own `strip_thinking`
+  chat-template macro), keeping the final answer. Rides the existing ThinkFilter toggle (default ON;
+  `--no-think-filter` surfaces raw channels). No-op for non-Gemma output.
+
+Validated: lib tests 273/273; Gemma-4-26B-A4B Q3_K_M via serve (FP8 KV) — Paris/391/Jupiter recall ✓,
+5-prompt smoke coherent + clean (no channel leak), decode ~90 t/s; dense Llama-3.1-8B serve smoke
+unaffected. **Caveat (unchanged):** agentic UX (OpenCode) stays prefill-bound on the 26B — 8B remains
+the recommended agent model.
+
 ## v0.5.7 — OpenAI API: tool-calling + /v1/completions + KV prefix-reuse (OpenCode backend) (2026-06-04)
 
 **OpenAI-compatible API — coding-agent backend (OpenCode):**

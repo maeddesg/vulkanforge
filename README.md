@@ -448,6 +448,12 @@ Q4_K_M**. The 27B (Q3_K_S) is impractical for agentic use today (prefill cost +
 aggressive quantization). Set **`VF_KV_PREFIX_REUSE=1`** to speed up multi-turn
 (opt-in; mitigates later turns, not the first).
 
+> **v0.5.8 — Gemma-4 (MoE) now coherent on serve.** Earlier serve builds produced
+> garbage on Gemma-4 specifically (the API path skipped the GPU MoE-router init the
+> CLI ran, and the GGUF path missed the channel-thought template detection). Fixed in
+> v0.5.8; dense models (Llama/Qwen) were never affected. The prefill-latency caveat
+> above still applies to the 26B for agentic use.
+
 ## Limitations
 
 - Single-stream only — no batch inference, no concurrent sessions on

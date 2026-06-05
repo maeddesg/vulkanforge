@@ -120,6 +120,22 @@ impl ChatTemplate {
         if template_str.contains("[INST]") {
             return ChatTemplate::Mistral;
         }
+        // Gemma-4: the GGUF embeds `tokenizer.chat_template` (16 KB Jinja)
+        // verbatim — including the asymmetric `<|turn>`/`<turn|>` boundary
+        // tokens (unique to Gemma-4; Gemma-1/2/3 use `<start_of_turn>`).
+        // Mirror `detect_hf`'s sub-detection: the 26B-A4B variant appends
+        // the literal `'<|channel>thought\n<channel|>'` after the assistant
+        // header when `add_generation_prompt && !enable_thinking` (the
+        // default). Without `Gemma4WithThoughtChannel` the rendered prompt
+        // omits that block and the model collapses on `<|channel>` (id 100)
+        // from token 1 — the serve-path garbage. The flavour fallback below
+        // only ever yields plain `Gemma4`, so this must run first.
+        if template_str.contains("<|turn>") && template_str.contains("<turn|>") {
+            if template_str.contains("<|channel>thought\\n<channel|>") {
+                return ChatTemplate::Gemma4WithThoughtChannel;
+            }
+            return ChatTemplate::Gemma4;
+        }
 
         // Fallback: pick from the tokenizer flavour. SPM (Mistral,
         // Llama-2 family) returns `None` from `flavour()` — default

@@ -1784,12 +1784,23 @@ pub fn embedding_row(
 // sequence ["<th","ink",">"] — both decode to the same string.
 // =======================================================================
 
-const THINK_OPEN: &str = "<think>";
-const THINK_CLOSE: &str = "</think>";
+// `(open, close)` span pairs stripped from the visible stream. The
+// classic `<think>…</think>` pair (Qwen3 / DeepSeek-R1 thinking mode)
+// plus Gemma-4's native channel scaffolding `<|channel>…<channel|>`
+// (the thought channel is rendered `<|channel>thought\n…\n<channel|>`,
+// and the canonical `strip_thinking` macro in the model's own
+// chat_template.jinja removes exactly these spans — keeping the answer
+// text that sits outside them). `<|channel>`/`<channel|>` don't occur
+// in non-Gemma output, so this is a no-op there.
+const SPAN_PATTERNS: &[(&str, &str)] = &[
+    ("<think>", "</think>"),
+    ("<|channel>", "<channel|>"),
+];
 
 #[derive(Debug, Default)]
 pub struct ThinkFilter {
-    in_think: bool,
+    /// `Some(i)` while inside `SPAN_PATTERNS[i]`; `None` when outside.
+    in_span: Option<usize>,
     /// Accumulator for partial-match boundaries across token chunks.
     pending: String,
 }
@@ -1800,20 +1811,21 @@ impl ThinkFilter {
     }
 
     /// Push a chunk of decoded text. Returns the visible portion (text
-    /// not inside a `<think>…</think>` block, with partial open/close
-    /// tags held back until the next chunk so they can be matched
-    /// across token boundaries).
+    /// not inside any stripped span, with partial open/close tags held
+    /// back until the next chunk so they can be matched across token
+    /// boundaries).
     pub fn push(&mut self, chunk: &str) -> String {
         self.pending.push_str(chunk);
         let mut out = String::new();
         loop {
-            if self.in_think {
-                if let Some(idx) = self.pending.find(THINK_CLOSE) {
-                    let cut = idx + THINK_CLOSE.len();
+            if let Some(i) = self.in_span {
+                let close = SPAN_PATTERNS[i].1;
+                if let Some(idx) = self.pending.find(close) {
+                    let cut = idx + close.len();
                     self.pending.drain(..cut);
-                    self.in_think = false;
+                    self.in_span = None;
                     continue;
-                } else if let Some(safe_end) = partial_tag_split(&self.pending, THINK_CLOSE) {
+                } else if let Some(safe_end) = partial_tag_split(&self.pending, close) {
                     // Discard everything before the partial tail; keep the tail.
                     self.pending.drain(..safe_end);
                     break;
@@ -1822,13 +1834,35 @@ impl ThinkFilter {
                     break;
                 }
             } else {
-                if let Some(idx) = self.pending.find(THINK_OPEN) {
+                // Outside any span: find the EARLIEST full open across all
+                // patterns (so interleaved span types are handled in stream
+                // order).
+                let mut best: Option<(usize, usize)> = None; // (byte_idx, pattern_idx)
+                for (pi, (open, _)) in SPAN_PATTERNS.iter().enumerate() {
+                    if let Some(idx) = self.pending.find(open) {
+                        if best.map_or(true, |(b, _)| idx < b) {
+                            best = Some((idx, pi));
+                        }
+                    }
+                }
+                if let Some((idx, pi)) = best {
                     out.push_str(&self.pending[..idx]);
-                    let cut = idx + THINK_OPEN.len();
+                    let cut = idx + SPAN_PATTERNS[pi].0.len();
                     self.pending.drain(..cut);
-                    self.in_think = true;
+                    self.in_span = Some(pi);
                     continue;
-                } else if let Some(safe_end) = partial_tag_split(&self.pending, THINK_OPEN) {
+                }
+                // No full open. Hold back from the earliest byte that could
+                // be the start of any open tag (partial match across the
+                // chunk boundary); emit the rest.
+                let mut earliest_partial: Option<usize> = None;
+                for (open, _) in SPAN_PATTERNS {
+                    if let Some(safe_end) = partial_tag_split(&self.pending, open) {
+                        earliest_partial =
+                            Some(earliest_partial.map_or(safe_end, |e: usize| e.min(safe_end)));
+                    }
+                }
+                if let Some(safe_end) = earliest_partial {
                     out.push_str(&self.pending[..safe_end]);
                     self.pending.drain(..safe_end);
                     break;
@@ -1842,10 +1876,10 @@ impl ThinkFilter {
         out
     }
 
-    /// Finalise at end of stream. If we're still inside a `<think>`
-    /// block, anything pending is dropped; otherwise it's emitted.
+    /// Finalise at end of stream. If we're still inside a stripped span,
+    /// anything pending is dropped; otherwise it's emitted.
     pub fn flush(&mut self) -> String {
-        if self.in_think {
+        if self.in_span.is_some() {
             self.pending.clear();
             String::new()
         } else {
@@ -1944,5 +1978,56 @@ mod tests {
         assert_eq!(partial_tag_split("hi <", "<think>"), Some(3));
         assert_eq!(partial_tag_split("hi", "<think>"), None);
         assert_eq!(partial_tag_split("", "<think>"), None);
+    }
+
+    // ---- Gemma-4 channel scaffolding (`<|channel>…<channel|>`) ----
+
+    #[test]
+    fn channel_filter_strips_thought_block() {
+        // Mirrors the model's `strip_thinking` macro: the thought channel
+        // `<|channel>thought\n…\n<channel|>` is removed, the answer kept.
+        assert_eq!(
+            ThinkFilter::strip_all("<|channel>thought\nreasoning here\n<channel|>The answer is 7."),
+            "The answer is 7."
+        );
+    }
+
+    #[test]
+    fn channel_filter_passthrough_clean_answer() {
+        // No channel markers (the common case once primed) → no-op.
+        assert_eq!(
+            ThinkFilter::strip_all("The capital of France is Paris."),
+            "The capital of France is Paris."
+        );
+    }
+
+    #[test]
+    fn channel_filter_handles_token_split_boundaries() {
+        // `<|channel>` / `<channel|>` arriving split across token chunks.
+        let mut f = ThinkFilter::new();
+        let mut visible = String::new();
+        for chunk in ["A", "<|", "channel>", "thought\nx", "<chan", "nel|>", "B"] {
+            visible.push_str(&f.push(chunk));
+        }
+        visible.push_str(&f.flush());
+        assert_eq!(visible, "AB");
+    }
+
+    #[test]
+    fn channel_filter_open_no_close_drops_tail() {
+        // Stream cut short inside a channel: drop the unterminated content.
+        let mut f = ThinkFilter::new();
+        let v = f.push("ok <|channel>thought\nunterminated");
+        let tail = f.flush();
+        assert_eq!(format!("{v}{tail}"), "ok ");
+    }
+
+    #[test]
+    fn channel_filter_coexists_with_think() {
+        // Both span types in one stream, in order.
+        assert_eq!(
+            ThinkFilter::strip_all("<think>q</think>visible<|channel>thought\nr<channel|> done"),
+            "visible done"
+        );
     }
 }

@@ -1120,8 +1120,22 @@ HuggingFace's `apply_chat_template(add_generation_prompt=True)`.
 
 Für Gemma-4-26B (siehe Memory `project_v0318_gemma4_26b_status`):
 zusätzlich `<|channel>thought\n<channel|>` anhängen — das ist die
-`ChatTemplate::Gemma4WithThoughtChannel` Variante, die der
-`detect_hf`-Path automatisch wählt.
+`ChatTemplate::Gemma4WithThoughtChannel` Variante. **Seit v0.5.8** wählt
+auch der GGUF-`detect()`-Path diese Variante (er snifft den im GGUF
+eingebetteten `tokenizer.chat_template` nach `<|turn>` +
+`<|channel>thought\n<channel|>`, gespiegelt von `detect_hf`); vorher konnte
+nur `detect_hf` das, weshalb `serve` (GGUF) den Channel-Block ausließ und
+Gemma-4 auf `<|channel>` (id 100) kollabierte.
+
+**v0.5.8 — Gemma-4 (MoE) serve-Korrektheit (3 gestapelte Fixes, Gemma-4-only):**
+`serve` rief nie `Forward::init_moe_router_gpu` → `moe_router_gpu=None` →
+Gemma-4-MoE-Decode fiel auf den Legacy-CPU-Pfad (nur für non-Gemma-4/Unit-Tests)
+→ Garbage selbst bei korrektem Prompt. `serve` spiegelt jetzt das CLI-Setup
+(`register_buckets` + `init_moe_router_gpu`; no-op für non-MoE). Plus die
+GGUF-Channel-Template-Detektion (oben) und ein channel-aware Output-Filter
+(strippt `<|channel>…<channel|>`-Gerüst aus der sichtbaren Antwort, analog dem
+`strip_thinking`-Makro der Modell-Template). Dense-Modelle waren nie betroffen
+(`moe_router_data` ist `None` für jede andere Architektur).
 
 ---
 

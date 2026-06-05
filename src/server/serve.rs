@@ -190,7 +190,17 @@ fn load_gguf_session(args: &ServeArgs) -> Result<ServerSession, Box<dyn std::err
         },
     )?;
     kv_cache.zero_fill(&dev)?;
-    let forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;
+    let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;
+    // Mirror the CLI setup (main.rs:819/821, :1275/1277): register the
+    // Sprint-B bucket handles, then init the GPU-side MoE router. Both are
+    // no-ops for non-bucketed / non-MoE models, but Gemma-4 (MoE) needs
+    // `init_moe_router_gpu` or `moe_router_gpu` stays `None` and the
+    // executor falls back to the legacy CPU slot-loop path that is
+    // "retained for non-Gemma-4 / unit tests" (executor/moe.rs:382) →
+    // garbage decode. `init_moe_router_gpu` also allocates the grouped /
+    // batched-decode scratch (VF_MOE_GROUPED default-ON).
+    forward.register_buckets(&model);
+    forward.init_moe_router_gpu(&dev, &mut allocator, &model, max_context)?;
 
     let template = ChatTemplate::detect(&gguf, &tokenizer);
 
