@@ -406,13 +406,27 @@ impl Forward {
         // in BAT Full-layer dispatch (51D-AK flash_attn_batch attention
         // + 51D-AM FFN/PostAttnNorm). Cost: 5 of 30 layers serialise
         // per prefill (~18 mid-frame submits per Full layer).
+        //
+        // Sprint 3 (Prefill-Arc, 2026-06-06) — `VF_PREFILL_FULL_BATCHED=1`
+        // keeps Full layers on the batched path instead. The 51D-AK
+        // (flash_attn_batch @ head_dim=512/8:1-GQA) and 51D-AM (BAT FFN)
+        // defects NO LONGER REPRODUCE on v0.5.8: the batched Full-layer
+        // output is bit-identical to an independent per-query DEC-shader
+        // reference dispatch and behaviourally equivalent to this
+        // per-token workaround (recall/smoke/multichunk green; remaining
+        // per-token-vs-batched tensor delta is GEMM-vs-GEMV FP-reorder
+        // noise, no Full-layer cliff). Default OFF — the per-token
+        // workaround stays the shipping default until the owner flips
+        // it; see results/sprint3_full_layer_batched_fix.md.
         let is_full = self.config.gemma4.as_ref()
             .map(|g| matches!(
                 g.layers[layer as usize].kind,
                 super::super::gguf::Gemma4LayerKind::Full,
             ))
             .unwrap_or(false);
-        if is_full {
+        let full_batched = std::env::var("VF_PREFILL_FULL_BATCHED")
+            .map(|v| v == "1").unwrap_or(false);
+        if is_full && !full_batched {
             self.dispatch_full_layer_per_token(
                 dev, registry, cmd, model, layer, seq_len, base_pos,
             );

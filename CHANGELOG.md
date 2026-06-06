@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.5.9 — Batched Full-attention prefill layers (opt-in) — Gemma-4 prefill +58 % (2026-06-06)
+
+**Adds `VF_PREFILL_FULL_BATCHED=1` (default OFF): Gemma-4's 5 Full-attention layers stay on the
+batched prefill path instead of the 51D-AN per-token workaround.**
+
+The v0.3.18-era 51D-AK (`flash_attn_batch` @ head_dim=512/8:1-GQA, cos 0.13) and 51D-AM (BAT FFN)
+defects that forced the workaround **no longer reproduce on the current codebase** (fixed in the
+interim by the 52K shader-type fix, the KV-layout work and the v0.5.3 bucket-offset audits — not
+re-bisected to a single commit). Evidence battery, all green:
+
+- batched Full-layer output is **bit-identical** to an independent per-query DEC-shader reference
+  dispatch (two shader implementations, byte-equal layer dumps);
+- the remaining batched-vs-per-token tensor delta is GEMM-vs-GEMV FP-reorder noise amplified by
+  MoE expert-routing flips (first Full layer cos 0.999996, no layer cliff — contrast 51D-AK's
+  cos 0.13 at the attention output itself);
+- fact recall (Paris / 391 / Jupiter), 5-prompt smoke (greeting / prime / mutex / binary-search /
+  arithmetic), 2048-token multichunk summary — all coherent, no garbage markers;
+- `cargo test --release --lib` 273/273.
+
+**Yield (Gemma-4-26B-A4B Q3_K_M, serve, KV-FP8, median of 3):** prefill 201 → **317 t/s** @p512
+(+58 %), 181 → **266 t/s** @p2048 (+47 %) — the 10,300 per-token GPU drains @p2048 (1 per token per
+Full layer) drop to 0. Decode unaffected. The flag costs nothing when off; the default stays the
+per-token workaround until the owner flips it (`results/sprint3_full_layer_batched_fix.md` has the
+flip recommendation).
+
 ## v0.5.8 — Gemma-4 (MoE) coherent on the API/serve path (2026-06-05)
 
 **Fixes Gemma-4 garbage output on `vulkanforge serve` (three stacked defects, all Gemma-4-specific).**
