@@ -269,6 +269,14 @@ pub enum ShaderId {
     FlashAttnSplitFp8Kv,
     FlashAttnBatchFp8Kv,
     FlashAttnTiledBr16Bc32Fp8Kv,
+    /// Sprint 7 (Prefill-Arc) — Gemma-4 Q-tiled flash attention:
+    /// HEAD_DIM=256 (Sliding, BR=8/BC=32) and HEAD_DIM=512 (Full,
+    /// BR=4/BC=16), FP8/FP16 KV variants. Same validated tiled
+    /// online-softmax source as the Br16 family.
+    FlashAttnTiledHd256Fp8Kv,
+    FlashAttnTiledHd256Fp16Kv,
+    FlashAttnTiledHd512Fp8Kv,
+    FlashAttnTiledHd512Fp16Kv,
     /// v0.2 Sprint 10B — scalar QK micro-benchmark. Computes Score =
     /// Q × K^T over Br=Bc=16, head_dim=128 in plain FP32 FMA. Used
     /// by examples/bench_qk to size up the coopmat win.
@@ -611,6 +619,10 @@ impl ShaderId {
             ShaderId::FlashAttnSplitFp8Kv => "flash_attn_split_fp8kv",
             ShaderId::FlashAttnBatchFp8Kv => "flash_attn_batch_fp8kv",
             ShaderId::FlashAttnTiledBr16Bc32Fp8Kv => "flash_attn_tiled_br16_bc32_fp8kv",
+            ShaderId::FlashAttnTiledHd256Fp8Kv => "flash_attn_tiled_hd256_fp8",
+            ShaderId::FlashAttnTiledHd256Fp16Kv => "flash_attn_tiled_hd256_fp16",
+            ShaderId::FlashAttnTiledHd512Fp8Kv => "flash_attn_tiled_hd512_fp8",
+            ShaderId::FlashAttnTiledHd512Fp16Kv => "flash_attn_tiled_hd512_fp16",
             ShaderId::BenchQkScalar => "bench_qk_scalar",
             ShaderId::BenchQkCoopmat => "bench_qk_coopmat",
             ShaderId::FlashAttnCoopmat => "flash_attn_coopmat",
@@ -781,6 +793,10 @@ impl ShaderId {
             ShaderId::FlashAttnSplitFp8Kv => FLASH_ATTN_SPLIT_FP8KV,
             ShaderId::FlashAttnBatchFp8Kv => FLASH_ATTN_BATCH_FP8KV,
             ShaderId::FlashAttnTiledBr16Bc32Fp8Kv => FLASH_ATTN_TILED_BR16_BC32_FP8KV,
+            ShaderId::FlashAttnTiledHd256Fp8Kv => FLASH_ATTN_TILED_HD256_FP8,
+            ShaderId::FlashAttnTiledHd256Fp16Kv => FLASH_ATTN_TILED_HD256_FP16,
+            ShaderId::FlashAttnTiledHd512Fp8Kv => FLASH_ATTN_TILED_HD512_FP8,
+            ShaderId::FlashAttnTiledHd512Fp16Kv => FLASH_ATTN_TILED_HD512_FP16,
             ShaderId::BenchQkScalar => BENCH_QK_SCALAR,
             ShaderId::BenchQkCoopmat => BENCH_QK_COOPMAT,
             ShaderId::FlashAttnCoopmat => FLASH_ATTN_COOPMAT,
@@ -958,6 +974,10 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::FlashAttnSplitFp8Kv,
     ShaderId::FlashAttnBatchFp8Kv,
     ShaderId::FlashAttnTiledBr16Bc32Fp8Kv,
+    ShaderId::FlashAttnTiledHd256Fp8Kv,
+    ShaderId::FlashAttnTiledHd256Fp16Kv,
+    ShaderId::FlashAttnTiledHd512Fp8Kv,
+    ShaderId::FlashAttnTiledHd512Fp16Kv,
     ShaderId::BenchQkScalar,
     ShaderId::BenchQkCoopmat,
     ShaderId::FlashAttnCoopmat,
@@ -1212,6 +1232,14 @@ pub const FLASH_ATTN_BATCH_FP8KV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_batch_fp8kv.spv"));
 pub const FLASH_ATTN_TILED_BR16_BC32_FP8KV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_tiled_br16_bc32_fp8kv.spv"));
+pub const FLASH_ATTN_TILED_HD256_FP8: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_tiled_hd256_fp8.spv"));
+pub const FLASH_ATTN_TILED_HD256_FP16: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_tiled_hd256_fp16.spv"));
+pub const FLASH_ATTN_TILED_HD512_FP8: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_tiled_hd512_fp8.spv"));
+pub const FLASH_ATTN_TILED_HD512_FP16: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_tiled_hd512_fp16.spv"));
 pub const BENCH_QK_SCALAR: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/bench_qk_scalar.spv"));
 pub const BENCH_QK_COOPMAT: &[u8] =

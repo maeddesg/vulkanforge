@@ -1009,6 +1009,96 @@ impl Forward {
         });
     }
 
+    /// Sprint 7 (Prefill-Arc, 2026-06-06) — Q-tiled flash attention for
+    /// Gemma-4's heterogeneous head dims. Dispatches the HEAD_DIM-256
+    /// (Sliding, BR=8/BC=32) or HEAD_DIM-512 (Full, BR=4/BC=16) build of
+    /// the validated `flash_attn_tiled.comp` Br-tiled online-softmax.
+    /// Each workgroup stages one K-tile in LDS and shares it across BR
+    /// queries → KV traffic ÷BR vs `flash_attn_batch` (the Sprint-6
+    /// mem-bound finding). Bind/push layout identical to fa_batch.
+    /// Falls back to `run_flash_attn_batch` if the KV cache is neither
+    /// FP8 nor FP16 (no FP32 variant built — production is FP8).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_flash_attn_tiled_gemma(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        layer: u32,
+        q_buf: vk::Buffer,
+        o_buf: vk::Buffer,
+        m: u32,
+        q_start: u32,
+        n_kv: u32,
+        kv_layer: u32,
+        kv_start: u32,
+    ) {
+        let cfg = self.config.clone();
+        let head_dim_layer = self.kv_cache.head_dim_for(layer);
+        let (shader_id, br) = match (head_dim_layer, self.kv_cache.is_fp8(), self.kv_cache.is_fp16()) {
+            (256, true, _) => (ShaderId::FlashAttnTiledHd256Fp8Kv, 8u32),
+            (256, false, true) => (ShaderId::FlashAttnTiledHd256Fp16Kv, 8u32),
+            (512, true, _) => (ShaderId::FlashAttnTiledHd512Fp8Kv, 4u32),
+            (512, false, true) => (ShaderId::FlashAttnTiledHd512Fp16Kv, 4u32),
+            _ => {
+                // Unsupported head_dim / KV-format combination — proven
+                // fallback path.
+                self.run_flash_attn_batch(
+                    dev, registry, cmd, layer, q_buf, o_buf, m, q_start, n_kv,
+                    kv_layer, kv_start,
+                );
+                return;
+            }
+        };
+        let kernel = registry.get(shader_id);
+        let layer_off = self.kv_cache.layer_offset_bytes(kv_layer);
+        let layer_size = self.kv_cache.layer_size_bytes(kv_layer);
+        // Gemma-4: scaling = 1.0 (Q-norm absorbs 1/√d) — 43D-4 rule.
+        let attn_scale_layer = if cfg.gemma4.is_some() {
+            1.0_f32
+        } else if head_dim_layer != cfg.head_dim {
+            1.0_f32 / (head_dim_layer as f32).sqrt()
+        } else {
+            self.attn_scale
+        };
+        let q_bytes_total = (m as u64) * (cfg.n_heads as u64) * (head_dim_layer as u64) * 4;
+        let set = self.alloc_or_get_set(
+            dev,
+            kernel.descriptor_set_layout,
+            &[
+                (0, q_buf, 0, q_bytes_total),
+                (1, self.kv_cache.k_buffer.handle, layer_off, layer_size),
+                (2, self.kv_cache.v_buffer.handle, layer_off, layer_size),
+                (3, o_buf, 0, q_bytes_total),
+            ],
+        );
+        let pc = FlashAttnBatchPushConstants {
+            n_heads: cfg.n_heads,
+            n_kv_heads: n_kv_heads_for(&cfg, layer),
+            head_dim: head_dim_layer,
+            m,
+            n_kv,
+            q_start,
+            scale: attn_scale_layer,
+            kv_start,
+        };
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        let n_heads = cfg.n_heads;
+        let q_tiles = m.div_ceil(br);
+        let label = if head_dim_layer == 512 { "fa_tiled_g512" } else { "fa_tiled_g256" };
+        self.profile(label, dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, n_heads, q_tiles, 1);
+        });
+    }
+
     /// Sprint 7 / 7.5 — Br>1 tiled-Q flash attention dispatch.
     /// Identical bind / push layout to `run_flash_attn_batch`; the
     /// shader ID is selected per `self.fa_tiled_br` and the dispatch

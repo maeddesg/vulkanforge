@@ -46,9 +46,18 @@
 #ifndef BC
 #define BC 64
 #endif
+// Sprint 7 (Prefill-Arc, 2026-06-06) — HEAD_DIM is now a build-time
+// define (-DHD=256/512 for Gemma-4 sliding/full layers; default 128 =
+// the original hardcoded value, compiled to IDENTICAL code: at
+// HD=128 the DPT=2 [[unroll]] loops reproduce the previous
+// hand-unrolled tid/tid+64 pairs).
+#ifndef HD
+#define HD 128
+#endif
 const uint WGSIZE   = 64;
 const uint TILE     = BC;
-const uint HEAD_DIM = 128;       // Hardcoded: Qwen3 / Llama-3.1 / Mistral / DSR1.
+const uint HEAD_DIM = HD;
+const uint DPT      = HEAD_DIM / WGSIZE;  // dims per thread (2/4/8)
 
 layout (local_size_x = WGSIZE) in;
 
@@ -129,11 +138,13 @@ void main() {
     [[unroll]] for (uint qi = 0; qi < BR; ++qi) {
         if (qi < actual_br) {
             uint q_off = ((q_base + qi) * p.n_heads + h) * p.head_dim;
-            q_lds[qi * HEAD_DIM + tid]      = q[q_off + tid];
-            q_lds[qi * HEAD_DIM + tid + 64] = q[q_off + tid + 64];
+            [[unroll]] for (uint di = 0; di < DPT; ++di) {
+                q_lds[qi * HEAD_DIM + tid + di * WGSIZE] = q[q_off + tid + di * WGSIZE];
+            }
         } else {
-            q_lds[qi * HEAD_DIM + tid]      = 0.0;
-            q_lds[qi * HEAD_DIM + tid + 64] = 0.0;
+            [[unroll]] for (uint di = 0; di < DPT; ++di) {
+                q_lds[qi * HEAD_DIM + tid + di * WGSIZE] = 0.0;
+            }
         }
     }
     barrier();
@@ -141,13 +152,13 @@ void main() {
     // Per-query running state — registers (BR=4 → 16 floats/thread).
     float my_max[BR];
     float my_sum[BR];
-    float my_out0[BR];
-    float my_out1[BR];
+    float my_out[BR * DPT];
     [[unroll]] for (uint qi = 0; qi < BR; ++qi) {
         my_max[qi]  = -1e30;
         my_sum[qi]  = 0.0;
-        my_out0[qi] = 0.0;
-        my_out1[qi] = 0.0;
+        [[unroll]] for (uint di = 0; di < DPT; ++di) {
+            my_out[qi * DPT + di] = 0.0;
+        }
     }
 
     // Causal upper bound for this Q-tile = max(q_pos)+1 across qi.
@@ -168,8 +179,10 @@ void main() {
             uint global_t = tile_base + local_pos;
             if (global_t < causal_len_max) {
                 uint kv_off = global_t * pos_stride + head_off;
-                k_lds[local_pos * HEAD_DIM + tid]      = load_k(kv_off + tid);
-                k_lds[local_pos * HEAD_DIM + tid + 64] = load_k(kv_off + tid + 64);
+                [[unroll]] for (uint di = 0; di < DPT; ++di) {
+                    k_lds[local_pos * HEAD_DIM + tid + di * WGSIZE] =
+                        load_k(kv_off + tid + di * WGSIZE);
+                }
             }
         }
         barrier();
@@ -207,8 +220,9 @@ void main() {
             float new_max  = max(my_max[qi], tile_max);
             // exp(-inf - -inf) is NaN in some implementations; guard.
             float kfac = (new_max == -1e30) ? 1.0 : exp(my_max[qi] - new_max);
-            my_out0[qi] *= kfac;
-            my_out1[qi] *= kfac;
+            [[unroll]] for (uint di = 0; di < DPT; ++di) {
+                my_out[qi * DPT + di] *= kfac;
+            }
             my_sum[qi]  *= kfac;
 
             float pscore = (valid && new_max > -1e30)
@@ -230,12 +244,15 @@ void main() {
             uint global_t = tile_base + i;
             if (global_t >= causal_len_max) break;
             uint v_off = global_t * pos_stride + head_off;
-            float v_d0 = load_v(v_off + tid);
-            float v_d1 = load_v(v_off + tid + 64);
+            float v_d[DPT];
+            [[unroll]] for (uint di = 0; di < DPT; ++di) {
+                v_d[di] = load_v(v_off + tid + di * WGSIZE);
+            }
             [[unroll]] for (uint qi = 0; qi < BR; ++qi) {
                 float pi = scores_lds[qi * TILE + i];
-                my_out0[qi] += pi * v_d0;
-                my_out1[qi] += pi * v_d1;
+                [[unroll]] for (uint di = 0; di < DPT; ++di) {
+                    my_out[qi * DPT + di] += pi * v_d[di];
+                }
             }
         }
         barrier();
@@ -249,11 +266,10 @@ void main() {
         float denom = (my_sum[qi] > 0.0) ? my_sum[qi] : 1.0;
         float inv_sum = 1.0 / denom;
         uint o_off = ((q_base + qi) * p.n_heads + h) * p.head_dim;
-        if (tid < HEAD_DIM) {
-            o[o_off + tid] = my_out0[qi] * inv_sum;
-        }
-        if ((tid + 64) < HEAD_DIM) {
-            o[o_off + tid + 64] = my_out1[qi] * inv_sum;
+        [[unroll]] for (uint di = 0; di < DPT; ++di) {
+            if ((tid + di * WGSIZE) < HEAD_DIM) {
+                o[o_off + tid + di * WGSIZE] = my_out[qi * DPT + di] * inv_sum;
+            }
         }
     }
 }

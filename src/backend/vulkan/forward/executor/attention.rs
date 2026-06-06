@@ -2217,6 +2217,47 @@ impl BatchExec {
         } else {
             (base_pos + seq_len).saturating_sub(kv_start_window)
         };
+        // Sprint 7 (Prefill-Arc, 2026-06-06) — Q-tiled flash attention for
+        // Gemma-4's heterogeneous head dims (Sprint-6 verdict: attention
+        // is 77 % of the prefill wall @p2048 and mem-bound on the KV
+        // stream; fa_batch re-streams the causal KV once per query).
+        // `VF_FA_TILED_SLIDING=1` routes the 25 Sliding layers
+        // (head_dim 256) and `VF_FA_TILED_FULL=1` the 5 Full layers
+        // (head_dim 512) through `run_flash_attn_tiled_gemma` — the
+        // HEAD_DIM-parametrised build of the validated Br-tiled
+        // online-softmax (KV traffic ÷8 / ÷4). Default OFF pending the
+        // owner default-flip decision; fa_batch stays the fallback.
+        {
+            let s7_sliding = {
+                use std::sync::OnceLock;
+                static F: OnceLock<bool> = OnceLock::new();
+                *F.get_or_init(|| {
+                    std::env::var("VF_FA_TILED_SLIDING").as_deref() == Ok("1")
+                })
+            };
+            let s7_full = {
+                use std::sync::OnceLock;
+                static F: OnceLock<bool> = OnceLock::new();
+                *F.get_or_init(|| {
+                    std::env::var("VF_FA_TILED_FULL").as_deref() == Ok("1")
+                })
+            };
+            let hd = fwd.kv_cache.head_dim_for(ctx.layer);
+            if _cfg.gemma4.is_some()
+                && ((hd == 256 && s7_sliding) || (hd == 512 && s7_full))
+            {
+                fwd.run_flash_attn_tiled_gemma(
+                    ctx.dev, ctx.registry, ctx.cmd,
+                    ctx.layer,
+                    fwd.batch_q.handle,
+                    fwd.batch_attn_out.handle,
+                    seq_len, base_pos, base_pos + seq_len,
+                    kv_layer, kv_start,
+                );
+                compute_barrier(ctx.dev, ctx.cmd);
+                return;
+            }
+        }
         // Sprint 46F — flash_attn_tiled.comp / flash_attn_coopmat.comp
         // hardcode HEAD_DIM=128 (Qwen3 / Llama-3.1 / Mistral / DSR1). For
         // Gemma-4 (head_dim=256) those shaders would silently leave dims

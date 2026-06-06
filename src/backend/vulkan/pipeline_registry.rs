@@ -845,6 +845,10 @@ impl PipelineRegistry {
                 | ShaderId::FlashAttnSplitFp8Kv
                 | ShaderId::FlashAttnBatchFp8Kv
                 | ShaderId::FlashAttnTiledBr16Bc32Fp8Kv
+                | ShaderId::FlashAttnTiledHd256Fp8Kv
+                | ShaderId::FlashAttnTiledHd256Fp16Kv
+                | ShaderId::FlashAttnTiledHd512Fp8Kv
+                | ShaderId::FlashAttnTiledHd512Fp16Kv
                 | ShaderId::BenchQkScalar
                 | ShaderId::BenchQkCoopmat
                 | ShaderId::BenchInt8CmGemm

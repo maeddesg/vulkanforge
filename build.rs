@@ -979,6 +979,30 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "flash_attn_tiled.comp",
         defines: &[("BR", "16"), ("BC", "32"), ("FP8_KV", "1")],
     },
+    // Sprint 7 (Prefill-Arc) — Gemma-4 Q-tiled flash attention. Same
+    // validated Br-tiled online-softmax source, HEAD_DIM parametrised:
+    // hd256 = Sliding layers (BR=8, BC=32 → 41 KB LDS), hd512 = Full
+    // layers (BR=4, BC=16 → 40 KB LDS; BC=32 would need 72 KB).
+    ShaderJob {
+        out_name: "flash_attn_tiled_hd256_fp8.spv",
+        entry_source: "flash_attn_tiled.comp",
+        defines: &[("BR", "8"), ("BC", "32"), ("HD", "256"), ("FP8_KV", "1")],
+    },
+    ShaderJob {
+        out_name: "flash_attn_tiled_hd256_fp16.spv",
+        entry_source: "flash_attn_tiled.comp",
+        defines: &[("BR", "8"), ("BC", "32"), ("HD", "256"), ("FP16_KV", "1")],
+    },
+    ShaderJob {
+        out_name: "flash_attn_tiled_hd512_fp8.spv",
+        entry_source: "flash_attn_tiled.comp",
+        defines: &[("BR", "4"), ("BC", "16"), ("HD", "512"), ("FP8_KV", "1")],
+    },
+    ShaderJob {
+        out_name: "flash_attn_tiled_hd512_fp16.spv",
+        entry_source: "flash_attn_tiled.comp",
+        defines: &[("BR", "4"), ("BC", "16"), ("HD", "512"), ("FP16_KV", "1")],
+    },
     // Phase-6A probe: confirms shaderc 0.8 + Mesa glslang ship a
     // coopmat + bfloat16 toolchain that produces SPV without warnings.
     // Output is unused at runtime — purely a build-time GO gate. See
