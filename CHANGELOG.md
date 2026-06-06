@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.6.0 — Prefill milestone: batched Full layers + MoE loop batching DEFAULT-ON (2026-06-06)
+
+**Gemma-4-26B-A4B prefill: 198 → 1073 t/s @p512 (5.4×) and 178 → 604 t/s @p2048 (3.4×) out of the box** —
+~37 % / ~21 % of llama.cpp's llama-server on identical GGUFs/prompts (was 6–7 %).
+
+Three coupled flags flip to **default-ON** (the exact configuration validated in the Sprint-5 gate battery):
+
+1. **`VF_PREFILL_FULL_BATCHED`** (v0.5.9, was opt-in): the 5 Full-attention layers stay on the batched
+   prefill path instead of the 51D-AN per-token workaround (1 GPU drain per token per Full layer —
+   10,300 drains @p2048 — and batch=1 GEMVs on 1/6 of the model = 76–80 % of prefill GPU time).
+2. **`VF_MOE_GLU_BATCHED`**: the per-(token,slot) GLU loop (125,760 mini-dispatches per 524-token chunk)
+   becomes ONE `GeluPytorchTanhGluBatched` dispatch per layer. Byte-identical output.
+3. **`VF_MOE_GATHER_COMBINE`**: the per-(token,slot) scatter-FMA loop (125,760 dispatches, each behind a
+   required accumulation barrier) becomes ONE `FmaReduceBatch` gather dispatch per layer — the
+   read-modify-write hazard, the barriers and the zero-fill disappear by design. Byte-identical output.
+
+Set any of the three to `0` to fall back to the previous path (all legacy paths retained).
+
+**Output note (honest):** items 2+3 are byte-identical; item 1 *changes the default output* vs v0.5.9 for
+Gemma-4 — the per-token and batched paths differ in FP reduction order (GEMM vs GEMV projections, amplified
+by discrete MoE expert-routing flips; layer cos ~0.93–0.99, no cliff). Both paths are validated correct
+(recall / 5-smoke / long-context recall / 2048-multichunk / 273-test battery); greedy outputs are
+equivalently coherent but not token-identical to v0.5.9 defaults.
+
+**Experimental, NOT recommended for performance:** `VF_FA_TILED_SLIDING=1` / `VF_FA_TILED_FULL=1`
+(HEAD_DIM-256/512 Q-tiled flash attention). Numerically validated (byte-identical single-tile, no-cliff
+multi-tile, long-context recall green) but **slower than the default fa_batch** (−31…−36 % prefill):
+the KV-traffic reduction works (KV-format sensitivity ÷5) but the 40 KB LDS tiles starve workgroup
+occupancy on RDNA4. Kept default-OFF as a validated platform for occupancy tuning; see
+`docs/prefill_arc_2026_06.md` for the dead-end analysis so it is not naively repeated.
+
+Dense models (Qwen3/Llama, head_dim 128) are unaffected by all of the above (Gemma-4-gated by construction;
+Qwen3-8B smoke green).
+
 ## v0.5.9 — Batched Full-attention prefill layers (opt-in) — Gemma-4 prefill +58 % (2026-06-06)
 
 **Adds `VF_PREFILL_FULL_BATCHED=1` (default OFF): Gemma-4's 5 Full-attention layers stay on the

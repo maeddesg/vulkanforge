@@ -69,15 +69,19 @@ pub(crate) fn prefill_skip_expert_ffn() -> bool {
 /// mini-dispatches per layer per chunk) with ONE
 /// `GeluPytorchTanhGluBatched` dispatch over all slots (grid
 /// `(ceil(mi/256), seq×top_k, 1)`; the decode path has used the same
-/// shader for its 8 slots since Sprint P1-2). Default OFF pending the
-/// owner default-flip decision. Cached after first read.
+/// shader for its 8 slots since Sprint P1-2). Byte-identical to the loop.
+///
+/// v0.6.0 (Sprint 8) — DEFAULT-ON, flipped as a coupled set with
+/// `VF_PREFILL_FULL_BATCHED` + `VF_MOE_GATHER_COMBINE` (the validated
+/// Sprint-5 configuration). `VF_MOE_GLU_BATCHED=0` is the opt-out back
+/// to the per-(token,slot) loop. Cached after first read.
 pub(crate) fn moe_glu_batched_prefill_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
         std::env::var("VF_MOE_GLU_BATCHED")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true)
     })
 }
 
@@ -89,14 +93,19 @@ pub(crate) fn moe_glu_batched_prefill_enabled() -> bool {
 /// thread owns one (token, elem) output, reads its token's top_k
 /// contiguous `down_out` rows + router weights and writes once — the
 /// hazard (and the barriers, and the zero-fill) disappear by design.
-/// Default OFF pending the owner default-flip decision. Cached.
+/// Byte-identical to the scatter chain (same FP accumulation order).
+///
+/// v0.6.0 (Sprint 8) — DEFAULT-ON, flipped as a coupled set with
+/// `VF_PREFILL_FULL_BATCHED` + `VF_MOE_GLU_BATCHED` (the validated
+/// Sprint-5 configuration). `VF_MOE_GATHER_COMBINE=0` is the opt-out
+/// back to the scatter-FMA loop. Cached.
 pub(crate) fn moe_gather_combine_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
         std::env::var("VF_MOE_GATHER_COMBINE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true)
     })
 }
 
