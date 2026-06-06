@@ -370,6 +370,7 @@ impl PipelineRegistry {
                 // SSBOs) + push range auto-derived from SPIR-V reflection.
                 | ShaderId::GeluPytorchTanhGluBatched
                 | ShaderId::FmaReduce
+                | ShaderId::FmaReduceBatch
                 | ShaderId::SigmoidMul
                 | ShaderId::MultiAddRms
                 | ShaderId::Copy

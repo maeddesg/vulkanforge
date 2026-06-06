@@ -708,6 +708,15 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "fma_reduce.comp",
         defines: &[],
     },
+    // Sprint 5 (Prefill-Arc) — batched weighted-sum expert combine for
+    // the GROUPED MoE prefill path (all tokens of a chunk in one
+    // dispatch; workgroup .y = token). Replaces the per-(token,slot)
+    // scatter-FMA loop + per-dispatch barriers.
+    ShaderJob {
+        out_name: "fma_reduce_batch_f32.spv",
+        entry_source: "fma_reduce_batch.comp",
+        defines: &[],
+    },
     // Sprint D2 (v0.4.6) — strided in-place sigmoid-gate multiply
     // for Qwen3.6 Full-Attention gated output (`attn = attn *
     // sigmoid(gate)`). 2 SSBOs (gate readonly, inout in-place), 4

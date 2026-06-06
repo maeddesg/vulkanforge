@@ -1,0 +1,61 @@
+#version 450
+
+// Sprint 5 (Prefill-Arc, 2026-06-06) — Batched weighted-sum expert
+// combine for the GROUPED MoE **prefill** path. The per-token variant
+// (`fma_reduce.comp`, Sprint P1-2) replaced the decode path's 8
+// per-slot scatter-FMA dispatches + barriers; this shader does the
+// same for ALL tokens of a prefill chunk in ONE dispatch:
+//
+//   out[t][i] = sum_{k=0..top_k-1} weights[t*top_k + k]
+//             * down_out[(t*top_k + k) * ne + i]
+//
+// It replaces the per-(token,slot) scatter-FMA loop in
+// `b_step_moe_expert_ffn_grouped` — seq_len × top_k dispatches, each
+// followed by a REQUIRED full compute_barrier (the accumulation
+// read-modify-write edge on the shared batch_out region; Sprint-4
+// profile: 125,760 dispatches + 125,760 barriers per 524-token chunk
+// = 35 % of the prefill wall). The gather formulation removes that
+// hazard BY DESIGN: each thread owns one (t, i) output element,
+// reads its token's top_k contiguous down_out rows and weights, and
+// writes batch_out[t*ne + i] exactly once — no inter-thread overlap,
+// no per-slot barrier, no zero-fill needed.
+//
+// Buffer layout (FP32):
+//   down_out : [seq_len × top_k][ne]   (row (t*top_k + k) at offset
+//                                       (t*top_k + k) * ne — the
+//                                       grouped down-MMQ_ID writes
+//                                       token-major (token, slot) rows)
+//   weights  : [seq_len × top_k]       (router weights, token-major —
+//                                       same order the scatter loop's
+//                                       weights_host readback used)
+//   out      : [seq_len][ne]           (batch_ffn_hidden)
+//
+// Accumulation runs in slot order 0..top_k-1 from acc = 0 — the SAME
+// FP reduction order as the zero-fill-then-scatter chain, mirroring
+// fma_reduce.comp's bit-identical-order argument.
+//
+// Dispatch grid: (ceil(ne/256), seq_len, 1); workgroup .y is the token.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0, std430) readonly  buffer DownOut { float data_down[]; };
+layout (binding = 1, std430) writeonly buffer Out     { float data_out[];  };
+layout (binding = 2, std430) readonly  buffer Weights { float weights[];   };
+
+layout (push_constant) uniform Params {
+    uint ne;     // hidden_size (output elements per token)
+    uint top_k;  // active expert slots per token
+} p;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= p.ne) return;
+    const uint t = gl_WorkGroupID.y;
+    const uint base = t * p.top_k;
+
+    float acc = 0.0;
+    for (uint k = 0u; k < p.top_k; ++k) {
+        acc += weights[base + k] * data_down[(base + k) * p.ne + i];
+    }
+    data_out[t * p.ne + i] = acc;
+}

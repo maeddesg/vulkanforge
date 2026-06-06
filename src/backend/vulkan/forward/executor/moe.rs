@@ -64,6 +64,42 @@ pub(crate) fn prefill_skip_expert_ffn() -> bool {
     })
 }
 
+/// Sprint 5 (Prefill-Arc, 2026-06-06) — `VF_MOE_GLU_BATCHED=1` replaces the
+/// per-(token,slot) GLU loop of the grouped prefill Expert-FFN (seq×top_k
+/// mini-dispatches per layer per chunk) with ONE
+/// `GeluPytorchTanhGluBatched` dispatch over all slots (grid
+/// `(ceil(mi/256), seq×top_k, 1)`; the decode path has used the same
+/// shader for its 8 slots since Sprint P1-2). Default OFF pending the
+/// owner default-flip decision. Cached after first read.
+pub(crate) fn moe_glu_batched_prefill_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("VF_MOE_GLU_BATCHED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Sprint 5 (Prefill-Arc, 2026-06-06) — `VF_MOE_GATHER_COMBINE=1` replaces
+/// the per-(token,slot) scatter-FMA loop (seq×top_k dispatches, each
+/// followed by a REQUIRED full compute_barrier — the accumulation RMW edge
+/// on the shared `batch_out` token region; 35 % of the prefill wall in the
+/// Sprint-4 profile) with ONE `FmaReduceBatch` gather dispatch: each
+/// thread owns one (token, elem) output, reads its token's top_k
+/// contiguous `down_out` rows + router weights and writes once — the
+/// hazard (and the barriers, and the zero-fill) disappear by design.
+/// Default OFF pending the owner default-flip decision. Cached.
+pub(crate) fn moe_gather_combine_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("VF_MOE_GATHER_COMBINE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 /// Sprint v0.5.3 (GROUPED-Drift-Bisect, diagnostic) — `VF_MOE_GROUPED_MAX_LAYER=N`
 /// routes the prefill Expert-FFN through the grouped MMQ_ID path for layers
 /// `[0, N)` and the (correct) GPU-direct GEMV slot-loop for `[N, ..]`,
@@ -2163,7 +2199,42 @@ impl BatchExec {
         );
         compute_barrier(ctx.dev, ctx.cmd);
 
-        // -------- 7. Per-(token, slot) GLU --------
+        // -------- 7. GLU over all (token, slot) pairs --------
+        // Sprint 5 — `VF_MOE_GLU_BATCHED=1`: ONE dispatch over all
+        // seq_len × top_k slots (grid `(ceil(mi/256), n_slots, 1)`,
+        // workgroup .y = flat slot). Same `GeluPytorchTanhGluBatched`
+        // shader the decode path has used since Sprint P1-2 — the
+        // grouped buffers share its [slot: gate(mi) up(mi)] / [slot: mi]
+        // layout with `n_slots = seq_len × top_k` instead of `top_k`.
+        // Bit-identical activation, no inter-slot hazard. Replaces the
+        // per-(token,slot) loop below (Sprint-4 profile: 23.8 % of the
+        // prefill wall, dominated by CPU record of seq×top_k dispatches).
+        if moe_glu_batched_prefill_enabled() {
+            let n_slots = seq_len * top_k;
+            let kernel = ctx.registry.get(ShaderId::GeluPytorchTanhGluBatched);
+            let set = fwd.alloc_or_get_set(
+                ctx.dev, kernel.descriptor_set_layout,
+                &[
+                    (0, grouped_gate_up_out, 0, (n_slots as u64) * two_mi_bytes),
+                    (1, grouped_glu_out,     0, (n_slots as u64) * mi_bytes),
+                ],
+            );
+            let pc = SwigluPushConstants { n: mi };
+            let dispatch_x = (mi + 255) / 256;
+            let layout = kernel.pipeline_layout;
+            let pipeline = kernel.pipeline;
+            fwd.profile("moe_glu_grouped_batched", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
+                dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                dev.device.cmd_bind_descriptor_sets(
+                    cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+                );
+                dev.device.cmd_push_constants(
+                    cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+                );
+                dev.device.cmd_dispatch(cmd, dispatch_x, n_slots, 1);
+            });
+        } else {
+        // -------- 7-legacy. Per-(token, slot) GLU --------
         // gate_up_out layout: [seq_len × top_k × 2*mi], so slot offset
         // is `(t * top_k + s) * 2*mi`. Gate occupies the first mi
         // elements of each slot block; up occupies the second mi.
@@ -2200,6 +2271,7 @@ impl BatchExec {
                 });
             }
         }
+        } // Sprint 5: end VF_MOE_GLU_BATCHED else-branch (legacy loop)
         compute_barrier(ctx.dev, ctx.cmd);
 
         // -------- Sprint 61C-2 bisect option: per-slot down GEMV --------
@@ -2445,7 +2517,54 @@ impl BatchExec {
             );
         }
 
-        // -------- 10. Zero output accumulator --------
+        // -------- 10+11. Combine: down_out × router weights → batch_out ----
+        // Sprint 5 — `VF_MOE_GATHER_COMBINE=1`: ONE `FmaReduceBatch`
+        // gather dispatch (grid `(ceil(h/256), seq_len, 1)`, workgroup
+        // .y = token). Each thread owns one (token, elem) output, reads
+        // its token's top_k CONTIGUOUS down_out rows (the grouped down
+        // MMQ_ID writes token-major (token, slot) lanes) + the
+        // token-major `weights_scratch` and writes `batch_out` exactly
+        // once, accumulating in slot order 0..top_k-1 (same FP order as
+        // the zero-fill-then-scatter chain). The accumulation RMW edge
+        // that made the scatter loop's per-dispatch compute_barrier
+        // REQUIRED (A/B 10/10-vs-0/10) does not exist in this
+        // formulation — no per-slot barriers, no zero-fill. Replaces
+        // seq×top_k dispatches + barriers (Sprint-4 profile: 35.2 % of
+        // the prefill wall). Guarded off in `VF_MOE_SINGLE_EXPERT`
+        // diagnostic mode (its re-written host weights never reach
+        // `weights_scratch`, which this kernel reads).
+        if moe_gather_combine_enabled() && !single_expert {
+            let kernel = ctx.registry.get(ShaderId::FmaReduceBatch);
+            let set = fwd.alloc_or_get_set(
+                ctx.dev, kernel.descriptor_set_layout,
+                &[
+                    (0, grouped_down_out, 0,
+                     (seq_len as u64) * (top_k as u64) * h_bytes),
+                    (1, batch_out, 0, (seq_len as u64) * h_bytes),
+                    (2, router_weights, 0,
+                     (seq_len as u64) * (top_k_real as u64) * 4),
+                ],
+            );
+            let pc = FmaReducePushConstants { ne: h, top_k };
+            let dispatch_x = (h + 255) / 256;
+            let layout = kernel.pipeline_layout;
+            let pipeline = kernel.pipeline;
+            fwd.profile("moe_combine_gather", ctx.dev, ctx.cmd, |dev, cmd| unsafe {
+                dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                dev.device.cmd_bind_descriptor_sets(
+                    cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+                );
+                dev.device.cmd_push_constants(
+                    cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+                );
+                dev.device.cmd_dispatch(cmd, dispatch_x, seq_len, 1);
+            });
+            fwd.mark_written(&[batch_out]);
+            compute_barrier(ctx.dev, ctx.cmd);
+            return;
+        }
+
+        // -------- 10-legacy. Zero output accumulator --------
         unsafe {
             ctx.dev.device.cmd_fill_buffer(
                 ctx.cmd, batch_out, 0, (seq_len as u64) * h_bytes, 0,
@@ -2453,7 +2572,7 @@ impl BatchExec {
         }
         transfer_to_compute_barrier(ctx.dev, ctx.cmd);
 
-        // -------- 11. Per-(token, slot) scalar-weight FMA add --------
+        // -------- 11-legacy. Per-(token, slot) scalar-weight FMA add --------
         // grouped_down_out layout: [seq_len × top_k × hidden] indexed by
         // (token, slot) — the MMQ_ID kernel wrote each output to its
         // (row_idx.y=token, row_idx.x=slot) lane. Iterate in the
@@ -2509,6 +2628,12 @@ impl BatchExec {
                 // 0 SYNC-HAZARD across three enablement methods. So sync-val's
                 // silence here proves nothing; the necessity rests on the A/B.
                 // (results/sprint_v053_compute_barrier_syncval.md)
+                // Sprint-5 re-verification (2026-06-06): A/B re-confirmed
+                // on v0.5.9 — without this barrier the output degenerates
+                // immediately (French rambling/garbage on Paris/391/
+                // Jupiter). The gather formulation (VF_MOE_GATHER_COMBINE,
+                // FmaReduceBatch) removes the hazard by design and is
+                // byte-identical to this scatter chain.
                 compute_barrier(ctx.dev, ctx.cmd);
             }
         }

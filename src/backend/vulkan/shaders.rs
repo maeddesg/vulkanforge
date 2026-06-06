@@ -158,6 +158,10 @@ pub enum ShaderId {
     /// glu_out) + 1 u32 push (mi); dispatched with `.y = top_k`.
     /// Activation matches `GeluPytorchTanhGlu` bit-for-bit.
     GeluPytorchTanhGluBatched,
+    /// Sprint 5 — batched weighted-sum expert combine (prefill grouped
+    /// path; workgroup .y = token). Gather formulation of the
+    /// per-(token,slot) scatter-FMA loop.
+    FmaReduceBatch,
     /// Sprint P1-2 — weighted-sum expert reduction (`ffn_hidden[i] =
     /// Σ weights[k]·down_out[k·ne+i]`) in one dispatch. 3 SSBOs
     /// (down_out, ffn_hidden, weights) + 8-byte push (ne + top_k).
@@ -585,6 +589,7 @@ impl ShaderId {
             ShaderId::GeluPytorchTanhGlu => "gelu_pytorch_tanh_f32",
             ShaderId::GeluPytorchTanhGluBatched => "gelu_pytorch_tanh_glu_batched_f32",
             ShaderId::FmaReduce => "fma_reduce_f32",
+            ShaderId::FmaReduceBatch => "fma_reduce_batch_f32",
             ShaderId::SigmoidMul => "sigmoid_mul_f32",
             ShaderId::SsmConvF32 => "ssm_conv_f32",
             ShaderId::SsmConvSetupF32 => "ssm_conv_setup_f32",
@@ -754,6 +759,7 @@ impl ShaderId {
             ShaderId::GeluPytorchTanhGlu => GELU_PYTORCH_TANH_F32,
             ShaderId::GeluPytorchTanhGluBatched => GELU_PYTORCH_TANH_GLU_BATCHED_F32,
             ShaderId::FmaReduce => FMA_REDUCE_F32,
+            ShaderId::FmaReduceBatch => FMA_REDUCE_BATCH_F32,
             ShaderId::SigmoidMul => SIGMOID_MUL_F32,
             ShaderId::SsmConvF32 => SSM_CONV_F32,
             ShaderId::SsmConvSetupF32 => SSM_CONV_SETUP_F32,
@@ -930,6 +936,7 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::GeluPytorchTanhGlu,
     ShaderId::GeluPytorchTanhGluBatched,
     ShaderId::FmaReduce,
+    ShaderId::FmaReduceBatch,
     ShaderId::SigmoidMul,
     ShaderId::SsmConvF32,
     ShaderId::SsmConvSetupF32,
@@ -1158,6 +1165,8 @@ pub const GELU_PYTORCH_TANH_GLU_BATCHED_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gelu_pytorch_tanh_glu_batched_f32.spv"));
 pub const FMA_REDUCE_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/fma_reduce_f32.spv"));
+pub const FMA_REDUCE_BATCH_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/fma_reduce_batch_f32.spv"));
 pub const SIGMOID_MUL_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/sigmoid_mul_f32.spv"));
 pub const SSM_CONV_F32: &[u8] =
