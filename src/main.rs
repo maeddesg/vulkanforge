@@ -1809,7 +1809,18 @@ fn inference_support(arch: &str, file_type: Option<u32>) -> (bool, bool) {
     // (Qwen2.5-7B/14B's ffn_down), and Q8_0 shader (Qwen2.5-0.5B's
     // output.weight). Q4_0 infrastructure stays in main and is
     // ready for an arch-Qwen2.5 sprint.
-    let quant_ok = matches!(file_type, Some(11 | 12 | 15 | 16 | 17));
+    //
+    // Sprint 9 (2026-06-07) — file_type=2 (Q4_0) lifts for **gemma4
+    // only** (the QAT GGUF line: E2B/E4B/12B/26B/31B ship pure
+    // Q4_0 + F32 norms). Per-tensor inventory of the 26B QAT file
+    // matched the running Q3_K_M tensor-for-tensor (same names/shapes,
+    // only types differ), and every weight-shader path was already
+    // type-driven with Q4_0 arms (Sprints 17D / 56C-2 / 61B / 61D) —
+    // the wireup gap was this whitelist plus the lm_head tied-embedding
+    // picker (decode.rs / mtp.rs). Qwen2.5-style Q4_0 stays gated on
+    // the missing arch features above, NOT on the quant.
+    let quant_ok = matches!(file_type, Some(11 | 12 | 15 | 16 | 17))
+        || (file_type == Some(2) && arch == "gemma4");
     (arch_ok, quant_ok)
 }
 

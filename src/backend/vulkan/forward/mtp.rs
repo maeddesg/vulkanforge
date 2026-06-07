@@ -421,6 +421,11 @@ impl Forward {
             (GgmlType::F16, _) => ShaderId::MulMatVecF16,
             (GgmlType::Q6K, true) => ShaderId::MulMatVecQ6KSubgroup,
             (GgmlType::Q6K, false) => ShaderId::MulMatVecQ6K,
+            // Sprint 9 (Q4_0 wireup) — mirror of the dispatch_final
+            // lm_head fix: Q4_0 tied embeddings must not fall through
+            // to the Q4_K shader (wrong block stride).
+            (GgmlType::Q4_0, true) => ShaderId::MulMatVecQ4_0Subgroup,
+            (GgmlType::Q4_0, false) => ShaderId::MulMatVecQ4_0,
             (_, true) => ShaderId::MulMatVecQ4KSubgroup,
             (_, false) => ShaderId::MulMatVecQ4K,
         };

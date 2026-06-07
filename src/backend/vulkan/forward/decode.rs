@@ -999,6 +999,14 @@ impl Forward {
             (GgmlType::F16,    _) => ShaderId::MulMatVecF16,
             (GgmlType::Q6K, true ) => ShaderId::MulMatVecQ6KSubgroup,
             (GgmlType::Q6K, false) => ShaderId::MulMatVecQ6K,
+            // Sprint 9 (Q4_0 wireup) — Gemma-4 QAT GGUFs (file_type=2)
+            // tie lm_head to a Q4_0 `token_embd.weight` (18 B / 32-weight
+            // blocks). The `_ =>` Q4_K catch-all below read those blocks
+            // with a 144 B stride → garbage logits (`<bos><bos><pad>`),
+            // the same silent-fallthrough class Sprint 52J fixed for the
+            // layer GEMVs.
+            (GgmlType::Q4_0, true ) => ShaderId::MulMatVecQ4_0Subgroup,
+            (GgmlType::Q4_0, false) => ShaderId::MulMatVecQ4_0,
             (_,             true ) => ShaderId::MulMatVecQ4KSubgroup,
             (_,             false) => ShaderId::MulMatVecQ4K,
         };
