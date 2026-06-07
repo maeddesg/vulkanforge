@@ -52,7 +52,11 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
   English with full Markdown structure as of v0.3.14; see
   [docs/MODELS.md](docs/MODELS.md) and the v0.3.14 entry in
   [CHANGELOG.md](CHANGELOG.md) for the 8-bug coherence fix-up plus
-  the `forward.rs` refactor that ships alongside it).
+  the `forward.rs` refactor that ships alongside it). **v0.6.1 adds
+  Q4_0 GGUF support for Gemma-4 — the QAT line (E2B…31B) runs**,
+  byte-gated vs llama.cpp (26B-A4B QAT: prefill 1143/646 t/s
+  @p512/p2048, decode 117 t/s out of the box). Qwen2.5-Q4_0 stays
+  deliberately gated (missing arch features, not the quant).
 - **`forward.rs` Refactor (v0.3.14):** the 7816-LOC dispatch file
   splits into 13 sibling modules with a `LayerStep` enum + two
   `LayerExecutor` impls. The Sprint 43F bug class — "added a

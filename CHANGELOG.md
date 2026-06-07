@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.6.1 — Q4_0 support for Gemma-4: the QAT GGUF line runs (2026-06-07)
+
+**Adds Q4_0 (`file_type=2`) support for `gemma4` — unlocks the Gemma-4 QAT GGUF line**
+(E2B / E4B / 12B / 26B / 31B, all pure Q4_0 + F32 norms; validated end-to-end on
+`gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf`, 13.27 GiB).
+
+All Q4_0 kernels already existed (Sprints 17D / 52J / 56C-2 / 61B / 61D) and every weight
+dispatch has been type-driven with Q4_0 arms since Sprint 52K — the 26B Q3_K_M GGUF already
+exercises Q4_0 for 16 of its `down_exps` tensors. The actual gaps were host-side wiring (26 LOC):
+
+- **`inference_support` whitelist**: `file_type=2` now passes preflight for `arch=gemma4`.
+  **Qwen2.5-style Q4_0 GGUFs stay deliberately gated** — they need architecture features
+  VulkanForge doesn't ship (attn bias add, Q4_1, Q8_0 lm_head), not the quant itself.
+- **lm_head picker fix (`decode.rs` dispatch_final + `mtp.rs`)**: the silent `_ => Q4_K`
+  catch-all read a tied Q4_0 `token_embd.weight` (18-byte blocks) with the 144-byte
+  K-quant stride → garbage logits (`<bos><bos><pad>`) — the Sprint-52J silent-fallthrough
+  class. Explicit Q4_0 arms added; `serve` (which never preflighted) ran straight into this.
+
+**Correctness anchor = byte identity vs llama.cpp** (Q4_0 dequant `d·(q−8)` is deterministic):
+the Q4_0 GLSL branches (`dequant_funcs` / `mul_mmq_funcs` / `mul_mm_funcs`) diff byte-identical
+to llama.cpp; new `tests/q4_0_qat_correctness.rs` (4 tests) proves one-hot GEMV column
+extraction **bit-exact** on real QAT tensors (one-hot input ⇒ no FP-accumulation ambiguity),
+with the GPU dumps comparing `np.array_equal == True` against gguf-py's reference dequant;
+dense MMQ GEMM max rel-to-mass 3.7e-4 (Q8_1-bounded by construction, as in llama.cpp's own
+integer path). E2E: chat loads, Paris/391/Jupiter recall, 5-prompt smoke, ~2970-token
+multichunk green; `VF_MOE_GROUPED=1/0` cross-check answer-identical; 273/273 lib + 4/4 new.
+
+**Out of the box (serve, KV-FP8, ctx 4096, median of 3):** prefill **1143 t/s @p512 /
+646 @p2048**, decode **117.3 t/s** — the v0.6.0 prefill arc carries over fully and Q4_0's
+cheaper dequant lands slightly above the Q3_K_M figures (1073 / 604 / ~103). VRAM peak
+15.30 GiB @ctx4096 (fits the 16 GiB card with ~0.6 GiB headroom; much larger contexts won't).
+
+**Correction to the v0.6.0 sprint report (attribution, docs-only):** the Sprint-8 report
+stated the prefill gain as "+229 %/+130 % vs v0.5.9-Default" — that baseline was the
+*intermediate* configuration with `VF_PREFILL_FULL_BATCHED` already enabled (317/325 t/s),
+not the v0.5.9 default. The honest default-to-default numbers are **5.4× @p512 / 3.4× @p2048**
+(198 → 1073, 178 → 604) — which is what this CHANGELOG and the GitHub release notes already
+said; the report file carries a correction note now.
+
 ## v0.6.0 — Prefill milestone: batched Full layers + MoE loop batching DEFAULT-ON (2026-06-06)
 
 **Gemma-4-26B-A4B prefill: 198 → 1073 t/s @p512 (5.4×) and 178 → 604 t/s @p2048 (3.4×) out of the box** —

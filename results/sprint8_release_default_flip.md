@@ -29,6 +29,11 @@
    Folge-Richtungen, damit es nicht naiv wiederholt wird). Lizenz UNVERÄNDERT.
 4. **Release-Notes-Kernaussage (ehrlich):** Prefill gemma4-26B **+229 %/+130 %** vs v0.5.9-Default bzw.
    **5,4×/3,4×** vs v0.5.8 (198→1073 @p512, 178→604 @p2048) = ~37 %/~21 % von llama-server (war 6–7 %).
+   > **KORREKTUR (2026-06-07, v0.6.1, Attribution):** „+229 %/+130 % vs v0.5.9-Default" ist falsch
+   > attribuiert — diese Baseline (312/317 t/s) war die *Zwischen-Konfiguration mit bereits aktiviertem*
+   > `VF_PREFILL_FULL_BATCHED` (in v0.5.9 opt-in, Default OFF → echter v0.5.9-Default = ~201 t/s).
+   > Korrekt Default-zu-Default: **5,4× @p512 / 3,4× @p2048** (198→1073, 178→604) — CHANGELOG und
+   > GitHub-Release-Notes v0.6.0 trugen von Anfang an diese korrekten Zahlen; nur dieser Report war falsch.
    **Output-Hinweis:** GLU+Gather byte-identisch; der FULL_BATCHED-Anteil ÄNDERT den Default-Greedy-Output vs
    ≤v0.5.9 (FP-Reorder + Routing-Flips, cos ~0,93–0,99, kein Cliff, beide Pfade validiert korrekt).
    **tiled-FA-Flags:** experimentell, default-OFF, „NICHT für Performance" (−31…−36 %, occupancy-bound,
