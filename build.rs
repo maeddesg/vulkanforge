@@ -1074,6 +1074,19 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "flash_attn_cm_gemma.comp",
         defines: &[("HD", "256"), ("FP8_KV", "1")],
     },
+    // Sprint 10c — row_split=4 coopmat FA (f16 K/V direct-global). hd256.
+    ShaderJob {
+        out_name: "flash_attn_cm_gemma_rs_hd256.spv",
+        entry_source: "flash_attn_cm_gemma_rs.comp",
+        defines: &[("HD", "256")],
+    },
+    // Sprint 10c — FP8(e4m3)→f16 convert pass (Pfad B: materialise f16 K/V
+    // scratch for the direct-global coopmat-FA read).
+    ShaderJob {
+        out_name: "kv_fp8_to_f16.spv",
+        entry_source: "kv_fp8_to_f16.comp",
+        defines: &[],
+    },
     // v0.2 smoke-test FP8 throughput bench (E4M3 × E4M3 → FP32).
     // Twin of bench_coopmat_pure for the FP8 path. Used by
     // examples/bench_coopmat when VF_BENCH_FP8=1.

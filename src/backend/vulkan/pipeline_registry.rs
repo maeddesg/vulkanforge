@@ -865,12 +865,21 @@ impl PipelineRegistry {
                 // Sprint 10b Phase-1a — HEAD_DIM-parametric coopmat FA;
                 // same plain coopmat surface (HD/FP8_KV baked at build).
                 | ShaderId::FlashAttnCmGemmaHd256
-                | ShaderId::FlashAttnCmGemmaHd256Fp8 => {
+                | ShaderId::FlashAttnCmGemmaHd256Fp8
+                // Sprint 10c — FP8→f16 convert (plain elementwise, no spec).
+                | ShaderId::KvFp8ToF16 => {
                     // No spec constants — BR/BC/HEAD_DIM/FP16_KV are
                     // baked in via -DBR=N -DBC=N (-DFP16_KV=1) at
                     // SPIR-V build time. KvCopyFp16 has no spec
                     // constants either.
                     ComputeKernel::from_spv(device, &words, cache)
+                }
+                // Sprint 10c — row_split=4 kernel REQUIRES Wave64 so WG=256 is
+                // exactly 4 subgroups (gl_SubgroupID 0..3 = row_tid). Pin
+                // requiredSubgroupSize=64; wave32 would give 8 subgroups and
+                // break the row_split mapping. No spec constants (HD baked).
+                ShaderId::FlashAttnCmGemmaRsHd256 => {
+                    ComputeKernel::from_spv_with_spec(device, &words, cache, &[], &[], Some(64))
                 }
                 // Sprint 3A — Q4_K coopmat with forward-pass layout.
                 // No spec constants: the BN tile size is already baked

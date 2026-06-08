@@ -1,0 +1,258 @@
+#version 450
+#extension GL_KHR_cooperative_matrix                       : require
+#extension GL_KHR_memory_scope_semantics                   : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage                     : require
+#extension GL_EXT_control_flow_attributes                  : enable
+#extension GL_KHR_shader_subgroup_basic                    : enable
+#extension GL_KHR_shader_subgroup_arithmetic               : enable
+
+// VulkanForge Sprint 10c — row_split=4 coopmat flash-attention for Gemma-4
+// (hd256/hd512). The occ-12 kernel that breaks v1's single-subgroup VGPR-256
+// ceiling. Faithful port of llama.cpp's flash_attn_cm1.comp index math,
+// adapted to VF's per-head FA layout + inline causal/sliding mask, stripped of
+// mask-tensor / ALiBi / softcap / split_k / quant.
+//
+//   Br=16 · Bc=64 (16×4 subgroups) · row_split=4 · WG=256 · MatBr=MatBc=16.
+//   rows_per_thread = Br/row_split = 4   → Of[4][d_per_thread] in regs (the
+//                                          VGPR break: 4 rows/thread not 16).
+//   K/V coopMatLoad DIRECT from global f16 (Phase-0b keystone; OOB→0 via
+//   cooperativeMatrixRobustBufferAccess). Q f32→shared f16 (scaled).
+//   QK: 4 subgroups split Bc → SfMat (Bc×Br transposed) → shared sfsh.
+//   Softmax: per-row subgroupMax/Add over col_tid, online rescale of Of regs.
+//   PV: coopmat P(Psh)·V(direct global) → pvsh → Of.
+//
+// Data-path B: K/V are f16 (Pfad-B convert materialises them from FP8). Q is
+// f32 (batch_q). Gated VF_FA_COOPMAT_GEMMA; default OFF; fa_batch fallback.
+
+#ifndef HD
+#define HD 256
+#endif
+const uint HSK   = HD;   // = HSV (Gemma square head)
+const uint HSV   = HD;
+const uint Br    = 16u;
+const uint Bc    = 64u;
+const uint row_split = 4u;
+const uint MatBr = 16u;
+const uint MatBc = 16u;
+const uint WG    = 256u;
+
+const uint rows_per_thread     = Br / row_split;     // 4
+const uint threads_per_rowgroup = WG / row_split;    // 64 (== subgroup size)
+const uint cols_per_iter       = threads_per_rowgroup; // 64
+const uint cols_per_thread     = Bc / cols_per_iter;   // 1
+
+layout (local_size_x = WG) in;
+
+layout (binding = 0) readonly  buffer Q  { float    data_q[]; };
+layout (binding = 0) readonly  buffer QV4{ vec4     data_qv4[]; };
+layout (binding = 1) readonly  buffer K  { float16_t data_k[]; };
+layout (binding = 1) readonly  buffer KV4{ f16vec4  data_kv4[]; };
+layout (binding = 2) readonly  buffer V  { float16_t data_v[]; };
+layout (binding = 2) readonly  buffer VV4{ f16vec4  data_vv4[]; };
+layout (binding = 3) writeonly buffer O  { float    data_o[]; };
+
+layout (push_constant) uniform Params {
+    uint  n_heads;
+    uint  n_kv_heads;
+    uint  head_dim;
+    uint  m;          // batch query count
+    uint  n_kv;       // total visible KV positions
+    uint  q_start;    // KV position of first query in this batch
+    float scale;      // attention scale (Gemma: 1.0)
+    uint  kv_start;   // sliding-window lower bound (0 = full)
+} p;
+
+const uint qstride   = HSK / 4u + 2u;          // f16vec4 per Q row (+2 pad)
+const uint sfshstride = Br / 4u;               // HD>128 ⇒ no +2 pad (fits 26KB)
+const uint psh_stride = Br / 4u + 2u;
+const uint osh_stride = row_split * MatBr / 4u; // 16
+
+shared f16vec4 Qf[Br * qstride];
+shared vec4    sfsh[Bc * sfshstride];          // scores, [col][row/4][row%4]
+shared f16vec4 Psh[Bc * psh_stride];           // softmax probs (f16)
+shared f16vec4 pvsh[MatBc * osh_stride];       // PV result staging
+
+void main() {
+    const float NEG_BIG = uintBitsToFloat(0xFEFFFFFFu); // -FLT_MAX/2
+    const uint tid     = gl_LocalInvocationID.x;
+    const uint row_tid = gl_SubgroupID;              // 0..row_split-1
+    const uint col_tid = gl_SubgroupInvocationID;    // 0..63
+    const uint h = gl_WorkGroupID.x;
+    const uint i = gl_WorkGroupID.y;                 // Q-tile index
+    if (h >= p.n_heads) return;
+    const uint q_base = i * Br;
+    if (q_base >= p.m) return;
+
+    const uint group_size = p.n_heads / p.n_kv_heads;
+    const uint kvh        = h / group_size;
+    const uint pos_stride = p.n_kv_heads * p.head_dim; // elements between KV positions
+    const uint head_off   = kvh * p.head_dim;          // this head's d-offset in a KV row
+    const uint q_stride    = p.n_heads * p.head_dim;    // elements between Q rows
+
+    // tile_row(r) = the query-row index (0..Br-1) this thread's slot r maps to.
+    #define tile_row(r) (row_tid * rows_per_thread + (r))
+
+    // (1) Load Q-tile → shared f16 (scaled). Each thread strides over Br×HSK/4.
+    [[unroll]] for (uint idx = 0; idx < Br * HSK / 4u; idx += WG) {
+        uint d = (idx + tid) % (HSK / 4u);
+        uint r = (idx + tid) / (HSK / 4u);
+        if (r < Br && q_base + r < p.m) {
+            uint qoff = ((q_base + r) * p.n_heads + h) * p.head_dim; // element offset
+            Qf[r * qstride + d] = f16vec4(data_qv4[qoff / 4u + d] * p.scale);
+        } else if (r < Br) {
+            Qf[r * qstride + d] = f16vec4(0);
+        }
+    }
+    barrier();
+
+    // Per-thread online-softmax state — only rows_per_thread rows (VGPR break).
+    const uint d_per_thread = (HSV / 4u + threads_per_rowgroup - 1u) / threads_per_rowgroup;
+    f16vec4 Of[rows_per_thread][2];   // [2] >= d_per_thread (1@256, 2@512)
+    float   Lf[rows_per_thread], Mf[rows_per_thread];
+    [[unroll]] for (uint r = 0; r < rows_per_thread; ++r) {
+        Lf[r] = 0.0; Mf[r] = NEG_BIG;
+        [[unroll]] for (uint dd = 0; dd < 2u; ++dd) Of[r][dd] = f16vec4(0);
+    }
+
+    const uint actual_br   = min(Br, p.m - q_base);
+    const uint causal_len  = min(p.q_start + q_base + actual_br, p.n_kv);
+    const uint start_j      = p.kv_start / Bc;
+    const uint end_j        = (causal_len + Bc - 1u) / Bc;
+    const uint k_stride_v4  = pos_stride / 4u;     // f16vec4 per KV position
+    const uint head_off_v4  = head_off / 4u;
+
+    [[dont_unroll]] for (uint j = start_j; j < end_j; ++j) {
+        // (2a) QK → SfMat (transposed Bc×Br): this subgroup owns MatBc KV rows.
+        coopmat<float, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator> SfMat =
+            coopmat<float, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(0.0);
+        coopmat<float16_t, gl_ScopeSubgroup, MatBc, 16, gl_MatrixUseA> KMat;
+        coopmat<float16_t, gl_ScopeSubgroup, 16, MatBr, gl_MatrixUseB> QMat;
+        [[unroll]] for (uint d = 0; d < HSK / 16u; ++d) {
+            // K direct from global f16: row = KV position, col = head-dim chunk.
+            uint kcoord = (j * Bc + row_tid * MatBc) * k_stride_v4 + head_off_v4 + d * 16u / 4u;
+            coopMatLoad(KMat, data_kv4, kcoord, k_stride_v4, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(QMat, Qf, d * 16u / 4u, qstride, gl_CooperativeMatrixLayoutColumnMajor);
+            SfMat = coopMatMulAdd(KMat, QMat, SfMat);
+        }
+        coopMatStore(SfMat, sfsh, row_tid * MatBc * sfshstride, sfshstride,
+                     gl_CooperativeMatrixLayoutRowMajor);
+        barrier();
+
+        // (2b) Inline causal + sliding-window mask on sfsh. sfsh[col*sfshstride
+        // + row/4][row%4] = score(KV col, query row). Mask kv_pos>q_pos or
+        // kv_pos<kv_start to -inf.
+        [[unroll]] for (uint idx = 0; idx < Bc * Br / 4u; idx += WG) {
+            uint lin = idx + tid;
+            if (lin < Bc * Br / 4u) {
+                uint c  = lin / (Br / 4u);   // KV col 0..Bc-1
+                uint rv = lin % (Br / 4u);   // row vec 0..Br/4-1
+                uint kv_pos = j * Bc + c;
+                vec4 s = sfsh[c * sfshstride + rv];
+                [[unroll]] for (uint comp = 0; comp < 4u; ++comp) {
+                    uint row = rv * 4u + comp;
+                    uint q_pos = p.q_start + q_base + row;
+                    bool ok = (kv_pos <= q_pos) && (kv_pos >= p.kv_start)
+                              && (kv_pos < causal_len) && (q_base + row < p.m);
+                    if (!ok) s[comp] = NEG_BIG;
+                }
+                sfsh[c * sfshstride + rv] = s;
+            }
+        }
+        barrier();
+
+        // (2c) Online softmax per owned row. col_tid splits the Bc KV positions.
+        float eMf[rows_per_thread];
+        [[unroll]] for (uint r = 0; r < rows_per_thread; ++r) {
+            uint row = tile_row(r);
+            uint r_vec = row / 4u, r_comp = row % 4u;
+            float rowmax = NEG_BIG;
+            [[unroll]] for (uint c = 0; c < cols_per_thread; ++c) {
+                uint col = c * cols_per_iter + col_tid;
+                rowmax = max(rowmax, sfsh[col * sfshstride + r_vec][r_comp]);
+            }
+            rowmax = subgroupMax(rowmax);
+            float Mold = Mf[r];
+            Mf[r] = max(rowmax, Mold);
+            eMf[r] = exp(Mold - Mf[r]);
+            Lf[r] *= eMf[r];
+        }
+        // Rescale the running output accumulator (registers).
+        [[unroll]] for (uint r = 0; r < rows_per_thread; ++r) {
+            [[unroll]] for (uint dl = 0; dl < d_per_thread; ++dl) {
+                Of[r][dl] = float16_t(eMf[r]) * Of[r][dl];
+            }
+        }
+        // Pf = exp(S - M) → Psh; accumulate Lf. Psh[col*psh_stride + row/4][.].
+        [[unroll]] for (uint c = 0; c < cols_per_thread; ++c) {
+            uint col = c * cols_per_iter + col_tid;
+            [[unroll]] for (uint rg = 0; rg < rows_per_thread; rg += 4u) {
+                uint row = tile_row(rg);
+                vec4 mfv = vec4(Mf[rg], Mf[rg + 1u], Mf[rg + 2u], Mf[rg + 3u]);
+                f16vec4 Pf = f16vec4(exp(sfsh[col * sfshstride + row / 4u] - mfv));
+                [[unroll]] for (uint vi = 0; vi < 4u; ++vi) Lf[rg + vi] += float(Pf[vi]);
+                Psh[col * psh_stride + row / 4u] = Pf;
+            }
+        }
+        barrier();
+
+        // (2d) PV: P·V via coopmat. Each subgroup handles 16 V-columns per
+        // hsv_tile; V direct from global f16.
+        const uint num_hsv_tiles = (HSV + MatBc * row_split - 1u) / (MatBc * row_split);
+        const uint v_stride_v4 = pos_stride / 4u;
+        [[unroll]] for (uint hsv_tile = 0; hsv_tile < num_hsv_tiles; ++hsv_tile) {
+            uint hsv_offset = (hsv_tile * row_split + row_tid) * 16u;  // this sg's 16 cols
+            coopmat<float16_t, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator> PVMat =
+                coopmat<float16_t, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(0.0);
+            if (hsv_offset < HSV) {
+                [[unroll]] for (uint bc = 0; bc < Bc / MatBc; ++bc) {
+                    coopMatLoad(KMat, Psh, bc * MatBc * psh_stride, psh_stride,
+                                gl_CooperativeMatrixLayoutColumnMajor);
+                    uint vrow = j * Bc + bc * MatBc;
+                    uint vcoord = vrow * v_stride_v4 + head_off_v4 + hsv_offset / 4u;
+                    coopMatLoad(QMat, data_vv4, vcoord, v_stride_v4,
+                                gl_CooperativeMatrixLayoutRowMajor);
+                    PVMat = coopMatMulAdd(KMat, QMat, PVMat);
+                }
+                coopMatStore(PVMat, pvsh, row_tid * MatBr / 4u, osh_stride,
+                             gl_CooperativeMatrixLayoutRowMajor);
+            }
+            barrier();
+            // Merge pvsh → Of for the d-values this thread owns within this tile.
+            uint hsv_base = hsv_tile * row_split * MatBc;
+            [[unroll]] for (uint r = 0; r < rows_per_thread; ++r) {
+                uint row = tile_row(r);
+                [[unroll]] for (uint dl = 0; dl < d_per_thread; ++dl) {
+                    uint d = dl * threads_per_rowgroup + col_tid;
+                    uint hsv_col = 4u * d;
+                    if (hsv_col >= hsv_base && hsv_col < hsv_base + row_split * MatBc && hsv_col < HSV) {
+                        uint local_hsv = (hsv_col - hsv_base) / 4u;
+                        Of[r][dl] += pvsh[row * osh_stride + local_hsv];
+                    }
+                }
+            }
+            barrier();
+        }
+    }
+
+    // (3) Finalize: Lf summed across col_tid, write O = Of / Lf.
+    [[unroll]] for (uint r = 0; r < rows_per_thread; ++r) Lf[r] = subgroupAdd(Lf[r]);
+    [[unroll]] for (uint r = 0; r < rows_per_thread; ++r) {
+        uint row = tile_row(r);
+        uint global_row = q_base + row;
+        if (global_row < p.m) {
+            float inv = (Lf[r] > 0.0) ? (1.0 / Lf[r]) : 1.0;
+            [[unroll]] for (uint dl = 0; dl < d_per_thread; ++dl) {
+                uint d = dl * threads_per_rowgroup + col_tid;
+                if (d < HSV / 4u) {
+                    uint ooff = (global_row * p.n_heads + h) * p.head_dim + d * 4u;
+                    vec4 ov = vec4(Of[r][dl]) * inv;
+                    data_o[ooff + 0u] = ov.x;
+                    data_o[ooff + 1u] = ov.y;
+                    data_o[ooff + 2u] = ov.z;
+                    data_o[ooff + 3u] = ov.w;
+                }
+            }
+        }
+    }
+}

@@ -2258,19 +2258,37 @@ impl BatchExec {
                 return;
             }
         }
-        // Sprint 10b Phase-0a — attention-dispatch skip ablation. When
-        // `VF_SKIP_FA=1`, bypass the flash-attention core dispatch only
-        // (QKV proj / RoPE / norms / o-proj stay). Prefill output is then
-        // garbage — this is a TIMING instrument: prefill_wall(normal) −
-        // prefill_wall(VF_SKIP_FA) isolates the fa_batch GPU cost, the
-        // baseline a coopmat-FA must beat. Default OFF (no-op). Diagnostic
-        // only; never gate correctness on it.
+        // Sprint 10b/10c Phase-0a — attention-dispatch skip ablation (TIMING
+        // instrument; prefill output is garbage; never gate correctness on it).
+        // Bypasses the flash-attention core dispatch (QKV proj / RoPE / norms /
+        // o-proj stay) so prefill_wall(normal) − prefill_wall(skip) isolates the
+        // attention GPU cost. Modes:
+        //   VF_SKIP_FA=1        → skip ALL attention layers (attn-free floor)
+        //   VF_SKIP_FA=full     → skip only hd512 (Gemma-4 full) layers
+        //   VF_SKIP_FA=sliding  → skip only hd256 (Gemma-4 sliding) layers
+        // The full/sliding modes (placed before the rs/fa_batch routing) let us
+        // attribute the wall to rs-sliding vs hd512-fa_batch. Default OFF.
         {
             use std::sync::OnceLock;
-            static SKIP_FA: OnceLock<bool> = OnceLock::new();
-            if *SKIP_FA.get_or_init(|| std::env::var("VF_SKIP_FA").as_deref() == Ok("1")) {
-                compute_barrier(ctx.dev, ctx.cmd);
-                return;
+            static SKIP_FA: OnceLock<u8> = OnceLock::new();
+            let mode = *SKIP_FA.get_or_init(|| match std::env::var("VF_SKIP_FA").as_deref() {
+                Ok("1") => 1u8,
+                Ok("full") => 2u8,
+                Ok("sliding") => 3u8,
+                _ => 0u8,
+            });
+            if mode != 0 {
+                let hd = fwd.kv_cache.head_dim_for(ctx.layer);
+                let skip = match mode {
+                    1 => true,
+                    2 => hd == 512,
+                    3 => hd == 256,
+                    _ => false,
+                };
+                if skip {
+                    compute_barrier(ctx.dev, ctx.cmd);
+                    return;
+                }
             }
         }
         // Sprint 46F — flash_attn_tiled.comp / flash_attn_coopmat.comp
@@ -2284,6 +2302,25 @@ impl BatchExec {
         // (sliding). Numerically validated (coopmat_fa_gemma.rs); E2E
         // perf-eval gate. hd512 stays on fa_batch (this kernel is HD=256
         // baked). Default OFF; fa_batch remains the fallback.
+        // Sprint 10c — row_split=4 coopmat FA (occ-12 kernel). Pfad B (FP8→f16
+        // scratch + direct-global f16). hd256 sliding only; hd512 stays fa_batch.
+        // Default OFF; orthogonal to the v1 VF_FA_COOPMAT_GEMMA flag.
+        {
+            use std::sync::OnceLock;
+            static CM_RS: OnceLock<bool> = OnceLock::new();
+            let on = *CM_RS.get_or_init(|| {
+                std::env::var("VF_FA_COOPMAT_RS").as_deref() == Ok("1")
+            });
+            if on && _cfg.gemma4.is_some() && head_dim_layer == 256 {
+                fwd.run_flash_attn_cm_gemma_rs(
+                    ctx.dev, ctx.registry, ctx.cmd, ctx.layer,
+                    fwd.batch_q.handle, fwd.batch_attn_out.handle,
+                    seq_len, base_pos, base_pos + seq_len, kv_layer, kv_start,
+                );
+                compute_barrier(ctx.dev, ctx.cmd);
+                return;
+            }
+        }
         {
             use std::sync::OnceLock;
             static CM_GEMMA: OnceLock<bool> = OnceLock::new();

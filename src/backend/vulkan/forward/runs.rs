@@ -1079,6 +1079,101 @@ impl Forward {
         });
     }
 
+    /// Sprint 10c — row_split=4 coopmat FA (occ-12 kernel). Pfad B: convert
+    /// the layer's FP8 K/V → f16 scratch (identity index, same position-major
+    /// layout), barrier, then dispatch the rs kernel which coopMatLoads K/V
+    /// direct-from-global f16. Q stays f32. hd256 (sliding) only; hd512 keeps
+    /// fa_batch. Gated VF_FA_COOPMAT_RS.
+    pub(super) fn run_flash_attn_cm_gemma_rs(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        layer: u32,
+        q_buf: vk::Buffer,
+        o_buf: vk::Buffer,
+        m: u32,
+        q_start: u32,
+        n_kv: u32,
+        kv_layer: u32,
+        kv_start: u32,
+    ) {
+        let cfg = self.config.clone();
+        let head_dim_layer = self.kv_cache.head_dim_for(layer);
+        let nkvh = n_kv_heads_for(&cfg, layer);
+        let pos_stride = (nkvh as u64) * (head_dim_layer as u64);
+        let n_elems = (n_kv as u64) * pos_stride;            // FP8 elems to convert
+        let layer_off = self.kv_cache.layer_offset_bytes(kv_layer);
+        let layer_size = self.kv_cache.layer_size_bytes(kv_layer);
+        // Copy handles out before the &mut self alloc_or_get_set calls.
+        let k_cache = self.kv_cache.k_buffer.handle;
+        let v_cache = self.kv_cache.v_buffer.handle;
+        let k_scr = self.k_f16_scratch.handle;
+        let v_scr = self.v_f16_scratch.handle;
+
+        // (1) Convert FP8 → f16 scratch (K then V). n_elems push bounds the loop.
+        let cvt = registry.get(ShaderId::KvFp8ToF16);
+        let cvt_layout = cvt.pipeline_layout;
+        let cvt_pipe = cvt.pipeline;
+        let cvt_dsl = cvt.descriptor_set_layout;
+        let groups = ((n_elems + 255) / 256) as u32;
+        let ne_bytes = (n_elems as u32).to_le_bytes();
+        for (src, dst, lbl) in [(k_cache, k_scr, "k"), (v_cache, v_scr, "v")] {
+            let set = self.alloc_or_get_set(dev, cvt_dsl, &[
+                (0, src, layer_off, layer_size),
+                (1, dst, 0, vk::WHOLE_SIZE),
+            ]);
+            let _ = lbl;
+            self.profile("fa_cm_rs_cvt", dev, cmd, |dev, cmd| unsafe {
+                dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, cvt_pipe);
+                dev.device.cmd_bind_descriptor_sets(
+                    cmd, vk::PipelineBindPoint::COMPUTE, cvt_layout, 0, &[set], &[]);
+                dev.device.cmd_push_constants(
+                    cmd, cvt_layout, vk::ShaderStageFlags::COMPUTE, 0, &ne_bytes);
+                dev.device.cmd_dispatch(cmd, groups, 1, 1);
+            });
+        }
+        // Scratch writes must complete before the FA reads them.
+        compute_barrier(dev, cmd);
+
+        // (2) Dispatch the row_split FA reading the f16 scratch.
+        let kernel = registry.get(ShaderId::FlashAttnCmGemmaRsHd256);
+        let attn_scale_layer = if cfg.gemma4.is_some() {
+            1.0_f32
+        } else if head_dim_layer != cfg.head_dim {
+            1.0_f32 / (head_dim_layer as f32).sqrt()
+        } else {
+            self.attn_scale
+        };
+        let q_bytes_total = (m as u64) * (cfg.n_heads as u64) * (head_dim_layer as u64) * 4;
+        let set = self.alloc_or_get_set(dev, kernel.descriptor_set_layout, &[
+            (0, q_buf, 0, q_bytes_total),
+            (1, k_scr, 0, vk::WHOLE_SIZE),
+            (2, v_scr, 0, vk::WHOLE_SIZE),
+            (3, o_buf, 0, q_bytes_total),
+        ]);
+        let pc = FlashAttnBatchPushConstants {
+            n_heads: cfg.n_heads,
+            n_kv_heads: nkvh,
+            head_dim: head_dim_layer,
+            m, n_kv, q_start,
+            scale: attn_scale_layer,
+            kv_start,
+        };
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        let n_heads = cfg.n_heads;
+        let n_qtiles = m.div_ceil(16);
+        self.profile("fa_cm_rs", dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc));
+            dev.device.cmd_dispatch(cmd, n_heads, n_qtiles, 1);
+        });
+    }
+
     /// Sprint 7 (Prefill-Arc, 2026-06-06) — Q-tiled flash attention for
     /// Gemma-4's heterogeneous head dims. Dispatches the HEAD_DIM-256
     /// (Sliding, BR=8/BC=32) or HEAD_DIM-512 (Full, BR=4/BC=16) build of

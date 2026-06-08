@@ -69,6 +69,71 @@ impl Harness {
         b
     }
 
+    /// Upload an f32 slice as f16 (the rs kernel reads f16 K/V).
+    fn buf_f16(&mut self, data: &[f32], name: &str) -> GpuBuffer {
+        let bytes: Vec<u8> = data.iter().flat_map(|&x| f16::from_f32(x).to_le_bytes()).collect();
+        let mut b = GpuBuffer::new(&self.dev.device, &mut self.allocator,
+            bytes.len().max(4) as u64, vk::BufferUsageFlags::STORAGE_BUFFER,
+            MemoryLocation::CpuToGpu, name).unwrap();
+        b.write_bytes(&bytes).unwrap();
+        b
+    }
+
+    /// Row-split=4 coopmat FA (Q f32, K/V f16 direct-global). Same push/grid
+    /// semantics as fa() but WG=256 (4 subgroups). Returns f32 output.
+    #[allow(clippy::too_many_arguments)]
+    fn fa_rs(&mut self, q: &[f32], k: &[f32], v: &[f32],
+             m: usize, n_heads: usize, n_kv_heads: usize, n_kv: usize) -> Vec<f32> {
+        let (pipeline, pipeline_layout, dsl) = {
+            let kr = self.registry.get(ShaderId::FlashAttnCmGemmaRsHd256);
+            (kr.pipeline, kr.pipeline_layout, kr.descriptor_set_layout)
+        };
+        let o_len = m * n_heads * HD;
+        let q_buf = self.buf(q, MemoryLocation::CpuToGpu, "rs_q");
+        let k_buf = self.buf_f16(k, "rs_k");
+        let v_buf = self.buf_f16(v, "rs_v");
+        let o_buf = self.buf(&vec![0f32; o_len], MemoryLocation::GpuToCpu, "rs_o");
+        let dev = &self.dev;
+
+        let pool_sizes = [vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 4 }];
+        let pool = unsafe { dev.device.create_descriptor_pool(
+            &vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&pool_sizes), None) }.unwrap();
+        let layouts = [dsl];
+        let set = unsafe { dev.device.allocate_descriptor_sets(
+            &vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&layouts)) }.unwrap()[0];
+        let infos = [q_buf.handle, k_buf.handle, v_buf.handle, o_buf.handle]
+            .map(|h| vk::DescriptorBufferInfo { buffer: h, offset: 0, range: vk::WHOLE_SIZE });
+        let writes: [vk::WriteDescriptorSet; 4] = std::array::from_fn(|i| {
+            vk::WriteDescriptorSet::default().dst_set(set).dst_binding(i as u32)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&infos[i..i + 1])
+        });
+        unsafe { dev.device.update_descriptor_sets(&writes, &[]) };
+
+        let pc = FaPush {
+            n_heads: n_heads as u32, n_kv_heads: n_kv_heads as u32, head_dim: HD as u32,
+            m: m as u32, n_kv: n_kv as u32, q_start: 0,
+            scale: 1.0 / (HD as f32).sqrt(), kv_start: 0,
+        };
+        let n_qtiles = m.div_ceil(BR);
+        self.cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE,
+                pipeline_layout, 0, &[set], &[]);
+            dev.device.cmd_push_constants(cmd, pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc));
+            dev.device.cmd_dispatch(cmd, n_heads as u32, n_qtiles as u32, 1);
+            let post = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+            dev.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), std::slice::from_ref(&post), &[], &[]);
+        }).unwrap();
+        let bytes = o_buf.read_bytes().unwrap();
+        let out = bytemuck::cast_slice::<u8, f32>(&bytes[..o_len * 4]).to_vec();
+        unsafe { dev.device.destroy_descriptor_pool(pool, None) };
+        out
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn fa(&mut self, q: &[f32], k: &[f32], v: &[f32],
           m: usize, n_heads: usize, n_kv_heads: usize, n_kv: usize) -> Vec<f32> {
@@ -202,3 +267,74 @@ fn fa_cm_gemma_hd256_multi_tile() { check(40, 4, 1); }    // 3 Q-tiles (partial 
 
 #[test]
 fn fa_cm_gemma_hd256_gqa8() { check(48, 8, 1); }          // GQA group 8 (sliding-like)
+
+// ---- Sprint 10c: row_split=4 kernel (f16 K AND f16 V; f16-accumulated PV) ----
+
+fn cpu_attn_rs(q: &[f32], k: &[f32], v: &[f32],
+               m: usize, n_heads: usize, n_kv_heads: usize, n_kv: usize) -> Vec<f32> {
+    let scale = 1.0f32 / (HD as f32).sqrt();
+    let group = n_heads / n_kv_heads;
+    let mut o = vec![0f32; m * n_heads * HD];
+    for h in 0..n_heads {
+        let kvh = h / group;
+        for qi in 0..m {
+            let qo = (qi * n_heads + h) * HD;
+            let lim = (qi + 1).min(n_kv);
+            let mut sc = vec![f32::NEG_INFINITY; lim];
+            for (t, s) in sc.iter_mut().enumerate() {
+                let ko = (t * n_kv_heads + kvh) * HD;
+                let mut acc = 0f64;
+                for d in 0..HD {
+                    acc += (f16::from_f32(q[qo + d]).to_f32() as f64)
+                         * (f16::from_f32(k[ko + d]).to_f32() as f64);
+                }
+                *s = (acc as f32) * scale;
+            }
+            let mx = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0f32;
+            for s in sc.iter_mut() { *s = (*s - mx).exp(); sum += *s; }
+            let inv = if sum > 0.0 { 1.0 / sum } else { 1.0 };
+            for (t, &p) in sc.iter().enumerate() {
+                let vo = (t * n_kv_heads + kvh) * HD;
+                let w = p * inv;
+                for d in 0..HD { o[qo + d] += w * f16::from_f32(v[vo + d]).to_f32(); }
+            }
+        }
+    }
+    o
+}
+
+fn check_rs(m: usize, n_heads: usize, n_kv_heads: usize) {
+    let n_kv = m;
+    let mut r = Lcg(0xabcd_ef01_2345_6789 ^ (m as u64));
+    let q: Vec<f32> = (0..m * n_heads * HD).map(|_| r.f()).collect();
+    let k: Vec<f32> = (0..n_kv * n_kv_heads * HD).map(|_| r.f()).collect();
+    let v: Vec<f32> = (0..n_kv * n_kv_heads * HD).map(|_| r.f()).collect();
+
+    let mut h = Harness::new();
+    let gpu = h.fa_rs(&q, &k, &v, m, n_heads, n_kv_heads, n_kv);
+    let cpu = cpu_attn_rs(&q, &k, &v, m, n_heads, n_kv_heads, n_kv);
+
+    let maxabs = cpu.iter().cloned().fold(0f32, |a, b| a.max(b.abs())).max(1e-6);
+    let mut max_rel = 0f32;
+    let mut worst = 0usize;
+    for i in 0..gpu.len() {
+        let rel = (gpu[i] - cpu[i]).abs() / maxabs;
+        if rel > max_rel { max_rel = rel; worst = i; }
+    }
+    println!("[fa_cm_gemma_rs m={m} nh={n_heads} nkv={n_kv_heads}] max_rel={max_rel:.2e} \
+              worst(i={worst} gpu={} cpu={})", gpu[worst], cpu[worst]);
+    // Looser than the QK-only gate: PV is f16-accumulated in the kernel (llama's
+    // precision class). An index bug gives O(1) error; f16-PV noise is ~1e-2.
+    assert!(max_rel < 2e-2,
+        "row_split coopmat-FA hd256 numerics off: max_rel={max_rel:.3e} (m={m})");
+}
+
+#[test]
+fn fa_cm_gemma_rs_single_tile() { check_rs(16, 4, 2); }   // 1 Q-tile, GQA 2
+
+#[test]
+fn fa_cm_gemma_rs_multi_tile() { check_rs(40, 4, 1); }    // 3 Q-tiles, MHA
+
+#[test]
+fn fa_cm_gemma_rs_gqa8() { check_rs(48, 8, 1); }          // GQA group 8

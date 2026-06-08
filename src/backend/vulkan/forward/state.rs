@@ -601,6 +601,12 @@ pub struct Forward {
     pub(super) batch_v: GpuBuffer,
     pub(super) batch_attn_out: GpuBuffer,
     pub(super) batch_o: GpuBuffer,
+    /// Sprint 10c — Pfad-B f16 K/V scratch for the row_split coopmat-FA
+    /// (prefill batch path). FP8 KV is converted here per layer so the
+    /// kernel coopMatLoads K/V direct-from-global as f16. Sized to the
+    /// largest per-layer KV slab × 2 (f16). GpuOnly.
+    pub(super) k_f16_scratch: GpuBuffer,
+    pub(super) v_f16_scratch: GpuBuffer,
     pub(super) batch_gate: GpuBuffer,
     pub(super) batch_up: GpuBuffer,
     pub(super) batch_ffn_hidden: GpuBuffer,

@@ -353,6 +353,14 @@ impl Forward {
         let batch_v          = mk_storage(pp_kv,     MemoryLocation::GpuOnly,  "batch_v")?;
         let batch_attn_out   = mk_storage(pp_q,      MemoryLocation::GpuOnly,  "batch_attn_out")?;
         let batch_o          = mk_storage(pp_hidden, MemoryLocation::GpuOnly,  "batch_o")?;
+        // Sprint 10c — Pfad-B f16 K/V scratch, sized to the largest per-layer
+        // KV slab (FP8 elems → ×2 for f16). The row_split coopmat-FA
+        // coopMatLoads K/V direct-from-global from here (full visible KV).
+        let kv_f16_bytes = (0..config.n_layers)
+            .map(|l| kv_cache.layer_size_bytes(l))
+            .max().unwrap_or(4).max(4) * 2;
+        let k_f16_scratch    = mk_storage(kv_f16_bytes, MemoryLocation::GpuOnly, "k_f16_scratch")?;
+        let v_f16_scratch    = mk_storage(kv_f16_bytes, MemoryLocation::GpuOnly, "v_f16_scratch")?;
         let batch_gate       = mk_storage(pp_ffn,    MemoryLocation::GpuOnly,  "batch_gate")?;
         let batch_up         = mk_storage(pp_ffn,    MemoryLocation::GpuOnly,  "batch_up")?;
         // Sprint 51D-D — same `max(ffn, hidden)` rationale as the
@@ -922,6 +930,7 @@ impl Forward {
             max_prefill_tokens,
             batch_input, batch_residual, batch_norm, batch_q8,
             batch_q, batch_k, batch_v, batch_attn_out, batch_o,
+            k_f16_scratch, v_f16_scratch,
             batch_gate, batch_up, batch_ffn_hidden, batch_ffn_out,
             batch_qgate,
             conv_state_buf,
@@ -1318,6 +1327,8 @@ impl Forward {
         self.batch_v.destroy(device, allocator);
         self.batch_attn_out.destroy(device, allocator);
         self.batch_o.destroy(device, allocator);
+        self.k_f16_scratch.destroy(device, allocator);
+        self.v_f16_scratch.destroy(device, allocator);
         self.batch_gate.destroy(device, allocator);
         self.batch_up.destroy(device, allocator);
         self.batch_ffn_hidden.destroy(device, allocator);

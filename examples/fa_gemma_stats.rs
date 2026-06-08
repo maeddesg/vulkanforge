@@ -18,7 +18,8 @@ use vulkanforge::backend::vulkan::shaders::{self, ShaderId};
 
 fn main() {
     let dev = VulkanDevice::new().expect("VulkanDevice::new");
-    for id in [ShaderId::FlashAttnCmGemmaHd256, ShaderId::FlashAttnCmGemmaHd256Fp8] {
+    for id in [ShaderId::FlashAttnCmGemmaHd256, ShaderId::FlashAttnCmGemmaHd256Fp8,
+               ShaderId::FlashAttnCmGemmaRsHd256] {
         eprintln!("=== building {} ===", id.name());
         let words = shaders::spv_words(id.spv_bytes());
         let k = ComputeKernel::from_spv(&dev.device, &words, vk::PipelineCache::null())

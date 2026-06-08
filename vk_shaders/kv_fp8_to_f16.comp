@@ -1,0 +1,34 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_float_e4m3                              : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8   : require
+
+// VulkanForge Sprint 10b Phase-1a — FP8(e4m3) → f16 convert pass.
+//
+// The coopmat-FA kernel (`flash_attn_cm_gemma.comp`) coopMatLoads K
+// DIRECTLY from a global f16 buffer (the Phase-0b keystone). VF's KV
+// cache is FP8, which cannot be coopMatLoad'd as f16, so this trivial
+// elementwise pre-pass materialises an f16 copy of the layer's K in the
+// SAME FA layout ([pos][kv_head][head_dim]). Memory-bound, ~µs/layer —
+// negligible vs the ms-scale attention it unblocks.
+//
+// Input is the FP8 KV slab packed 4 e4m3 bytes per uint32 (matching
+// `flash_attn_coopmat.comp`'s load_k). Output is contiguous f16, one
+// element per source element, same index space.
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly  buffer Kin  { uint   src[]; };   // FP8, 4 bytes/uint32
+layout(binding = 1) writeonly buffer Kout { float16_t dst[]; }; // f16, FA layout
+
+layout(push_constant) uniform P {
+    uint n_elems;   // total e4m3 elements to convert (positions*kv_heads*head_dim)
+} p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n_elems) return;
+    uint w = src[i >> 2];
+    uint b = (w >> ((i & 3u) * 8u)) & 0xFFu;
+    dst[i] = float16_t(float(uintBitsToFloate4m3EXT(uint8_t(b))));
+}
