@@ -31,10 +31,9 @@ use vulkanforge::backend::vulkan::kv_cache::{KvCache, KvCacheConfig};
 use vulkanforge::backend::vulkan::loader::LoadedModel;
 use vulkanforge::backend::vulkan::pipeline_registry::{default_cache_path, PipelineRegistry};
 
-// Bumped from 2048 to 8192 so the chunked path can sweep pp up to
-// ~8K. KV cache scales linearly: 8192 × 8 × 128 × 4 × 2 (K+V) ×
-// 36 layers ≈ 3 GB at fp32 — comfortable in 16 GB.
-const MAX_SEQ_LEN: u32 = 8192;
+// 2048 covers the pp sweep up to 2048 while keeping the KV cache small
+// enough for the 27B/26B models (13 GB weights + KV) to fit in 16 GB.
+const MAX_SEQ_LEN: u32 = 2048;
 
 fn parse_env_u32(key: &str, default_val: u32) -> u32 {
     std::env::var(key)
@@ -111,12 +110,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let gguf = GgufFile::open(&model_path)?;
     let cfg = ModelConfig::from_gguf(&gguf)?;
     let load_start = Instant::now();
-    let model = LoadedModel::load(&dev, &mut allocator, &gguf)?;
+    let model = LoadedModel::load(&dev, &mut allocator, &gguf, None)?;
     println!(
         "  {} loaded in {:.1} s",
         model_path.display(),
         load_start.elapsed().as_secs_f64()
     );
+    // Per-layer KV config — mirror serve.rs/main.rs so Gemma-4
+    // (heterogeneous sliding=256/full=512 head_dim) and Qwen3.6
+    // (GDN per-layer kv_heads) size the KV cache correctly.
     let kv_cache = KvCache::new(
         &dev.device,
         &mut allocator,
@@ -125,9 +127,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             n_kv_heads: cfg.n_kv_heads,
             head_dim: cfg.head_dim,
             max_seq_len: MAX_SEQ_LEN,
+            per_layer_head_dim: cfg
+                .gemma4
+                .as_ref()
+                .map(|g| g.layers.iter().map(|s| s.head_dim).collect()),
+            per_layer_n_kv_heads: cfg
+                .gemma4
+                .as_ref()
+                .map(|g| g.layers.iter().map(|s| s.n_kv_heads).collect::<Vec<_>>())
+                .or_else(|| cfg.qwen35.as_ref().map(|q| {
+                    (0..q.block_count)
+                        .map(|l| if q.is_full_attention_layer(l) {
+                            q.n_head_kv_full_attn
+                        } else { 0 })
+                        .collect::<Vec<_>>()
+                })),
         },
     )?;
     let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;
+    // Mirror serve.rs/main.rs production setup: register bucket handles
+    // and init the GPU MoE router (no-op for non-MoE/non-bucketed). Gemma-4
+    // MoE prefill needs this to take the production grouped path instead of
+    // the legacy CPU fallback.
+    forward.register_buckets(&model);
+    forward.init_moe_router_gpu(&dev, &mut allocator, &model, MAX_SEQ_LEN)?;
     println!(
         "  arch={} hidden={} ffn={} layers={}",
         cfg.architecture, cfg.hidden_dim, cfg.ffn_dim, cfg.n_layers,
