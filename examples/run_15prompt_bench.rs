@@ -169,13 +169,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let gguf = GgufFile::open(&model_path)?;
     let cfg = ModelConfig::from_gguf(&gguf)?;
     let load_start = Instant::now();
-    let model = LoadedModel::load(&dev, &mut allocator, &gguf)?;
+    let model = LoadedModel::load(&dev, &mut allocator, &gguf, None)?;
     println!(
         "  {} loaded in {:.1} s",
         model_path.display(),
         load_start.elapsed().as_secs_f64()
     );
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
+    // Sprint 10h — API-sync (was stale, like run_pp_bench pre-10g): per-layer KV
+    // mirrors serve.rs/main.rs (Gemma-4 heterogeneous head_dim, Qwen3.6 GDN kv_heads).
     let kv_cache = KvCache::new(
         &dev.device, &mut allocator,
         KvCacheConfig {
@@ -183,6 +185,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             n_kv_heads: cfg.n_kv_heads,
             head_dim: cfg.head_dim,
             max_seq_len: MAX_SEQ_LEN,
+            per_layer_head_dim: cfg
+                .gemma4
+                .as_ref()
+                .map(|g| g.layers.iter().map(|s| s.head_dim).collect()),
+            per_layer_n_kv_heads: cfg
+                .gemma4
+                .as_ref()
+                .map(|g| g.layers.iter().map(|s| s.n_kv_heads).collect::<Vec<_>>())
+                .or_else(|| cfg.qwen35.as_ref().map(|q| {
+                    (0..q.block_count)
+                        .map(|l| if q.is_full_attention_layer(l) {
+                            q.n_head_kv_full_attn
+                        } else { 0 })
+                        .collect::<Vec<_>>()
+                })),
         },
     )?;
     let forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;

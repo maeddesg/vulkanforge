@@ -340,8 +340,73 @@ impl GenerateResult {
         if s == 0.0 { 0.0 } else { self.prompt_tokens as f64 / s }
     }
     pub fn decode_tok_s(&self) -> f64 {
-        let s = self.decode_time.as_secs_f64();
-        if s == 0.0 { 0.0 } else { self.generated_tokens as f64 / s }
+        canonical_decode_tok_s(self.generated_tokens, self.decode_time)
+    }
+}
+
+// ===================== CANONICAL DECODE THROUGHPUT (Sprint 10h) =====================
+// Single source of truth for decode tok/s. EVERY decode reporter (this crate's
+// `bench` subcommand, `chat`'s TurnResult, the example benches) MUST route through
+// these so the Sprint-10e mismatch cannot recur — that ad-hoc harness computed
+// `N_decode / total_wall` WITHOUT subtracting prefill, a systematic ~13 %
+// underestimate (QAT-Q4_0 read 103 t/s vs the true ~117).
+//
+// Contract:
+//   - decode_tok_s = generated_tokens / decode_time, where `decode_time` is the
+//     DECODE-ONLY wall (measured AFTER prefill completes) — prefill is subtracted
+//     by construction (it is NOT total wall minus a separate term).
+//   - n_decode fixed and >= 128 (amortise first-token / fixed costs comparably).
+//   - discard >= 1 warm-up run before sampling.
+//   - report the MEDIAN of N samples (default 5).
+//   - DEGENERATE runs (generated_tokens < min_tokens, e.g. early-EOS / 0 tokens)
+//     are DISCARDED, never counted as 0 — a single 0-sample skews the median.
+//   - always report alongside conditions (model / quant / ctx / kv-fp8 / n_decode /
+//     runs); a decode number is never reported naked.
+
+/// The canonical per-run decode rate. `decode_time` MUST be the decode-only wall
+/// (post-prefill); see the contract above.
+pub fn canonical_decode_tok_s(generated_tokens: usize, decode_time: std::time::Duration) -> f64 {
+    let s = decode_time.as_secs_f64();
+    if s <= 0.0 { 0.0 } else { generated_tokens as f64 / s }
+}
+
+/// Median decode tok/s over `(generated_tokens, decode_time)` samples, DISCARDING
+/// degenerate runs (`generated_tokens < min_tokens`). Returns `None` if every run
+/// was degenerate. Use with >= 1 warm-up run already excluded by the caller.
+pub fn decode_median_tok_s(
+    samples: &[(usize, std::time::Duration)],
+    min_tokens: usize,
+) -> Option<f64> {
+    let mut v: Vec<f64> = samples
+        .iter()
+        .filter(|(n, _)| *n >= min_tokens)
+        .map(|(n, t)| canonical_decode_tok_s(*n, *t))
+        .filter(|x| *x > 0.0)
+        .collect();
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    Some(v[v.len() / 2])
+}
+
+/// Measurement conditions that MUST accompany any reported decode number.
+pub struct DecodeConditions {
+    pub model: String,
+    pub quant: String,
+    pub ctx: u32,
+    pub kv_fp8: bool,
+    pub n_decode: u32,
+    pub runs: u32,
+}
+
+impl std::fmt::Display for DecodeConditions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[model={} quant={} ctx={} kv_fp8={} n_decode={} runs={} (decode_tok_s = N/decode_time, prefill-subtracted, median, degenerate discarded)]",
+            self.model, self.quant, self.ctx, self.kv_fp8, self.n_decode, self.runs
+        )
     }
 }
 

@@ -1944,46 +1944,60 @@ fn run_bench(
     )?;
     let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;
     forward.register_buckets(&model);
+    // Sprint 10h — mirror serve.rs/main.rs production setup so MoE decode takes the
+    // GPU grouped-router path (not the slow CPU fallback). Without this, Gemma-4-26B
+    // decode reads ~46 t/s here vs ~117 over serve — a non-representative bench, not
+    // a real rate. No-op for dense / non-MoE models.
+    forward.init_moe_router_gpu(&dev, &mut allocator, &model, bench_max_seq)?;
 
     println!();
     println!("  vulkanforge bench — {} runs/sample", runs);
     println!();
 
-    // ---- 1. Decode benchmark: generate 32 tokens after a 1-token prompt ----
-    let decode_max = 32u32;
+    // ---- 1. Decode benchmark — Sprint 10h CANONICAL method (see decode.rs
+    //         contract): decode_tok_s = N/decode_time (prefill-subtracted by
+    //         construction), n_decode >= 128 (env VF_DECODE_BENCH_N), >= 1 warm-up
+    //         run discarded, median over `runs`, degenerate (gen < n/2) discarded.
+    let decode_n = std::env::var("VF_DECODE_BENCH_N")
+        .ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(128);
     let cfg_g = GenerateConfig {
-        max_tokens: decode_max,
+        max_tokens: decode_n,
         print_stream: false,
         think_filter: false,
         sampling: Sampling { temperature: 0.0, top_k: 0, top_p: 1.0, repetition_penalty: 1.0, seed: 0 },
         cancel_token: None,
     };
     let prefill_tok = vec![tokenizer.bos_id.unwrap_or(1)];
-    let mut decode_samples = Vec::new();
-    let mut prefill_samples = Vec::new();
+    // Warm-up: discard >= 1 cold run (first-token latency + pipeline residency).
+    forward.kv_cache.reset();
+    let _ = generate_from_tokens(
+        &mut forward, &dev, &registry, &cmd_ctx, &model,
+        EmbeddingSource::Gguf(&gguf), &cfg, &tokenizer,
+        &prefill_tok, 0, &cfg_g, false, &mut |_, _| {},
+    )?;
+    let mut decode_samples: Vec<(usize, std::time::Duration)> = Vec::new();
     for _ in 0..runs {
         forward.kv_cache.reset();
-        let t0 = Instant::now();
         let r = generate_from_tokens(
             &mut forward, &dev, &registry, &cmd_ctx, &model,
             EmbeddingSource::Gguf(&gguf),
             &cfg, &tokenizer,
             &prefill_tok, 0, &cfg_g, false, &mut |_, _| {},
         )?;
-        let _ = t0; // (timings live inside r)
-        if r.generated_tokens > 0 {
-            decode_samples.push(r.decode_time.as_secs_f64() / r.generated_tokens as f64);
-            prefill_samples.push(r.prefill_time.as_secs_f64());
-        }
+        decode_samples.push((r.generated_tokens, r.decode_time));
     }
-    decode_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let med_decode_s_per_tok = decode_samples[decode_samples.len() / 2];
-    let decode_tok_s = 1.0 / med_decode_s_per_tok;
-    println!("  Decode (1-tok prompt + {} gen)", decode_max);
-    println!(
-        "    {:>6.1} tok/s  (median over {} runs)",
-        decode_tok_s, runs
-    );
+    let decode_tok_s = vulkanforge::backend::vulkan::decode::decode_median_tok_s(
+        &decode_samples, (decode_n / 2) as usize).unwrap_or(0.0);
+    let fname = model_path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let quant = ["Q4_K_XL", "Q4_K_M", "Q3_K_M", "Q3_K_S", "Q5_K_M", "Q6_K", "Q8_0", "Q4_0", "FP8", "F16"]
+        .iter().find(|q| fname.contains(*q)).map(|q| q.to_string()).unwrap_or_else(|| "gguf".into());
+    let conds = vulkanforge::backend::vulkan::decode::DecodeConditions {
+        model: fname, quant, ctx: bench_max_seq,
+        kv_fp8: std::env::var("VULKANFORGE_KV_FP8").as_deref() == Ok("1"),
+        n_decode: decode_n, runs,
+    };
+    println!("  Decode: {:>6.1} tok/s  (median of {} runs, +1 warm-up)", decode_tok_s, runs);
+    println!("    {conds}");
 
     // ---- 2. Prefill sweep ----
     println!();
@@ -2157,17 +2171,26 @@ fn run_bench_safetensors(
     println!("    Tokenizer: {}", tokenizer_source_label);
     println!();
 
-    // ---- 1. Decode benchmark ----
-    let decode_max = 32u32;
+    // ---- 1. Decode benchmark — Sprint 10h canonical method (see decode.rs
+    //         contract): N/decode_time prefill-subtracted, n>=128 (VF_DECODE_BENCH_N),
+    //         warm-up discarded, median over `runs`, degenerate discarded.
+    let decode_n = std::env::var("VF_DECODE_BENCH_N")
+        .ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(128);
     let cfg_g = GenerateConfig {
-        max_tokens: decode_max,
+        max_tokens: decode_n,
         print_stream: false,
         think_filter: false,
         sampling: Sampling { temperature: 0.0, top_k: 0, top_p: 1.0, repetition_penalty: 1.0, seed: 0 },
         cancel_token: None,
     };
     let prefill_tok = vec![tokenizer.bos_id.unwrap_or(1)];
-    let mut decode_samples = Vec::new();
+    forward.kv_cache.reset();
+    let _ = generate_from_tokens(
+        &mut forward, &dev, &registry, &cmd_ctx, &model,
+        EmbeddingSource::Host(&host_embed), &cfg, &tokenizer,
+        &prefill_tok, 0, &cfg_g, false, &mut |_, _| {},
+    )?;
+    let mut decode_samples: Vec<(usize, std::time::Duration)> = Vec::new();
     for _ in 0..runs {
         forward.kv_cache.reset();
         let r = generate_from_tokens(
@@ -2176,15 +2199,18 @@ fn run_bench_safetensors(
             &cfg, &tokenizer,
             &prefill_tok, 0, &cfg_g, false, &mut |_, _| {},
         )?;
-        if r.generated_tokens > 0 {
-            decode_samples.push(r.decode_time.as_secs_f64() / r.generated_tokens as f64);
-        }
+        decode_samples.push((r.generated_tokens, r.decode_time));
     }
-    decode_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let med_decode_s_per_tok = decode_samples[decode_samples.len() / 2];
-    let decode_tok_s = 1.0 / med_decode_s_per_tok;
-    println!("  Decode (1-tok prompt + {} gen)", decode_max);
-    println!("    {:>6.1} tok/s  (median over {} runs)", decode_tok_s, runs);
+    let decode_tok_s = vulkanforge::backend::vulkan::decode::decode_median_tok_s(
+        &decode_samples, (decode_n / 2) as usize).unwrap_or(0.0);
+    let conds = vulkanforge::backend::vulkan::decode::DecodeConditions {
+        model: model_dir.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+        quant: "FP8-safetensors".into(), ctx: bench_max_seq,
+        kv_fp8: std::env::var("VULKANFORGE_KV_FP8").as_deref() == Ok("1"),
+        n_decode: decode_n, runs,
+    };
+    println!("  Decode: {:>6.1} tok/s  (median of {} runs, +1 warm-up)", decode_tok_s, runs);
+    println!("    {conds}");
 
     // ---- 2. Prefill sweep ----
     println!();

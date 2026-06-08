@@ -302,7 +302,7 @@ impl TurnResult {
         if s == 0.0 { 0.0 } else { self.prompt_tokens as f64 / s }
     }
     pub fn decode_tok_s(&self) -> f64 {
-        let s = self.decode_time.as_secs_f64();
-        if s == 0.0 { 0.0 } else { self.generated_tokens as f64 / s }
+        // Sprint 10h — canonical decode-t/s (single source of truth, decode.rs).
+        super::decode::canonical_decode_tok_s(self.generated_tokens as usize, self.decode_time)
     }
 }
