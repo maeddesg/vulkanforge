@@ -1136,8 +1136,13 @@ impl Forward {
         // Scratch writes must complete before the FA reads them.
         compute_barrier(dev, cmd);
 
-        // (2) Dispatch the row_split FA reading the f16 scratch.
-        let kernel = registry.get(ShaderId::FlashAttnCmGemmaRsHd256);
+        // (2) Dispatch the row_split FA reading the f16 scratch (hd256 sliding
+        // or hd512 full — select the HD-baked SPV by the layer's head_dim).
+        let kernel = registry.get(if head_dim_layer == 512 {
+            ShaderId::FlashAttnCmGemmaRsHd512
+        } else {
+            ShaderId::FlashAttnCmGemmaRsHd256
+        });
         let attn_scale_layer = if cfg.gemma4.is_some() {
             1.0_f32
         } else if head_dim_layer != cfg.head_dim {

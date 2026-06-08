@@ -2302,16 +2302,23 @@ impl BatchExec {
         // (sliding). Numerically validated (coopmat_fa_gemma.rs); E2E
         // perf-eval gate. hd512 stays on fa_batch (this kernel is HD=256
         // baked). Default OFF; fa_batch remains the fallback.
-        // Sprint 10c — row_split=4 coopmat FA (occ-12 kernel). Pfad B (FP8→f16
-        // scratch + direct-global f16). hd256 sliding only; hd512 stays fa_batch.
-        // Default OFF; orthogonal to the v1 VF_FA_COOPMAT_GEMMA flag.
+        // Sprint 10c/10d — row_split=4 coopmat FA (occ 12/8 = llama budget),
+        // Pfad B (FP8→f16 scratch + direct-global f16). Covers the WHOLE Gemma-4
+        // attention: hd256 sliding + hd512 full. Sprint 10d flip: DEFAULT-ON
+        // (prefill 612→2625 t/s @p2048 ≈ 92% llama; attention free). Output
+        // changes deliberately (coopmat f16-PV vs fa_batch f32, rel ~5e-4,
+        // ctx4096-coherent — validated, documented like v0.6.0). `VF_FA_COOPMAT_RS=0`
+        // (or `false`) escapes back to fa_batch (the pre-10d default).
         {
             use std::sync::OnceLock;
             static CM_RS: OnceLock<bool> = OnceLock::new();
             let on = *CM_RS.get_or_init(|| {
-                std::env::var("VF_FA_COOPMAT_RS").as_deref() == Ok("1")
+                std::env::var("VF_FA_COOPMAT_RS")
+                    .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+                    .unwrap_or(true)
             });
-            if on && _cfg.gemma4.is_some() && head_dim_layer == 256 {
+            // Sprint 10d — route both hd256 (sliding) and hd512 (full) layers.
+            if on && _cfg.gemma4.is_some() && (head_dim_layer == 256 || head_dim_layer == 512) {
                 fwd.run_flash_attn_cm_gemma_rs(
                     ctx.dev, ctx.registry, ctx.cmd, ctx.layer,
                     fwd.batch_q.handle, fwd.batch_attn_out.handle,

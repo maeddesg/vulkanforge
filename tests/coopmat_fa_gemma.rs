@@ -83,12 +83,14 @@ impl Harness {
     /// semantics as fa() but WG=256 (4 subgroups). Returns f32 output.
     #[allow(clippy::too_many_arguments)]
     fn fa_rs(&mut self, q: &[f32], k: &[f32], v: &[f32],
-             m: usize, n_heads: usize, n_kv_heads: usize, n_kv: usize) -> Vec<f32> {
+             m: usize, n_heads: usize, n_kv_heads: usize, n_kv: usize, hd: usize) -> Vec<f32> {
+        let sid = if hd == 512 { ShaderId::FlashAttnCmGemmaRsHd512 }
+                  else { ShaderId::FlashAttnCmGemmaRsHd256 };
         let (pipeline, pipeline_layout, dsl) = {
-            let kr = self.registry.get(ShaderId::FlashAttnCmGemmaRsHd256);
+            let kr = self.registry.get(sid);
             (kr.pipeline, kr.pipeline_layout, kr.descriptor_set_layout)
         };
-        let o_len = m * n_heads * HD;
+        let o_len = m * n_heads * hd;
         let q_buf = self.buf(q, MemoryLocation::CpuToGpu, "rs_q");
         let k_buf = self.buf_f16(k, "rs_k");
         let v_buf = self.buf_f16(v, "rs_v");
@@ -111,9 +113,9 @@ impl Harness {
         unsafe { dev.device.update_descriptor_sets(&writes, &[]) };
 
         let pc = FaPush {
-            n_heads: n_heads as u32, n_kv_heads: n_kv_heads as u32, head_dim: HD as u32,
+            n_heads: n_heads as u32, n_kv_heads: n_kv_heads as u32, head_dim: hd as u32,
             m: m as u32, n_kv: n_kv as u32, q_start: 0,
-            scale: 1.0 / (HD as f32).sqrt(), kv_start: 0,
+            scale: 1.0 / (hd as f32).sqrt(), kv_start: 0,
         };
         let n_qtiles = m.div_ceil(BR);
         self.cmd_ctx.one_shot(&dev.device, dev.compute_queue, |cmd| unsafe {
@@ -271,20 +273,20 @@ fn fa_cm_gemma_hd256_gqa8() { check(48, 8, 1); }          // GQA group 8 (slidin
 // ---- Sprint 10c: row_split=4 kernel (f16 K AND f16 V; f16-accumulated PV) ----
 
 fn cpu_attn_rs(q: &[f32], k: &[f32], v: &[f32],
-               m: usize, n_heads: usize, n_kv_heads: usize, n_kv: usize) -> Vec<f32> {
-    let scale = 1.0f32 / (HD as f32).sqrt();
+               m: usize, n_heads: usize, n_kv_heads: usize, n_kv: usize, hd: usize) -> Vec<f32> {
+    let scale = 1.0f32 / (hd as f32).sqrt();
     let group = n_heads / n_kv_heads;
-    let mut o = vec![0f32; m * n_heads * HD];
+    let mut o = vec![0f32; m * n_heads * hd];
     for h in 0..n_heads {
         let kvh = h / group;
         for qi in 0..m {
-            let qo = (qi * n_heads + h) * HD;
+            let qo = (qi * n_heads + h) * hd;
             let lim = (qi + 1).min(n_kv);
             let mut sc = vec![f32::NEG_INFINITY; lim];
             for (t, s) in sc.iter_mut().enumerate() {
-                let ko = (t * n_kv_heads + kvh) * HD;
+                let ko = (t * n_kv_heads + kvh) * hd;
                 let mut acc = 0f64;
-                for d in 0..HD {
+                for d in 0..hd {
                     acc += (f16::from_f32(q[qo + d]).to_f32() as f64)
                          * (f16::from_f32(k[ko + d]).to_f32() as f64);
                 }
@@ -295,25 +297,25 @@ fn cpu_attn_rs(q: &[f32], k: &[f32], v: &[f32],
             for s in sc.iter_mut() { *s = (*s - mx).exp(); sum += *s; }
             let inv = if sum > 0.0 { 1.0 / sum } else { 1.0 };
             for (t, &p) in sc.iter().enumerate() {
-                let vo = (t * n_kv_heads + kvh) * HD;
+                let vo = (t * n_kv_heads + kvh) * hd;
                 let w = p * inv;
-                for d in 0..HD { o[qo + d] += w * f16::from_f32(v[vo + d]).to_f32(); }
+                for d in 0..hd { o[qo + d] += w * f16::from_f32(v[vo + d]).to_f32(); }
             }
         }
     }
     o
 }
 
-fn check_rs(m: usize, n_heads: usize, n_kv_heads: usize) {
+fn check_rs_hd(m: usize, n_heads: usize, n_kv_heads: usize, hd: usize) {
     let n_kv = m;
-    let mut r = Lcg(0xabcd_ef01_2345_6789 ^ (m as u64));
-    let q: Vec<f32> = (0..m * n_heads * HD).map(|_| r.f()).collect();
-    let k: Vec<f32> = (0..n_kv * n_kv_heads * HD).map(|_| r.f()).collect();
-    let v: Vec<f32> = (0..n_kv * n_kv_heads * HD).map(|_| r.f()).collect();
+    let mut r = Lcg(0xabcd_ef01_2345_6789 ^ ((m as u64) << 16) ^ (hd as u64));
+    let q: Vec<f32> = (0..m * n_heads * hd).map(|_| r.f()).collect();
+    let k: Vec<f32> = (0..n_kv * n_kv_heads * hd).map(|_| r.f()).collect();
+    let v: Vec<f32> = (0..n_kv * n_kv_heads * hd).map(|_| r.f()).collect();
 
     let mut h = Harness::new();
-    let gpu = h.fa_rs(&q, &k, &v, m, n_heads, n_kv_heads, n_kv);
-    let cpu = cpu_attn_rs(&q, &k, &v, m, n_heads, n_kv_heads, n_kv);
+    let gpu = h.fa_rs(&q, &k, &v, m, n_heads, n_kv_heads, n_kv, hd);
+    let cpu = cpu_attn_rs(&q, &k, &v, m, n_heads, n_kv_heads, n_kv, hd);
 
     let maxabs = cpu.iter().cloned().fold(0f32, |a, b| a.max(b.abs())).max(1e-6);
     let mut max_rel = 0f32;
@@ -322,19 +324,25 @@ fn check_rs(m: usize, n_heads: usize, n_kv_heads: usize) {
         let rel = (gpu[i] - cpu[i]).abs() / maxabs;
         if rel > max_rel { max_rel = rel; worst = i; }
     }
-    println!("[fa_cm_gemma_rs m={m} nh={n_heads} nkv={n_kv_heads}] max_rel={max_rel:.2e} \
+    println!("[fa_cm_gemma_rs hd{hd} m={m} nh={n_heads} nkv={n_kv_heads}] max_rel={max_rel:.2e} \
               worst(i={worst} gpu={} cpu={})", gpu[worst], cpu[worst]);
-    // Looser than the QK-only gate: PV is f16-accumulated in the kernel (llama's
-    // precision class). An index bug gives O(1) error; f16-PV noise is ~1e-2.
+    // PV is f16-accumulated (llama's precision class). Index bug → O(1) error.
     assert!(max_rel < 2e-2,
-        "row_split coopmat-FA hd256 numerics off: max_rel={max_rel:.3e} (m={m})");
+        "row_split coopmat-FA hd{hd} numerics off: max_rel={max_rel:.3e} (m={m})");
 }
 
 #[test]
-fn fa_cm_gemma_rs_single_tile() { check_rs(16, 4, 2); }   // 1 Q-tile, GQA 2
+fn fa_cm_gemma_rs_single_tile() { check_rs_hd(16, 4, 2, 256); }   // 1 Q-tile, GQA 2
 
 #[test]
-fn fa_cm_gemma_rs_multi_tile() { check_rs(40, 4, 1); }    // 3 Q-tiles, MHA
+fn fa_cm_gemma_rs_multi_tile() { check_rs_hd(40, 4, 1, 256); }    // 3 Q-tiles, MHA
+
+// Sprint 10d — hd512 full layers (GQA 16:2 → 2 KV-heads, full attention).
+#[test]
+fn fa_cm_gemma_rs_hd512_single_tile() { check_rs_hd(16, 16, 2, 512); }
 
 #[test]
-fn fa_cm_gemma_rs_gqa8() { check_rs(48, 8, 1); }          // GQA group 8
+fn fa_cm_gemma_rs_hd512_multi_tile() { check_rs_hd(40, 16, 2, 512); }
+
+#[test]
+fn fa_cm_gemma_rs_gqa8() { check_rs_hd(48, 8, 1, 256); }  // GQA group 8

@@ -1080,6 +1080,12 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "flash_attn_cm_gemma_rs.comp",
         defines: &[("HD", "256")],
     },
+    // Sprint 10d — hd512 (full) variant of the row_split kernel.
+    ShaderJob {
+        out_name: "flash_attn_cm_gemma_rs_hd512.spv",
+        entry_source: "flash_attn_cm_gemma_rs.comp",
+        defines: &[("HD", "512")],
+    },
     // Sprint 10c — FP8(e4m3)→f16 convert pass (Pfad B: materialise f16 K/V
     // scratch for the direct-global coopmat-FA read).
     ShaderJob {
