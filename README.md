@@ -18,6 +18,17 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
 
 ## Highlights
 
+- **Gemma-4 prefill 612 → 2629 t/s (v0.6.2, default-on)** — the whole Gemma-4
+  attention now runs on a KHR-cooperative-matrix flash-attention kernel (a
+  faithful port of llama.cpp's `flash_attn_cm1`: 16×16×16 coopmat QK + PV,
+  Br16/Bc64/row_split4, K/V coopMatLoad'd direct-from-global f16). Attention
+  drops from 76 % of the prefill wall to ~0 → prefill hits the attention-free
+  ceiling: Gemma-4-26B-A4B Q3_K_M **612 → 2629 t/s @p2048** (**92 % of
+  llama.cpp**, 4.3× over v0.6.1); QAT-Q4_0 hits 3107 t/s. Occupancy matches
+  llama's budget (hd256 occ 12 / hd512 occ 8, 0 spills). Default change
+  (coopmat f16-PV vs fa_batch f32, rel ~5e-4, ctx4096-coherent); `VF_FA_COOPMAT_RS=0`
+  escapes to fa_batch. Non-Gemma-4 / hd128 untouched (15-prompt regression across
+  11 models: no flip regression). See `CHANGELOG.md`.
 - **Big-MoE decode +89 % (v0.5.2)** — adaptive load-staging eliminates a
   fixed-buffer VRAM load-transient that was evicting weights to GTT, plus a
   parallel MoE-router top-K (both value-preserving, bit-identical to v0.5.1).

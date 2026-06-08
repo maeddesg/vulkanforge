@@ -7,7 +7,7 @@
 | Q4_K_M | ✅     |       121 t/s   | Primary GGUF format, all benches use it  |
 | Q3_K_M | ✅     |       132 t/s   | Smaller VRAM, slight quality drop        |
 | Q5_K   | ✅     |       105 t/s   |                                          |
-| Q4_0   | ✅     |             —   | **Gemma-4 QAT GGUF line (E2B/E4B/12B/26B/31B) since v0.6.1** — byte-gated vs llama.cpp; 26B-A4B QAT: prefill 1143/646 t/s @p512/p2048, decode 117 t/s. Qwen2.5-Q4_0 stays deliberately gated (needs attn-bias / Q4_1 / Q8_0-lm_head arch features, not the quant). |
+| Q4_0   | ✅     |             —   | **Gemma-4 QAT GGUF line (E2B/E4B/12B/26B/31B) since v0.6.1** — byte-gated vs llama.cpp; 26B-A4B QAT: prefill **2479/3107 t/s @p512/p2048** (v0.6.2 coopmat-FA; was 1143/646 in v0.6.1), decode 117 t/s. Qwen2.5-Q4_0 stays deliberately gated (needs attn-bias / Q4_1 / Q8_0-lm_head arch features, not the quant). |
 | Q6_K   | ✅     |             —   | Less common; chat works                  |
 | Q8_0   | ⚠️    |             —   | Loadable via `chat` but rejected by `bench` |
 
@@ -63,7 +63,7 @@ sessions, otherwise leave the flag off.
 | Qwen3            | ✅   | ✅ block-wise [128,128]  | gpt2      | `<think>` mode, Q/K-norm             |
 | Mistral 7B       | ✅   | ⚠️                       | SPM       | GGUF works; FP8 SPM tokenizer not yet wired |
 | DeepSeek-R1      | ✅   | —                        | gpt2      | R1-Distill-Llama works on GGUF; native MoE pending |
-| Gemma-4          | ✅   | — (BF16/F32 SafeTensors) | gemma4    | incl. 26B-A4B **MoE** (128 experts, top-8); GGUF Q3_K_M + **Q4_0 QAT line (v0.6.1)**; thought-channel template auto-detected |
+| Gemma-4          | ✅   | — (BF16/F32 SafeTensors) | gemma4    | incl. 26B-A4B **MoE** (128 experts, top-8); GGUF Q3_K_M + **Q4_0 QAT line (v0.6.1)**; thought-channel template auto-detected. **v0.6.2: prefill attention (hd256 sliding + hd512 full) on KHR-coopmat flash-attention by default → 612→2629 t/s @p2048 (92 % llama); `VF_FA_COOPMAT_RS=0` reverts to fa_batch.** |
 
 `gpt2` tokenizer covers Qwen, Llama-3 (which uses BPE), and the
 DeepSeek family. SPM (Mistral / Llama-2 family) is GGUF-only at the

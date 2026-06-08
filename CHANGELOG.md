@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.6.2 — CoopMat Flash-Attention for Gemma-4: prefill 612 → 2629 t/s (2026-06-08)
+
+**The entire Gemma-4 prefill attention now runs on a KHR-cooperative-matrix flash-attention
+kernel by default** — prefill **612 → 2629 t/s @p2048** (Gemma-4-26B-A4B Q3_K_M, serve, KV-FP8,
+ctx 4096, median of 3) = **92 % of llama.cpp** (2859), **4.3× over v0.6.1**. Attention drops from
+76 % of the prefill wall to ~0; prefill now hits the attention-free ceiling. The QAT-Q4_0 line is
+even faster (3107 t/s @p2048, ahead of llama — Q4_0 dequant is cheaper).
+
+**The kernel** (`flash_attn_cm_gemma_rs.comp`) is a faithful port of llama.cpp's
+`flash_attn_cm1.comp`: KHR coopmat 16×16×16, Br=16 · Bc=64 (16×4 subgroups) · row_split=4 · WG=256,
+coopmat QK + coopmat-PV with online-softmax rescale, cross-subgroup combine via shared memory.
+Adapted to VulkanForge's per-head FA layout with **inline causal/sliding masking** (no mask tensor),
+HEAD_DIM-parametric for both Gemma-4 attention types (hd256 sliding, hd512 full). K/V are
+coopMatLoad'd **direct from global f16** — the occupancy-preserving load that Sprint 7's tiled
+attempt lacked (it staged K-tiles into 41 KB LDS + VGPR-256 accumulators → 2 waves/SIMD and was
+*slower*). Because VF's KV cache is FP8, a small convert pass (`kv_fp8_to_f16.comp`) materialises an
+f16 scratch in the same layout; Q stays f32.
+
+**Occupancy = llama's budget, both head dims** (`RADV_DEBUG=shaderstats`, 0 spills):
+hd256 = VGPR 120 / LDS 18432 / **occ 12**; hd512 = VGPR 192 / LDS 26624 / **occ 8** — identical to
+llama's `cm1`. row_split=4 keeps only Br/4 = 4 query rows per thread, which is what breaks the
+single-subgroup VGPR-256 ceiling (the occupancy mechanism, not optional).
+
+**Default change, documented (like v0.6.0):** `VF_FA_COOPMAT_RS` is now **default-ON**. Output
+changes deliberately vs the old fa_batch path (coopmat f16-PV accumulate vs f32; rel ~5e-4,
+ctx4096-coherent — *not* bit-identical). **`VF_FA_COOPMAT_RS=0` escapes back to fa_batch** (the
+pre-v0.6.2 default; a clean value-preserving fallback, validated at 613 t/s, recall 3/3). Scoped to
+`gemma4` hd256/512 only — **all non-Gemma-4 / hd128 paths and decode are untouched by construction.**
+
+**Correctness:** numerics vs an f16-aware CPU reference max rel **4–6e-4** (hd256 + hd512, all
+tiles/GQA); a coopMatLoad-direct-from-global keystone test is **bit-exact** on the real FA strides;
+ctx4096 long-context retrieval matches fa_batch (no f16-softmax drift); recall (Paris/391/Jupiter) +
+5-prompt smoke + ~2970-token multichunk green; **273/273 lib + coopmat tests**. A **post-flip
+15-prompt regression across 11 models** (`results/sprint10e_postflip_regression.md`) confirms **no
+model regressed by the flip**: Gemma-4 Q3_K_M + QAT coherent + recall 3/3 with only 3/15 prompts
+diverging from fa_batch (no cliff); all 8 hd128 controls unchanged/coherent. (Two operational
+failures — `gemma-4-26B Q4_K_M` MoE `mmq_id_shader_for` panic, `Llama-3.1-8B Q8_0` 500 — are
+pre-existing, quant-specific, and flip-independent by code path.)
+
+Build arc: Sprint 10a (recon of llama's cm1 budget) → 10b (Phase-0 keystone + opt-in v1, occ 4,
+1.88×) → 10c (row_split=4, occ 12, hd256) → 10d (hd512 + default flip).
+
 ## v0.6.1 — Q4_0 support for Gemma-4: the QAT GGUF line runs (2026-06-07)
 
 **Adds Q4_0 (`file_type=2`) support for `gemma4` — unlocks the Gemma-4 QAT GGUF line**
