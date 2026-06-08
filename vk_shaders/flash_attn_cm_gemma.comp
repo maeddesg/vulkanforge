@@ -1,0 +1,199 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic      : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// VulkanForge Sprint 10b Phase-1a — HEAD_DIM-parametric coopmat
+// flash-attention for Gemma-4 (hd256 sliding / hd512 full).
+//
+// Derived from the production `flash_attn_coopmat.comp` (hd128, default-ON):
+// QK score via 16×16×16 KHR coopmat, online-softmax + PV scalar — identical
+// proven numerics. The ONLY structural change is HEAD_DIM generalisation:
+// the hardcoded 2-chunk (tid, tid+64) Q/K/V/O lanes become a DPT = HEAD_DIM/64
+// loop. BR=16, BC=16, WGSIZE=64 (one Wave64 subgroup) are unchanged.
+//
+// Occupancy (the Sprint-7 lesson): K is staged to a SMALL BC×HEAD_DIM f16 LDS
+// tile (BC=16 → 8 KB at hd256, not Sprint-7's 41 KB full-Bc64 tile), so LDS
+// stays ~17 KB at hd256 (q_lds 8 + k_lds 8 + scores 1) ≈ llama's 18 KB → occ
+// ~12. The Phase-0b direct-global keystone (proven) is reserved for the
+// hd512/Bc64 follow-up where LDS would otherwise blow up.
+//
+// Gated `VF_FA_COOPMAT_GEMMA`, default OFF; fa_batch stays the fallback.
+
+#ifndef BR
+#define BR 16
+#endif
+#ifndef BC
+#define BC 16
+#endif
+#ifndef HD
+#define HD 256
+#endif
+const uint WGSIZE   = 64;
+const uint TILE     = BC;
+const uint HEAD_DIM = HD;
+const uint DPT      = HEAD_DIM / 64;   // head-dim values per thread (4 @256, 8 @512)
+
+layout (local_size_x = WGSIZE) in;
+
+layout (binding = 0) readonly  buffer Q { float q[]; };   // [m, n_heads, head_dim]
+#if FP8_KV
+#extension GL_EXT_float_e4m3                          : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8  : require
+layout (binding = 1) readonly  buffer K { uint k_packed[]; };
+layout (binding = 2) readonly  buffer V { uint v_packed[]; };
+float load_k(uint idx) {
+    uint w = k_packed[idx >> 2];
+    uint b = (w >> ((idx & 3u) * 8u)) & 0xFFu;
+    return float(uintBitsToFloate4m3EXT(uint8_t(b)));
+}
+float load_v(uint idx) {
+    uint w = v_packed[idx >> 2];
+    uint b = (w >> ((idx & 3u) * 8u)) & 0xFFu;
+    return float(uintBitsToFloate4m3EXT(uint8_t(b)));
+}
+#elif FP16_KV
+layout (binding = 1) readonly  buffer K { uint k_packed[]; };
+layout (binding = 2) readonly  buffer V { uint v_packed[]; };
+float load_k(uint idx) { return unpackHalf2x16(k_packed[idx >> 1])[idx & 1u]; }
+float load_v(uint idx) { return unpackHalf2x16(v_packed[idx >> 1])[idx & 1u]; }
+#else
+layout (binding = 1) readonly  buffer K { float k[]; };
+layout (binding = 2) readonly  buffer V { float v[]; };
+float load_k(uint idx) { return k[idx]; }
+float load_v(uint idx) { return v[idx]; }
+#endif
+layout (binding = 3) writeonly buffer O { float o[]; };
+
+layout (push_constant) uniform Params {
+    uint  n_heads;
+    uint  n_kv_heads;
+    uint  head_dim;
+    uint  m;
+    uint  n_kv;
+    uint  q_start;
+    float scale;
+    uint  kv_start;
+} p;
+
+shared float16_t q_lds[BR * HEAD_DIM];
+shared float16_t k_lds[BC * HEAD_DIM];
+shared float     scores_lds[BR * BC];
+
+void main() {
+    uint h        = gl_WorkGroupID.x;
+    uint q_tile   = gl_WorkGroupID.y;
+    uint tid      = gl_LocalInvocationID.x;
+    if (h >= p.n_heads) return;
+
+    uint q_base = q_tile * BR;
+    if (q_base >= p.m) return;
+    uint actual_br = min(BR, p.m - q_base);
+
+    uint group_size = p.n_heads / p.n_kv_heads;
+    uint kvh        = h / group_size;
+    uint pos_stride = p.n_kv_heads * p.head_dim;
+    uint head_off   = kvh * p.head_dim;
+
+    // (1) Load Q-tile into f16 LDS — DPT chunks/thread (was hardcoded 2 @hd128).
+    [[unroll]] for (uint qi = 0; qi < BR; ++qi) {
+        uint q_off = ((q_base + qi) * p.n_heads + h) * p.head_dim;
+        [[unroll]] for (uint c = 0; c < DPT; ++c) {
+            float val = (qi < actual_br) ? q[q_off + tid + c * 64] : 0.0;
+            q_lds[qi * HEAD_DIM + tid + c * 64] = float16_t(val);
+        }
+    }
+    barrier();
+
+    // Per-query running state — registers. my_out is DPT chunks × BR.
+    float my_max[BR];
+    float my_sum[BR];
+    float my_out[DPT * BR];
+    [[unroll]] for (uint qi = 0; qi < BR; ++qi) {
+        my_max[qi] = -1e30;
+        my_sum[qi] = 0.0;
+        [[unroll]] for (uint c = 0; c < DPT; ++c) my_out[c * BR + qi] = 0.0;
+    }
+
+    uint causal_len_max = min(p.q_start + q_base + actual_br, p.n_kv);
+    uint window_lo = (p.kv_start / TILE) * TILE;
+
+    for (uint tile_base = window_lo; tile_base < causal_len_max; tile_base += TILE) {
+        // (2a) Stage K-tile into f16 LDS — DPT chunks/thread.
+        for (uint local_pos = 0; local_pos < TILE; ++local_pos) {
+            uint global_t = tile_base + local_pos;
+            uint kv_off = global_t * pos_stride + head_off;
+            [[unroll]] for (uint c = 0; c < DPT; ++c) {
+                float val = (global_t < causal_len_max)
+                          ? load_k(kv_off + tid + c * 64) : 0.0;
+                k_lds[local_pos * HEAD_DIM + tid + c * 64] = float16_t(val);
+            }
+        }
+        barrier();
+
+        // (2b) QK = Q·Kᵀ via coopmat. HEAD_DIM/16 MulAdd steps.
+        {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> C_frag =
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            for (uint d = 0; d < HEAD_DIM; d += 16) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A_frag;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B_frag;
+                coopMatLoad(A_frag, q_lds, d, HEAD_DIM, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(B_frag, k_lds, d, HEAD_DIM, gl_CooperativeMatrixLayoutColumnMajor);
+                C_frag = coopMatMulAdd(A_frag, B_frag, C_frag);
+            }
+            coopMatStore(C_frag, scores_lds, 0, BC, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+
+        // (2c) Online-softmax — per-qi, IDENTICAL recurrence to the proven path.
+        uint t_global = tile_base + tid;
+        bool tid_in_tile = tid < BC;
+        bool t_in_range = tid_in_tile && t_global < causal_len_max;
+        [[unroll]] for (uint qi = 0; qi < BR; ++qi) {
+            uint q_pos_qi = p.q_start + q_base + qi;
+            bool valid = t_in_range && qi < actual_br
+                      && t_global <= q_pos_qi && t_global >= p.kv_start;
+            float score = valid ? scores_lds[qi * BC + tid] * p.scale : -1e30;
+
+            float tile_max = subgroupMax(score);
+            float new_max  = max(my_max[qi], tile_max);
+            float kfac = (new_max == -1e30) ? 1.0 : exp(my_max[qi] - new_max);
+            [[unroll]] for (uint c = 0; c < DPT; ++c) my_out[c * BR + qi] *= kfac;
+            my_sum[qi] *= kfac;
+
+            float pscore = (valid && new_max > -1e30) ? exp(score - new_max) : 0.0;
+            my_sum[qi] += subgroupAdd(pscore);
+            my_max[qi]  = new_max;
+            if (tid_in_tile) scores_lds[qi * BC + tid] = pscore;
+        }
+        barrier();
+
+        // (2d) Weighted V-sum — DPT chunks/thread.
+        for (uint i = 0; i < TILE; ++i) {
+            uint global_t = tile_base + i;
+            if (global_t >= causal_len_max) break;
+            uint v_off = global_t * pos_stride + head_off;
+            float v_d[DPT];
+            [[unroll]] for (uint c = 0; c < DPT; ++c) v_d[c] = load_v(v_off + tid + c * 64);
+            [[unroll]] for (uint qi = 0; qi < BR; ++qi) {
+                float pi = scores_lds[qi * BC + i];
+                [[unroll]] for (uint c = 0; c < DPT; ++c) my_out[c * BR + qi] += pi * v_d[c];
+            }
+        }
+        barrier();
+    }
+
+    // (3) Normalize + write back.
+    for (uint qi = 0; qi < actual_br; ++qi) {
+        float denom = (my_sum[qi] > 0.0) ? my_sum[qi] : 1.0;
+        float inv_sum = 1.0 / denom;
+        uint o_off = ((q_base + qi) * p.n_heads + h) * p.head_dim;
+        [[unroll]] for (uint c = 0; c < DPT; ++c) {
+            if (tid + c * 64 < HEAD_DIM) o[o_off + tid + c * 64] = my_out[c * BR + qi] * inv_sum;
+        }
+    }
+}

@@ -2258,6 +2258,21 @@ impl BatchExec {
                 return;
             }
         }
+        // Sprint 10b Phase-0a — attention-dispatch skip ablation. When
+        // `VF_SKIP_FA=1`, bypass the flash-attention core dispatch only
+        // (QKV proj / RoPE / norms / o-proj stay). Prefill output is then
+        // garbage — this is a TIMING instrument: prefill_wall(normal) −
+        // prefill_wall(VF_SKIP_FA) isolates the fa_batch GPU cost, the
+        // baseline a coopmat-FA must beat. Default OFF (no-op). Diagnostic
+        // only; never gate correctness on it.
+        {
+            use std::sync::OnceLock;
+            static SKIP_FA: OnceLock<bool> = OnceLock::new();
+            if *SKIP_FA.get_or_init(|| std::env::var("VF_SKIP_FA").as_deref() == Ok("1")) {
+                compute_barrier(ctx.dev, ctx.cmd);
+                return;
+            }
+        }
         // Sprint 46F — flash_attn_tiled.comp / flash_attn_coopmat.comp
         // hardcode HEAD_DIM=128 (Qwen3 / Llama-3.1 / Mistral / DSR1). For
         // Gemma-4 (head_dim=256) those shaders would silently leave dims
@@ -2265,6 +2280,26 @@ impl BatchExec {
         // through `run_flash_attn_batch`, which uses per-thread striped
         // accumulators (Sprint 43D-2) and handles head_dim up to 512.
         let head_dim_layer = fwd.kv_cache.head_dim_for(ctx.layer);
+        // Sprint 10b Phase-1a — opt-in coopmat FA for Gemma-4 hd256
+        // (sliding). Numerically validated (coopmat_fa_gemma.rs); E2E
+        // perf-eval gate. hd512 stays on fa_batch (this kernel is HD=256
+        // baked). Default OFF; fa_batch remains the fallback.
+        {
+            use std::sync::OnceLock;
+            static CM_GEMMA: OnceLock<bool> = OnceLock::new();
+            let on = *CM_GEMMA.get_or_init(|| {
+                std::env::var("VF_FA_COOPMAT_GEMMA").as_deref() == Ok("1")
+            });
+            if on && _cfg.gemma4.is_some() && head_dim_layer == 256 {
+                fwd.run_flash_attn_cm_gemma(
+                    ctx.dev, ctx.registry, ctx.cmd, ctx.layer,
+                    fwd.batch_q.handle, fwd.batch_attn_out.handle,
+                    seq_len, base_pos, base_pos + seq_len, kv_layer, kv_start,
+                );
+                compute_barrier(ctx.dev, ctx.cmd);
+                return;
+            }
+        }
         let force_fa_batch = head_dim_layer != 128;
         if fwd.fa_tiled_enabled && !force_fa_batch {
             fwd.run_flash_attn_tiled(

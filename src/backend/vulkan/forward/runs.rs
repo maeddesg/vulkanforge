@@ -1009,6 +1009,76 @@ impl Forward {
         });
     }
 
+    /// Sprint 10b Phase-1a — HEAD_DIM-parametric coopmat flash-attention
+    /// for Gemma-4 hd256 (sliding). Same bindings / push-constants as
+    /// `run_flash_attn_batch` but coopmat-QK and a BR=16 Q-tile grid
+    /// (one WG per (head, 16-query tile)). hd256 only; the caller keeps
+    /// hd512 on fa_batch. Gated `VF_FA_COOPMAT_GEMMA`.
+    pub(super) fn run_flash_attn_cm_gemma(
+        &mut self,
+        dev: &VulkanDevice,
+        registry: &PipelineRegistry,
+        cmd: vk::CommandBuffer,
+        layer: u32,
+        q_buf: vk::Buffer,
+        o_buf: vk::Buffer,
+        m: u32,
+        q_start: u32,
+        n_kv: u32,
+        kv_layer: u32,
+        kv_start: u32,
+    ) {
+        let cfg = self.config.clone();
+        // hd256 FP8-KV variant (the standing KV format). FP32/FP16 KV
+        // would pick a different SPV — not wired for v1 (E2E uses FP8).
+        let kernel = registry.get(ShaderId::FlashAttnCmGemmaHd256Fp8);
+        let layer_off = self.kv_cache.layer_offset_bytes(kv_layer);
+        let layer_size = self.kv_cache.layer_size_bytes(kv_layer);
+        let head_dim_layer = self.kv_cache.head_dim_for(layer);
+        let attn_scale_layer = if cfg.gemma4.is_some() {
+            1.0_f32
+        } else if head_dim_layer != cfg.head_dim {
+            1.0_f32 / (head_dim_layer as f32).sqrt()
+        } else {
+            self.attn_scale
+        };
+        let q_bytes_total = (m as u64) * (cfg.n_heads as u64) * (head_dim_layer as u64) * 4;
+        let set = self.alloc_or_get_set(
+            dev,
+            kernel.descriptor_set_layout,
+            &[
+                (0, q_buf, 0, q_bytes_total),
+                (1, self.kv_cache.k_buffer.handle, layer_off, layer_size),
+                (2, self.kv_cache.v_buffer.handle, layer_off, layer_size),
+                (3, o_buf, 0, q_bytes_total),
+            ],
+        );
+        let pc = FlashAttnBatchPushConstants {
+            n_heads: cfg.n_heads,
+            n_kv_heads: n_kv_heads_for(&cfg, layer),
+            head_dim: head_dim_layer,
+            m,
+            n_kv,
+            q_start,
+            scale: attn_scale_layer,
+            kv_start,
+        };
+        let layout = kernel.pipeline_layout;
+        let pipeline = kernel.pipeline;
+        let n_heads = cfg.n_heads;
+        let n_qtiles = m.div_ceil(16);
+        self.profile("fa_cm_gemma", dev, cmd, |dev, cmd| unsafe {
+            dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            dev.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[],
+            );
+            dev.device.cmd_push_constants(
+                cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc),
+            );
+            dev.device.cmd_dispatch(cmd, n_heads, n_qtiles, 1);
+        });
+    }
+
     /// Sprint 7 (Prefill-Arc, 2026-06-06) — Q-tiled flash attention for
     /// Gemma-4's heterogeneous head dims. Dispatches the HEAD_DIM-256
     /// (Sliding, BR=8/BC=32) or HEAD_DIM-512 (Full, BR=4/BC=16) build of

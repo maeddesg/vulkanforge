@@ -1055,6 +1055,25 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "flash_attn_coopmat.comp",
         defines: &[("FP8_KV", "1")],
     },
+    // Sprint 10b Phase-0b — coopMatLoad-direct-from-global keystone spike.
+    ShaderJob {
+        out_name: "spike_cm_global_qk.spv",
+        entry_source: "spike_cm_global_qk.comp",
+        defines: &[],
+    },
+    // Sprint 10b Phase-1a — HEAD_DIM-parametric coopmat FA for Gemma-4.
+    // FP32 variant (unit-test reference) + FP8 KV variant (E2E, default
+    // KV format). hd256 (sliding) first; hd512 (full) is the follow-up.
+    ShaderJob {
+        out_name: "flash_attn_cm_gemma_hd256.spv",
+        entry_source: "flash_attn_cm_gemma.comp",
+        defines: &[("HD", "256")],
+    },
+    ShaderJob {
+        out_name: "flash_attn_cm_gemma_hd256_fp8.spv",
+        entry_source: "flash_attn_cm_gemma.comp",
+        defines: &[("HD", "256"), ("FP8_KV", "1")],
+    },
     // v0.2 smoke-test FP8 throughput bench (E4M3 × E4M3 → FP32).
     // Twin of bench_coopmat_pure for the FP8 path. Used by
     // examples/bench_coopmat when VF_BENCH_FP8=1.

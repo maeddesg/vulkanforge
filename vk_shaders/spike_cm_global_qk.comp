@@ -1,0 +1,64 @@
+#version 450
+#extension GL_KHR_cooperative_matrix          : require
+#extension GL_KHR_memory_scope_semantics      : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic       : enable
+
+// VulkanForge Sprint 10b Phase-0b — KEYSTONE SPIKE.
+//
+// Question this shader answers: can VF's KHR-coopmat path coopMatLoad a
+// K-fragment DIRECTLY from a *global* storage buffer laid out in the real
+// flash-attention per-head shape (positions strided by n_kv_heads*head_dim),
+// with NO LDS staging, and produce a value-correct Q·Kᵀ?
+//
+// This is the occupancy-preserving load that Sprint 7 lacked (it staged
+// full K-tiles into 41 KB LDS + VGPR-256 accumulators → occ 2) and that
+// llama's flash_attn_*_aligned_cm1 relies on (shmem_staging=0 on RADV →
+// K/V coopMatLoad'd straight from L2). No existing VF shader does this;
+// every coopmat shader so far stages Q/K into `shared` first.
+//
+// Math (one 16×16 score tile, head_dim summed in 16-chunks):
+//   scores[qi][t] = Σ_d Q[qi][d] · K[t][d]
+//   A = Q   : RowMajor, 16 rows × head_dim, stride = head_dim   (contiguous)
+//   B = Kᵀ  : ColumnMajor, stride = k_stride, base = head_off    (FA-strided,
+//             loaded DIRECTLY from the global K SSBO — the keystone)
+//   C += A·B over each d-chunk  ⇒  C[qi][t] = (Q·Kᵀ)[qi][t]
+//
+// Inputs are small integers (exactly f16-representable, |Σ| < 2^24) so the
+// f32 accumulate is EXACT and the CPU reference comparison is unambiguous.
+
+layout(local_size_x = 64) in;            // coopmat scope = subgroup
+
+const uint MATDIM = 16;
+
+layout(binding = 0) readonly  buffer Q { float16_t q[]; };   // [16 * head_dim]
+layout(binding = 1) readonly  buffer K { float16_t k[]; };   // FA layout, strided
+layout(binding = 2) writeonly buffer S { float scores[]; };  // [16 * 16] f32
+
+layout(push_constant) uniform P {
+    uint head_dim;   // D — 256 (sliding) or 512 (full)
+    uint k_stride;   // elements between consecutive K positions = n_kv_heads*head_dim
+    uint head_off;   // this head's d-offset within a K row = kvh*head_dim
+} p;
+
+void main() {
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> C =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    for (uint d = 0; d < p.head_dim; d += MATDIM) {
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;  // Q rows
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;  // Kᵀ
+
+        // Q: contiguous, RowMajor — A[qi][dd] = q[qi*head_dim + (d+dd)].
+        coopMatLoad(A, q, d, p.head_dim, gl_CooperativeMatrixLayoutRowMajor);
+
+        // K: DIRECT from the global SSBO in FA layout. ColumnMajor with
+        // leading dimension = k_stride makes B[dd][t] = k[head_off + (d+dd) +
+        // t*k_stride] = K[t][d+dd]. NO copy into `shared` first.
+        coopMatLoad(B, k, p.head_off + d, p.k_stride, gl_CooperativeMatrixLayoutColumnMajor);
+
+        C = coopMatMulAdd(A, B, C);
+    }
+
+    coopMatStore(C, scores, 0, MATDIM, gl_CooperativeMatrixLayoutRowMajor);
+}

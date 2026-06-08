@@ -857,7 +857,15 @@ impl PipelineRegistry {
                 | ShaderId::ProbeCoopmatLayout
                 | ShaderId::FlashAttnCoopmat
                 | ShaderId::FlashAttnCoopmatFp16Kv
-                | ShaderId::FlashAttnCoopmatFp8Kv => {
+                | ShaderId::FlashAttnCoopmatFp8Kv
+                // Sprint 10b Phase-0b — keystone spike; same plain
+                // coopmat surface (local_size_x=64 = 1 Wave64 subgroup,
+                // no spec constants, push/bindings from reflection).
+                | ShaderId::SpikeCmGlobalQk
+                // Sprint 10b Phase-1a — HEAD_DIM-parametric coopmat FA;
+                // same plain coopmat surface (HD/FP8_KV baked at build).
+                | ShaderId::FlashAttnCmGemmaHd256
+                | ShaderId::FlashAttnCmGemmaHd256Fp8 => {
                     // No spec constants — BR/BC/HEAD_DIM/FP16_KV are
                     // baked in via -DBR=N -DBC=N (-DFP16_KV=1) at
                     // SPIR-V build time. KvCopyFp16 has no spec

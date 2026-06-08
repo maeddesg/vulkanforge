@@ -297,6 +297,16 @@ pub enum ShaderId {
     /// attention shader. Same source as `FlashAttnCoopmatFp16Kv`,
     /// `-DFP8_KV=1` build define.
     FlashAttnCoopmatFp8Kv,
+    /// Sprint 10b Phase-0b — keystone spike: coopMatLoad a K-fragment
+    /// directly from a global SSBO in FA-strided layout (no LDS),
+    /// Q·Kᵀ via coopmat. Validates the occupancy-preserving load
+    /// before the real coopmat-FA build. Test-only pipeline.
+    SpikeCmGlobalQk,
+    /// Sprint 10b Phase-1a — HEAD_DIM-parametric coopmat flash-attention
+    /// for Gemma-4 hd256 (sliding). FP32 KV (unit-test reference).
+    FlashAttnCmGemmaHd256,
+    /// Sprint 10b Phase-1a — same, FP8 KV (E2E default format).
+    FlashAttnCmGemmaHd256Fp8,
     SoftMax,
     Copy,
     ScalarAttn,
@@ -628,6 +638,9 @@ impl ShaderId {
             ShaderId::FlashAttnCoopmat => "flash_attn_coopmat",
             ShaderId::FlashAttnCoopmatFp16Kv => "flash_attn_coopmat_fp16kv",
             ShaderId::FlashAttnCoopmatFp8Kv => "flash_attn_coopmat_fp8kv",
+            ShaderId::SpikeCmGlobalQk => "spike_cm_global_qk",
+            ShaderId::FlashAttnCmGemmaHd256 => "flash_attn_cm_gemma_hd256",
+            ShaderId::FlashAttnCmGemmaHd256Fp8 => "flash_attn_cm_gemma_hd256_fp8",
             ShaderId::SoftMax => "soft_max_f32",
             ShaderId::Copy => "copy_f32_f32",
             ShaderId::ScalarAttn => "scalar_attn_f32",
@@ -802,6 +815,9 @@ impl ShaderId {
             ShaderId::FlashAttnCoopmat => FLASH_ATTN_COOPMAT,
             ShaderId::FlashAttnCoopmatFp16Kv => FLASH_ATTN_COOPMAT_FP16KV,
             ShaderId::FlashAttnCoopmatFp8Kv => FLASH_ATTN_COOPMAT_FP8KV,
+            ShaderId::SpikeCmGlobalQk => SPIKE_CM_GLOBAL_QK,
+            ShaderId::FlashAttnCmGemmaHd256 => FLASH_ATTN_CM_GEMMA_HD256,
+            ShaderId::FlashAttnCmGemmaHd256Fp8 => FLASH_ATTN_CM_GEMMA_HD256_FP8,
             ShaderId::SoftMax => SOFT_MAX_F32,
             ShaderId::Copy => COPY_F32_F32,
             ShaderId::ScalarAttn => SCALAR_ATTN_F32,
@@ -983,6 +999,9 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::FlashAttnCoopmat,
     ShaderId::FlashAttnCoopmatFp16Kv,
     ShaderId::FlashAttnCoopmatFp8Kv,
+    ShaderId::SpikeCmGlobalQk,
+    ShaderId::FlashAttnCmGemmaHd256,
+    ShaderId::FlashAttnCmGemmaHd256Fp8,
     ShaderId::SoftMax,
     ShaderId::Copy,
     ShaderId::ScalarAttn,
@@ -1250,6 +1269,12 @@ pub const FLASH_ATTN_COOPMAT_FP16KV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_coopmat_fp16kv.spv"));
 pub const FLASH_ATTN_COOPMAT_FP8KV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_coopmat_fp8kv.spv"));
+pub const SPIKE_CM_GLOBAL_QK: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/spike_cm_global_qk.spv"));
+pub const FLASH_ATTN_CM_GEMMA_HD256: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_cm_gemma_hd256.spv"));
+pub const FLASH_ATTN_CM_GEMMA_HD256_FP8: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_cm_gemma_hd256_fp8.spv"));
 pub const SOFT_MAX_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/soft_max_f32.spv"));
 pub const COPY_F32_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/copy_f32_f32.spv"));
 pub const SCALAR_ATTN_F32: &[u8] =
