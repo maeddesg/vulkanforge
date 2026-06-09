@@ -511,8 +511,11 @@ aggressive quantization). Set **`VF_KV_PREFIX_REUSE=1`** to speed up multi-turn
 
 - Single-stream only — no batch inference, no concurrent sessions on
   one `Forward` instance.
-- Decode at 0.87–0.97× llama.cpp Vulkan (unified matrix, Sprint 11a);
-  prefill 0.60–0.91×; coopmat is prefill-only on this codebase.
+- vs llama.cpp Vulkan (same backend, v0.7.0 matrix): dense models reach
+  prefill **parity** (~0.93–1.04×) and near-parity decode (~0.95–0.97×);
+  Gemma-4 MoE prefill is still behind (~0.64× at short context, ~0.83–0.89×
+  @p2048 — the grouped expert-GEMM), MoE decode ~0.87–0.91×. Coopmat is
+  prefill-only on this codebase.
 - FP8 prefill structurally behind ROCm-specialized kernels (vLLM's
   `ROCmFP8ScaledMMLinearKernel` is in a different class).
 - `vulkanforge bench` accepts only Q4_K_M GGUF; Q8_0 chat works but
