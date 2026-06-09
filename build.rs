@@ -1086,6 +1086,14 @@ const JOBS: &[ShaderJob] = &[
         entry_source: "flash_attn_cm_gemma_rs.comp",
         defines: &[("HD", "512")],
     },
+    // Sprint 11e — hd128 variant (dense Qwen3 / Llama-3.1 / Mistral-v0.3 /
+    // DeepSeek-R1-Distill-Llama, full-causal, f16 K/V direct-global). Same
+    // row_split kernel at HD=128 (8× 16-tile K-span, d_per_thread=1, occ-12).
+    ShaderJob {
+        out_name: "flash_attn_cm_gemma_rs_hd128.spv",
+        entry_source: "flash_attn_cm_gemma_rs.comp",
+        defines: &[("HD", "128")],
+    },
     // Sprint 10c — FP8(e4m3)→f16 convert pass (Pfad B: materialise f16 K/V
     // scratch for the direct-global coopmat-FA read).
     ShaderJob {

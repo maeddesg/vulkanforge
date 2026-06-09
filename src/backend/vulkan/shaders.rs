@@ -312,6 +312,9 @@ pub enum ShaderId {
     FlashAttnCmGemmaRsHd256,
     /// Sprint 10d — hd512 (full) variant of the row_split kernel.
     FlashAttnCmGemmaRsHd512,
+    /// Sprint 11e — hd128 variant (dense hd128: Qwen3 / Llama-3.1 / Mistral /
+    /// DeepSeek-R1; full-causal, f16 K/V direct-global). Same row_split kernel.
+    FlashAttnCmGemmaRsHd128,
     /// Sprint 10c — FP8(e4m3)→f16 convert pass (Pfad B scratch).
     KvFp8ToF16,
     SoftMax,
@@ -650,6 +653,7 @@ impl ShaderId {
             ShaderId::FlashAttnCmGemmaHd256Fp8 => "flash_attn_cm_gemma_hd256_fp8",
             ShaderId::FlashAttnCmGemmaRsHd256 => "flash_attn_cm_gemma_rs_hd256",
             ShaderId::FlashAttnCmGemmaRsHd512 => "flash_attn_cm_gemma_rs_hd512",
+            ShaderId::FlashAttnCmGemmaRsHd128 => "flash_attn_cm_gemma_rs_hd128",
             ShaderId::KvFp8ToF16 => "kv_fp8_to_f16",
             ShaderId::SoftMax => "soft_max_f32",
             ShaderId::Copy => "copy_f32_f32",
@@ -830,6 +834,7 @@ impl ShaderId {
             ShaderId::FlashAttnCmGemmaHd256Fp8 => FLASH_ATTN_CM_GEMMA_HD256_FP8,
             ShaderId::FlashAttnCmGemmaRsHd256 => FLASH_ATTN_CM_GEMMA_RS_HD256,
             ShaderId::FlashAttnCmGemmaRsHd512 => FLASH_ATTN_CM_GEMMA_RS_HD512,
+            ShaderId::FlashAttnCmGemmaRsHd128 => FLASH_ATTN_CM_GEMMA_RS_HD128,
             ShaderId::KvFp8ToF16 => KV_FP8_TO_F16,
             ShaderId::SoftMax => SOFT_MAX_F32,
             ShaderId::Copy => COPY_F32_F32,
@@ -1017,6 +1022,7 @@ pub const ALL_SHADERS: &[ShaderId] = &[
     ShaderId::FlashAttnCmGemmaHd256Fp8,
     ShaderId::FlashAttnCmGemmaRsHd256,
     ShaderId::FlashAttnCmGemmaRsHd512,
+    ShaderId::FlashAttnCmGemmaRsHd128,
     ShaderId::KvFp8ToF16,
     ShaderId::SoftMax,
     ShaderId::Copy,
@@ -1295,6 +1301,8 @@ pub const FLASH_ATTN_CM_GEMMA_RS_HD256: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_cm_gemma_rs_hd256.spv"));
 pub const FLASH_ATTN_CM_GEMMA_RS_HD512: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_cm_gemma_rs_hd512.spv"));
+pub const FLASH_ATTN_CM_GEMMA_RS_HD128: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn_cm_gemma_rs_hd128.spv"));
 pub const KV_FP8_TO_F16: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/kv_fp8_to_f16.spv"));
 pub const SOFT_MAX_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/soft_max_f32.spv"));

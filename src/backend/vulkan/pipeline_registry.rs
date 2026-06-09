@@ -879,7 +879,8 @@ impl PipelineRegistry {
                 // requiredSubgroupSize=64; wave32 would give 8 subgroups and
                 // break the row_split mapping. No spec constants (HD baked).
                 ShaderId::FlashAttnCmGemmaRsHd256
-                | ShaderId::FlashAttnCmGemmaRsHd512 => {
+                | ShaderId::FlashAttnCmGemmaRsHd512
+                | ShaderId::FlashAttnCmGemmaRsHd128 => {
                     ComputeKernel::from_spv_with_spec(device, &words, cache, &[], &[], Some(64))
                 }
                 // Sprint 3A — Q4_K coopmat with forward-pass layout.

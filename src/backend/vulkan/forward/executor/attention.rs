@@ -2344,6 +2344,31 @@ impl BatchExec {
                 return;
             }
         }
+        // Sprint 11e — dense-hd128 CoopMat flash-attention (Phase-2 attack on
+        // the 11d finding: dense attention ran on `fa_tiled`, 5.5× llama,
+        // occ-2–4). Routes the four dense hd128 models (NON-gemma4, f16 KV,
+        // full-causal) onto the validated occ-12 row_split kernel at HD=128
+        // (the same `flash_attn_cm_gemma_rs` that made gemma attention free).
+        // `fa_tiled` stays the fallback + correctness oracle:
+        // `VF_FA_COOPMAT_HD128=0` escapes back to it.
+        {
+            use std::sync::OnceLock;
+            static CM_HD128: OnceLock<bool> = OnceLock::new();
+            let on = *CM_HD128.get_or_init(|| {
+                std::env::var("VF_FA_COOPMAT_HD128")
+                    .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+                    .unwrap_or(true)
+            });
+            if on && _cfg.gemma4.is_none() && head_dim_layer == 128 && fwd.kv_cache.is_fp16() {
+                fwd.run_flash_attn_cm_rs_hd128(
+                    ctx.dev, ctx.registry, ctx.cmd, ctx.layer,
+                    fwd.batch_q.handle, fwd.batch_attn_out.handle,
+                    seq_len, base_pos, base_pos + seq_len, kv_layer, kv_start,
+                );
+                compute_barrier(ctx.dev, ctx.cmd);
+                return;
+            }
+        }
         let force_fa_batch = head_dim_layer != 128;
         if fwd.fa_tiled_enabled && !force_fa_batch {
             fwd.run_flash_attn_tiled(
