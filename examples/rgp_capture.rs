@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     let gguf = GgufFile::open(&model_path)?;
     let cfg = ModelConfig::from_gguf(&gguf)?;
-    let model = LoadedModel::load(&dev, &mut allocator, &gguf)?;
+    let model = LoadedModel::load(&dev, &mut allocator, &gguf, None)?;
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
 
     let kv_cache = KvCache::new(&dev.device, &mut allocator, KvCacheConfig {
@@ -81,6 +81,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         n_kv_heads: cfg.n_kv_heads,
         head_dim: cfg.head_dim,
         max_seq_len: MAX_SEQ_LEN,
+        per_layer_head_dim: cfg
+            .gemma4
+            .as_ref()
+            .map(|g| g.layers.iter().map(|s| s.head_dim).collect()),
+        per_layer_n_kv_heads: cfg
+            .gemma4
+            .as_ref()
+            .map(|g| g.layers.iter().map(|s| s.n_kv_heads).collect::<Vec<_>>())
+            .or_else(|| cfg.qwen35.as_ref().map(|q| {
+                (0..q.block_count)
+                    .map(|l| if q.is_full_attention_layer(l) {
+                        q.n_head_kv_full_attn
+                    } else { 0 })
+                    .collect::<Vec<_>>()
+            })),
     })?;
     // Capture binary uses the token-by-token GEMV path, so a small
     // max_prefill_tokens keeps the descriptor pool from blowing up.
@@ -99,7 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pos: u32 = 0;
     for &tid in &prompt_tokens {
         let embd = embedding_row(&gguf, &cfg, tid)?;
-        forward.forward_token(&dev, &registry, &cmd_ctx, &model, &embd, pos)?;
+        forward.forward_token(&dev, &registry, &cmd_ctx, &model, &embd, pos, tid)?;
         pos += 1;
     }
     eprintln!(
@@ -117,7 +132,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
         let embd = embedding_row(&gguf, &cfg, next_id)?;
-        forward.forward_token(&dev, &registry, &cmd_ctx, &model, &embd, pos)?;
+        forward.forward_token(&dev, &registry, &cmd_ctx, &model, &embd, pos, next_id)?;
         pos += 1;
     }
     eprintln!(

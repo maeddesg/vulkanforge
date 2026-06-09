@@ -88,6 +88,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             n_kv_heads: cfg.n_kv_heads,
             head_dim: cfg.head_dim,
             max_seq_len: 1024,
+            per_layer_head_dim: cfg
+                .gemma4
+                .as_ref()
+                .map(|g| g.layers.iter().map(|s| s.head_dim).collect()),
+            per_layer_n_kv_heads: cfg
+                .gemma4
+                .as_ref()
+                .map(|g| g.layers.iter().map(|s| s.n_kv_heads).collect::<Vec<_>>())
+                .or_else(|| cfg.qwen35.as_ref().map(|q| {
+                    (0..q.block_count)
+                        .map(|l| if q.is_full_attention_layer(l) {
+                            q.n_head_kv_full_attn
+                        } else { 0 })
+                        .collect::<Vec<_>>()
+                })),
         },
     )?;
 
@@ -115,7 +130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_logits = forward.logits()?;
     let next_id = argmax(&last_logits) as u32;
     let embd = embedding_row_host(&host_embed, &cfg, next_id);
-    let _stats = forward.forward_token(&dev, &registry, &cmd_ctx, &model, &embd, pos)?;
+    let _stats = forward.forward_token(&dev, &registry, &cmd_ctx, &model, &embd, pos, next_id)?;
     last_logits = forward.logits()?;
     pos += 1;
 
@@ -126,7 +141,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..n_profile_tokens {
         let next_id = argmax(&last_logits) as u32;
         let embd = embedding_row_host(&host_embed, &cfg, next_id);
-        let stats = forward.forward_token(&dev, &registry, &cmd_ctx, &model, &embd, pos)?;
+        let stats = forward.forward_token(&dev, &registry, &cmd_ctx, &model, &embd, pos, next_id)?;
         last_logits = forward.logits()?;
         pos += 1;
 

@@ -53,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let gguf = GgufFile::open(&model_path)?;
     let cfg = ModelConfig::from_gguf(&gguf)?;
-    let model = LoadedModel::load(&dev, &mut allocator, &gguf)?;
+    let model = LoadedModel::load(&dev, &mut allocator, &gguf, None)?;
     let kv_cache = KvCache::new(
         &dev.device, &mut allocator,
         KvCacheConfig {
@@ -61,6 +61,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             n_kv_heads: cfg.n_kv_heads,
             head_dim: cfg.head_dim,
             max_seq_len: MAX_SEQ_LEN,
+            per_layer_head_dim: cfg
+                .gemma4
+                .as_ref()
+                .map(|g| g.layers.iter().map(|s| s.head_dim).collect()),
+            per_layer_n_kv_heads: cfg
+                .gemma4
+                .as_ref()
+                .map(|g| g.layers.iter().map(|s| s.n_kv_heads).collect::<Vec<_>>())
+                .or_else(|| cfg.qwen35.as_ref().map(|q| {
+                    (0..q.block_count)
+                        .map(|l| if q.is_full_attention_layer(l) {
+                            q.n_head_kv_full_attn
+                        } else { 0 })
+                        .collect::<Vec<_>>()
+                })),
         },
     )?;
     let mut forward = Forward::new(&dev, &mut allocator, kv_cache, cfg.clone(), None)?;
@@ -118,7 +133,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Re-prime KV up to pos=100 with cheap no-op-ish forwards using
     // forward_token (no profile) so we land in a comparable state.
     for pos in 0..100u32 {
-        let _ = forward.forward_token(&dev, &registry, &cmd_ctx, &model, &embd, pos)?;
+        let _ = forward.forward_token(&dev, &registry, &cmd_ctx, &model, &embd, pos, dummy_token)?;
     }
     let (drill, per_layer, dfin) = forward.forward_token_profile_layers(
         &dev, &registry, &cmd_ctx, &model, &embd, 100,

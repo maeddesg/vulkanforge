@@ -218,6 +218,10 @@ fn dispatch_once(
         n_kv,
         q_start,
         scale,
+        // Sprint 46E field; 0 = no sliding-window lower bound, i.e. full
+        // causal attention from position 0 — matches this probe's f64 CPU
+        // reference (bit-identical to the pre-46E shader this diagnostic targets).
+        kv_start: 0,
     };
 
     let device = dev.device.clone();
