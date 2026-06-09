@@ -23,8 +23,9 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
   faithful port of llama.cpp's `flash_attn_cm1`: 16×16×16 coopmat QK + PV,
   Br16/Bc64/row_split4, K/V coopMatLoad'd direct-from-global f16). Attention
   drops from 76 % of the prefill wall to ~0 → prefill hits the attention-free
-  ceiling: Gemma-4-26B-A4B Q3_K_M **612 → 2629 t/s @p2048** (**92 % of
-  llama.cpp**, 4.3× over v0.6.1); QAT-Q4_0 hits 3107 t/s. Occupancy matches
+  ceiling: Gemma-4-26B-A4B Q3_K_M **612 → 2629 t/s @p2048** (4.3× over v0.6.1;
+  **0.80× llama.cpp Vulkan** at p2048 on the unified matrix below); QAT-Q4_0 hits
+  3107 t/s. Occupancy matches
   llama's budget (hd256 occ 12 / hd512 occ 8, 0 spills). Default change
   (coopmat f16-PV vs fa_batch f32, rel ~5e-4, ctx4096-coherent); `VF_FA_COOPMAT_RS=0`
   escapes to fa_batch. Non-Gemma-4 / hd128 untouched (15-prompt regression across
@@ -32,8 +33,9 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
 - **Big-MoE decode +89 % (v0.5.2)** — adaptive load-staging eliminates a
   fixed-buffer VRAM load-transient that was evicting weights to GTT, plus a
   parallel MoE-router top-K (both value-preserving, bit-identical to v0.5.1).
-  Gemma-4-26B-A4B Q3_K_M decode **54 → 102.6 tok/s** (78 % of llama.cpp on the
-  same GGUF, was 41 %); Qwen3.6-27B **24 → 39.7**. See `CHANGELOG.md`.
+  Gemma-4-26B-A4B Q3_K_M decode **54 → 102.6 tok/s** (was 41 % of llama.cpp;
+  v0.6.2 reaches **0.87× llama.cpp** on the same GGUF — see matrix below);
+  Qwen3.6-27B **24 → 39.7**. See `CHANGELOG.md`.
 - **Software Graph dispatch pipeline (v0.5.0, default-on)** — the
   `LayerStep`-based imperative executor is now scheduled through a
   topologically-sorted dependency graph (`SubDispatch` enum, byte-
@@ -43,8 +45,8 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
   0 Vulkan synchronization hazards under `validate_sync`. Decode
   +28 % on Qwen3.6 (SG-3 SSM step decomposition); see
   `results/v050_release_bench.md`.
-- **Wins decode on every direct comparison on RDNA4** — beats
-  llama.cpp (Vulkan + ROCm) on Q4_K_M 8B, beats vLLM 0.20.1 ROCm
+- **Near-parity decode vs llama.cpp Vulkan on RDNA4** — 0.87–0.97×
+  on the unified matrix below (same backend); beats vLLM 0.20.1 ROCm
   on FP8 single-user decode (1.3–2× ahead).
 - **Native FP8 E4M3** loader that ingests HuggingFace SafeTensors
   directly, no FP16 round-trip on disk.
@@ -118,22 +120,40 @@ cargo build --release   # Rust 1.85+, Vulkan headers required
 
 ## Performance at a glance
 
-All numbers on AMD Radeon RX 9070 XT (gfx1201, RDNA4), Mesa 26.1-rc3
-RADV unless noted. Full tables with power data and methodology in
+All numbers on AMD Radeon RX 9070 XT (gfx1201, RDNA4), RADV/Vulkan.
+Full tables with power data and methodology in
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
-### GGUF decode (single-user, batch=1)
+### VulkanForge vs llama.cpp — unified bench matrix (v0.6.2)
 
-| Engine        | Model        | Format | Backend  | Decode tok/s | tok/s/W |
-|---------------|--------------|--------|----------|-------------:|--------:|
-| **VF v0.3.9** | 8B Llama     | Q4_K_M | Vulkan   |      **121** | **0.58** |
-| llama.cpp     | 8B Llama     | Q4_K_M | Vulkan   |          114 |   0.37  |
-| llama.cpp     | 8B Llama     | Q4_K_M | ROCm     |           94 |   0.30  |
+One run, identical conditions per row, no cherry-picking (Sprint 11a). **HW:** RX 9070 XT,
+gfx1201 (RDNA4). **Driver:** RADV / Mesa 26.1.2-arch2.1 (Vulkan 1.4.303). **VF:** v0.6.2 @
+`d1aa177`, coopmat-FA default-on. **llama.cpp:** Vulkan build (`GGML_VULKAN`, `KHR_coopmat`,
+*not* HIP), `b9174-g0253fb21f`, `-fa 1 -ngl 99`. **ctx** 4096, greedy, validation off, warm,
+median ≥3–5; runs strictly sequential (never both engines at once). Measured 2026-06-09.
+
+| Model | Quant | KV | VF p≈512 | llama p≈512 | VF/ll | VF p≈2048 | llama p≈2048 | VF/ll | VF dec | llama dec | VF/ll |
+|---|---|---|--:|--:|:-:|--:|--:|:-:|--:|--:|:-:|
+| Qwen3-8B | Q4_K_M | f16 | 3867 | 4472 | 0.86 | 3171 | 4479 | 0.71 | 109.4 | 114.9 | **0.95** |
+| Llama-3.1-8B-Instruct | Q4_K_M | f16 | 4086 | 4802 | 0.85 | 3386 | 4644 | 0.73 | 114.5 | 119.6 | **0.96** |
+| Mistral-7B-v0.3 | Q4_K_M | f16 | 4377 | 4826 | 0.91 | 3625 | 4654 | 0.78 | 124.2 | 127.5 | **0.97** |
+| DeepSeek-R1-Distill-Llama-8B | Q4_K_M | f16 | 4090 | 4785 | 0.85 | 3390 | 4628 | 0.73 | 114.7 | 118.6 | **0.97** |
+| gemma-4-26B-A4B (MoE) | Q3_K_M | FP8/q8_0 | 1955 | 3251 | 0.60 | 2585 | 3219 | **0.80** | 110.2 | 127.1 | 0.87 |
+| gemma-4-26B-A4B (MoE) | Q4_0 ⁑ | FP8/q8_0 | 2476 | 4140 | 0.60 | 3076 | 4119 | 0.75 | 121.2 | 132.7 | **0.91** |
+
+Prefill is tok/s, decode is generated tok/s. **Prefill lengths (matched per row):** dense exact
+512 / 2048; MoE 513 / 2049. **KV:** 8B both f16; 26B = VF-FP8 vs llama-`q8_0` (both 8-bit, nearest
+equivalent — the one config difference). **⁑ QAT** = the same file
+`gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf` for both engines; VF labels it `Q4_K_XL` by filename,
+llama reads the tensors as `Q4_0`. **MoE prefill is measured with varied tokens** — *not* the
+`run_pp_bench` micro-bench, whose single-token-repeat degenerates MoE routing and overstates MoE
+prefill by 1.2–1.7×. Net: **decode 0.87–0.97× llama, prefill 0.60–0.91×** (gap largest at short
+context / MoE, narrowing with length as coopmat-FA amortizes).
 
 ### v0.3.16 15-prompt mixed-workload benchmark
 
-The v0.3.9 row above is `vulkanforge bench tg128` (1-token prompt,
-constant-low KV). The 15-prompt suite is a real-workload mix (smoke /
+The decode column in the matrix above is `vulkanforge bench`-style tg128
+(1-token prompt, constant-low KV). The 15-prompt suite is a real-workload mix (smoke /
 code / prose / reasoning / context-stress / numerics / tokenizer) with
 generations up to 1024 tokens — KV grows during decode, so steady-state
 numbers are below `tg128`. Mesa 26.1.0 RADV.
@@ -477,8 +497,8 @@ aggressive quantization). Set **`VF_KV_PREFIX_REUSE=1`** to speed up multi-turn
 
 - Single-stream only — no batch inference, no concurrent sessions on
   one `Forward` instance.
-- Decode at 0.80–1.06× llama.cpp Vulkan (model-dependent); coopmat
-  is prefill-only on this codebase.
+- Decode at 0.87–0.97× llama.cpp Vulkan (unified matrix, Sprint 11a);
+  prefill 0.60–0.91×; coopmat is prefill-only on this codebase.
 - FP8 prefill structurally behind ROCm-specialized kernels (vLLM's
   `ROCmFP8ScaledMMLinearKernel` is in a different class).
 - `vulkanforge bench` accepts only Q4_K_M GGUF; Q8_0 chat works but
