@@ -19,7 +19,8 @@ Zen 4 / 7945HX 16-core for the CPU `lm_head` numbers.
 | GGUF decode raw t/s (Vulkan, b=1)     | ~parity — llama.cpp **0.87–0.97×** ahead of VF (unified matrix, README) |
 | Decode power efficiency (tok/s/W)     | **VulkanForge** everywhere on 8B (≈ −33 % power) |
 | FP8 single-user decode (b=1)          | **VulkanForge** (1.3–2.8× ahead of vLLM 0.20.1 ROCm) |
-| GGUF prefill (Q4_K_M / Q8_0)          | llama.cpp (VF **0.60–0.91×** on Vulkan; ROCm ≤ Vulkan on RDNA4) |
+| GGUF prefill — dense (Q4_K_M)         | **~parity** — VF **0.93–1.04×** llama.cpp Vulkan (v0.7.0, coopmat-FA hd128) |
+| GGUF prefill — Gemma-4 MoE            | llama.cpp ahead (VF 0.64× @512 → 0.83–0.89× @2048; rest = grouped expert-GEMM) |
 | FP8 prefill (per-tensor / block-wise) | vLLM (untuned but still 2.5–12× ahead) |
 | Batch serving (b≥4)                   | vLLM (VF is single-stream)           |
 | **14B FP8 decode + VRAM-tight**       | **VulkanForge with `VF_CPU_LM_HEAD=1`** (17.8 vs GPU 13.5 + 970 MB freed) |
@@ -29,10 +30,10 @@ Zen 4 / 7945HX 16-core for the CPU `lm_head` numbers.
 ## GGUF — VulkanForge vs llama.cpp
 
 > **Single source of truth for the VF-vs-llama.cpp _Vulkan_ axis:** the unified bench matrix in
-> [README.md → Performance at a glance](../README.md#performance-at-a-glance) (Sprint 11a, v0.6.2,
+> [README.md → Performance at a glance](../README.md#performance-at-a-glance) (Sprint 11i, **v0.7.0**,
 > same HW / driver / GGUF file / quant / ctx / FA per row, one run, Mesa 26.1.2, llama
-> `b9174-g0253fb21f`). Same-backend Vulkan summary: **decode 0.87–0.97× llama, prefill 0.60–0.91×**
-> (gap largest at short context / MoE). It supersedes the v0.3.9 single-point numbers below. The
+> `b9174-g0253fb21f`). Same-backend Vulkan summary: **dense prefill 0.93–1.04× llama (parity, v0.7.0),
+> Gemma-MoE prefill 0.64× @512 → 0.83–0.89× @2048, decode 0.87–0.97×**. It supersedes the v0.3.9 single-point numbers below. The
 > tables here are kept only for the **axes the matrix does not cover**: llama.cpp **ROCm/HIP**,
 > **Q8_0** (which VF cannot bench), and decode **power-efficiency** (tok/s/W).
 
@@ -68,12 +69,11 @@ per the README matrix); the old "VF 121 t/s wins 1.06×" was a v0.3.9 single poi
 | llama.cpp     | 14B Qwen | Q8_0   | ROCm     |  1333 |   1820 |   2535 |    — |
 | llama.cpp     | 14B Qwen | Q8_0   | Vulkan   |  1272 |   2134 |   1660 |    — |
 
-llama.cpp wins prefill on GGUF formats (rocBLAS / coopmat-tuned tile
-selection) — confirmed by the unified matrix (README): VF prefill is
-**0.60–0.91× llama.cpp Vulkan** (dense 0.71–0.91×, MoE 0.60–0.80×; the
-gap is largest at short context and narrows with length as coopmat-FA
-amortizes). The v0.3.9 row above is a historical reference point (Q4_K_M
-8B ~0.89×); the matrix is the current same-run source of truth.
+Prefill on GGUF — confirmed by the unified matrix (README, v0.7.0): **dense is at parity**
+(VF **0.93–1.04× llama.cpp Vulkan** @p2048, Mistral ahead) since coopmat flash-attention was
+extended to dense `head_dim=128` (v0.7.0); **Gemma-4 MoE** is **0.64× @512 → 0.83–0.89× @2048**
+(router gate-proj now batched). The remaining MoE gap is the grouped expert-GEMM. The v0.3.9 row
+above is a historical reference point (Q4_K_M 8B ~0.89×); the matrix is the current source of truth.
 
 ### Honest-negatives
 

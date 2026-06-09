@@ -1,5 +1,52 @@
 # Changelog
 
+## v0.7.0 — Prefill Parity: dense CoopMat-FA hd128 + Gemma MoE router/gate-proj (2026-06-09)
+
+**Prefill reaches llama.cpp-Vulkan parity on dense models and closes most of the Gemma-4 MoE
+prefill gap** — a three-part bundle, all default-on, decode untouched. Authoritative same-run
+matrix (RX 9070 XT, RADV Mesa 26.1.2-arch2.1, llama.cpp Vulkan `b9174-g0253fb21f`, `-fa 1 -ngl 99`,
+greedy, median ≥3–5, ctx 4096; dense prefill = `run_pp_bench`, MoE prefill = varied-token; KV: 8B
+f16 / 26B VF-FP8 vs llama-q8_0):
+
+| Model | Prefill p2048 (VF / llama) | VF/ll | Decode (VF / llama) | VF/ll |
+|---|---|:-:|---|:-:|
+| Qwen3-8B Q4_K_M | 4280 / 4479 | **0.96×** | 109.4 / 114.9 | 0.95× |
+| Llama-3.1-8B Q4_K_M | 4470 / 4644 | **0.96×** | 114.5 / 119.6 | 0.96× |
+| Mistral-7B-v0.3 Q4_K_M | 4825 / 4654 | **1.04×** | 124.2 / 127.5 | 0.97× |
+| DeepSeek-R1-Distill-8B Q4_K_M | 4464 / 4628 | **0.96×** | 114.7 / 118.6 | 0.97× |
+| Gemma-4-26B-A4B Q3_K_M (MoE) | 2862 / 3219 | **0.89×** | 110.2 / 127.1 | 0.87× |
+| Gemma-4-26B-A4B QAT-Q4_0 (MoE) | 3436 / 4119 | **0.83×** | 121.2 / 132.7 | 0.91× |
+
+**(1) Dense CoopMat-FA hd128 (Sprint 11e).** The dense `head_dim=128` prefill attention ran on the
+non-coopmat `fa_tiled` (VGPR-256, occ ~2–4, ~5.5× llama) — the only super-linearly-growing prefill
+stage. Extended the validated Gemma row-split coopmat-FA kernel (`flash_attn_cm_gemma_rs.comp`) to
+HD=128 (occ ~12, VGPR 96). Dense prefill @p2048 **0.71–0.78× → 0.96–1.04× llama** (+32–35 %),
+**byte-identical** to the `fa_tiled` oracle (greedy, all 4 models). Opt out: `VF_FA_COOPMAT_HD128=0`.
+
+**(2) MoE router prefill-aware (Sprint 11f).** The fused MoE router (`MoeRouterFused`, one-workgroup-
+per-token, decode-optimal) is ~3 % slower at prefill than the bit-identical separate path; the router
+is now **fused only for decode**, the separate path for prefill. Opt out: `VF_MOE_FUSED_ROUTER`.
+
+**(3) MoE gate-proj batching (Sprint 11h).** The router gate-projection (`hidden→n_experts`) ran
+per-token (~54.5 ms @2048). It is a standalone dense F32 projection (NOT the grouped expert-GEMM),
+so it is now batched through `mul_mm_f32` (gate-proj 54.5 → ~6 ms). Gemma-MoE prefill @p2048
+**Q3 0.80→0.89× / QAT 0.73→0.83× llama**. Opt out: `VF_MOE_ROUTER_BATCHED=0`. The router's
+`1/√hidden` factor is applied via a new `logit_scale` push on `moe_router_softmax_topk` (existing
+paths pass 1.0 = no-op).
+
+**Behaviour note (top-k flip).** The batched MoE router reorders the gate-proj reduction vs the
+per-token GEMV → last-ULP logit deltas → a *borderline* top-k expert flip can occur late in a
+generation. This is llama-aligned and **value-preserving on factual/structural output** (audited:
+Paris/391/Jupiter recall, prime lists, arithmetic reasoning all identical batched vs GEMV on Q3_K_M
++ QAT-Q4_0; only free-form prose/explanation phrasing diverges). It is a deliberate, documented
+numerical change (like the v0.6.2 coopmat-FA rel ~5e-4); `VF_MOE_ROUTER_BATCHED=0` restores the
+exact pre-v0.7.0 routing.
+
+**Decode unchanged** (109–124 t/s; all three changes are prefill-only; the decode router stays the
+per-token fused path). **Remaining gap to llama** = the grouped expert-GEMM (`moe_gate_up/down_grouped`,
+`MUL_MAT_ID`), fenced behind the grouped-MMQ_ID drift bisect (a future sprint) — dense attention and
+the router/gate-proj are no longer the bottleneck. 273/273 lib tests; all examples build.
+
 ## v0.6.2 — CoopMat Flash-Attention for Gemma-4: prefill 612 → 2629 t/s (2026-06-08)
 
 **The entire Gemma-4 prefill attention now runs on a KHR-cooperative-matrix flash-attention

@@ -18,6 +18,14 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
 
 ## Highlights
 
+- **Prefill parity with llama.cpp Vulkan (v0.7.0, default-on)** — coopmat flash-attention now
+  also covers **dense `head_dim=128`** (Qwen3 / Llama-3.1 / Mistral-v0.3 / DeepSeek-R1), and the
+  Gemma-4 MoE router gate-projection is batched through the dense GEMM. Dense prefill @p2048
+  **0.71–0.78× → 0.96–1.04× llama** (parity; Mistral ahead); Gemma-4-26B-A4B MoE **Q3 0.80→0.89× /
+  QAT 0.73→0.83×**. Decode unchanged. Three new default-on paths (`VF_FA_COOPMAT_HD128`,
+  prefill-separate MoE router, `VF_MOE_ROUTER_BATCHED`), each with an opt-out. The batched MoE
+  router is value-preserving on factual output (a borderline top-k flip can diverge a free-form
+  tail; opt out via `VF_MOE_ROUTER_BATCHED=0`). See the matrix below + `CHANGELOG.md`.
 - **Gemma-4 prefill 612 → 2629 t/s (v0.6.2, default-on)** — the whole Gemma-4
   attention now runs on a KHR-cooperative-matrix flash-attention kernel (a
   faithful port of llama.cpp's `flash_attn_cm1`: 16×16×16 coopmat QK + PV,
@@ -124,22 +132,23 @@ All numbers on AMD Radeon RX 9070 XT (gfx1201, RDNA4), RADV/Vulkan.
 Full tables with power data and methodology in
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
-### VulkanForge vs llama.cpp — unified bench matrix (v0.6.2)
+### VulkanForge vs llama.cpp — unified bench matrix (v0.7.0)
 
-One run, identical conditions per row, no cherry-picking (Sprint 11a). **HW:** RX 9070 XT,
-gfx1201 (RDNA4). **Driver:** RADV / Mesa 26.1.2-arch2.1 (Vulkan 1.4.303). **VF:** v0.6.2 @
-`d1aa177`, coopmat-FA default-on. **llama.cpp:** Vulkan build (`GGML_VULKAN`, `KHR_coopmat`,
-*not* HIP), `b9174-g0253fb21f`, `-fa 1 -ngl 99`. **ctx** 4096, greedy, validation off, warm,
-median ≥3–5; runs strictly sequential (never both engines at once). Measured 2026-06-09.
+One run, identical conditions per row, no cherry-picking (Sprint 11i, measured fresh at the
+v0.7.0 HEAD). **HW:** RX 9070 XT, gfx1201 (RDNA4). **Driver:** RADV / Mesa 26.1.2-arch2.1
+(Vulkan 1.4.303). **VF:** v0.7.0 — coopmat flash-attention (dense hd128 + Gemma-4 hd256/512) +
+batched MoE-router gate-proj, all default-on. **llama.cpp:** Vulkan build (`GGML_VULKAN`,
+`KHR_coopmat`, *not* HIP), `b9174-g0253fb21f`, `-fa 1 -ngl 99`. **ctx** 4096, greedy, validation
+off, warm, median ≥3–5; runs strictly sequential (never both engines at once). Measured 2026-06-09.
 
 | Model | Quant | KV | VF p≈512 | llama p≈512 | VF/ll | VF p≈2048 | llama p≈2048 | VF/ll | VF dec | llama dec | VF/ll |
 |---|---|---|--:|--:|:-:|--:|--:|:-:|--:|--:|:-:|
-| Qwen3-8B | Q4_K_M | f16 | 3867 | 4472 | 0.86 | 3171 | 4479 | 0.71 | 109.4 | 114.9 | **0.95** |
-| Llama-3.1-8B-Instruct | Q4_K_M | f16 | 4086 | 4802 | 0.85 | 3386 | 4644 | 0.73 | 114.5 | 119.6 | **0.96** |
-| Mistral-7B-v0.3 | Q4_K_M | f16 | 4377 | 4826 | 0.91 | 3625 | 4654 | 0.78 | 124.2 | 127.5 | **0.97** |
-| DeepSeek-R1-Distill-Llama-8B | Q4_K_M | f16 | 4090 | 4785 | 0.85 | 3390 | 4628 | 0.73 | 114.7 | 118.6 | **0.97** |
-| gemma-4-26B-A4B (MoE) | Q3_K_M | FP8/q8_0 | 1955 | 3251 | 0.60 | 2585 | 3219 | **0.80** | 110.2 | 127.1 | 0.87 |
-| gemma-4-26B-A4B (MoE) | Q4_0 ⁑ | FP8/q8_0 | 2476 | 4140 | 0.60 | 3076 | 4119 | 0.75 | 121.2 | 132.7 | **0.91** |
+| Qwen3-8B | Q4_K_M | f16 | 4291 | 4472 | 0.96 | 4280 | 4479 | **0.96** | 109.4 | 114.9 | **0.95** |
+| Llama-3.1-8B-Instruct | Q4_K_M | f16 | 4474 | 4802 | 0.93 | 4470 | 4644 | **0.96** | 114.5 | 119.6 | **0.96** |
+| Mistral-7B-v0.3 | Q4_K_M | f16 | 4845 | 4826 | 1.00 | 4825 | 4654 | **1.04** | 124.2 | 127.5 | **0.97** |
+| DeepSeek-R1-Distill-Llama-8B | Q4_K_M | f16 | 4461 | 4785 | 0.93 | 4464 | 4628 | **0.96** | 114.7 | 118.6 | **0.97** |
+| gemma-4-26B-A4B (MoE) | Q3_K_M | FP8/q8_0 | 2085 | 3251 | 0.64 | 2862 | 3219 | **0.89** | 110.2 | 127.1 | 0.87 |
+| gemma-4-26B-A4B (MoE) | Q4_0 ⁑ | FP8/q8_0 | 2653 | 4140 | 0.64 | 3436 | 4119 | **0.83** | 121.2 | 132.7 | **0.91** |
 
 Prefill is tok/s, decode is generated tok/s. **Prefill lengths (matched per row):** dense exact
 512 / 2048; MoE 513 / 2049. **KV:** 8B both f16; 26B = VF-FP8 vs llama-`q8_0` (both 8-bit, nearest
@@ -147,8 +156,13 @@ equivalent — the one config difference). **⁑ QAT** = the same file
 `gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf` for both engines; VF labels it `Q4_K_XL` by filename,
 llama reads the tensors as `Q4_0`. **MoE prefill is measured with varied tokens** — *not* the
 `run_pp_bench` micro-bench, whose single-token-repeat degenerates MoE routing and overstates MoE
-prefill by 1.2–1.7×. Net: **decode 0.87–0.97× llama, prefill 0.60–0.91×** (gap largest at short
-context / MoE, narrowing with length as coopmat-FA amortizes).
+prefill by 1.2–1.7×. Net (v0.7.0): **dense prefill 0.93–1.04× llama (parity), Gemma-MoE prefill
+0.64× @512 → 0.83–0.89× @2048, decode 0.87–0.97×**. Dense attention (coopmat-FA on hd128, v0.7.0)
+and the Gemma router/gate-proj are no longer the bottleneck; the remaining MoE prefill gap is the
+grouped expert-GEMM (`MUL_MAT_ID`). **Behaviour note:** the batched MoE router is llama-aligned and
+value-preserving on factual/structural output, but a borderline top-k expert flip can make a
+free-form generation tail diverge from the pre-v0.7.0 per-token router (deliberate; opt out with
+`VF_MOE_ROUTER_BATCHED=0`).
 
 ### v0.3.16 15-prompt mixed-workload benchmark
 
