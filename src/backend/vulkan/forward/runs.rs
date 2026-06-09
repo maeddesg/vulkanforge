@@ -3213,7 +3213,7 @@ impl Forward {
         //     write/read + no inter-stage barrier). One workgroup per
         //     token (same as both source stages), so this covers decode
         //     (seq_len=1) and batch prefill (seq_len>1) alike. ───
-        if super::executor::moe_fused_router_enabled() {
+        if super::executor::moe_fused_router_for(seq_len) {
             let kf = registry.get(ShaderId::MoeRouterFused);
             let setf = self.alloc_or_get_set(
                 dev,

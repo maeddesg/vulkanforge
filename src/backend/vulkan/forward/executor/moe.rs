@@ -179,19 +179,33 @@ pub(crate) fn moe_fused_glu_fma_enabled() -> bool {
     })
 }
 
-/// Sprint P1-3 — fused MoE router gate. `VF_MOE_FUSED_ROUTER=1` (default)
-/// runs `run_moe_router_gpu` as a single `MoeRouterFused` dispatch
-/// (norm_gemv + softmax_topk, logits kept in shared memory) instead of
-/// the 2-dispatch + barrier path. Bit-identical; opt-out via
-/// `VF_MOE_FUSED_ROUTER=0` (or "false") for regression bisects.
-pub(crate) fn moe_fused_router_enabled() -> bool {
+/// Sprint P1-3 — fused MoE router gate. Runs `run_moe_router_gpu` as a single
+/// `MoeRouterFused` dispatch (norm_gemv + softmax_topk, logits kept in shared
+/// memory) instead of the 2-dispatch + barrier path. **Bit-identical** to the
+/// separate path (so path selection is value-preserving).
+///
+/// Sprint 11f — **prefill-aware** selection. The fused dispatch is
+/// one-workgroup-per-token (decode-optimal); at prefill (`seq_len>1`) its
+/// un-batched gate-proj GEMV is ~3 % slower (wall) than the separate
+/// norm_gemv+softmax_topk fallthrough (measured 11f: gemma-Q3 @2048
+/// 3025→3125 t/s, @512 2326→2394 t/s). Default now: **fused only for decode
+/// (`seq_len==1`)**; prefill takes the faster separate path. Env override
+/// preserved for bisects: `VF_MOE_FUSED_ROUTER=1` forces fused everywhere,
+/// `=0`/"false" forces the separate path everywhere.
+pub(crate) fn moe_fused_router_for(seq_len: u32) -> bool {
     use std::sync::OnceLock;
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("VF_MOE_FUSED_ROUTER")
-            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
-            .unwrap_or(true)
-    })
+    static MODE: OnceLock<u8> = OnceLock::new();
+    // 0 = force separate · 1 = force fused · 2 = default (fused = decode-only)
+    let mode = *MODE.get_or_init(|| match std::env::var("VF_MOE_FUSED_ROUTER") {
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") => 0u8,
+        Ok(_) => 1u8,
+        Err(_) => 2u8,
+    });
+    match mode {
+        0 => false,
+        1 => true,
+        _ => seq_len == 1,
+    }
 }
 
 /// Sprint C.1 — optimized DECODE router path. `VF_ROUTER_OPTIMIZED=1`
