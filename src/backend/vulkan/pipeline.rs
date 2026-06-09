@@ -304,8 +304,14 @@ pub struct MoeRouterSoftmaxTopkPushConstants {
     pub seq_len: u32,
     pub n_experts: u32,
     pub top_k: u32,
+    /// Sprint 11h — uniform pre-softmax logit scale. 1.0 for paths that already
+    /// fold the router's 1/sqrt(hidden) into the GEMV/norm_gemv; the batched-
+    /// prefill path (scaleless `mul_mm` gate-proj) passes 1/sqrt(hidden). For a
+    /// positive scale the top-k SELECTION is invariant; only the softmax gating
+    /// WEIGHTS change (so it faithfully reproduces the canonical router).
+    pub logit_scale: f32,
 }
-const _: () = assert!(std::mem::size_of::<MoeRouterSoftmaxTopkPushConstants>() == 12);
+const _: () = assert!(std::mem::size_of::<MoeRouterSoftmaxTopkPushConstants>() == 16);
 
 /// Sprint P1-3 — push block for `moe_router_fused.comp` (norm_gemv +
 /// softmax_topk fused). 20 B; field order matches the shader. Combines

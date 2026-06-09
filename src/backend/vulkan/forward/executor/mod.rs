@@ -58,6 +58,7 @@ pub(crate) use moe::batched_decode_moe_enabled;
 // Sprint P1-3 — re-export the fused-router gate so `run_moe_router_gpu`
 // in `runs.rs` can pick the single-dispatch path.
 pub(crate) use moe::moe_fused_router_for;
+pub(crate) use moe::moe_router_batched_prefill_enabled;
 // Sprint C.1 — re-export the optimized-router gate for `run_moe_router_gpu`.
 pub(crate) use moe::moe_router_optimized_enabled;
 // Sprint C.2 — re-export the parallel top-K gate for `run_moe_router_gpu`.

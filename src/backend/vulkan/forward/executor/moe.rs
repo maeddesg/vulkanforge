@@ -192,6 +192,22 @@ pub(crate) fn moe_fused_glu_fma_enabled() -> bool {
 /// (`seq_len==1`)**; prefill takes the faster separate path. Env override
 /// preserved for bisects: `VF_MOE_FUSED_ROUTER=1` forces fused everywhere,
 /// `=0`/"false" forces the separate path everywhere.
+/// Sprint 11h — batch the PREFILL router gate-projection (`hidden→n_experts`)
+/// through the dense `mul_mm_f32` GEMM instead of the per-token GEMV
+/// (`moe_router_norm_gemv` / fused, one-WG-per-token = ~54 ms @2048, 11d/11f).
+/// `seq_len>1` only (decode keeps the per-token fused/optimized path). Reuses
+/// rms_norm + mul_mm_f32 + softmax_topk — the grouped expert-GEMM is untouched.
+/// Default ON; `VF_MOE_ROUTER_BATCHED=0`/"false" falls back to the GEMV (A/B / bisect).
+pub(crate) fn moe_router_batched_prefill_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("VF_MOE_ROUTER_BATCHED")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true)
+    })
+}
+
 pub(crate) fn moe_fused_router_for(seq_len: u32) -> bool {
     use std::sync::OnceLock;
     static MODE: OnceLock<u8> = OnceLock::new();
@@ -1207,7 +1223,8 @@ impl DecodeExec {
             ],
         );
         let pc2 = crate::backend::vulkan::pipeline::MoeRouterSoftmaxTopkPushConstants {
-            seq_len, n_experts, top_k,
+            // logit_scale=1.0: this path's norm+GEMV (Shader 1) already baked 1/sqrt(hidden).
+            seq_len, n_experts, top_k, logit_scale: 1.0,
         };
         let layout2 = k2.pipeline_layout;
         let pipeline2 = k2.pipeline;

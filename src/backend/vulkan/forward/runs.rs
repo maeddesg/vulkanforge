@@ -3192,7 +3192,8 @@ impl Forward {
                     (3, weights_buf, 0, topk_bytes),
                 ],
             );
-            let pc2 = MoeRouterSoftmaxTopkPushConstants { seq_len, n_experts, top_k };
+            // logit_scale=1.0: the optimized-decode GEMV already folded 1/sqrt(hidden).
+            let pc2 = MoeRouterSoftmaxTopkPushConstants { seq_len, n_experts, top_k, logit_scale: 1.0 };
             let layout2 = k2.pipeline_layout;
             let pipeline2 = k2.pipeline;
             self.profile("moe_router_softmax_topk", dev, cmd, |dev, cmd| unsafe {
@@ -3203,6 +3204,70 @@ impl Forward {
                 dev.device.cmd_push_constants(
                     cmd, layout2, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc2),
                 );
+                dev.device.cmd_dispatch(cmd, seq_len, 1, 1);
+            });
+            return;
+        }
+
+        // ─── Sprint 11h — batched PREFILL router gate-proj. The per-token
+        //     gate-proj (fused / norm_gemv, one-WG-per-token) is ~54 ms @2048
+        //     (11d/11f). Batch it: rms_norm + batched `mul_mm_f32` GEMM +
+        //     softmax_topk. The gate-proj is a standalone dense
+        //     [seq×hidden]@[hidden×n_experts] F32 projection — NOT the grouped
+        //     expert-GEMM (MUL_MAT_ID, fenced). `run_gemm` is scaleless → the
+        //     router's 1/sqrt(hidden) is applied via softmax_topk's
+        //     `logit_scale` (selection is scale-invariant; gating weights need
+        //     it). Reuses existing kernels; the grouped kernel is untouched.
+        //     Decode (seq_len==1) keeps the per-token path above. ───
+        if super::executor::moe_router_batched_prefill_enabled()
+            && seq_len > 1
+            && input_offset == 0
+        {
+            let inv_sqrt_h = 1.0f32 / (hidden_size as f32).sqrt();
+            // 1. RMSNorm (batched, per-channel scale) → normed [seq × hidden].
+            self.run_rms_norm(
+                dev, registry, cmd,
+                input_buf, scale_buf, normed_buf,
+                hidden_size, seq_len, rms_eps, "moe_router_norm_b",
+            );
+            compute_barrier(dev, cmd);
+            // 2. Batched gate-proj GEMM → logits[token·n_experts + e].
+            //    m = n_experts (output dim), n = seq_len (tokens), k = hidden.
+            //    Aligned variant needs n (seq_len) % 4 == 0.
+            let gemm_shader = if seq_len % 4 == 0 {
+                ShaderId::MulMmF32Aligned
+            } else {
+                ShaderId::MulMmF32
+            };
+            self.run_gemm(
+                dev, registry, cmd, gemm_shader,
+                proj_buf, 0, 0, normed_buf, logits_buf,
+                n_experts, seq_len, hidden_size, "moe_router_gemm_b",
+            );
+            compute_barrier(dev, cmd);
+            // 3. Softmax + top-K + renorm + pes, applying 1/sqrt(hidden) here
+            //    (the scaleless GEMM did not).
+            let k2 = registry.get(topk_shader);
+            let set2 = self.alloc_or_get_set(
+                dev, k2.descriptor_set_layout,
+                &[
+                    (0, logits_buf, 0, logits_bytes),
+                    (1, pes_buf, 0, 0),
+                    (2, indices_buf, 0, topk_bytes),
+                    (3, weights_buf, 0, topk_bytes),
+                ],
+            );
+            let pc2 = MoeRouterSoftmaxTopkPushConstants {
+                seq_len, n_experts, top_k, logit_scale: inv_sqrt_h,
+            };
+            let layout2 = k2.pipeline_layout;
+            let pipeline2 = k2.pipeline;
+            self.profile("moe_router_softmax_topk", dev, cmd, |dev, cmd| unsafe {
+                dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline2);
+                dev.device.cmd_bind_descriptor_sets(
+                    cmd, vk::PipelineBindPoint::COMPUTE, layout2, 0, &[set2], &[]);
+                dev.device.cmd_push_constants(
+                    cmd, layout2, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc2));
                 dev.device.cmd_dispatch(cmd, seq_len, 1, 1);
             });
             return;
@@ -3310,6 +3375,8 @@ impl Forward {
             seq_len,
             n_experts,
             top_k,
+            // logit_scale=1.0: the per-token norm_gemv already baked 1/sqrt(hidden).
+            logit_scale: 1.0,
         };
         let layout2 = k2.pipeline_layout;
         let pipeline2 = k2.pipeline;

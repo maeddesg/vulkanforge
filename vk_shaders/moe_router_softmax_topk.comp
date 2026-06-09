@@ -32,6 +32,8 @@ layout(push_constant) uniform PushConstants {
     uint seq_len;
     uint n_experts;
     uint top_k;
+    float logit_scale;   // Sprint 11h — uniform pre-softmax scale (1.0 unless the
+                         // batched-prefill gate-proj needs 1/sqrt(hidden) here).
 } pc;
 
 const uint TPB = 128;
@@ -61,7 +63,9 @@ void main() {
     uint logit_base = token * pc.n_experts;
 
     // ─── Step 1: max(logits) for stable softmax. ───
-    float v = (tid < pc.n_experts) ? logits.data[logit_base + tid] : -1e38;
+    // Sprint 11h — apply the uniform logit scale once here; it propagates to
+    // s_max and the step-2 exp (v reused), so softmax(scale·logits) is correct.
+    float v = (tid < pc.n_experts) ? logits.data[logit_base + tid] * pc.logit_scale : -1e38;
     s_probs[tid] = v;
     barrier();
     for (uint stride = TPB / 2u; stride > 0u; stride >>= 1) {

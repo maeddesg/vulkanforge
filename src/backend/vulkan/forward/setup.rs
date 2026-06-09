@@ -1066,10 +1066,12 @@ impl Forward {
 
         let logits_scratch = mk_storage(
             allocator, logits_bytes, MemoryLocation::GpuOnly, "moe_router_logits_scratch")?;
-        // Sprint C.1 — [hidden] FP32 scratch for the optimized decode
-        // router path (RMSNorm output → coalesced mul_mat_vec_f32 GEMV input).
+        // Sprint C.1 — FP32 RMSNorm-output scratch for the router GEMV/GEMM input.
+        // Sprint 11h — sized for **max_seq** (not 1 token): the batched PREFILL
+        // gate-proj does rms_norm over [max_seq × hidden] before the batched
+        // mul_mm_f32 GEMM. Decode (seq_len=1) uses the first row.
         let router_normed_scratch = mk_storage(
-            allocator, (hidden_size as u64) * 4, MemoryLocation::GpuOnly,
+            allocator, (max_seq as u64) * (hidden_size as u64) * 4, MemoryLocation::GpuOnly,
             "moe_router_normed_scratch")?;
         let indices_scratch = mk_storage(
             allocator, indices_bytes, MemoryLocation::GpuOnly, "moe_router_indices_scratch")?;
