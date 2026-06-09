@@ -8,6 +8,12 @@ ctx 4096, median of 3) = **92 % of llama.cpp** (2859), **4.3× over v0.6.1**. At
 76 % of the prefill wall to ~0; prefill now hits the attention-free ceiling. The QAT-Q4_0 line is
 even faster (3107 t/s @p2048, ahead of llama — Q4_0 dequant is cheaper).
 
+> **Correction (2026-06-09):** the "92 % of llama" (and the QAT "ahead of llama") above were computed
+> against an earlier llama.cpp reference. The unified same-run matrix (README → Performance, Sprint
+> 11a; Mesa 26.1.2, llama `b9174-g0253fb21f`) puts VF prefill at **0.80×** (Q3_K_M) / **0.75×** (QAT)
+> of llama.cpp **Vulkan** @p2048 — llama.cpp leads GGUF prefill. The shipped VF numbers (2629 / 3107
+> t/s) stand; only the llama-relative ratio is corrected.
+
 **The kernel** (`flash_attn_cm_gemma_rs.comp`) is a faithful port of llama.cpp's
 `flash_attn_cm1.comp`: KHR coopmat 16×16×16, Br=16 · Bc=64 (16×4 subgroups) · row_split=4 · WG=256,
 coopmat QK + coopmat-PV with online-softmax rescale, cross-subgroup combine via shared memory.

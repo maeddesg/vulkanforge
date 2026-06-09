@@ -16,10 +16,10 @@ Zen 4 / 7945HX 16-core for the CPU `lm_head` numbers.
 
 | Workload                              | Best engine                          |
 |---------------------------------------|--------------------------------------|
-| Single-user chat decode (b=1)         | **VulkanForge** (1.06–2.0× ahead)    |
-| Power efficiency (tok/s/W) — decode   | **VulkanForge** everywhere on 8B    |
-| GGUF Q4_K_M decode                    | **VulkanForge** (121 vs 114 vs 94)   |
-| GGUF prefill (Q4_K_M / Q8_0)          | llama.cpp (Vulkan ≥ ROCm on RDNA4)   |
+| GGUF decode raw t/s (Vulkan, b=1)     | ~parity — llama.cpp **0.87–0.97×** ahead of VF (unified matrix, README) |
+| Decode power efficiency (tok/s/W)     | **VulkanForge** everywhere on 8B (≈ −33 % power) |
+| FP8 single-user decode (b=1)          | **VulkanForge** (1.3–2.8× ahead of vLLM 0.20.1 ROCm) |
+| GGUF prefill (Q4_K_M / Q8_0)          | llama.cpp (VF **0.60–0.91×** on Vulkan; ROCm ≤ Vulkan on RDNA4) |
 | FP8 prefill (per-tensor / block-wise) | vLLM (untuned but still 2.5–12× ahead) |
 | Batch serving (b≥4)                   | vLLM (VF is single-stream)           |
 | **14B FP8 decode + VRAM-tight**       | **VulkanForge with `VF_CPU_LM_HEAD=1`** (17.8 vs GPU 13.5 + 970 MB freed) |
@@ -28,24 +28,33 @@ Zen 4 / 7945HX 16-core for the CPU `lm_head` numbers.
 
 ## GGUF — VulkanForge vs llama.cpp
 
+> **Single source of truth for the VF-vs-llama.cpp _Vulkan_ axis:** the unified bench matrix in
+> [README.md → Performance at a glance](../README.md#performance-at-a-glance) (Sprint 11a, v0.6.2,
+> same HW / driver / GGUF file / quant / ctx / FA per row, one run, Mesa 26.1.2, llama
+> `b9174-g0253fb21f`). Same-backend Vulkan summary: **decode 0.87–0.97× llama, prefill 0.60–0.91×**
+> (gap largest at short context / MoE). It supersedes the v0.3.9 single-point numbers below. The
+> tables here are kept only for the **axes the matrix does not cover**: llama.cpp **ROCm/HIP**,
+> **Q8_0** (which VF cannot bench), and decode **power-efficiency** (tok/s/W).
+
 llama.cpp build `23b8cc4`, built with `-DGGML_HIP=ON -DGGML_VULKAN=ON
 -DAMDGPU_TARGETS=gfx1201`.
 
-### Decode (tok/s, single-user, batch=1)
+### Decode — power-efficiency & ROCm reference (tok/s, single-user, batch=1)
 
-| Engine        | Model        | Format | Backend     | Decode | Avg W | tok/s/W |
-|---------------|--------------|--------|-------------|-------:|------:|--------:|
-| **VF v0.3.9** | 8B Llama     | Q4_K_M | Vulkan      |    **121** | 209 | **0.58** |
-| llama.cpp     | 8B Llama     | Q4_K_M | Vulkan      |        114 | 312 |   0.37  |
-| llama.cpp     | 8B Llama     | Q4_K_M | ROCm/HIP    |         94 | 310 |   0.30  |
-| llama.cpp     | 8B Llama     | Q8_0   | Vulkan      |         73 | 251 |   0.29  |
-| llama.cpp     | 8B Llama     | Q8_0   | ROCm/HIP    |         64 | 246 |   0.26  |
-| llama.cpp     | 14B Qwen2.5  | Q8_0   | Vulkan      |         40 | 215 |   0.19  |
-| llama.cpp     | 14B Qwen2.5  | Q8_0   | ROCm/HIP    |         38 | 226 |   0.17  |
+| Engine          | Model        | Format | Backend     | Decode | Avg W | tok/s/W |
+|-----------------|--------------|--------|-------------|-------:|------:|--------:|
+| VF (v0.3.9 ref) | 8B Llama     | Q4_K_M | Vulkan      |    121 | 209 | **0.58** |
+| llama.cpp       | 8B Llama     | Q4_K_M | Vulkan      |    114 | 312 |   0.37  |
+| llama.cpp       | 8B Llama     | Q4_K_M | ROCm/HIP    |     94 | 310 |   0.30  |
+| llama.cpp       | 8B Llama     | Q8_0   | Vulkan      |     73 | 251 |   0.29  |
+| llama.cpp       | 8B Llama     | Q8_0   | ROCm/HIP    |     64 | 246 |   0.26  |
+| llama.cpp       | 14B Qwen2.5  | Q8_0   | Vulkan      |     40 | 215 |   0.19  |
+| llama.cpp       | 14B Qwen2.5  | Q8_0   | ROCm/HIP    |     38 | 226 |   0.17  |
 
-**VF wins decode 1.06× over the closest llama.cpp build, 1.93× over
-llama.cpp ROCm.** Power-efficiency lead is structural (≈ −33 % power
-at higher throughput), not a backend artifact.
+**Power-efficiency lead is structural** — VF draws ≈ −33 % power (209 W vs llama's 312 W on 8B
+Q4_K_M Vulkan) → higher tok/s/W — and VF decode leads llama.cpp **ROCm** comfortably. On the **raw
+same-backend Vulkan** decode axis, VF v0.6.2 is **0.87–0.97× llama** (near-parity, slightly behind,
+per the README matrix); the old "VF 121 t/s wins 1.06×" was a v0.3.9 single point, now superseded.
 
 ### Prefill pp=512 (tok/s)
 
@@ -54,15 +63,17 @@ at higher throughput), not a backend artifact.
 | llama.cpp     | 8B Llama | Q8_0   | Vulkan   |  1620 |   2510 | **4972** |    — |
 | llama.cpp     | 8B Llama | Q8_0   | ROCm     |  1545 |   2380 |   4790 |    — |
 | llama.cpp     | 8B Llama | Q4_K_M | Vulkan   |  1600 |   2360 |   4458 |    — |
-| VF v0.3.9     | 8B Llama | Q4_K_M | Vulkan   |  1802 |   2806 |   3992 |   3923 |
+| VF (v0.3.9)   | 8B Llama | Q4_K_M | Vulkan   |  1802 |   2806 |   3992 |   3923 |
 | llama.cpp     | 8B Llama | Q4_K_M | ROCm     |  1490 |   2240 |   3936 |    — |
 | llama.cpp     | 14B Qwen | Q8_0   | ROCm     |  1333 |   1820 |   2535 |    — |
 | llama.cpp     | 14B Qwen | Q8_0   | Vulkan   |  1272 |   2134 |   1660 |    — |
 
 llama.cpp wins prefill on GGUF formats (rocBLAS / coopmat-tuned tile
-selection). VF Q4_K_M sits at 0.89–0.90× vs llama.cpp Vulkan; the gap
-is structural at the graph level (verified via the nine-hypothesis
-falsification table in v0.2.x sprints).
+selection) — confirmed by the unified matrix (README): VF prefill is
+**0.60–0.91× llama.cpp Vulkan** (dense 0.71–0.91×, MoE 0.60–0.80×; the
+gap is largest at short context and narrows with length as coopmat-FA
+amortizes). The v0.3.9 row above is a historical reference point (Q4_K_M
+8B ~0.89×); the matrix is the current same-run source of truth.
 
 ### Honest-negatives
 
