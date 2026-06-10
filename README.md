@@ -166,15 +166,18 @@ free-form generation tail diverge from the pre-v0.7.0 per-token router (delibera
 
 **Recommended Gemma quant — QAT (Q4_0).** For Gemma-4-26B-A4B the **QAT** build
 (`gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf`, quantization-aware-trained, Q4_0 tensors) is the
-recommended default over `Q3_K_M`. This is primarily a **quality** choice — 4-bit QAT preserves
-noticeably more than post-hoc 3-bit `Q3_K_M`, which is the quality floor for coding/reasoning. It is
-*also* faster on this engine: measured gate-clean (interleaved, VRAM-ghost-free; Sprint 13),
-QAT prefill is ~1.3× Q3_K_M and QAT decode is **+9 %** (117 vs 107 tok/s, `vulkanforge bench`,
-KV-FP8) — both prefill *and* decode favour QAT, so the quality upgrade carries no speed penalty.
-**Caveat — VRAM:** QAT is the tightest Gemma profile (≈14.7 GiB resident at `--max-context 2048`,
-≈1.25 GiB free on a 16 GiB card; ctx 4096 leaves ≈1.0 GiB). Keep the default `--max-context 2048`
-on 16 GiB cards, and the pre-load free-VRAM gate (`VF_VRAM_GATE=1`) guards against a previous
-process's un-freed VRAM or compositor pressure pushing the load into GTT / OOM.
+recommended default over `Q3_K_M`. This is a **quality** choice — 4-bit QAT preserves noticeably
+more than post-hoc 3-bit `Q3_K_M`, which is the quality floor for coding/reasoning. (A clean,
+Citrix-free VF speed comparison vs `Q3_K_M` and vs llama.cpp is pending; see `CHANGELOG.md`. The
+recommendation rests on quality and on the VRAM residency below, both measurement-independent of
+throughput.) **Caveat — VRAM (clean residency, Citrix-immune):** QAT is the tightest Gemma profile —
+VF residency ≈13.7 GiB, so on a 16 GiB card with a typical ~1 GiB desktop it loads to ≈14.7 GiB
+(**≈1.2 GiB free**) at `--max-context 2048`; `--max-context 4096` reaches ≈15.0 GiB (**≈0.9 GiB
+free**) and trips the compositor-headroom warning. **Keep `--max-context 2048` as the default on
+16 GiB cards** — even a light desktop leaves under the ~1.5 GiB comfort headroom at ctx 4096, so
+ctx 2048 is the genuine default (not a Citrix artifact). Users with a very light desktop can opt
+into ctx 4096. The pre-load free-VRAM gate (`VF_VRAM_GATE=1`) guards against a previous process's
+un-freed VRAM or compositor pressure pushing the load into GTT / OOM.
 
 ### v0.3.16 15-prompt mixed-workload benchmark
 
