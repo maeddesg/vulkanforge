@@ -703,6 +703,12 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
     let load_start = Instant::now();
     let gguf = GgufFile::open(&model_path)?;
     let cfg = ModelConfig::from_gguf(&gguf)?;
+    // Sprint 13 — pre-load free-VRAM gate (warn-only by default;
+    // VF_VRAM_GATE=1 waits for a VRAM ghost to clear / aborts cleanly).
+    Forward::gate_vram_before_load(
+        std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0),
+        "chat model load",
+    )?;
     let model = LoadedModel::load(&dev, &mut allocator, &gguf, args.gamma_from.as_deref())?;
     // Sprint 52R R-1 — `--tokenizer-from` is now bidirectional:
     //   `Some(dir)`  → load tokenizer.json + chat_template.jinja from
@@ -1903,6 +1909,12 @@ fn run_bench(
     let cmd_ctx = CommandContext::new(&dev.device, dev.queue_family_index)?;
     let gguf = GgufFile::open(&model_path)?;
     let cfg = ModelConfig::from_gguf(&gguf)?;
+    // Sprint 13 — pre-load free-VRAM gate (see run_chat). VF_VRAM_GATE=1
+    // makes A/B bench loads ghost-free (the Sprint 12c lesson).
+    Forward::gate_vram_before_load(
+        std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0),
+        "bench model load",
+    )?;
     // Bench path: no --gamma-from override.
     let model = LoadedModel::load(&dev, &mut allocator, &gguf, None)?;
     let tokenizer = Tokenizer::from_gguf(&gguf)?;

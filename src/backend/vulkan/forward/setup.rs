@@ -1261,6 +1261,87 @@ impl Forward {
         }
     }
 
+    /// Sprint 13 — pre-load free-VRAM gate. Called BEFORE the heavy
+    /// weight allocation (unlike `print_vram_budget`, which runs after
+    /// weights are already resident, too late to prevent a mid-load
+    /// freeze). A previous process that hasn't released its 12–13 GiB
+    /// ("VRAM ghost", e.g. after an unclean exit) silently pushes this
+    /// load into GTT — the Sprint 12c measurement artifact — and on the
+    /// QAT-at-~1.25-GiB-free cliff it can exhaust VRAM mid-load.
+    ///
+    /// `required_free_bytes` = the model's on-disk footprint (a tight
+    /// lower bound on its VRAM residency). Default is **warn-only**
+    /// (non-blocking; preserves the existing flow). `VF_VRAM_GATE=1`
+    /// makes it **strict**: poll every 500 ms up to
+    /// `VF_VRAM_GATE_TIMEOUT_S` (default 30) for free VRAM to reach the
+    /// floor (ghost release), then return `Err` if it never does — so a
+    /// bench harness can guarantee gate-clean, ghost-free loads (the
+    /// 12c lesson). No-op when the AMD sysfs nodes aren't readable
+    /// (non-AMD / CI / different distro).
+    pub fn gate_vram_before_load(required_free_bytes: u64, label: &str) -> Result<(), String> {
+        let read_free = || -> Option<u64> {
+            let card = (0..8).find_map(|i| {
+                match std::fs::read_to_string(format!("/sys/class/drm/card{i}/device/vendor")) {
+                    Ok(v) if v.trim() == "0x1002" => Some(i),
+                    _ => None,
+                }
+            })?;
+            let used = std::fs::read_to_string(format!(
+                "/sys/class/drm/card{card}/device/mem_info_vram_used"
+            )).ok()?.trim().parse::<u64>().ok()?;
+            let total = std::fs::read_to_string(format!(
+                "/sys/class/drm/card{card}/device/mem_info_vram_total"
+            )).ok()?.trim().parse::<u64>().ok()?;
+            Some(total.saturating_sub(used))
+        };
+        let gib = |b: u64| (b as f64) / (1024.0 * 1024.0 * 1024.0);
+        let Some(free) = read_free() else { return Ok(()); };
+        if free >= required_free_bytes {
+            return Ok(());
+        }
+        let strict = std::env::var("VF_VRAM_GATE").as_deref() == Ok("1");
+        if !strict {
+            eprintln!(
+                "VulkanForge: ⚠️  pre-load free VRAM {:.2} GiB < model footprint {:.2} GiB ({label}). \
+                 A previous process may still hold VRAM (ghost), or the compositor/another app is \
+                 using it — this load may spill to GTT (slow) or exhaust VRAM. Set VF_VRAM_GATE=1 \
+                 to wait for it to clear and abort cleanly if it doesn't.",
+                gib(free), gib(required_free_bytes),
+            );
+            return Ok(());
+        }
+        let timeout_s = std::env::var("VF_VRAM_GATE_TIMEOUT_S")
+            .ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(30);
+        eprintln!(
+            "VulkanForge: VRAM gate — free {:.2} GiB < {:.2} GiB floor ({label}); \
+             waiting up to {timeout_s}s for VRAM to free…",
+            gib(free), gib(required_free_bytes),
+        );
+        let start = std::time::Instant::now();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if let Some(f) = read_free() {
+                if f >= required_free_bytes {
+                    eprintln!(
+                        "VulkanForge: VRAM gate — free recovered to {:.2} GiB, proceeding.",
+                        gib(f),
+                    );
+                    return Ok(());
+                }
+            }
+            if start.elapsed().as_secs() >= timeout_s {
+                let last = read_free().unwrap_or(free);
+                return Err(format!(
+                    "VRAM gate ({label}): free VRAM stayed below {:.2} GiB (last {:.2} GiB) after \
+                     {timeout_s}s. A previous process likely still holds VRAM (ghost), or the \
+                     compositor/another app is using it. Close GPU apps, lower --max-context, or \
+                     use a smaller quant.",
+                    gib(required_free_bytes), gib(last),
+                ));
+            }
+        }
+    }
+
     pub fn destroy(self, device: &ash::Device, allocator: &mut Allocator) {
         // Sprint 44B-2 — harness-pipeline teardown collapsed into one
         // call per pipeline (Sprint 24-Inline / 35 / 36 / 29).
