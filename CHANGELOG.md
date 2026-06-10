@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — pre-load VRAM gate + Gemma coding-model comparison + ctx3072 (Sprint 13)
+## v0.7.1 — pre-load VRAM gate + Gemma coding-model comparison + ctx3072 (2026-06-10)
 
 **No single recommended Gemma quant** — `Q3_K_M` (3-bit) and QAT (`…-qat-UD-Q4_K_XL.gguf`, Q4_0) trade
 quality / speed / context; users pick by priority (a new wiki page *Choosing a Model for Coding* compares
