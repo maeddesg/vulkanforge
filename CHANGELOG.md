@@ -1,19 +1,18 @@
 # Changelog
 
-## Unreleased — Gemma default → QAT (Q4_0) + pre-load VRAM gate (Sprint 13)
+## Unreleased — pre-load VRAM gate + Gemma coding-model comparison + ctx3072 (Sprint 13)
 
-**Recommended Gemma-4-26B-A4B quant flipped from `Q3_K_M` to QAT (`…-qat-UD-Q4_K_XL.gguf`, Q4_0)** — on
-**quality *and* speed**, both now measured clean (Citrix-free, interleaved, gate-clean).
+**No single recommended Gemma quant** — `Q3_K_M` (3-bit) and QAT (`…-qat-UD-Q4_K_XL.gguf`, Q4_0) trade
+quality / speed / context; users pick by priority (a new wiki page *Choosing a Model for Coding* compares
+them, plus the dense Qwen3.6-27B): QAT leads on speed and on harder coding, `Q3_K_M` has more context headroom.
 
 - **Quality (measured):** 4-bit QAT preserves more than post-hoc 3-bit `Q3_K_M`, and it shows up under
   difficulty — a harder coding A/B (recursive-descent expression evaluator) discriminates QAT > `Q3_K_M`
   (QAT yields a compilable, precedence-correct impl; Q3 false-starts / token-corrupts), while an easy task
   ties. The edge appears on non-trivial coding.
-- **Speed (clean, interleaved, KV-FP8, Citrix-free):** QAT decode **119 vs 108 tok/s (+10 %)** and prefill
-  **~1.25–1.27×** `Q3_K_M` — both axes favour QAT, no penalty. (The earlier "QAT slower / more bytes"
-  prognosis is wrong; Sprint-13's Citrix-tainted +9.5 % is confirmed at +10.4 % clean.) vs llama.cpp-Vulkan
-  (same Mesa 26.1.2): QAT prefill 0.63× @512 → 0.86× @~1.8k, decode 0.85× — **confirms the v0.7.0 matrix
-  QAT row (0.83× / 0.91×) was correct, not pessimistic**.
+- **Speed (KV-FP8):** QAT decode **119 vs 108 tok/s (+10 %)** and prefill **~1.25–1.27×** `Q3_K_M` — both
+  axes favour QAT, no penalty. vs llama.cpp-Vulkan (same Mesa 26.1.2): QAT prefill 0.63× @512 → 0.86× @~1.8k,
+  decode 0.85× — in line with the v0.7.0 matrix QAT row (0.83× / 0.91×).
 - **Pre-load free-VRAM gate** (`Forward::gate_vram_before_load`, chat + bench load paths): checks free
   VRAM *before* the weight allocation (the existing `print_vram_budget` runs after, too late to prevent a
   mid-load freeze). Default warn-only; `VF_VRAM_GATE=1` waits up to `VF_VRAM_GATE_TIMEOUT_S` (30 s) for a
@@ -22,12 +21,11 @@
   **and `3072`** (the extra ctx costs ~no VRAM), and ≈14.7 GiB / ≈1.2 GiB free at `4096`. Default raised to
   **3072** — same VRAM as 2048 but enough generation budget for a substantial function (2048 truncates
   ~180-line coding outputs); the active gate covers the tighter headroom. ctx 4096 is a light-desktop opt-in.
-- Flip non-regression confirmed: QAT decode is *faster* than Q3, not slower. Docs-only (no Gemma code path
-  changed); the v0.7.0 matrix already carries the QAT row.
+- No decode regression: QAT decode is *faster* than Q3, not slower. Docs-only for the model framing (no Gemma
+  code path changed); the v0.7.0 matrix carries the QAT row.
 - Validation: lib **273/273**, `--examples` build, QAT recall (Paris / 391 / Jupiter) ✓ + 5-prompt smoke
   (ids 1/3/6/9/14: greeting / prime-fn / mutex / O(log n) / 391) all coherent ✓.
-- Release: candidate for a **v0.7.1** patch once the Citrix-free speed numbers land (owner decision —
-  not tagged here).
+- Release: candidate for a **v0.7.1** patch (owner decision).
 
 ## v0.7.0 — Prefill Parity: dense CoopMat-FA hd128 + Gemma MoE router/gate-proj (2026-06-09)
 

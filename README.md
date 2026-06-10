@@ -164,22 +164,19 @@ value-preserving on factual/structural output, but a borderline top-k expert fli
 free-form generation tail diverge from the pre-v0.7.0 per-token router (deliberate; opt out with
 `VF_MOE_ROUTER_BATCHED=0`).
 
-**Recommended Gemma quant — QAT (Q4_0).** For Gemma-4-26B-A4B the **QAT** build
-(`gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf`, quantization-aware-trained, Q4_0 tensors) is the
-recommended default over `Q3_K_M`, on **quality *and* speed**.
-- **Quality:** 4-bit QAT preserves noticeably more than post-hoc 3-bit `Q3_K_M`, and this shows up
-  *measurably* under difficulty — on a harder coding A/B (a recursive-descent expression evaluator)
-  QAT yields a compilable, precedence-correct implementation while `Q3_K_M` does not (false-starts /
-  token corruption); on an easy task both tie. The edge appears where it matters (non-trivial coding).
-- **Speed (clean, interleaved, KV-FP8):** QAT decode **119 vs 108 tok/s (+10 %)** and prefill
-  **~1.25–1.27×** `Q3_K_M` — both axes favour QAT, no penalty. vs llama.cpp-Vulkan (same Mesa): QAT
-  prefill 0.63× @512 → 0.86× @~1.8k, decode 0.85× (confirms the v0.7.0 matrix QAT row).
-- **VRAM + context (clean residency):** QAT is the tightest Gemma profile (VF ≈13.7 GiB). On a 16 GiB
-  card it loads to ≈14.5 GiB / **≈1.4 GiB free** at `--max-context 2048` **and `3072`** (the extra ctx
-  costs ~no VRAM), and ≈14.7 GiB / **≈1.2 GiB free** at `4096`. **Default `--max-context 3072`** — same
-  VRAM as 2048 but enough generation budget for a substantial function (2048 truncates ~180-line
-  outputs) — guarded by the pre-load free-VRAM gate (`VF_VRAM_GATE=1`, which waits for / aborts on a
-  prior process's un-freed VRAM "ghost"). ctx 4096 (≈1.2 GiB free) is a light-desktop opt-in.
+**Gemma quant: `Q3_K_M` vs QAT (`Q4_0`) — no single default.** Gemma-4-26B-A4B runs as both `Q3_K_M`
+(3-bit) and the QAT `Q4_0` line (`gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf`, quantization-aware-trained,
+4-bit); they trade quality, speed, and context — pick by your priority. Measured on the 16 GB reference
+card: QAT decode **~119 vs ~108 tok/s** and prefill **~1.25–1.27×** `Q3_K_M`, and QAT is stronger on
+harder coding tasks; `Q3_K_M` is smaller, with more context headroom. vs llama.cpp-Vulkan (same Mesa):
+QAT prefill 0.63× @512 → 0.86× @~1.8k, decode 0.85× (≈ the v0.7.0 matrix QAT row above). For a three-way
+comparison that also includes the dense Qwen3.6-27B, see the wiki:
+[Choosing a Model for Coding](https://github.com/maeddesg/vulkanforge/wiki/Choosing-a-Model-for-Coding).
+**Context (engine setting, not a model default):** `--max-context 3072` is a good general coding value —
+same VRAM as 2048 but enough generation budget for a substantial function (2048 can truncate ~180-line
+outputs); `4096` is a spare-VRAM opt-in. The pre-load free-VRAM gate (`VF_VRAM_GATE=1`) guards against a
+prior process's un-freed VRAM or compositor pressure, and `VULKANFORGE_KV_FP8=1` helps the 26B models fit
+16 GB.
 
 ### v0.3.16 15-prompt mixed-workload benchmark
 
