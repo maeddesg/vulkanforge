@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased — Gemma default → QAT (Q4_0) + pre-load VRAM gate (Sprint 13)
+
+**Recommended Gemma-4-26B-A4B quant flipped from `Q3_K_M` to QAT (`…-qat-UD-Q4_K_XL.gguf`, Q4_0).**
+A **quality** decision (4-bit QAT > post-hoc 3-bit `Q3_K_M`) that, measured gate-clean (interleaved,
+VRAM-ghost-free), turns out to also be **faster on both axes**: QAT prefill ~1.3× Q3_K_M, decode
+**+9 %** (117 vs 107 tok/s, `vulkanforge bench`, KV-FP8). Earlier Sprint-12b figures that showed QAT
+*slower* than Q3 were a VRAM-cliff measurement artifact (QAT loads to ≈1.25 GiB free; a non-interleaved
+batch left a previous process's VRAM resident → GTT spill); Sprint 12c reproduced clean and reversed it.
+
+- **Pre-load free-VRAM gate** (`Forward::gate_vram_before_load`, chat + bench load paths): checks free
+  VRAM *before* the weight allocation (the existing `print_vram_budget` runs after, too late to prevent a
+  mid-load freeze). Default warn-only; `VF_VRAM_GATE=1` waits up to `VF_VRAM_GATE_TIMEOUT_S` (30 s) for a
+  VRAM ghost to clear, then aborts cleanly. No-op on non-AMD / unreadable sysfs.
+- **VRAM guidance:** QAT is the tightest Gemma profile — keep `--max-context 2048` on 16 GiB cards
+  (ctx 4096 leaves ≈1.0 GiB free). The gate + the existing compositor-headroom warning cover the cliff.
+- Docs-only flip (no Gemma code path changed); the v0.7.0 matrix already carried the QAT row
+  (prefill 0.83× / decode 0.91× llama), which the gate-clean re-measure confirms (not pessimistic).
+- Validation: lib **273/273**, `--examples` build, QAT recall (Paris / 391 / Jupiter) ✓.
+- Release: candidate for a **v0.7.1** patch (owner decision — not tagged here).
+
 ## v0.7.0 — Prefill Parity: dense CoopMat-FA hd128 + Gemma MoE router/gate-proj (2026-06-09)
 
 **Prefill reaches llama.cpp-Vulkan parity on dense models and closes most of the Gemma-4 MoE
