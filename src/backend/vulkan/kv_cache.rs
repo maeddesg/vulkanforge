@@ -183,20 +183,27 @@ impl KvCache {
                     .as_ref()
                     .map(|v| v[i])
                     .unwrap_or(config.n_kv_heads);
+                // Hardening (F5): checked products — file-derived dims feed
+                // these. checked_* gives a clean Err instead of a wrap
+                // (release) / panic (overflow-checks) on an absurd config.
                 let layer_bytes = (config.max_seq_len as u64)
-                    * (kvh as u64)
-                    * (hd as u64)
-                    * elem_size;
-                acc += layer_bytes;
+                    .checked_mul(kvh as u64)
+                    .and_then(|x| x.checked_mul(hd as u64))
+                    .and_then(|x| x.checked_mul(elem_size))
+                    .ok_or("kv-cache per-layer size overflow")?;
+                acc = acc
+                    .checked_add(layer_bytes)
+                    .ok_or("kv-cache total size overflow")?;
                 offsets.push(acc);
             }
             (acc, Some(offsets))
         } else {
             let total = (config.n_layers as u64)
-                * (config.n_kv_heads as u64)
-                * (config.max_seq_len as u64)
-                * (config.head_dim as u64)
-                * elem_size;
+                .checked_mul(config.n_kv_heads as u64)
+                .and_then(|x| x.checked_mul(config.max_seq_len as u64))
+                .and_then(|x| x.checked_mul(config.head_dim as u64))
+                .and_then(|x| x.checked_mul(elem_size))
+                .ok_or("kv-cache size overflow")?;
             (total, None)
         };
         let _ = elem_size; // also referenced via kv_dtype below; silence warning if drift

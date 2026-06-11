@@ -389,7 +389,10 @@ pub unsafe fn quantize_block_q4k_avx512(input: &[f32], output: &mut [u8]) {
 /// load. The output pointer is 4-byte aligned (Vec<f32> guarantees).
 #[target_feature(enable = "avx512f")]
 pub unsafe fn bf16_bytes_to_fp32_avx512(input_bytes: &[u8], output: &mut [f32]) {
-    debug_assert_eq!(input_bytes.len(), output.len() * 2);
+    // Real assert (not debug-only): this `pub unsafe fn` over-reads `input`
+    // via raw loads if it is shorter than `output.len()*2`. Production calls
+    // go through the dispatcher's assert, but make the fn sound for any caller.
+    assert_eq!(input_bytes.len(), output.len() * 2);
     let n = output.len();
     let in_ptr = input_bytes.as_ptr();
     let out_ptr = output.as_mut_ptr();

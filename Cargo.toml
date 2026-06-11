@@ -36,3 +36,8 @@ shaderc = "0.8"
 [profile.release]
 opt-level = 3
 lto = "thin"
+# Security hardening: untrusted GGUF/SafeTensors file input flows into size
+# arithmetic. overflow-checks turns a silent wrap into a defined panic; the
+# parser itself returns clean Errs (checked_* in gguf.rs) before reaching it.
+# Hot work is GPU shaders / AVX intrinsics, unaffected by this flag.
+overflow-checks = true

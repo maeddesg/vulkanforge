@@ -134,6 +134,34 @@ impl Shard {
     fn slice(&self, start: usize, end: usize) -> &[u8] {
         &self.mmap[self.data_start + start .. self.data_start + end]
     }
+
+    /// Hardening (audit F1 SafeTensors twin): validate a tensor's
+    /// `data_offsets` against this shard *once* at open time, so `slice`
+    /// stays infallible and a crafted header yields a clean `Err` instead
+    /// of a panic / OOB at first `tensor_bytes`. Checks `start <= end` (else
+    /// `byte_len() = end - start` underflows) and `data_start + end` within
+    /// the mapped length. Transparent for valid files.
+    fn check_range(&self, start: usize, end: usize) -> Result<(), String> {
+        range_in_bounds(self.data_start, self.mmap.len(), start, end)
+    }
+}
+
+/// Pure bounds check for a SafeTensors `data_offsets` pair against a shard's
+/// data block. Split out from `Shard::check_range` so it is unit-testable
+/// without an mmap/file (audit F1-twin). Requires `start <= end` (else
+/// `byte_len = end - start` underflows) and `data_start + end` within the
+/// mapped length; `checked_add` guards the offset overflow.
+fn range_in_bounds(data_start: usize, mmap_len: usize, start: usize, end: usize) -> Result<(), String> {
+    if start > end {
+        return Err(format!("data_offsets start {start} > end {end}"));
+    }
+    match data_start.checked_add(end) {
+        Some(abs_end) if abs_end <= mmap_len => Ok(()),
+        _ => Err(format!(
+            "data range end {end} exceeds shard length {}",
+            mmap_len.saturating_sub(data_start)
+        )),
+    }
 }
 
 pub struct SafeTensorsFile {
@@ -168,6 +196,8 @@ impl SafeTensorsFile {
         for (name, raw) in entries {
             let dtype = TensorDtype::from_str(&raw.dtype)
                 .ok_or_else(|| format!("safetensors {}: unsupported dtype {} for tensor '{name}'", path.display(), raw.dtype))?;
+            shard.check_range(raw.data_offsets[0], raw.data_offsets[1])
+                .map_err(|e| format!("safetensors {}: tensor '{name}': {e}", path.display()))?;
             tensors.insert(name, TensorInfo {
                 dtype,
                 shape: raw.shape,
@@ -194,6 +224,18 @@ impl SafeTensorsFile {
         let mut shard_idx_for: HashMap<String, usize> = HashMap::new();
         for shard_name in index.weight_map.values() {
             if !shard_idx_for.contains_key(shard_name) {
+                // Hardening (audit F9): the shard filename comes from the
+                // (untrusted) index.json. Require a plain filename — a single
+                // `Normal` path component — so `dir.join(shard_name)` can't
+                // escape `dir` via an absolute path or `..` traversal.
+                let mut comps = Path::new(shard_name).components();
+                let plain = matches!(comps.next(), Some(std::path::Component::Normal(_)))
+                    && comps.next().is_none();
+                if !plain {
+                    return Err(format!(
+                        "safetensors index: shard name '{shard_name}' must be a plain filename (no path components)"
+                    ));
+                }
                 shard_idx_for.insert(shard_name.clone(), shard_paths.len());
                 shard_paths.push(dir.join(shard_name));
             }
@@ -220,6 +262,8 @@ impl SafeTensorsFile {
             let dtype = TensorDtype::from_str(&raw.dtype).ok_or_else(|| {
                 format!("safetensors '{name}': unsupported dtype {}", raw.dtype)
             })?;
+            shards[idx].check_range(raw.data_offsets[0], raw.data_offsets[1])
+                .map_err(|e| format!("safetensors '{name}': {e}"))?;
             tensors.insert(name, TensorInfo {
                 dtype,
                 shape: raw.shape.clone(),
@@ -467,5 +511,27 @@ mod tests {
         assert_eq!(hf_to_vf_name("model.audio_tower.encoder.0.weight"), None);
         assert_eq!(hf_to_vf_name("model.embed_vision.embedding_projection.weight"), None);
         assert_eq!(hf_to_vf_name("model.embed_audio.embedding_projection.weight"), None);
+    }
+
+    // ---- Hardening regression tests (Security-Audit F1-twin) ----
+
+    #[test]
+    fn range_in_bounds_accepts_valid() {
+        // data_start=8, mmap_len=108 → 100 bytes of data; [0,100] fits.
+        assert!(range_in_bounds(8, 108, 0, 100).is_ok());
+        assert!(range_in_bounds(8, 108, 10, 50).is_ok());
+    }
+
+    #[test]
+    fn range_in_bounds_rejects_start_gt_end() {
+        // start > end would underflow byte_len = end - start.
+        assert!(range_in_bounds(8, 108, 50, 10).is_err());
+    }
+
+    #[test]
+    fn range_in_bounds_rejects_end_past_len() {
+        // data_start + end exceeds mmap_len.
+        assert!(range_in_bounds(8, 108, 0, 101).is_err());
+        assert!(range_in_bounds(8, 108, 0, usize::MAX).is_err()); // checked_add overflow
     }
 }

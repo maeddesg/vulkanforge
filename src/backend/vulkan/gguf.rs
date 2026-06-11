@@ -30,6 +30,15 @@ pub enum GgufError {
     EndOfFile,
     MissingMetadata(String),
     UnexpectedType(String, &'static str),
+    /// `general.alignment` must be a non-zero power of two; rejected
+    /// otherwise so a crafted value can't corrupt `data_section_offset`.
+    InvalidAlignment(u64),
+    /// A tensor's declared data range (`data_section_offset + data_offset
+    /// + byte_size`) overflows or exceeds the mapped file length. Hardening
+    /// guard — turns a would-be panic/OOB at `tensor_bytes` into a clean Err.
+    TensorOutOfBounds(String),
+    /// Metadata array nesting exceeded the recursion cap (anti stack-overflow).
+    MetadataNestingTooDeep,
 }
 
 impl std::fmt::Display for GgufError {
@@ -44,6 +53,15 @@ impl std::fmt::Display for GgufError {
             GgufError::MissingMetadata(k) => write!(f, "missing metadata key '{k}'"),
             GgufError::UnexpectedType(k, want) => {
                 write!(f, "metadata key '{k}' is not a {want}")
+            }
+            GgufError::InvalidAlignment(a) => {
+                write!(f, "invalid general.alignment {a} (must be a non-zero power of two)")
+            }
+            GgufError::TensorOutOfBounds(name) => {
+                write!(f, "tensor '{name}' data range overflows or exceeds the file length")
+            }
+            GgufError::MetadataNestingTooDeep => {
+                write!(f, "metadata array nesting exceeds the maximum depth")
             }
         }
     }
@@ -240,6 +258,38 @@ impl TensorInfo {
         debug_assert!(n % bs == 0, "tensor element count not a multiple of block size");
         (n / bs) * ts
     }
+
+    /// Overflow-checked element count — `None` if the product of the
+    /// file-controlled dimensions overflows `u64`. Used by the parse-time
+    /// validation pass so a malicious/corrupt GGUF yields a clean `Err`
+    /// instead of a wrapped (release) or panicking (overflow-checks) product.
+    pub fn checked_n_elements(&self) -> Option<u64> {
+        self.dimensions
+            .iter()
+            .try_fold(1u64, |acc, &d| acc.checked_mul(d))
+    }
+
+    /// Overflow-checked byte size. Byte-for-byte identical to [`byte_size`]
+    /// for any valid tensor (same truncating `(n / bs) * ts`); only the
+    /// arithmetic is checked. `None` on overflow. `block_size()` is never 0.
+    pub fn checked_byte_size(&self) -> Option<u64> {
+        let n = self.checked_n_elements()?;
+        let bs = self.ggml_type.block_size();
+        let ts = self.ggml_type.type_size();
+        (n / bs).checked_mul(ts)
+    }
+}
+
+/// Result of the mmap-independent header parse (`GgufFile::parse_inner`).
+/// Everything in `GgufFile` except the `Mmap` backing.
+#[derive(Debug)]
+struct ParsedHeader {
+    version: u32,
+    tensor_count: u64,
+    metadata: HashMap<String, MetadataValue>,
+    tensors: HashMap<String, TensorInfo>,
+    data_section_offset: u64,
+    alignment: u64,
 }
 
 pub struct GgufFile {
@@ -262,7 +312,25 @@ impl GgufFile {
     }
 
     fn parse(mmap: Mmap) -> Result<Self, GgufError> {
-        let mut cursor = Cursor::new(&mmap);
+        let h = Self::parse_inner(&mmap)?;
+        Ok(Self {
+            mmap,
+            version: h.version,
+            tensor_count: h.tensor_count,
+            metadata: h.metadata,
+            tensors: h.tensors,
+            data_section_offset: h.data_section_offset,
+            alignment: h.alignment,
+        })
+    }
+
+    /// Pure byte-level parse + validation; the data slice **is** the file
+    /// (mmap or not). Split out from [`parse`] so the hardening guards
+    /// (F1–F4) can be exercised with in-memory byte vectors in unit tests —
+    /// no temp files on disk. `data.len()` is the authoritative file length
+    /// used by the F1 bounds check.
+    fn parse_inner(data: &[u8]) -> Result<ParsedHeader, GgufError> {
+        let mut cursor = Cursor::new(data);
         let magic = cursor.read_u32()?;
         if magic != GGUF_MAGIC {
             return Err(GgufError::BadMagic);
@@ -274,7 +342,11 @@ impl GgufFile {
         let tensor_count = cursor.read_u64()?;
         let kv_count = cursor.read_u64()?;
 
-        let mut metadata = HashMap::with_capacity(kv_count as usize);
+        // Hardening (F2): `kv_count`/`tensor_count` are raw file values.
+        // Fill-don't-preallocate — never reserve capacity from an untrusted
+        // count (a 24-byte file with `tensor_count = u64::MAX` would OOM /
+        // `capacity overflow` panic). The read loops below terminate on EOF.
+        let mut metadata = HashMap::new();
         for _ in 0..kv_count {
             let key = cursor.read_string()?;
             let value = cursor.read_metadata_value()?;
@@ -286,12 +358,21 @@ impl GgufFile {
             .and_then(|v| v.as_u32())
             .map(|v| v as u64)
             .unwrap_or(DEFAULT_ALIGNMENT);
+        // Hardening (F4): a zero / non-power-of-two alignment makes
+        // `align_up` produce a bogus `data_section_offset` (0 when
+        // alignment==0), which would corrupt every `tensor_bytes` start.
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return Err(GgufError::InvalidAlignment(alignment));
+        }
 
-        let mut tensors = HashMap::with_capacity(tensor_count as usize);
+        let mut tensors = HashMap::new();
         for _ in 0..tensor_count {
             let name = cursor.read_string()?;
             let n_dims = cursor.read_u32()?;
-            let mut dims = Vec::with_capacity(n_dims as usize);
+            // `n_dims` is a raw file value — fill-don't-preallocate (a huge
+            // `n_dims` would otherwise reserve a multi-GB Vec). The loop
+            // EOFs long before that on any real file.
+            let mut dims = Vec::new();
             for _ in 0..n_dims {
                 dims.push(cursor.read_u64()?);
             }
@@ -314,8 +395,28 @@ impl GgufFile {
         let header_end = cursor.pos();
         let data_section_offset = align_up(header_end as u64, alignment);
 
-        Ok(Self {
-            mmap,
+        // Hardening (F1): validate every tensor's data range against the
+        // mapped length *once*, here at parse time, so the invariant holds
+        // for all (~25 GGUF) `tensor_bytes` call sites and the accessor can
+        // stay infallible. A crafted `data_offset`/`dimensions` that would
+        // overflow or slice past the mmap now yields a clean `Err` instead
+        // of a panic / SIGSEGV at first access. Fully transparent for valid
+        // models (`checked_byte_size` equals `byte_size` for them).
+        let mmap_len = data.len() as u64;
+        for info in tensors.values() {
+            let size = info
+                .checked_byte_size()
+                .ok_or_else(|| GgufError::TensorOutOfBounds(info.name.clone()))?;
+            let end = data_section_offset
+                .checked_add(info.data_offset)
+                .and_then(|s| s.checked_add(size))
+                .ok_or_else(|| GgufError::TensorOutOfBounds(info.name.clone()))?;
+            if end > mmap_len {
+                return Err(GgufError::TensorOutOfBounds(info.name.clone()));
+            }
+        }
+
+        Ok(ParsedHeader {
             version,
             tensor_count,
             metadata,
@@ -1225,11 +1326,16 @@ impl<'a> Cursor<'a> {
         self.pos
     }
     fn read_n(&mut self, n: usize) -> Result<&'a [u8], GgufError> {
-        if self.pos + n > self.data.len() {
+        // `checked_add` closes the String-length sibling of F2: `read_string`
+        // feeds a raw u64 length here; without the check `self.pos + n` could
+        // wrap (release) / panic (overflow-checks) past the EOF guard. A huge
+        // length now returns a clean EndOfFile instead.
+        let end = self.pos.checked_add(n).ok_or(GgufError::EndOfFile)?;
+        if end > self.data.len() {
             return Err(GgufError::EndOfFile);
         }
-        let s = &self.data[self.pos..self.pos + n];
-        self.pos += n;
+        let s = &self.data[self.pos..end];
+        self.pos = end;
         Ok(s)
     }
     fn read_u8(&mut self) -> Result<u8, GgufError> {
@@ -1278,9 +1384,20 @@ impl<'a> Cursor<'a> {
 
     fn read_metadata_value(&mut self) -> Result<MetadataValue, GgufError> {
         let kind = self.read_u32()?;
-        self.read_metadata_value_of_kind(kind)
+        self.read_metadata_value_of_kind(kind, 0)
     }
-    fn read_metadata_value_of_kind(&mut self, kind: u32) -> Result<MetadataValue, GgufError> {
+    fn read_metadata_value_of_kind(
+        &mut self,
+        kind: u32,
+        depth: u32,
+    ) -> Result<MetadataValue, GgufError> {
+        // Hardening (F3): cap array-of-array nesting. GGUF does not use
+        // nested arrays in practice, but the recursion is otherwise
+        // unbounded on a file-controlled depth → stack-overflow DoS.
+        const MAX_NESTING: u32 = 8;
+        if depth > MAX_NESTING {
+            return Err(GgufError::MetadataNestingTooDeep);
+        }
         Ok(match kind {
             0 => MetadataValue::U8(self.read_u8()?),
             1 => MetadataValue::I8(self.read_i8()?),
@@ -1296,7 +1413,7 @@ impl<'a> Cursor<'a> {
                 let len = self.read_u64()? as usize;
                 let mut v = Vec::with_capacity(len.min(1024));
                 for _ in 0..len {
-                    v.push(self.read_metadata_value_of_kind(inner_kind)?);
+                    v.push(self.read_metadata_value_of_kind(inner_kind, depth + 1)?);
                 }
                 MetadataValue::Array(v)
             }
@@ -1503,5 +1620,115 @@ mod tests {
 
         // Non-bool element returns None — defensive.
         assert!(MetadataValue::U32(5).as_bool().is_none());
+    }
+
+    // ---- Hardening regression tests (Security-Audit F1-F4) ----
+    // These build malformed GGUF byte streams *in memory* and assert that
+    // `parse_inner` returns a clean `Err` instead of panicking / OOM /
+    // SIGSEGV. No temp files on disk; `parse_inner` takes `&[u8]` exactly so
+    // these guards are exercisable without an mmap.
+
+    fn header(tensor_count: u64, kv_count: u64) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        b.extend_from_slice(&3u32.to_le_bytes()); // version 3
+        b.extend_from_slice(&tensor_count.to_le_bytes());
+        b.extend_from_slice(&kv_count.to_le_bytes());
+        b
+    }
+    fn push_str_kv(b: &mut Vec<u8>, s: &str) {
+        b.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        b.extend_from_slice(s.as_bytes());
+    }
+    /// One u32 metadata entry: key + type(4=U32) + value.
+    fn push_u32_meta(b: &mut Vec<u8>, key: &str, val: u32) {
+        push_str_kv(b, key);
+        b.extend_from_slice(&4u32.to_le_bytes()); // GGUF metadata type 4 = U32
+        b.extend_from_slice(&val.to_le_bytes());
+    }
+    fn push_tensor(b: &mut Vec<u8>, name: &str, dims: &[u64], ggml_type: u32, data_offset: u64) {
+        push_str_kv(b, name);
+        b.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+        for d in dims {
+            b.extend_from_slice(&d.to_le_bytes());
+        }
+        b.extend_from_slice(&ggml_type.to_le_bytes());
+        b.extend_from_slice(&data_offset.to_le_bytes());
+    }
+
+    /// F2: a 24-byte file declaring `tensor_count = u64::MAX` must NOT OOM /
+    /// panic on `with_capacity` — it must return a clean Err (EOF on the
+    /// first tensor name read).
+    #[test]
+    fn f2_huge_tensor_count_is_err_not_oom() {
+        let bytes = header(u64::MAX, 0);
+        let r = GgufFile::parse_inner(&bytes);
+        assert!(r.is_err(), "huge tensor_count must Err, got Ok");
+    }
+
+    /// F2: a tensor declaring `n_dims = u32::MAX` must NOT reserve a multi-GB
+    /// Vec — clean Err (EOF reading the first dimension).
+    #[test]
+    fn f2_huge_n_dims_is_err_not_oom() {
+        let mut b = header(1, 0);
+        push_str_kv(&mut b, "t"); // tensor name
+        b.extend_from_slice(&u32::MAX.to_le_bytes()); // n_dims = u32::MAX, no dim data
+        let r = GgufFile::parse_inner(&b);
+        assert!(r.is_err(), "huge n_dims must Err, got Ok");
+    }
+
+    /// F1: a tensor whose data range exceeds the file length → TensorOutOfBounds.
+    #[test]
+    fn f1_tensor_offset_past_eof_is_err() {
+        let mut b = header(1, 0);
+        // dims=[1_000_000] F32 → byte_size 4 MB, but the file is ~40 bytes.
+        push_tensor(&mut b, "t", &[1_000_000], 0 /*F32*/, 0);
+        let r = GgufFile::parse_inner(&b);
+        assert!(matches!(r, Err(GgufError::TensorOutOfBounds(_))),
+            "out-of-bounds tensor must be TensorOutOfBounds, got {r:?}");
+    }
+
+    /// F1: a dims product that overflows u64 → TensorOutOfBounds (checked_mul),
+    /// not a wrapped small size that slices wrong data.
+    #[test]
+    fn f1_dims_product_overflow_is_err() {
+        let mut b = header(1, 0);
+        push_tensor(&mut b, "t", &[u64::MAX, 2], 0 /*F32*/, 0);
+        let r = GgufFile::parse_inner(&b);
+        assert!(matches!(r, Err(GgufError::TensorOutOfBounds(_))),
+            "overflowing dims must be TensorOutOfBounds, got {r:?}");
+    }
+
+    /// F4: alignment 0 and non-power-of-two are rejected at parse time.
+    #[test]
+    fn f4_invalid_alignment_is_err() {
+        for bad in [0u32, 3, 7, 100] {
+            let mut b = header(0, 1);
+            push_u32_meta(&mut b, "general.alignment", bad);
+            let r = GgufFile::parse_inner(&b);
+            assert!(matches!(r, Err(GgufError::InvalidAlignment(_))),
+                "alignment {bad} must be InvalidAlignment, got {r:?}");
+        }
+        // Sanity: a valid power-of-two alignment with 0 tensors parses OK.
+        let mut ok = header(0, 1);
+        push_u32_meta(&mut ok, "general.alignment", 64);
+        assert!(GgufFile::parse_inner(&ok).is_ok(), "valid alignment must parse");
+    }
+
+    /// F3: deeply nested metadata arrays hit the recursion cap → Err, not a
+    /// stack overflow.
+    #[test]
+    fn f3_nested_array_recursion_is_capped() {
+        let mut b = header(0, 1);
+        push_str_kv(&mut b, "x"); // metadata key
+        b.extend_from_slice(&9u32.to_le_bytes()); // value type 9 = Array
+        // 12 levels of [inner_kind=9(Array), len=1] — exceeds MAX_NESTING(8).
+        for _ in 0..12 {
+            b.extend_from_slice(&9u32.to_le_bytes()); // inner_kind = Array
+            b.extend_from_slice(&1u64.to_le_bytes()); // len = 1
+        }
+        let r = GgufFile::parse_inner(&b);
+        assert!(matches!(r, Err(GgufError::MetadataNestingTooDeep)),
+            "deep nesting must be MetadataNestingTooDeep, got {r:?}");
     }
 }
