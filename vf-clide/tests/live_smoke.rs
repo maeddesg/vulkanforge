@@ -16,15 +16,15 @@ async fn live_stream_roundtrip() {
     let client = Client::new(url, model);
 
     let mut streamed = String::new();
-    let full = client
+    let out = client
         .chat_stream(vec![ChatMessage::user("Reply with exactly one word: PONG")], |t| {
             streamed.push_str(t)
         })
         .await
         .expect("stream request should succeed against a live server");
 
-    assert!(!full.is_empty(), "streamed answer must be non-empty");
-    assert_eq!(full, streamed, "per-token callback must reconstruct the full answer");
+    assert!(!out.text.is_empty(), "streamed answer must be non-empty");
+    assert_eq!(out.text, streamed, "per-token callback must reconstruct the full answer");
 }
 
 /// Demonstrates the REPL's core mechanism — in-memory multi-turn history
@@ -45,13 +45,13 @@ async fn live_multiturn_history() {
     // NOTE: the REPL stores `strip_think(reply)`; for thinking models the
     // exact history bytes are a greedy knife-edge (trimming whitespace can
     // flip turn 2 into a think-only, empty-visible answer). See the report.
-    history.push(ChatMessage::assistant(a1.clone()));
+    history.push(ChatMessage::assistant(a1.text.clone()));
 
     history.push(ChatMessage::user(
         "What number did I ask you to remember? Reply with just the number.",
     ));
     let a2 = client.chat_once(history.clone()).await.expect("turn 2");
-    assert!(a2.contains("42"), "multi-turn history must carry the fact; got: {a2:?}");
+    assert!(a2.text.contains("42"), "multi-turn history must carry the fact; got: {:?}", a2.text);
 }
 
 #[tokio::test]
@@ -61,9 +61,9 @@ async fn live_non_streaming_roundtrip() {
     let model = std::env::var("VF_CLIDE_MODEL").unwrap_or_else(|_| "x".into());
     let client = Client::new(url, model);
 
-    let text = client
+    let out = client
         .chat_once(vec![ChatMessage::user("Reply with exactly one word: PONG")])
         .await
         .expect("non-streaming request should succeed against a live server");
-    assert!(!text.is_empty(), "answer must be non-empty");
+    assert!(!out.text.is_empty(), "answer must be non-empty");
 }

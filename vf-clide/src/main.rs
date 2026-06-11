@@ -36,6 +36,16 @@ struct Args {
     #[arg(long, default_value_t = 0.0)]
     temperature: f32,
 
+    /// Max generated tokens. Default is generous so thinking models have
+    /// room for the `<think>` block AND a complete answer.
+    #[arg(long, default_value_t = 2048)]
+    max_tokens: u32,
+
+    /// Disable thinking: append the `/no_think` directive to the prompt
+    /// (Qwen3 convention) so the budget goes to the answer, not reasoning.
+    #[arg(long)]
+    no_think: bool,
+
     /// Project name — memory seam. Phase 1 parses and threads it through
     /// but it is a no-op (see `memory::NoopMemory`).
     #[arg(long)]
@@ -47,11 +57,13 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let mut client = Client::new(&args.url, &args.model);
     client.temperature = Some(args.temperature);
+    client.max_tokens = Some(args.max_tokens);
 
     match args.prompt {
-        Some(prompt) => run_headless(client, prompt, args.no_stream, args.project).await,
+        Some(prompt) => run_headless(client, prompt, args.no_stream, args.no_think, args.project).await,
         None => {
-            let mut repl = Repl::new(client, Box::new(NoopMemory), args.project);
+            let mut repl =
+                Repl::new(client, Box::new(NoopMemory), args.project).with_no_think(args.no_think);
             repl.run().await
         }
     }
@@ -61,8 +73,11 @@ async fn run_headless(
     client: Client,
     prompt: String,
     no_stream: bool,
+    no_think: bool,
     project: Option<String>,
 ) -> Result<()> {
+    use vf_clide::client::{empty_notice, truncation_notice};
+
     // Single point where the (no-op) memory seam is consulted, mirroring
     // the REPL path.
     let memory = NoopMemory;
@@ -70,21 +85,34 @@ async fn run_headless(
     if let Some(ctx) = memory.context_for(project.as_deref(), &[]) {
         msgs.push(ChatMessage::system(ctx));
     }
-    msgs.push(ChatMessage::user(prompt));
+    // `/no_think` is a model directive in the message content (Qwen3), not
+    // a CLI/slash command.
+    let content = if no_think { format!("{prompt} /no_think") } else { prompt };
+    msgs.push(ChatMessage::user(content));
 
-    if no_stream {
-        let text = client.chat_once(msgs).await?;
-        println!("{text}");
+    let max_tokens = client.max_tokens;
+    let outcome = if no_stream {
+        let o = client.chat_once(msgs).await?;
+        println!("{}", o.text);
+        o
     } else {
         use std::io::Write;
         let mut stdout = std::io::stdout();
-        client
+        let o = client
             .chat_stream(msgs, |t| {
                 print!("{t}");
                 let _ = stdout.flush();
             })
             .await?;
         println!();
+        o
+    };
+
+    // Make truncation / empty answers visible instead of silent.
+    if let Some(m) = empty_notice(&outcome.text) {
+        eprintln!("{m}");
+    } else if let Some(m) = truncation_notice(outcome.finish_reason.as_deref(), max_tokens) {
+        eprintln!("{m}");
     }
     Ok(())
 }

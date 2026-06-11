@@ -8,7 +8,7 @@ use std::io::Write;
 
 use rustyline::DefaultEditor;
 
-use crate::client::{Client, Result};
+use crate::client::{empty_notice, truncation_notice, Client, Result};
 use crate::memory::Memory;
 use crate::types::{strip_think, ChatMessage};
 
@@ -19,6 +19,11 @@ pub enum Command {
     Quit,
     Clear,
     Model(String),
+    /// `/think` (true → thinking on) / `/no-think` (false → off). Note:
+    /// `/no-think` is the REPL toggle; the model directive `/no_think`
+    /// (underscore) is appended to message *content*, never parsed here.
+    Think(bool),
+    MaxTokens(u32),
     /// A `/`-line that isn't a known command (or a malformed one). The
     /// string is a human-readable hint; the REPL prints it and does not
     /// send the line to the model.
@@ -42,6 +47,12 @@ pub fn parse_command(line: &str) -> Option<Command> {
             Some(m) => Command::Model(m),
             None => Command::Unknown("usage: /model <name>".into()),
         },
+        "/think" => Command::Think(true),
+        "/no-think" => Command::Think(false),
+        "/max-tokens" => match arg.and_then(|a| a.parse::<u32>().ok()) {
+            Some(n) if n > 0 => Command::MaxTokens(n),
+            _ => Command::Unknown("usage: /max-tokens <N>".into()),
+        },
         other => Command::Unknown(format!("unknown command: {other}")),
     })
 }
@@ -53,30 +64,46 @@ pub struct Repl {
     memory: Box<dyn Memory>,
     project: Option<String>,
     history: Vec<ChatMessage>,
+    /// When true, append the `/no_think` directive to each new user turn
+    /// so thinking models skip the `<think>` block (Qwen3 convention).
+    no_think: bool,
 }
 
 impl Repl {
     pub fn new(client: Client, memory: Box<dyn Memory>, project: Option<String>) -> Self {
-        Self { client, memory, project, history: Vec::new() }
+        Self { client, memory, project, history: Vec::new(), no_think: false }
+    }
+
+    /// Start with thinking disabled (`--no-think`).
+    pub fn with_no_think(mut self, no_think: bool) -> Self {
+        self.no_think = no_think;
+        self
     }
 
     /// Build the message list for one turn: optional memory context
     /// (no-op in Phase 1) + prior history + the new user input. This is
-    /// the single point where the memory seam is consulted.
+    /// the single point where the memory seam is consulted. When
+    /// `no_think` is set, the `/no_think` directive is appended to the
+    /// new user content (NOT a slash-command — it belongs in the message).
     pub fn build_messages(&self, user_input: &str) -> Vec<ChatMessage> {
         let mut msgs = Vec::with_capacity(self.history.len() + 2);
         if let Some(ctx) = self.memory.context_for(self.project.as_deref(), &self.history) {
             msgs.push(ChatMessage::system(ctx));
         }
         msgs.extend(self.history.iter().cloned());
-        msgs.push(ChatMessage::user(user_input));
+        let content = if self.no_think {
+            format!("{user_input} /no_think")
+        } else {
+            user_input.to_string()
+        };
+        msgs.push(ChatMessage::user(content));
         msgs
     }
 
     pub async fn run(&mut self) -> Result<()> {
         let mut rl = DefaultEditor::new().map_err(|e| format!("readline init: {e}"))?;
         println!(
-            "vf-clide — model: {} · commands: /quit /clear /model <name>",
+            "vf-clide — model: {} · commands: /quit /clear /model <name> /max-tokens <N> /think /no-think",
             self.client.model
         );
         loop {
@@ -101,6 +128,14 @@ impl Repl {
                         self.client.model = m.clone();
                         println!("(model → {m})");
                     }
+                    Command::Think(on) => {
+                        self.no_think = !on;
+                        println!("(thinking {})", if on { "on" } else { "off (/no_think appended)" });
+                    }
+                    Command::MaxTokens(n) => {
+                        self.client.max_tokens = Some(n);
+                        println!("(max-tokens → {n})");
+                    }
                     Command::Unknown(hint) => println!("({hint})"),
                 }
                 continue;
@@ -118,11 +153,20 @@ impl Repl {
                 .await;
             println!();
             match result {
-                Ok(text) => {
-                    // Store the turn. Strip prior-turn <think> from the
-                    // assistant reply so it doesn't bloat later context.
+                Ok(o) => {
+                    // Surface empty / truncated answers (instead of a
+                    // silent blank line or a cut-off sentence).
+                    if let Some(m) = empty_notice(&o.text) {
+                        eprintln!("{m}");
+                    } else if let Some(m) =
+                        truncation_notice(o.finish_reason.as_deref(), self.client.max_tokens)
+                    {
+                        eprintln!("{m}");
+                    }
+                    // Store the turn (raw user line; /no_think is re-applied
+                    // per-turn by build_messages). Strip prior-turn <think>.
                     self.history.push(ChatMessage::user(line));
-                    self.history.push(ChatMessage::assistant(strip_think(&text)));
+                    self.history.push(ChatMessage::assistant(strip_think(&o.text)));
                 }
                 Err(e) => eprintln!("error: {e}"),
             }
@@ -150,6 +194,27 @@ mod tests {
         assert_eq!(msgs[0], ChatMessage::user("turn1"));
         assert_eq!(msgs[1], ChatMessage::assistant("ans1"));
         assert_eq!(msgs[2], ChatMessage::user("turn2"));
+    }
+
+    #[test]
+    fn no_think_appends_directive_to_content() {
+        let client = Client::new("http://localhost:0", "m");
+        let repl = Repl::new(client, Box::new(NoopMemory), None).with_no_think(true);
+        let msgs = repl.build_messages("explain mutex");
+        assert_eq!(msgs.last().unwrap().content, "explain mutex /no_think");
+        // ...and NOT when thinking is on.
+        let client2 = Client::new("http://localhost:0", "m");
+        let repl2 = Repl::new(client2, Box::new(NoopMemory), None);
+        assert_eq!(repl2.build_messages("explain mutex").last().unwrap().content, "explain mutex");
+    }
+
+    #[test]
+    fn think_and_max_tokens_commands() {
+        assert_eq!(parse_command("/think"), Some(Command::Think(true)));
+        assert_eq!(parse_command("/no-think"), Some(Command::Think(false)));
+        assert_eq!(parse_command("/max-tokens 4096"), Some(Command::MaxTokens(4096)));
+        assert!(matches!(parse_command("/max-tokens"), Some(Command::Unknown(_))));
+        assert!(matches!(parse_command("/max-tokens abc"), Some(Command::Unknown(_))));
     }
 
     #[test]
