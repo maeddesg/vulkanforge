@@ -307,8 +307,10 @@ pub enum Role {
     System,
     User,
     Assistant,
-    /// Parsed for forward compatibility, rejected by the handler in
-    /// v0.4. Spec §8.1 (`unsupported_role`).
+    /// Tool-result role. The handler renders it into the prompt as a
+    /// Qwen3 `<tool_response>` user turn (multi-turn tool-calling round-trip);
+    /// `tool_call_id` echoes the answered call. (Earlier v0.4 rejected it;
+    /// the tool-calling path now consumes it.)
     Tool,
 }
 
@@ -401,7 +403,8 @@ mod tests {
 
     #[test]
     fn tool_role_parses_but_is_distinguishable() {
-        // The handler will reject Tool later; parser must accept it.
+        // Parser must accept the Tool role; the handler renders it as a
+        // `<tool_response>` turn for multi-turn tool-calling.
         let json = r#"{"model":"x","messages":[
             {"role": "tool", "content": "tool output"}
         ]}"#;
