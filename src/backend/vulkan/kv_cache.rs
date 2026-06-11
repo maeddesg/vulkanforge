@@ -129,9 +129,10 @@ fn guard_kv_precision_inner(
         return Ok(());
     }
     let msg = format!(
-        "gemma-4-MoE (26B) requires VULKANFORGE_KV_FP8=1 — {} KV is known-broken for this model \
-         (Layer-0 attention NaN → garbage output). Set VULKANFORGE_KV_FP8=1, or \
-         VULKANFORGE_ALLOW_BROKEN_KV=1 to force.",
+        "gemma-4-MoE (26B) requires VULKANFORGE_KV_FP8=1 — non-FP8 KV (here: {}; both F16 and F32 \
+         are affected) is known-broken for this model (Layer-0 attention NaN → garbage output); \
+         only FP8 (E4M3) KV is correct. Set VULKANFORGE_KV_FP8=1, or VULKANFORGE_ALLOW_BROKEN_KV=1 \
+         to force.",
         kv_dtype.label()
     );
     if force {
@@ -174,7 +175,9 @@ pub struct KvCache {
     pub config: KvCacheConfig,
     pub current_seq_len: u32,
     /// v0.2 Sprint 9d.1 — element type chosen at allocation time.
-    /// Defaults to `F32`; `VULKANFORGE_FP16_KV=1` flips to `F16`.
+    /// Effective default is **F16** (`kv_dtype_from_env`):
+    /// `VULKANFORGE_FP16_KV=0` opts out to F32; `VULKANFORGE_KV_FP8=1`
+    /// selects F8 (E4M3).
     pub kv_dtype: KvDtype,
     /// Sprint 43D-1 — cumulative byte-offset table for heterogeneous
     /// per-layer head_dim. `layer_byte_offsets[i]` is the start of
