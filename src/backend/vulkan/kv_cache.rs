@@ -96,6 +96,55 @@ fn kv_dtype_from_env() -> KvDtype {
     }
 }
 
+/// Fail-loud guard for the known-broken **non-FP8 KV-cache path of the
+/// gemma-4-MoE (26B-A4B)** attention. With F32/F16 KV this model produces a
+/// Layer-0 attention NaN → garbage `<pad>` output (latent VF bug, version-
+/// invariant; root cause in `results/gemma_nan_release_bisect.md`). Only FP8
+/// (E4M3) KV is correct for it — the canonical mandatory KV mode at 26B.
+///
+/// Scope is deliberately narrow: **only gemma-4-MoE**. Dense models *and*
+/// qwen35 run F32/F16 KV correctly (verified blast-radius) and are NOT
+/// guarded. The caller derives `is_gemma4_moe` from the parsed config as
+/// `config.gemma4.as_ref().map_or(false, |g| g.enable_moe_block)` — gemma-4
+/// arch AND `expert_count > 0` (excludes E2B, which has no experts).
+///
+/// Default: hard `Err` (no silent NaN). Escape hatch
+/// `VULKANFORGE_ALLOW_BROKEN_KV=1` → loud warning + proceed (for the eventual
+/// numerical fix work on the F32/F16-KV path).
+pub fn guard_kv_precision(is_gemma4_moe: bool, kv_dtype: KvDtype) -> Result<(), String> {
+    let force = std::env::var("VULKANFORGE_ALLOW_BROKEN_KV")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    guard_kv_precision_inner(is_gemma4_moe, kv_dtype, force)
+}
+
+/// Pure core of [`guard_kv_precision`] — `force` injected so the override
+/// path is unit-testable without mutating process env (avoids test races).
+fn guard_kv_precision_inner(
+    is_gemma4_moe: bool,
+    kv_dtype: KvDtype,
+    force: bool,
+) -> Result<(), String> {
+    if !is_gemma4_moe || kv_dtype == KvDtype::F8 {
+        return Ok(());
+    }
+    let msg = format!(
+        "gemma-4-MoE (26B) requires VULKANFORGE_KV_FP8=1 — {} KV is known-broken for this model \
+         (Layer-0 attention NaN → garbage output). Set VULKANFORGE_KV_FP8=1, or \
+         VULKANFORGE_ALLOW_BROKEN_KV=1 to force.",
+        kv_dtype.label()
+    );
+    if force {
+        eprintln!("VulkanForge: ⚠️  {msg}");
+        eprintln!(
+            "VulkanForge: ⚠️  proceeding anyway (VULKANFORGE_ALLOW_BROKEN_KV=1) — output will be invalid."
+        );
+        Ok(())
+    } else {
+        Err(msg)
+    }
+}
+
 pub struct KvCacheConfig {
     pub n_layers: u32,
     pub n_kv_heads: u32,
@@ -462,5 +511,48 @@ mod tests {
         // FP16: 288 MB.
         let f16_total = 2 * f16_layer_bytes * n_layers;
         assert_eq!(f16_total, 288 * 1024 * 1024);
+    }
+
+    // ---- Sprint [kv-guard]: fail-loud guard for non-FP8 KV @ gemma-4-MoE ----
+    // Pure tests on `guard_kv_precision_inner` (force injected; no env mutation).
+
+    /// gemma-4-MoE + non-FP8 KV (F32 and F16) → hard Err with an actionable
+    /// message naming the required env var.
+    #[test]
+    fn guard_gemma4_moe_nonfp8_kv_is_err() {
+        for kv in [KvDtype::F32, KvDtype::F16] {
+            let r = guard_kv_precision_inner(true, kv, false);
+            assert!(r.is_err(), "{kv:?} KV on gemma-4-MoE must Err");
+            assert!(
+                r.unwrap_err().contains("VULKANFORGE_KV_FP8=1"),
+                "message must name the fix env var"
+            );
+        }
+    }
+
+    /// gemma-4-MoE + FP8 KV → no false positive (loads normally).
+    #[test]
+    fn guard_gemma4_moe_fp8_kv_is_ok() {
+        assert!(guard_kv_precision_inner(true, KvDtype::F8, false).is_ok());
+    }
+
+    /// Non-gemma-4-MoE (dense / qwen35) + non-FP8 KV → guard must NOT fire
+    /// (these run F32/F16 KV correctly per the blast-radius).
+    #[test]
+    fn guard_non_gemma4_moe_nonfp8_kv_is_ok() {
+        for kv in [KvDtype::F32, KvDtype::F16, KvDtype::F8] {
+            assert!(
+                guard_kv_precision_inner(false, kv, false).is_ok(),
+                "dense/qwen35 ({kv:?}) must not be guarded"
+            );
+        }
+    }
+
+    /// Override (`VULKANFORGE_ALLOW_BROKEN_KV=1` → force=true) → warning, not
+    /// Err, even for gemma-4-MoE + non-FP8.
+    #[test]
+    fn guard_override_forces_ok() {
+        assert!(guard_kv_precision_inner(true, KvDtype::F32, true).is_ok());
+        assert!(guard_kv_precision_inner(true, KvDtype::F16, true).is_ok());
     }
 }

@@ -16,7 +16,7 @@ use gpu_allocator::vulkan::Allocator;
 use super::super::buffers::GpuBuffer;
 use super::super::device::VulkanDevice;
 use super::super::gguf::ModelConfig;
-use super::super::kv_cache::KvCache;
+use super::super::kv_cache::{guard_kv_precision, KvCache};
 use super::super::pipeline::{
     Fp8BlockwiseGemmPushConstants, Fp8BlockwiseGemvPushConstants, MatVecPushConstants,
 };
@@ -91,6 +91,16 @@ impl Forward {
         // the "after-weights" baseline and warn if free < 1 GiB.
         // No-op when sysfs isn't readable (different distro,
         // dGPU not AMD, etc.).
+
+        // Sprint [kv-guard] — fail loud (not silent NaN) when a gemma-4-MoE
+        // (26B-A4B) is loaded with a non-FP8 KV cache: the F32/F16-KV path of
+        // its attention is known-broken (Layer-0 NaN, see
+        // results/gemma_nan_release_bisect.md). Narrow scope: only gemma-4-MoE
+        // (dense + qwen35 run non-FP8 KV correctly). Default aborts;
+        // VULKANFORGE_ALLOW_BROKEN_KV=1 downgrades to a warning.
+        let is_gemma4_moe = config.gemma4.as_ref().map_or(false, |g| g.enable_moe_block);
+        guard_kv_precision(is_gemma4_moe, kv_cache.kv_dtype)?;
+
         Self::print_vram_budget(dev);
         let device = &dev.device;
         let mut mk_storage = |size: u64, location: MemoryLocation, name: &str| {
