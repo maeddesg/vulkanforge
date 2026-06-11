@@ -36,7 +36,14 @@ use axum::response::{IntoResponse, Json, Response};
 use tokio::sync::mpsc;
 use tokio::sync::OwnedSemaphorePermit;
 
-use crate::backend::vulkan::chat_template::{HistoryRole, RenderMessage};
+use crate::backend::vulkan::chat_template::{ChatTemplate, HistoryRole, RenderMessage};
+
+/// True when the model uses the gemma-4 chat template — selects the
+/// gemma-native (permissive) tool parser + the `<tool_call|>` runaway
+/// stop. Any non-gemma model keeps the byte-identical Qwen/Hermes path.
+fn is_gemma_template(t: ChatTemplate) -> bool {
+    matches!(t, ChatTemplate::Gemma4 | ChatTemplate::Gemma4WithThoughtChannel)
+}
 use crate::backend::vulkan::decode::{GenerateConfig, Sampling, ThinkFilter};
 use crate::server::cancel::CancelToken;
 use crate::server::error::ApiError;
@@ -446,7 +453,13 @@ fn process_request(
     req: NormalisedRequest,
 ) -> Result<ChatCompletionResponse, ApiError> {
     let reuse = crate::server::state::kv_prefix_reuse_enabled();
-    let (prefill_tokens, cfg_g, _max_tokens) = prepare_generate(session, &req, None)?;
+    // gemma tool path: stop the `<|tool_response>` runaway by flipping a
+    // cancel flag when the model emits `<tool_call|>`. Non-gemma (or
+    // no-tools) → `None`, so the path stays byte-identical.
+    let gemma_tools = req.tools_active && is_gemma_template(session.template);
+    let tool_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+        gemma_tools.then(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    let (prefill_tokens, cfg_g, _max_tokens) = prepare_generate(session, &req, tool_stop.clone())?;
     let max_seq = session.chat.forward.kv_cache.config.max_seq_len;
 
     // Set up an incremental ThinkFilter so the visible/raw split
@@ -458,9 +471,17 @@ fn process_request(
     } else {
         None
     };
+    let tool_stop_cb = tool_stop;
+    let mut tool_watch = String::new();
     let mut on_token = move |_id: u32, raw: &str| {
         if let Some(f) = filter.as_mut() {
             let _visible = f.push(raw);
+        }
+        if let Some(flag) = tool_stop_cb.as_ref() {
+            tool_watch.push_str(raw);
+            if tool_watch.contains(crate::server::tools::GEMMA_TOOL_CALL_END) {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
         }
     };
 
@@ -485,7 +506,11 @@ fn process_request(
     // visible text passes through unchanged (a stray `<tool_call>` in a
     // no-tools chat stays as content).
     let (message, finish_reason) = if req.tools_active {
-        let (content, calls) = crate::server::tools::parse_tool_calls(&result.visible_text);
+        let (content, calls) = if gemma_tools {
+            crate::server::tools::parse_tool_calls_gemma(&result.visible_text)
+        } else {
+            crate::server::tools::parse_tool_calls(&result.visible_text)
+        };
         if calls.is_empty() {
             (AssistantMessage::new(content.unwrap_or_default()), plain_finish)
         } else {
@@ -634,6 +659,7 @@ fn run_streaming_generation(
     // delta rather than leaking out as content. Without tools we stream
     // token deltas live exactly as before.
     let tools_active = req.tools_active;
+    let gemma_tools = tools_active && is_gemma_template(session.template);
     let buf = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
     let buf_cb = buf.clone();
     let tx_for_cb = tx.clone();
@@ -655,6 +681,13 @@ fn run_streaming_generation(
         }
         if tools_active {
             buf_cb.borrow_mut().push_str(&visible_owned);
+            // gemma runaway stop: once the call terminator is buffered,
+            // cancel so the decode loop halts within ~1 token.
+            if gemma_tools
+                && buf_cb.borrow().contains(crate::server::tools::GEMMA_TOOL_CALL_END)
+            {
+                cancel_for_cb.cancel();
+            }
             return;
         }
         if tx_for_cb
@@ -681,7 +714,11 @@ fn run_streaming_generation(
         Ok(g) if tools_active => {
             // Parse the buffered output → leading text + tool calls.
             let text = buf.borrow().clone();
-            let (content, calls) = crate::server::tools::parse_tool_calls(&text);
+            let (content, calls) = if gemma_tools {
+                crate::server::tools::parse_tool_calls_gemma(&text)
+            } else {
+                crate::server::tools::parse_tool_calls(&text)
+            };
             if let Some(c) = content {
                 if !c.is_empty() {
                     let _ = tx.blocking_send(StreamEvent::Delta(c));

@@ -157,6 +157,147 @@ fn short_id(idx: usize) -> String {
     format!("{}{idx}", &u[..u.len().min(20)])
 }
 
+// =====================================================================
+// Gemma-4 tool format (Sprint gemma-tool-layer)
+// =====================================================================
+//
+// Authoritative format, extracted from the gemma-4-26B GGUF
+// `tokenizer.chat_template` (NOT guessed):
+//   call:   <|tool_call>call:NAME{key:value,…}<tool_call|>
+//   args:   non-JSON `key:value` pairs; strings are `"…"` (the `<|"|>`
+//           quote special-token detokenises to `"`).
+// The `<tool_call|>` terminator is also the runaway-stop marker the
+// server watches for (the gemma tool tokens are not in the EOG set).
+
+/// The gemma-4 tool-call terminator. The server adds this as a
+/// string-level stop (via the cancel flag) when a gemma model has tools
+/// active, killing the `<|tool_response>`-repetition runaway.
+pub const GEMMA_TOOL_CALL_END: &str = "<tool_call|>";
+
+/// **Permissive** gemma tool-call parser. Recognises BOTH the gemma-4
+/// native form (`<|tool_call>call:NAME{k:v}<tool_call|>`, emitted by
+/// gemma-QAT) AND the Qwen/Hermes `<tool_call>{json}</tool_call>` form
+/// (emitted by gemma-Q3, which follows the in-prompt instruction). Both
+/// normalise to the same OpenAI `tool_calls` output. Robust: multiple
+/// calls, text+call mix, malformed args, unterminated block — never panics.
+pub fn parse_tool_calls_gemma(text: &str) -> (Option<String>, Vec<ToolCall>) {
+    // 1) Extract gemma-native `<|tool_call>…<tool_call|>` blocks first
+    //    (their delimiters don't overlap the Qwen `<tool_call>` literal).
+    let (residual, mut calls) = parse_gemma_native(text);
+    // 2) Run the Qwen parser on what's left (gemma-Q3 fallback path).
+    let (content, qwen_calls) = parse_tool_calls(&residual);
+    calls.extend(qwen_calls);
+    (content, calls)
+}
+
+fn parse_gemma_native(text: &str) -> (String, Vec<ToolCall>) {
+    const OPEN: &str = "<|tool_call>";
+    const CLOSE: &str = "<tool_call|>";
+    let mut residual = String::new();
+    let mut calls = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find(OPEN) {
+        residual.push_str(&rest[..open]);
+        let after = &rest[open + OPEN.len()..];
+        let (inner, next) = match after.find(CLOSE) {
+            Some(c) => (&after[..c], &after[c + CLOSE.len()..]),
+            None => (after, ""), // unterminated (max_tokens / cancel mid-call)
+        };
+        if let Some(tc) = parse_gemma_one(inner.trim(), calls.len()) {
+            calls.push(tc);
+        }
+        rest = next;
+    }
+    residual.push_str(rest);
+    (residual, calls)
+}
+
+/// Parse one gemma block inner (`call:NAME{key:value,…}`) → [`ToolCall`].
+fn parse_gemma_one(inner: &str, idx: usize) -> Option<ToolCall> {
+    let inner = inner.strip_prefix("call:").unwrap_or(inner).trim();
+    let brace = inner.find('{')?;
+    let name = inner[..brace].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let args_part = &inner[brace + 1..];
+    // Take everything up to the last `}` as the argument body.
+    let args = args_part.rfind('}').map(|e| &args_part[..e]).unwrap_or(args_part);
+    let arguments = gemma_args_to_json(args);
+    Some(ToolCall::new(format!("call_{}", short_id(idx)), name, arguments))
+}
+
+/// Convert gemma's non-JSON `key:value,key:value` argument body into a
+/// JSON object string (OpenAI `arguments` convention).
+fn gemma_args_to_json(args: &str) -> String {
+    let mut obj = serde_json::Map::new();
+    for pair in split_top_level_commas(args) {
+        if let Some((k, v)) = pair.split_once(':') {
+            let key = k.trim().trim_matches('"').to_string();
+            if key.is_empty() {
+                continue;
+            }
+            obj.insert(key, parse_gemma_value(v.trim()));
+        }
+    }
+    serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn parse_gemma_value(v: &str) -> serde_json::Value {
+    let v = v.trim();
+    if v.len() >= 2 && v.starts_with('"') && v.ends_with('"') {
+        return serde_json::Value::String(v[1..v.len() - 1].to_string());
+    }
+    match v {
+        "true" => return serde_json::Value::Bool(true),
+        "false" => return serde_json::Value::Bool(false),
+        "null" => return serde_json::Value::Null,
+        _ => {}
+    }
+    if let Ok(n) = v.parse::<i64>() {
+        return serde_json::Value::from(n);
+    }
+    if let Ok(f) = v.parse::<f64>() {
+        return serde_json::json!(f);
+    }
+    // Try as embedded JSON (nested object/array); else raw string.
+    if let Ok(j) = serde_json::from_str::<serde_json::Value>(v) {
+        return j;
+    }
+    serde_json::Value::String(v.to_string())
+}
+
+/// Split on top-level commas, ignoring commas inside quotes or nested
+/// `{}` / `[]`.
+fn split_top_level_commas(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut in_q = false;
+    let mut cur = String::new();
+    for c in s.chars() {
+        match c {
+            '"' => {
+                in_q = !in_q;
+                cur.push(c);
+            }
+            '{' | '[' if !in_q => {
+                depth += 1;
+                cur.push(c);
+            }
+            '}' | ']' if !in_q => {
+                depth -= 1;
+                cur.push(c);
+            }
+            ',' if !in_q && depth == 0 => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +383,86 @@ mod tests {
         assert!(s.contains("</tools>"));
         assert!(s.contains("get_weather"));
         assert!(s.contains("<tool_call>"));
+    }
+
+    // ---- Gemma permissive parser (gemma-native + Qwen fallback) ----
+
+    #[test]
+    fn gemma_native_single_call() {
+        let (content, calls) = parse_tool_calls_gemma(
+            "<|tool_call>call:get_weather{location: \"Tokyo\"}<tool_call|>",
+        );
+        assert!(content.is_none());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[0].function.arguments, "{\"location\":\"Tokyo\"}");
+        assert!(calls[0].id.starts_with("call_"));
+    }
+
+    #[test]
+    fn gemma_native_two_args_and_types() {
+        let (_c, calls) = parse_tool_calls_gemma(
+            "<|tool_call>call:search_files{directory: \"src\", pattern: \"*.rs\"}<tool_call|>",
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "search_files");
+        let v: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(v["directory"], "src");
+        assert_eq!(v["pattern"], "*.rs");
+    }
+
+    #[test]
+    fn gemma_numeric_and_bool_args() {
+        let (_c, calls) = parse_tool_calls_gemma("<|tool_call>call:f{n: 42, flag: true}<tool_call|>");
+        let v: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(v["n"], 42);
+        assert_eq!(v["flag"], true);
+    }
+
+    #[test]
+    fn gemma_qwen_fallback_still_parses() {
+        // gemma-Q3 follows the in-prompt Qwen instruction → must still parse.
+        let (content, calls) = parse_tool_calls_gemma(
+            "<tool_call>\n{\"name\":\"get_weather\",\"arguments\":{\"location\":\"Paris\"}}\n</tool_call>",
+        );
+        assert!(content.is_none());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[0].function.arguments, "{\"location\":\"Paris\"}");
+    }
+
+    #[test]
+    fn gemma_text_plus_call_splits() {
+        let (content, calls) =
+            parse_tool_calls_gemma("Let me check.\n<|tool_call>call:f{}<tool_call|>");
+        assert_eq!(content.as_deref(), Some("Let me check."));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "f");
+        assert_eq!(calls[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn gemma_unterminated_does_not_panic() {
+        // Runaway cut mid-call (cancel/max_tokens) — salvage name + args.
+        let (_c, calls) = parse_tool_calls_gemma("<|tool_call>call:do_thing{x: 1}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "do_thing");
+    }
+
+    #[test]
+    fn gemma_no_call_is_plain_text() {
+        let (content, calls) = parse_tool_calls_gemma("The capital of France is Paris.");
+        assert_eq!(content.as_deref(), Some("The capital of France is Paris."));
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn gemma_runaway_tail_ignored_after_first_call() {
+        // QAT runaway: a valid call followed by repeated <|tool_response>.
+        let (_c, calls) = parse_tool_calls_gemma(
+            "<|tool_call>call:get_weather{location: \"Tokyo\"}<tool_call|><|tool_response><|tool_response>",
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
     }
 }
