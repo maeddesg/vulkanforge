@@ -1,0 +1,21 @@
+[package]
+name = "vf-clide"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-only"
+description = "Lean agentic CLI client for VulkanForge's OpenAI-compatible API (HTTP-only, no engine deps)"
+
+# Empty [workspace] isolates this crate from the parent `vulkanforge`
+# package so it builds standalone (and a future `git subtree split` is
+# trivial — there is no internal VulkanForge dependency, only HTTP).
+[workspace]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+rustyline = "15"
