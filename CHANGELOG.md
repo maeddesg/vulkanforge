@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.7.2 — GGUF parser hardening + fail-loud KV-FP8 guard (2026-06-11)
+
+**Hardening + safety patch.** No API changes; behavior of supported configs unchanged.
+
+- **Hardened GGUF parser** against malformed / untrusted model files: bounds and overflow
+  checks across the read path (checked arithmetic, slice-bounds, capacity guards). All
+  real-world models continue to parse unchanged (6/6 verified, 0 rejects).
+- **Fail-loud KV-cache guard:** loading a gemma-4-26B-A4B (MoE) model without
+  `VULKANFORGE_KV_FP8=1` now aborts with a clear, actionable error instead of silently
+  producing garbage output — the non-FP8 KV path (F16/F32) is known-broken for these MoE
+  models (Layer-0 attention NaN). Override with `VULKANFORGE_ALLOW_BROKEN_KV=1` to force the
+  broken path for debugging. Dense and Qwen3.5/3.6 models are unaffected.
+- **Diagnostics:** clarified the effective KV-cache default dtype (**F16**); the guard's
+  error message names both affected non-FP8 paths (F16 / F32).
+- Validation: lib **286/286** + `--examples` build; full 15-prompt suite across all loadable
+  models (gemma-4-26B with `VULKANFORGE_KV_FP8=1`) coherent + recall 3/3.
+
 ## v0.7.1 — pre-load VRAM gate + Gemma coding-model comparison + ctx3072 (2026-06-10)
 
 **No single recommended Gemma quant** — `Q3_K_M` (3-bit) and QAT (`…-qat-UD-Q4_K_XL.gguf`, Q4_0) trade

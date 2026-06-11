@@ -175,8 +175,11 @@ comparison that also includes the dense Qwen3.6-27B, see the wiki:
 **Context (engine setting, not a model default):** `--max-context 3072` is a good general coding value —
 same VRAM as 2048 but enough generation budget for a substantial function (2048 can truncate ~180-line
 outputs); `4096` is a spare-VRAM opt-in. The pre-load free-VRAM gate (`VF_VRAM_GATE=1`) guards against a
-prior process's un-freed VRAM or compositor pressure, and `VULKANFORGE_KV_FP8=1` helps the 26B models fit
-16 GB.
+prior process's un-freed VRAM or compositor pressure. **`VULKANFORGE_KV_FP8=1` is required for the
+gemma-4-26B-A4B MoE models** — with a non-FP8 KV cache (F16/F32) these MoE models produce invalid output,
+so loading one without it now aborts with a clear, actionable error (override with
+`VULKANFORGE_ALLOW_BROKEN_KV=1`); it also helps the 26B models fit 16 GB. Dense and Qwen3.5/3.6 models are
+unaffected.
 
 ### v0.3.16 15-prompt mixed-workload benchmark
 
