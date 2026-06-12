@@ -18,6 +18,12 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
 
 ## Highlights
 
+- **Automatic context sizing + Gemma-4 tool-calling + the `vf-clide` client (v0.8.0)** —
+  `serve` without `--ctx-size` now picks the largest safe KV context from live VRAM + the model and
+  prints what it chose and why (explicit `--ctx-size` still overrides; hardware-capped at 16384 on
+  RDNA4). The OpenAI `tools` API now works with **Gemma-4**'s native tool-call format (Qwen/Hermes
+  path unchanged). And a new standalone CLI chat client, **`vf-clide/`** (streaming REPL + headless,
+  no engine deps), ships alongside. Inference output unchanged. See `CHANGELOG.md`.
 - **Prefill parity with llama.cpp Vulkan (v0.7.0, default-on)** — coopmat flash-attention now
   also covers **dense `head_dim=128`** (Qwen3 / Llama-3.1 / Mistral-v0.3 / DeepSeek-R1), and the
   Gemma-4 MoE router gate-projection is batched through the dense GEMM. Dense prefill @p2048

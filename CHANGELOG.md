@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.8.0 — automatic context sizing + Gemma-4 tool-calling + vf-clide client (2026-06-12)
+
+**Feature release.** Supported-config inference output is unchanged; decode/prefill behavior
+matches the v0.7.0 bench matrix (auto-ctx is allocation-time only, decode-neutral).
+
+- **Automatic context size.** `vulkanforge serve` without `--ctx-size` now computes the largest
+  *safe* KV-cache context from live free VRAM (`VK_EXT_memory_budget`), the model's weights and
+  training context, and the active KV dtype — and prints a one-line, itemized rationale at startup
+  (e.g. `auto ctx-size = 16384 (free … − weights … − reserve … ; bound: …)`). No more guessing a
+  value that's either too small (answers truncated) or too large (out-of-memory at load). Explicit
+  `--ctx-size <N>` remains a verbatim override. The context is additionally capped by a hardware
+  limit (the per-workgroup shared-memory/LDS budget — 16384 tokens on RDNA4); going above it via an
+  explicit override aborts at pipeline creation rather than clamping silently.
+- **Gemma-4 native tool / function calling.** The OpenAI-compatible `tools` API now works with
+  Gemma-4 models, which emit tool calls in their own native format. A permissive parser handles
+  both the Gemma-native and the Qwen/Hermes ChatML format, plus a server-side stop for the
+  non-terminating tool-call token. The Qwen/Hermes tool path is byte-identical to v0.7.x.
+- **New: `vf-clide`** — a lean, standalone command-line chat client for the server. Its own crate
+  (GPL-3.0, no engine dependencies; talks only to the OpenAI-compatible API over HTTP). Streaming
+  and non-streaming chat, an interactive REPL with in-session history, a headless one-shot mode
+  (`-p`), `--no-think` / `--max-tokens` (default 6144), and visible markers for truncated or empty
+  (think-only) answers instead of silent failures. Validated through the client across gemma
+  (QAT / Q3 @KV-FP8), Qwen3 (14B / 8B), Llama-3.1-8B, Mistral-7B and DeepSeek-R1-Distill. See
+  `vf-clide/README.md`.
+
 ## v0.7.2 — GGUF parser hardening + fail-loud KV-FP8 guard (2026-06-11)
 
 **Hardening + safety patch.** No API changes; behavior of supported configs unchanged.
