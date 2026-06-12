@@ -13,7 +13,12 @@ use vf_clide::types::ChatMessage;
 async fn live_stream_roundtrip() {
     let url = std::env::var("VF_CLIDE_URL").unwrap_or_else(|_| "http://localhost:8080".into());
     let model = std::env::var("VF_CLIDE_MODEL").unwrap_or_else(|_| "x".into());
-    let client = Client::new(url, model);
+    let mut client = Client::new(url, model);
+    // A bare Client defaults max_tokens to the server's small budget; a
+    // thinking model (Qwen3 etc.) then spends it all in the <think> block
+    // and the visible answer is empty. Mirror the CLI's generous default so
+    // these round-trips reflect real usage instead of flaking on thinkers.
+    client.max_tokens = Some(2048);
 
     let mut streamed = String::new();
     let out = client
@@ -36,7 +41,12 @@ async fn live_stream_roundtrip() {
 async fn live_multiturn_history() {
     let url = std::env::var("VF_CLIDE_URL").unwrap_or_else(|_| "http://localhost:8080".into());
     let model = std::env::var("VF_CLIDE_MODEL").unwrap_or_else(|_| "x".into());
-    let client = Client::new(url, model);
+    let mut client = Client::new(url, model);
+    // A bare Client defaults max_tokens to the server's small budget; a
+    // thinking model (Qwen3 etc.) then spends it all in the <think> block
+    // and the visible answer is empty. Mirror the CLI's generous default so
+    // these round-trips reflect real usage instead of flaking on thinkers.
+    client.max_tokens = Some(2048);
 
     let mut history: Vec<ChatMessage> = Vec::new();
     history.push(ChatMessage::user("Remember this number: 42. Just acknowledge briefly."));
@@ -59,7 +69,12 @@ async fn live_multiturn_history() {
 async fn live_non_streaming_roundtrip() {
     let url = std::env::var("VF_CLIDE_URL").unwrap_or_else(|_| "http://localhost:8080".into());
     let model = std::env::var("VF_CLIDE_MODEL").unwrap_or_else(|_| "x".into());
-    let client = Client::new(url, model);
+    let mut client = Client::new(url, model);
+    // A bare Client defaults max_tokens to the server's small budget; a
+    // thinking model (Qwen3 etc.) then spends it all in the <think> block
+    // and the visible answer is empty. Mirror the CLI's generous default so
+    // these round-trips reflect real usage instead of flaking on thinkers.
+    client.max_tokens = Some(2048);
 
     let out = client
         .chat_once(vec![ChatMessage::user("Reply with exactly one word: PONG")])
