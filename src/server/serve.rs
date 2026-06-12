@@ -19,11 +19,14 @@ use crate::backend::vulkan::commands::CommandContext;
 use crate::backend::vulkan::device::VulkanDevice;
 use crate::backend::vulkan::forward::Forward;
 use crate::backend::vulkan::gguf::{GgufFile, ModelConfig};
-use crate::backend::vulkan::kv_cache::{KvCache, KvCacheConfig};
+use crate::backend::vulkan::kv_cache::{
+    kv_bytes_per_token, kv_dtype_from_env, KvCache, KvCacheConfig,
+};
 use crate::backend::vulkan::loader::LoadedModel;
 use crate::backend::vulkan::pipeline_registry::{default_cache_path, PipelineRegistry};
 use crate::backend::vulkan::tokenizer::Tokenizer;
 
+use super::auto_ctx::{self, CtxBound};
 use super::routes::build_router;
 use super::state::{AppState, ServerSession};
 
@@ -142,14 +145,51 @@ fn load_gguf_session(args: &ServeArgs) -> Result<ServerSession, Box<dyn std::err
         allocation_sizes: gpu_allocator::AllocationSizes::default(),
     })?;
 
-    let max_context = args.ctx_size.unwrap_or(DEFAULT_CTX_SIZE);
+    // Parse model metadata BEFORE the pipeline registry: auto-ctx-size
+    // needs n_layers/n_kv_heads/head_dim/context_length, and the registry
+    // bakes `max_seq` into a spec-constant — so the context must be decided
+    // first. (Reordered from the old "registry then gguf" sequence; the
+    // registry only depends on the device + the chosen max_seq.)
+    let gguf = GgufFile::open(&args.model)?;
+    let cfg = ModelConfig::from_gguf(&gguf)?;
+
+    // Per-layer KV tables (heterogeneous Gemma-4 sliding/full; Qwen3.6
+    // recurrent layers contribute 0 KV heads). Derived once here, then
+    // reused for BOTH the KV-per-token estimate (auto-ctx) and the
+    // KvCacheConfig below — single source of truth, no divergence.
+    let per_layer_head_dim: Option<Vec<u32>> = cfg
+        .gemma4
+        .as_ref()
+        .map(|g| g.layers.iter().map(|s| s.head_dim).collect());
+    // Sprint D2 — Qwen3.6 per-layer KV-heads (0 for recurrent Linear-Attn
+    // layers, n_head_kv_full_attn for Full-Attn); drops the FP8 KV cache
+    // from 520 MB to ~136 MB.
+    let per_layer_n_kv_heads: Option<Vec<u32>> = cfg
+        .gemma4
+        .as_ref()
+        .map(|g| g.layers.iter().map(|s| s.n_kv_heads).collect::<Vec<_>>())
+        .or_else(|| {
+            cfg.qwen35.as_ref().map(|q| {
+                (0..q.block_count)
+                    .map(|l| if q.is_full_attention_layer(l) { q.n_head_kv_full_attn } else { 0 })
+                    .collect::<Vec<_>>()
+            })
+        });
+
+    let max_context = resolve_ctx_size(
+        args,
+        &dev,
+        &cfg,
+        &args.model,
+        per_layer_head_dim.as_deref(),
+        per_layer_n_kv_heads.as_deref(),
+    );
+
     let cache_path = default_cache_path();
     let (registry, _pipelines_loaded) =
         PipelineRegistry::new_with_max_seq(&dev.device, cache_path.as_deref(), max_context)?;
     let cmd_ctx = CommandContext::new(&dev.device, dev.queue_family_index)?;
 
-    let gguf = GgufFile::open(&args.model)?;
-    let cfg = ModelConfig::from_gguf(&gguf)?;
     // serve path: no --gamma-from CLI option yet (Sprint 52F scope was
     // chat only; serve is a follow-up).
     let model = LoadedModel::load(&dev, &mut allocator, &gguf, None)?;
@@ -169,24 +209,8 @@ fn load_gguf_session(args: &ServeArgs) -> Result<ServerSession, Box<dyn std::err
             n_kv_heads: cfg.n_kv_heads,
             head_dim: cfg.head_dim,
             max_seq_len: max_context,
-            per_layer_head_dim: cfg
-                .gemma4
-                .as_ref()
-                .map(|g| g.layers.iter().map(|s| s.head_dim).collect()),
-            // Sprint D2 — Qwen3.6 per-layer KV-heads (0 for recurrent
-            // Linear-Attn layers, n_head_kv_full_attn for Full-Attn);
-            // drops the FP8 KV cache from 520 MB to ~136 MB.
-            per_layer_n_kv_heads: cfg
-                .gemma4
-                .as_ref()
-                .map(|g| g.layers.iter().map(|s| s.n_kv_heads).collect::<Vec<_>>())
-                .or_else(|| cfg.qwen35.as_ref().map(|q| {
-                    (0..q.block_count)
-                        .map(|l| if q.is_full_attention_layer(l) {
-                            q.n_head_kv_full_attn
-                        } else { 0 })
-                        .collect::<Vec<_>>()
-                })),
+            per_layer_head_dim,
+            per_layer_n_kv_heads,
         },
     )?;
     kv_cache.zero_fill(&dev)?;
@@ -222,6 +246,89 @@ fn load_gguf_session(args: &ServeArgs) -> Result<ServerSession, Box<dyn std::err
         chat,
         cached_tokens: Vec::new(),
     })
+}
+
+// =========================================================================
+// Context-size resolution (explicit override or VRAM-aware auto)
+// =========================================================================
+
+/// Resolve the KV-cache context size.
+///
+/// An explicit `--ctx-size N` is used verbatim (unchanged behavior). When
+/// omitted, auto-size from live VRAM (`VK_EXT_memory_budget`) + model
+/// metadata and print a one-line, fully-itemized rationale — no silent
+/// magic, so the user can reproduce the decision and override it. If the
+/// VRAM budget can't be read (extension absent / CI), fall back to the
+/// fixed default rather than guessing.
+fn resolve_ctx_size(
+    args: &ServeArgs,
+    dev: &VulkanDevice,
+    cfg: &ModelConfig,
+    model_path: &std::path::Path,
+    per_layer_head_dim: Option<&[u32]>,
+    per_layer_n_kv_heads: Option<&[u32]>,
+) -> u32 {
+    if let Some(n) = args.ctx_size {
+        eprintln!("VulkanForge: ctx-size = {n} (explicit --ctx-size override)");
+        return n;
+    }
+
+    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    let Some(free) = dev.free_vram_bytes() else {
+        eprintln!(
+            "VulkanForge: auto ctx-size unavailable (VK_EXT_memory_budget not reported) — \
+             using default {DEFAULT_CTX_SIZE}. Pass --ctx-size N to override."
+        );
+        return DEFAULT_CTX_SIZE;
+    };
+
+    // Weights footprint = GGUF on-disk size (the quantized tensors are
+    // mmap'd and uploaded as-is, so for GGUF this closely tracks VRAM
+    // residency). `free` is measured here, before weights + registry +
+    // scratch are allocated, so the reserve must cover all of those.
+    let weights = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
+    let elem = kv_dtype_from_env().element_size();
+    let kv_bpt = kv_bytes_per_token(
+        cfg.n_layers,
+        cfg.n_kv_heads,
+        cfg.head_dim,
+        per_layer_head_dim,
+        per_layer_n_kv_heads,
+        elem,
+    );
+    let reserve = auto_ctx::reserve_bytes();
+    // Hardware LDS ceiling: scalar_attn.comp's `scores[MAX_SEQ]` is built
+    // unconditionally, so MAX_SEQ × 4 B must fit maxComputeSharedMemorySize
+    // (else pipeline creation aborts the load).
+    let lds_cap = auto_ctx::lds_ctx_cap(dev.max_compute_shared_memory_bytes());
+    let a = auto_ctx::compute_auto_ctx(
+        free,
+        weights,
+        reserve,
+        kv_bpt,
+        cfg.context_length,
+        lds_cap,
+        auto_ctx::SANE_CAP,
+    );
+
+    let bound = match a.bound {
+        CtxBound::Vram => "VRAM".to_string(),
+        CtxBound::ModelMax => format!("model max context {}", cfg.context_length),
+        CtxBound::HwLds => format!("hardware LDS limit {lds_cap}"),
+        CtxBound::SaneCap => format!("sane cap {}", auto_ctx::SANE_CAP),
+    };
+    let kv_mib_per_tok = kv_bpt as f64 / (1024.0 * 1024.0);
+    eprintln!(
+        "VulkanForge: auto ctx-size = {} (free {:.2}G − weights {:.2}G − reserve {:.2}G \
+         = {:.2}G for KV / {:.3} MiB/tok; bound: {bound}; override with --ctx-size N)",
+        a.ctx,
+        gib(free),
+        gib(weights),
+        gib(reserve),
+        gib(a.avail_for_kv),
+        kv_mib_per_tok,
+    );
+    a.ctx
 }
 
 // =========================================================================

@@ -78,7 +78,11 @@ impl KvDtype {
 /// Precedence: `VULKANFORGE_KV_FP8=1` wins (and implies
 /// `VULKANFORGE_ENABLE_FP8=1`). Otherwise `VULKANFORGE_FP16_KV=0`
 /// requests FP32. Default is FP16, matching v0.3.x behaviour.
-fn kv_dtype_from_env() -> KvDtype {
+///
+/// `pub(crate)` so the server's auto-ctx-size sizing can read the
+/// *active* KV dtype (its byte width drives the KV-per-token estimate)
+/// from the same source `KvCache::new` uses — no divergence.
+pub(crate) fn kv_dtype_from_env() -> KvDtype {
     if std::env::var("VULKANFORGE_KV_FP8")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
@@ -167,6 +171,34 @@ pub struct KvCacheConfig {
     /// offset table sums `max_seq × per_layer_n_kv_heads[i] ×
     /// head_dim_for(i) × elem` per layer.
     pub per_layer_n_kv_heads: Option<Vec<u32>>,
+}
+
+/// KV-cache bytes consumed **per context token** (both K and V buffers),
+/// mirroring the allocation math in [`KvCache::new`]: `2 × elem_size ×
+/// Σ_layer (n_kv_heads(layer) × head_dim(layer))`. Honors the per-layer
+/// overrides (heterogeneous Gemma-4 sliding/full, Qwen3.6 recurrent
+/// layers that contribute 0 KV heads). `max_ctx × this` is therefore the
+/// exact total KV footprint at `max_seq_len = max_ctx`.
+///
+/// Used by the server's auto-ctx-size sizing to invert that relation:
+/// `max_ctx = avail_vram / kv_bytes_per_token`. Pure / file-derived
+/// inputs only → unit-testable without a device.
+pub(crate) fn kv_bytes_per_token(
+    n_layers: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    per_layer_head_dim: Option<&[u32]>,
+    per_layer_n_kv_heads: Option<&[u32]>,
+    elem_size: u64,
+) -> u64 {
+    let mut per_token_elems: u64 = 0;
+    for i in 0..(n_layers as usize) {
+        let hd = per_layer_head_dim.map(|v| v[i]).unwrap_or(head_dim) as u64;
+        let kvh = per_layer_n_kv_heads.map(|v| v[i]).unwrap_or(n_kv_heads) as u64;
+        per_token_elems = per_token_elems.saturating_add(kvh.saturating_mul(hd));
+    }
+    // ×2 for the separate K and V buffers (KvCache::new allocates both).
+    per_token_elems.saturating_mul(elem_size).saturating_mul(2)
 }
 
 pub struct KvCache {
@@ -481,6 +513,44 @@ mod tests {
     fn kv_dtype_label() {
         assert_eq!(KvDtype::F32.label(), "FP32");
         assert_eq!(KvDtype::F16.label(), "FP16");
+    }
+
+    #[test]
+    fn kv_bytes_per_token_uniform_matches_alloc() {
+        // Qwen3-14B-ish: 40 layers × 8 kv_heads × 128 head_dim.
+        let (nl, kvh, hd) = (40u32, 8u32, 128u32);
+        // F16 (2B): 2 × 2 × Σ(8×128) = 2 × 2 × 40×1024 = 163_840 B/tok.
+        let f16 = kv_bytes_per_token(nl, kvh, hd, None, None, 2);
+        assert_eq!(f16, 2 * 2 * (nl as u64) * (kvh as u64) * (hd as u64));
+        // The full cache at max_seq equals KvCache::new's `2 × bytes`:
+        // 2 buffers × (nl × kvh × max_seq × hd × elem).
+        let max_seq: u64 = 12288;
+        assert_eq!(
+            f16 * max_seq,
+            2 * (nl as u64) * (kvh as u64) * max_seq * (hd as u64) * 2,
+        );
+    }
+
+    #[test]
+    fn kv_bytes_per_token_fp8_is_half_of_f16() {
+        let (nl, kvh, hd) = (40u32, 8u32, 128u32);
+        let f16 = kv_bytes_per_token(nl, kvh, hd, None, None, 2);
+        let fp8 = kv_bytes_per_token(nl, kvh, hd, None, None, 1);
+        assert_eq!(fp8 * 2, f16, "FP8 (1B) KV must be exactly half of F16 (2B)");
+    }
+
+    #[test]
+    fn kv_bytes_per_token_heterogeneous_sums_per_layer() {
+        // 4-layer mixed cache: 2 sliding (kvh=2, hd=256) + 2 full
+        // (kvh=4, hd=512), FP8 (1B). Σ(kvh×hd) = 2·(2·256) + 2·(4·512)
+        // = 1024 + 4096 = 5120 elems/tok → ×1 ×2 buffers = 10_240 B/tok.
+        let plhd = [256u32, 256, 512, 512];
+        let plkv = [2u32, 2, 4, 4];
+        let got = kv_bytes_per_token(4, 999, 999, Some(&plhd), Some(&plkv), 1);
+        assert_eq!(got, 2 * (2 * 256 + 2 * 256 + 4 * 512 + 4 * 512));
+        // The uniform fallback args (999) must be ignored when per-layer
+        // tables are present.
+        assert_eq!(got, 10_240);
     }
 
     /// Sprint 9d.1 — verify the element-size scaling cascades through

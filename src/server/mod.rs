@@ -7,6 +7,7 @@
 //! Sprint 3 will lift the streaming-rejection in `chat::completions`
 //! by wiring up an SSE adapter.
 
+pub mod auto_ctx;
 pub mod cancel;
 pub mod error;
 pub mod handlers;

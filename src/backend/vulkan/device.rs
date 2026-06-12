@@ -30,6 +30,12 @@ pub struct VulkanDevice {
     /// `runs.rs` reads (Sprint 47B; before that the routing went
     /// through a `VF_FP8_NATIVE_WMMA` env var).
     pub native_fp8_wmma: bool,
+    /// True when the driver advertises `VK_EXT_memory_budget` (enabled at
+    /// device creation). Gates [`VulkanDevice::free_vram_bytes`], which the
+    /// server's auto-ctx-size sizing uses to read live VRAM headroom. When
+    /// false, that query returns `None` and callers fall back to a fixed
+    /// default.
+    pub memory_budget_ext: bool,
     debug_loader: Option<debug_utils::Instance>,
     debug_messenger: vk::DebugUtilsMessengerEXT,
 }
@@ -245,6 +251,28 @@ impl VulkanDevice {
             );
         }
 
+        // `VK_EXT_memory_budget` — exposes per-heap budget/usage via
+        // `vkGetPhysicalDeviceMemoryProperties2`, the Vulkan-native,
+        // vendor-neutral source of live VRAM headroom (vs scraping AMD
+        // sysfs). The server's auto-ctx-size sizing reads it through
+        // `free_vram_bytes`. Probe-and-enable like the extensions above;
+        // when the driver doesn't advertise it, `free_vram_bytes` returns
+        // `None` and the caller falls back to a fixed default.
+        let memory_budget_available = unsafe {
+            instance
+                .enumerate_device_extension_properties(physical_device)
+                .map(|exts| {
+                    exts.iter().any(|e| {
+                        let name = std::ffi::CStr::from_ptr(e.extension_name.as_ptr());
+                        name == vk::EXT_MEMORY_BUDGET_NAME
+                    })
+                })
+                .unwrap_or(false)
+        };
+        if memory_budget_available {
+            device_extensions.push(vk::EXT_MEMORY_BUDGET_NAME.as_ptr());
+        }
+
         let mut coopmat_features =
             vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
         let mut fp8_features =
@@ -288,9 +316,70 @@ impl VulkanDevice {
             compute_queue,
             queue_family_index,
             native_fp8_wmma: push_fp8_ext,
+            memory_budget_ext: memory_budget_available,
             debug_loader,
             debug_messenger,
         })
+    }
+
+    /// Live free VRAM in bytes via `VK_EXT_memory_budget`
+    /// (`vkGetPhysicalDeviceMemoryProperties2` → `heap_budget − heap_usage`
+    /// of the largest `DEVICE_LOCAL` heap, i.e. VRAM, not the small
+    /// host-visible BAR heap). Returns `None` when the extension isn't
+    /// enabled (non-AMD / older driver / CI) or the driver reports a zero
+    /// budget — callers then fall back to a fixed default.
+    ///
+    /// The reported *budget* already accounts for memory pressure from
+    /// other processes, so this is the headroom *this* process may
+    /// actually allocate right now — exactly what auto-ctx-size needs.
+    pub fn free_vram_bytes(&self) -> Option<u64> {
+        if !self.memory_budget_ext {
+            return None;
+        }
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        // `props2` mutably borrows `budget` for the duration of the call;
+        // copy the (Copy) base properties out so the borrow ends before we
+        // read `budget` below.
+        let mem = {
+            let mut props2 =
+                vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+            unsafe {
+                self.instance
+                    .get_physical_device_memory_properties2(self.physical_device, &mut props2);
+            }
+            props2.memory_properties
+        };
+        // Pick the largest DEVICE_LOCAL heap (= VRAM) and report its
+        // remaining budget. Summing would double-count AMD's small
+        // host-visible-DEVICE_LOCAL BAR heap.
+        let mut best: Option<(u64, u64)> = None; // (heap_size, free_bytes)
+        for i in 0..(mem.memory_heap_count as usize) {
+            let heap = mem.memory_heaps[i];
+            if !heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) {
+                continue;
+            }
+            let b = budget.heap_budget[i];
+            if b == 0 {
+                continue; // extension present but driver didn't populate it
+            }
+            let free = b.saturating_sub(budget.heap_usage[i]);
+            if best.map_or(true, |(sz, _)| heap.size > sz) {
+                best = Some((heap.size, free));
+            }
+        }
+        best.map(|(_, free)| free)
+    }
+
+    /// `maxComputeSharedMemorySize` (per-workgroup LDS budget) in bytes —
+    /// 65536 on RDNA4. Auto-ctx-size caps `max_seq` by it: the pipeline
+    /// registry builds `scalar_attn.comp` unconditionally, and that shader
+    /// allocates `shared float scores[MAX_SEQ]` (4 B/entry), so
+    /// `MAX_SEQ × 4` must fit here or `vkCreateComputePipelines` rejects
+    /// the shader and the load aborts.
+    pub fn max_compute_shared_memory_bytes(&self) -> u32 {
+        let props =
+            unsafe { self.instance.get_physical_device_properties(self.physical_device) };
+        props.limits.max_compute_shared_memory_size
     }
 }
 
