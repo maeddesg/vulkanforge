@@ -7,7 +7,7 @@
 
 use futures_util::StreamExt;
 
-use crate::types::{ChatChunk, ChatMessage, ChatRequest, ChatResponse};
+use crate::types::{ChatChunk, ChatMessage, ChatRequest, ChatResponse, Tool, ToolCall};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -17,6 +17,16 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + S
 #[derive(Debug, Clone, Default)]
 pub struct ChatOutcome {
     pub text: String,
+    pub finish_reason: Option<String>,
+}
+
+/// Result of one agent turn (a `tools`-enabled completion): the
+/// assistant's text (often `None` when it only called tools), the tool
+/// calls it requested, and the finish_reason.
+#[derive(Debug, Clone, Default)]
+pub struct AgentTurn {
+    pub content: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
     pub finish_reason: Option<String>,
 }
 
@@ -64,7 +74,10 @@ impl Client {
             base_url,
             model: model.into(),
             temperature: Some(0.0),
-            max_tokens: None,
+            // Match the CLI default so library users (e.g. the agent loop)
+            // don't silently inherit the server's small floor and get a
+            // thinking model's answer eaten by its `<think>` block.
+            max_tokens: Some(6144),
         }
     }
 
@@ -80,6 +93,7 @@ impl Client {
             temperature: self.temperature,
             max_tokens: self.max_tokens,
             stream,
+            tools: None,
         }
     }
 
@@ -97,6 +111,34 @@ impl Client {
         let finish_reason = choice.as_ref().and_then(|c| c.finish_reason.clone());
         let text = choice.and_then(|c| c.message.content).unwrap_or_default();
         Ok(ChatOutcome { text, finish_reason })
+    }
+
+    /// One agent turn: non-streaming completion **with `tools`**, returning
+    /// the assistant's text (if any), any `tool_calls` it made, and the
+    /// finish_reason. Tool calls require the full message, so this path is
+    /// non-streaming.
+    pub async fn chat_with_tools(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: &[Tool],
+    ) -> Result<AgentTurn> {
+        let mut req = self.build_request(messages, false);
+        req.tools = Some(tools.to_vec());
+        let resp = self.http.post(self.endpoint()).json(&req).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("server returned {status}: {body}").into());
+        }
+        let parsed: ChatResponse = resp.json().await?;
+        let choice = parsed
+            .choices
+            .into_iter()
+            .next()
+            .ok_or("server returned no choices")?;
+        let finish_reason = choice.finish_reason;
+        let tool_calls = choice.message.tool_calls.unwrap_or_default();
+        Ok(AgentTurn { content: choice.message.content, tool_calls, finish_reason })
     }
 
     /// Streaming completion. `on_token` is called for each content delta
@@ -185,6 +227,15 @@ mod tests {
         assert!(r.stream);
         assert_eq!(r.temperature, Some(0.0));
         assert_eq!(r.messages.len(), 1);
+        assert!(r.tools.is_none());
+    }
+
+    #[test]
+    fn default_max_tokens_is_6144() {
+        // Phase 1: the library Client defaults to the CLI budget (6144),
+        // not None → server floor (200), so the agent loop isn't truncated.
+        let c = Client::new("http://localhost:8080", "m");
+        assert_eq!(c.max_tokens, Some(6144));
     }
 
     #[test]

@@ -6,17 +6,24 @@
 
 use serde::{Deserialize, Serialize};
 
-/// One chat message (`role` + `content`). Phase 1 uses string content
-/// only (no content-part arrays, no tool roles).
+/// One chat message (`role` + `content`). The tool fields are
+/// Phase-2 (agent loop) additions: `tool_call_id` on `role:"tool"`
+/// results, `tool_calls` on a replayed `role:"assistant"` turn. Both
+/// are omitted from the wire when `None`, so the plain chat path is
+/// unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 impl ChatMessage {
     pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
-        Self { role: role.into(), content: content.into() }
+        Self { role: role.into(), content: content.into(), tool_call_id: None, tool_calls: None }
     }
     pub fn system(content: impl Into<String>) -> Self {
         Self::new("system", content)
@@ -26,6 +33,69 @@ impl ChatMessage {
     }
     pub fn assistant(content: impl Into<String>) -> Self {
         Self::new("assistant", content)
+    }
+    /// A `role:"tool"` result message answering a specific call.
+    pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: "tool".into(),
+            content: content.into(),
+            tool_call_id: Some(tool_call_id.into()),
+            tool_calls: None,
+        }
+    }
+    /// A replayed assistant turn that made `tool_calls` (content is
+    /// whatever text preceded the calls — often empty for Qwen3).
+    pub fn assistant_with_tool_calls(content: impl Into<String>, calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: "assistant".into(),
+            content: content.into(),
+            tool_call_id: None,
+            tool_calls: Some(calls),
+        }
+    }
+}
+
+/// One tool call (OpenAI shape) — both directions: parsed out of a
+/// response, and replayed into the next request's assistant turn.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolCall {
+    #[serde(default)]
+    pub id: String,
+    #[serde(rename = "type", default = "function_kind")]
+    pub kind: String,
+    pub function: ToolCallFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolCallFunction {
+    pub name: String,
+    /// Arguments as a JSON **string** (OpenAI convention).
+    #[serde(default)]
+    pub arguments: String,
+}
+
+fn function_kind() -> String {
+    "function".into()
+}
+
+/// A tool definition sent in the request `tools` array.
+#[derive(Debug, Clone, Serialize)]
+pub struct Tool {
+    #[serde(rename = "type")]
+    pub kind: &'static str, // always "function"
+    pub function: ToolDef,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolDef {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+impl Tool {
+    pub fn function(name: impl Into<String>, description: impl Into<String>, parameters: serde_json::Value) -> Self {
+        Self { kind: "function", function: ToolDef { name: name.into(), description: description.into(), parameters } }
     }
 }
 
@@ -39,6 +109,10 @@ pub struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     pub stream: bool,
+    /// Tool definitions (agent loop). Omitted from the wire for the
+    /// plain chat path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<Tool>>,
 }
 
 // ---- Non-streaming response (only the fields we read) ----
@@ -59,6 +133,8 @@ pub struct Choice {
 pub struct RespMessage {
     #[serde(default)]
     pub content: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 // ---- Streaming chunk (`stream: true`) ----
@@ -121,6 +197,7 @@ mod tests {
             temperature: Some(0.0),
             max_tokens: None,
             stream: true,
+            tools: None,
         };
         let v: serde_json::Value = serde_json::to_value(&req).unwrap();
         assert_eq!(v["model"], "Qwen3-14B-Q4_K_M");
@@ -128,8 +205,51 @@ mod tests {
         assert_eq!(v["messages"][0]["content"], "Hi");
         assert_eq!(v["stream"], true);
         assert_eq!(v["temperature"], 0.0);
-        // max_tokens omitted when None.
+        // max_tokens + tools omitted when None.
         assert!(v.get("max_tokens").is_none());
+        assert!(v.get("tools").is_none());
+        // a plain user message has no tool fields on the wire.
+        assert!(v["messages"][0].get("tool_call_id").is_none());
+        assert!(v["messages"][0].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn tool_call_parses_from_response_message() {
+        let json = r#"{"choices":[{"message":{"role":"assistant","content":null,
+            "tool_calls":[{"id":"call_1","type":"function",
+            "function":{"name":"read_file","arguments":"{\"path\":\"/tmp/x\"}"}}]},
+            "finish_reason":"tool_calls"}]}"#;
+        let r: ChatResponse = serde_json::from_str(json).unwrap();
+        let m = &r.choices[0].message;
+        assert!(m.content.is_none());
+        let calls = m.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].kind, "function");
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"/tmp/x"}"#);
+        assert_eq!(r.choices[0].finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn tool_and_assistant_messages_serialize_with_tool_fields() {
+        let call = ToolCall {
+            id: "call_1".into(),
+            kind: "function".into(),
+            function: ToolCallFunction { name: "read_file".into(), arguments: r#"{"path":"/tmp/x"}"#.into() },
+        };
+        let assistant = ChatMessage::assistant_with_tool_calls("", vec![call.clone()]);
+        let av = serde_json::to_value(&assistant).unwrap();
+        assert_eq!(av["role"], "assistant");
+        assert_eq!(av["tool_calls"][0]["function"]["name"], "read_file");
+        assert!(av.get("tool_call_id").is_none());
+
+        let result = ChatMessage::tool("call_1", "file body");
+        let rv = serde_json::to_value(&result).unwrap();
+        assert_eq!(rv["role"], "tool");
+        assert_eq!(rv["tool_call_id"], "call_1");
+        assert_eq!(rv["content"], "file body");
+        assert!(rv.get("tool_calls").is_none());
     }
 
     #[test]

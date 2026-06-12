@@ -67,16 +67,26 @@ pub struct Repl {
     /// When true, append the `/no_think` directive to each new user turn
     /// so thinking models skip the `<think>` block (Qwen3 convention).
     no_think: bool,
+    /// When true (`--agent`), each turn runs the agent loop with
+    /// interactive tool-call permission instead of plain chat.
+    agent: bool,
 }
 
 impl Repl {
     pub fn new(client: Client, memory: Box<dyn Memory>, project: Option<String>) -> Self {
-        Self { client, memory, project, history: Vec::new(), no_think: false }
+        Self { client, memory, project, history: Vec::new(), no_think: false, agent: false }
     }
 
     /// Start with thinking disabled (`--no-think`).
     pub fn with_no_think(mut self, no_think: bool) -> Self {
         self.no_think = no_think;
+        self
+    }
+
+    /// Start in agent mode (`--agent`): tool-calling loop with interactive
+    /// permission per call.
+    pub fn with_agent(mut self, agent: bool) -> Self {
+        self.agent = agent;
         self
     }
 
@@ -137,6 +147,37 @@ impl Repl {
                         println!("(max-tokens → {n})");
                     }
                     Command::Unknown(hint) => println!("({hint})"),
+                }
+                continue;
+            }
+
+            // Agent turn — tool-calling loop with interactive permission.
+            if self.agent {
+                let msgs = self.build_messages(&line);
+                match crate::agent::run(&self.client, msgs, crate::agent::Permission::Interactive).await {
+                    Ok(crate::agent::LoopEnd::Final { content, finish_reason }) => {
+                        let text = content.unwrap_or_default();
+                        println!("{text}");
+                        if let Some(m) = empty_notice(&text) {
+                            eprintln!("{m}");
+                        } else if let Some(m) =
+                            truncation_notice(finish_reason.as_deref(), self.client.max_tokens)
+                        {
+                            eprintln!("{m}");
+                        }
+                        self.history.push(ChatMessage::user(line));
+                        self.history.push(ChatMessage::assistant(strip_think(&text)));
+                    }
+                    Ok(crate::agent::LoopEnd::CapReached) => {
+                        eprintln!(
+                            "[agent] stopped: reached the tool-call loop cap ({}). \
+                             The task may be incomplete.",
+                            crate::agent::LOOP_CAP
+                        );
+                        // Keep the user turn in history so context isn't lost.
+                        self.history.push(ChatMessage::user(line));
+                    }
+                    Err(e) => eprintln!("error: {e}"),
                 }
                 continue;
             }

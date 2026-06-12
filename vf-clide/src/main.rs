@@ -55,6 +55,18 @@ struct Args {
     /// but it is a no-op (see `memory::NoopMemory`).
     #[arg(long)]
     project: Option<String>,
+
+    /// Opt into the agent loop: the model may call tools (Slice 1:
+    /// `read_file`, read-only) and the client runs the tool-call roundtrip.
+    /// Without this flag vf-clide is a plain chat client.
+    #[arg(long)]
+    agent: bool,
+
+    /// Auto-approve tool calls in a headless `--agent` run. Without it, a
+    /// headless tool call is denied (and the loop ends gracefully). In the
+    /// REPL, tool calls always prompt interactively regardless of `--yes`.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[tokio::main]
@@ -65,13 +77,59 @@ async fn main() -> Result<()> {
     client.max_tokens = Some(args.max_tokens);
 
     match args.prompt {
+        Some(prompt) if args.agent => {
+            run_agent_headless(client, prompt, args.no_think, args.yes, args.project).await
+        }
         Some(prompt) => run_headless(client, prompt, args.no_stream, args.no_think, args.project).await,
         None => {
-            let mut repl =
-                Repl::new(client, Box::new(NoopMemory), args.project).with_no_think(args.no_think);
+            let mut repl = Repl::new(client, Box::new(NoopMemory), args.project)
+                .with_no_think(args.no_think)
+                .with_agent(args.agent);
             repl.run().await
         }
     }
+}
+
+/// Headless agent loop. `--yes` auto-approves the (read-only) tool calls;
+/// without it, tool calls are denied and the loop ends gracefully.
+async fn run_agent_headless(
+    client: Client,
+    prompt: String,
+    no_think: bool,
+    yes: bool,
+    project: Option<String>,
+) -> Result<()> {
+    use vf_clide::agent::{self, LoopEnd, Permission, LOOP_CAP};
+    use vf_clide::client::{empty_notice, truncation_notice};
+
+    let memory = NoopMemory;
+    let mut msgs: Vec<ChatMessage> = Vec::new();
+    if let Some(ctx) = memory.context_for(project.as_deref(), &[]) {
+        msgs.push(ChatMessage::system(ctx));
+    }
+    let content = if no_think { format!("{prompt} /no_think") } else { prompt };
+    msgs.push(ChatMessage::user(content));
+
+    let mode = if yes { Permission::AutoApprove } else { Permission::DenyHeadless };
+    let max_tokens = client.max_tokens;
+    match agent::run(&client, msgs, mode).await? {
+        LoopEnd::Final { content, finish_reason } => {
+            let text = content.unwrap_or_default();
+            println!("{text}");
+            if let Some(m) = empty_notice(&text) {
+                eprintln!("{m}");
+            } else if let Some(m) = truncation_notice(finish_reason.as_deref(), max_tokens) {
+                eprintln!("{m}");
+            }
+        }
+        LoopEnd::CapReached => {
+            eprintln!(
+                "[agent] stopped: reached the tool-call loop cap ({LOOP_CAP}). \
+                 The task may be incomplete — simplify the request or raise the cap."
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn run_headless(
