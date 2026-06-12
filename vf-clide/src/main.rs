@@ -36,9 +36,14 @@ struct Args {
     #[arg(long, default_value_t = 0.0)]
     temperature: f32,
 
-    /// Max generated tokens. Default is generous so thinking models have
-    /// room for the `<think>` block AND a complete answer.
-    #[arg(long, default_value_t = 2048)]
+    /// Max generated tokens. Default is generous so a thinking model has
+    /// room for the full `<think>` block AND a complete answer. It is a
+    /// *cap*, not a target: short answers stop early at EOS and cost
+    /// nothing. 6144 is the empirically-measured minimum that lets a
+    /// thinking model (Qwen3-14B) finish a real coding task — its think
+    /// block alone runs ~5000 tokens, so 4096 yields a think-only/empty
+    /// answer (see results/vf_clide_default4096.md).
+    #[arg(long, default_value_t = 6144)]
     max_tokens: u32,
 
     /// Disable thinking: append the `/no_think` directive to the prompt
