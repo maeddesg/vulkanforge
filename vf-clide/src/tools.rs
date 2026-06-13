@@ -354,12 +354,24 @@ fn walk_search(
             return;
         }
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if path.is_dir() {
+        // Use the entry's OWN type via `symlink_metadata` (which does NOT
+        // follow the final component) — `Path::is_dir`/`is_file` follow
+        // symlinks, so a symlink pointing OUT of the workspace (e.g.
+        // `escape -> /etc`) would be seen as a directory/file and
+        // recursed/read, leaking files outside the root. A code search has
+        // no reason to follow symlinks out of the workspace, so skip them
+        // entirely (closes the confinement hole + avoids symlink cycles).
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+        let ft = meta.file_type();
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
             if SEARCH_SKIP_DIRS.contains(&name) {
                 continue;
             }
             walk_search(&path, root, query, hits, bytes, capped);
-        } else if path.is_file() {
+        } else if ft.is_file() {
             // Read as text; skip binary / unreadable files silently.
             let Ok(text) = std::fs::read_to_string(&path) else { continue };
             let rel = display_rel(&path, root);
@@ -656,6 +668,28 @@ mod tests {
         let ws = workspace("search_out");
         let out = execute_search(&args(serde_json::json!({"query": "x", "path": "/etc"})), &ws);
         assert!(out.contains("outside the workspace"), "got: {out}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_does_not_follow_escaping_symlink() {
+        // v0.9.1 regression: the recursive walk used Path::is_dir/is_file,
+        // which FOLLOW symlinks — a symlink out of the workspace was
+        // recursed and its files read. The walk must skip symlinks.
+        let ws = workspace("search_symlink");
+        std::fs::write(ws.join("inside.txt"), b"NEEDLE inside the workspace\n").unwrap();
+        // A directory OUTSIDE the workspace, with a matching file.
+        let outside = workspace("search_symlink_outside");
+        std::fs::write(outside.join("secret.txt"), b"NEEDLE outside the workspace\n").unwrap();
+        // A symlink inside the workspace pointing at that outside dir.
+        std::os::unix::fs::symlink(&outside, ws.join("escape")).unwrap();
+
+        let out = execute_search(&args(serde_json::json!({"query": "NEEDLE"})), &ws);
+        assert!(out.contains("inside.txt"), "must find the in-workspace file: {out}");
+        assert!(
+            !out.contains("secret.txt") && !out.contains("escape/"),
+            "search followed an escaping symlink and read outside the workspace: {out}"
+        );
     }
 
     // ---- shell ----
