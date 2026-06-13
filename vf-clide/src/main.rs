@@ -62,11 +62,24 @@ struct Args {
     #[arg(long)]
     agent: bool,
 
-    /// Auto-approve tool calls in a headless `--agent` run. Without it, a
-    /// headless tool call is denied (and the loop ends gracefully). In the
+    /// Auto-approve **read-only** tool calls (`read_file`, `search`) in a
+    /// headless `--agent` run. Does NOT approve mutating tools
+    /// (`write_file`, `shell`) — those need `--allow-mutating`. In the
     /// REPL, tool calls always prompt interactively regardless of `--yes`.
     #[arg(long)]
     yes: bool,
+
+    /// Permit **mutating** tools (`write_file`, `shell`) in a headless
+    /// `--agent` run. Separate from `--yes` on purpose: `--yes` waves safe
+    /// reads through, this one is the explicit "I accept writes/exec" opt-in.
+    #[arg(long)]
+    allow_mutating: bool,
+
+    /// Workspace root for the file tools (`read_file`/`write_file`/`search`).
+    /// Paths are confined inside it (`..`/symlinks that escape are rejected).
+    /// Default: the current directory. `shell` runs here but is NOT confined.
+    #[arg(long)]
+    workspace: Option<String>,
 }
 
 #[tokio::main]
@@ -76,30 +89,50 @@ async fn main() -> Result<()> {
     client.temperature = Some(args.temperature);
     client.max_tokens = Some(args.max_tokens);
 
+    // Workspace root for the file tools — canonicalized ONCE so the
+    // confinement check compares canonical-to-canonical (resolves `..`
+    // and symlinks in the root itself).
+    let workspace = resolve_workspace(args.workspace.as_deref())?;
+
     match args.prompt {
         Some(prompt) if args.agent => {
-            run_agent_headless(client, prompt, args.no_think, args.yes, args.project).await
+            run_agent_headless(client, prompt, args.no_think, args.yes, args.allow_mutating, workspace, args.project).await
         }
         Some(prompt) => run_headless(client, prompt, args.no_stream, args.no_think, args.project).await,
         None => {
             let mut repl = Repl::new(client, Box::new(NoopMemory), args.project)
                 .with_no_think(args.no_think)
-                .with_agent(args.agent);
+                .with_agent(args.agent)
+                .with_workspace(workspace);
             repl.run().await
         }
     }
 }
 
-/// Headless agent loop. `--yes` auto-approves the (read-only) tool calls;
-/// without it, tool calls are denied and the loop ends gracefully.
+/// Resolve + canonicalize the workspace root (default = cwd).
+fn resolve_workspace(arg: Option<&str>) -> Result<std::path::PathBuf> {
+    let raw = match arg {
+        Some(p) => std::path::PathBuf::from(p),
+        None => std::env::current_dir()?,
+    };
+    raw.canonicalize()
+        .map_err(|e| format!("--workspace {}: {e}", raw.display()).into())
+}
+
+/// Headless agent loop. `--yes` auto-approves read-only tool calls;
+/// `--allow-mutating` additionally permits write/shell. Without the
+/// relevant opt-in, a call is denied and the loop ends gracefully.
+#[allow(clippy::too_many_arguments)]
 async fn run_agent_headless(
     client: Client,
     prompt: String,
     no_think: bool,
     yes: bool,
+    allow_mutating: bool,
+    workspace: std::path::PathBuf,
     project: Option<String>,
 ) -> Result<()> {
-    use vf_clide::agent::{self, LoopEnd, Permission, LOOP_CAP};
+    use vf_clide::agent::{self, Gate, LoopEnd, Permission, LOOP_CAP};
     use vf_clide::client::{empty_notice, truncation_notice};
 
     let memory = NoopMemory;
@@ -111,8 +144,9 @@ async fn run_agent_headless(
     msgs.push(ChatMessage::user(content));
 
     let mode = if yes { Permission::AutoApprove } else { Permission::DenyHeadless };
+    let gate = Gate::new(mode, allow_mutating);
     let max_tokens = client.max_tokens;
-    match agent::run(&client, msgs, mode).await? {
+    match agent::run(&client, msgs, gate, &workspace).await? {
         LoopEnd::Final { content, finish_reason } => {
             let text = content.unwrap_or_default();
             println!("{text}");

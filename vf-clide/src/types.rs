@@ -78,12 +78,28 @@ fn function_kind() -> String {
     "function".into()
 }
 
-/// A tool definition sent in the request `tools` array.
+/// A tool's risk class — the single source of truth for permission
+/// gating, declared **at the tool definition** (in each `*_tool()` fn),
+/// never in a separate map that could drift from the dispatch. `ReadOnly`
+/// tools (`read_file`, `search`) can be auto-approved with `--yes`;
+/// `Mutating` tools (`write_file`, `shell`) never are — they require an
+/// interactive `y/N` or the explicit `--allow-mutating` headless opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolRisk {
+    ReadOnly,
+    Mutating,
+}
+
+/// A tool definition sent in the request `tools` array. `risk` is local
+/// metadata (the permission class) and is **not** part of the OpenAI wire
+/// format, so it is skipped during serialization.
 #[derive(Debug, Clone, Serialize)]
 pub struct Tool {
     #[serde(rename = "type")]
     pub kind: &'static str, // always "function"
     pub function: ToolDef,
+    #[serde(skip)]
+    pub risk: ToolRisk,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -94,8 +110,18 @@ pub struct ToolDef {
 }
 
 impl Tool {
-    pub fn function(name: impl Into<String>, description: impl Into<String>, parameters: serde_json::Value) -> Self {
-        Self { kind: "function", function: ToolDef { name: name.into(), description: description.into(), parameters } }
+    /// Define a function tool with its risk class (the gating source of truth).
+    pub fn function(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: serde_json::Value,
+        risk: ToolRisk,
+    ) -> Self {
+        Self {
+            kind: "function",
+            function: ToolDef { name: name.into(), description: description.into(), parameters },
+            risk,
+        }
     }
 }
 

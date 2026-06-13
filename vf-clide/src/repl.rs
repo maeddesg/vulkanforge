@@ -70,11 +70,22 @@ pub struct Repl {
     /// When true (`--agent`), each turn runs the agent loop with
     /// interactive tool-call permission instead of plain chat.
     agent: bool,
+    /// Workspace root for the file tools (confinement). Set via
+    /// [`Repl::with_workspace`]; defaults to `.` (agent unused otherwise).
+    workspace: std::path::PathBuf,
 }
 
 impl Repl {
     pub fn new(client: Client, memory: Box<dyn Memory>, project: Option<String>) -> Self {
-        Self { client, memory, project, history: Vec::new(), no_think: false, agent: false }
+        Self {
+            client,
+            memory,
+            project,
+            history: Vec::new(),
+            no_think: false,
+            agent: false,
+            workspace: std::path::PathBuf::from("."),
+        }
     }
 
     /// Start with thinking disabled (`--no-think`).
@@ -87,6 +98,12 @@ impl Repl {
     /// permission per call.
     pub fn with_agent(mut self, agent: bool) -> Self {
         self.agent = agent;
+        self
+    }
+
+    /// Set the (canonicalized) workspace root for the file tools.
+    pub fn with_workspace(mut self, workspace: std::path::PathBuf) -> Self {
+        self.workspace = workspace;
         self
     }
 
@@ -152,9 +169,12 @@ impl Repl {
             }
 
             // Agent turn — tool-calling loop with interactive permission.
+            // Interactive mode prompts y/N per call (mutating tools get a
+            // visible warning), so no `--allow-mutating` is needed here.
             if self.agent {
                 let msgs = self.build_messages(&line);
-                match crate::agent::run(&self.client, msgs, crate::agent::Permission::Interactive).await {
+                let gate = crate::agent::Gate::new(crate::agent::Permission::Interactive, false);
+                match crate::agent::run(&self.client, msgs, gate, &self.workspace).await {
                     Ok(crate::agent::LoopEnd::Final { content, finish_reason }) => {
                         let text = content.unwrap_or_default();
                         println!("{text}");
