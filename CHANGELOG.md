@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.9.0 — agentic vf-clide (2026-06-13)
+
+**Feature release.** The `vf-clide` client becomes an agentic coding client; the engine gets a
+test-infrastructure hardening. Supported-config inference output is unchanged — there is **no
+decode/prefill/behavior change** in this release (the engine changes are tests-only).
+
+- **vf-clide can now code agentically.** A new opt-in `--agent` mode runs a tool-call loop over the
+  server's OpenAI-compatible API: the model requests a tool, the client gates it, runs it, feeds the
+  result back, and continues (capped at 8 iterations). Four tools: **`read_file`**, **`search`**
+  (substring, `file:line` results), **`write_file`**, and **`shell`** (cwd = workspace, output cap,
+  30 s timeout). Default coder = `Qwen3-14B-Q4_K_M`.
+- **Three-tier permission model.** Tools carry a risk tier — ReadOnly (`read_file`/`search`),
+  Mutating (`write_file`), Exec (`shell`). Headless auto-approval is opt-in and cumulative:
+  `--yes` (ReadOnly) → `--allow-mutating` (+Mutating) → `--allow-shell` (+Exec), each implying the
+  lower tiers. `--yes` alone never approves a write or a shell command. In the REPL every call is
+  confirmed interactively (`y/N`), with a louder warning for mutating/exec tools.
+- **Workspace confinement.** The file tools are confined to the workspace root (`--workspace`,
+  default cwd, canonicalized once): paths are resolved lexically and through `canonicalize`, so
+  `../` escapes and out-of-root symlinks are rejected with a structured error (no crash). `shell` is
+  honestly **not** confinable (a command can read anywhere) — its guard is the Exec tier, not cwd.
+- **Constitution.** A concise built-in system prompt gives the agent its operating instructions
+  (use tools, stay concise, respect the permission model — never claim a denied action succeeded);
+  a project `AGENTS.md` in the workspace root is appended (read confined). `--system <file>` replaces
+  the default; `--no-system` disables it. The plain chat path is unchanged.
+- **Engine: test-infrastructure hardening.** The end-to-end regression suite (`tests/regression.rs`)
+  and the per-shader correctness suite (`tests/correctness.rs`), which had drifted against the
+  library API and been excluded from the gate, are repaired and run again; `cargo test --no-run` is
+  added as a compile-only drift guard so they can't silently rot again. The context-overflow contract
+  test was updated to the current clamp-then-stop behavior, and the opt-in (default-OFF) coopmat
+  `gemm_q` path — which produces end-to-end NaN at full-model scale, a pre-existing regression in a
+  path nothing in production uses — is quarantined (`#[ignore]`) with a documented reason. No
+  decode/behavior change. See `vf-clide/README.md`.
+
 ## v0.8.0 — automatic context sizing + Gemma-4 tool-calling + vf-clide client (2026-06-12)
 
 **Feature release.** Supported-config inference output is unchanged; decode/prefill behavior

@@ -18,6 +18,14 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
 
 ## Highlights
 
+- **Agentic `vf-clide` + engine test-infra hardening (v0.9.0)** — the `vf-clide` client grows from a chat
+  client into an **agentic coding client**: an opt-in `--agent` tool loop with **read_file / write_file /
+  search / shell**, a **three-tier permission model** (ReadOnly / Mutating / Exec, opt-in via
+  `--yes` → `--allow-mutating` → `--allow-shell`, cumulative), **workspace confinement** for the file tools
+  (`../` and symlink escapes rejected), and a **constitution** (built-in system prompt + project `AGENTS.md`).
+  `shell` is deliberately *not* confined — `--allow-shell` is the explicit opt-in. The engine's end-to-end
+  regression + per-shader correctness suites are reactivated and guarded against drift; **no decode/behavior
+  change**. See [`vf-clide/README.md`](vf-clide/README.md), the wiki's *vf-clide* page, and `CHANGELOG.md`.
 - **Automatic context sizing + Gemma-4 tool-calling + the `vf-clide` client (v0.8.0)** —
   `serve` without `--ctx-size` now picks the largest safe KV context from live VRAM + the model and
   prints what it chose and why (explicit `--ctx-size` still overrides; hardware-capped at 16384 on
