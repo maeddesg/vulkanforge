@@ -64,6 +64,26 @@ impl Fixture {
         }
     }
 
+    /// Like [`Fixture::new`] but opts into `VULKANFORGE_COOPMAT=1` for the
+    /// registry build. Sprint 16C moved the Q4_K coopmat fwd/naive shaders
+    /// (`MulCoopmatQ4KFwd{Bn16,Bn32,Bn64}`, `…NaiveBf16`, …) out of the
+    /// default registry into `COOPMAT_Q4K_OPTIONAL_SHADERS`, gated behind
+    /// this env var (default OFF). The coopmat parity tests below dispatch
+    /// those shaders, so the registry must build them. The var is set only
+    /// across `Self::new` (which reads it while building the registry) and
+    /// removed immediately after, so it never leaks into other tests. Run
+    /// the GPU suite single-threaded (`--test-threads=1`, the §5.2 gate)
+    /// so the set/remove can't race a concurrent registry build.
+    fn new_coopmat() -> Self {
+        // SAFETY: set only across the registry build (inside `Self::new`),
+        // then removed, so it can't leak into other tests; the §5.2
+        // correctness gate runs these GPU tests single-threaded.
+        unsafe { std::env::set_var("VULKANFORGE_COOPMAT", "1") };
+        let fix = Self::new();
+        unsafe { std::env::remove_var("VULKANFORGE_COOPMAT") };
+        fix
+    }
+
     fn track(&mut self, buf: GpuBuffer) -> vk::Buffer {
         let h = buf.handle;
         self.pending_buffers.push(buf);
@@ -933,6 +953,7 @@ fn test_scalar_attn_qwen3_dims_with_binding_offset() {
     unsafe { fix.dev.device.update_descriptor_sets(&writes, &[]) };
 
     let pc = ScalarAttnPushConstants {
+        kv_start: 0,
         n_heads, n_kv_heads, head_dim,
         seq_len: 1,
         max_seq, scale,
@@ -998,6 +1019,7 @@ fn test_scalar_attn_qwen3_dims_seq1() {
     let v_h = fix.host_buffer_f32(&v, "v");
     let o_h = fix.output_buffer_f32((n_heads * head_dim) as usize, "o");
     let pc = ScalarAttnPushConstants {
+        kv_start: 0,
         n_heads, n_kv_heads, head_dim,
         seq_len: 1,
         max_seq, scale,
@@ -1039,6 +1061,7 @@ fn test_scalar_attn_two_tokens() {
     let v_h = fix.host_buffer_f32(&v, "v");
     let o_h = fix.output_buffer_f32((n_heads * head_dim) as usize, "o");
     let pc = ScalarAttnPushConstants {
+        kv_start: 0,
         n_heads, n_kv_heads, head_dim,
         seq_len: 2,
         max_seq, scale,
@@ -1077,6 +1100,7 @@ fn test_scalar_attn_single_token() {
     let o_h = fix.output_buffer_f32((n_heads * head_dim) as usize, "o");
 
     let pc = ScalarAttnPushConstants {
+        kv_start: 0,
         n_heads, n_kv_heads, head_dim,
         seq_len: 1,
         max_seq, scale,
@@ -1620,7 +1644,8 @@ fn run_coopmat_q4k_parity(m: u32, n: u32, k: u32, label: &str) {
     use vulkanforge::backend::vulkan::q4k;
     assert_eq!(k as usize % q4k::QUANT_K, 0, "K must be a multiple of QUANT_K");
 
-    let mut fix = Fixture::new();
+    // Sprint 16C: the MulCoopmatQ4KFwd{Bn16,Bn32,Bn64} shaders are opt-in.
+    let mut fix = Fixture::new_coopmat();
     let weights = q4k::build_random_weights(m as usize, k as usize, 0xC0FFEE);
     let w_buf = {
         let device = fix.dev.device.clone();
@@ -1705,7 +1730,8 @@ fn run_coopmat_q4k_naive_parity(m: u32, n: u32, k: u32, label: &str) {
     use vulkanforge::backend::vulkan::pipeline::CoopmatPushConstants;
     use vulkanforge::backend::vulkan::q4k;
     assert_eq!(k as usize % q4k::QUANT_K, 0);
-    let mut fix = Fixture::new();
+    // Sprint 16C: the MulCoopmatQ4KNaiveBf16 shader is opt-in.
+    let mut fix = Fixture::new_coopmat();
     let weights = q4k::build_random_weights(m as usize, k as usize, 0xC0FFEE);
     let w_buf = {
         let device = fix.dev.device.clone();
@@ -2629,6 +2655,7 @@ fn run_tiled_attn_seqlen(seq_len: u32, abs_threshold: f32) {
     let v_h = fix.host_buffer_f32(&v, "v");
     let o_h = fix.output_buffer_f32((n_heads * head_dim) as usize, "o");
     let pc = ScalarAttnPushConstants {
+        kv_start: 0,
         n_heads, n_kv_heads, head_dim,
         seq_len, max_seq, scale,
     };
@@ -2712,6 +2739,7 @@ fn run_flash_attn_seqlen(seq_len: u32, abs_threshold: f32) {
     let v_h = fix.host_buffer_f32(&v, "v");
     let o_h = fix.output_buffer_f32((n_heads * head_dim) as usize, "o");
     let pc = ScalarAttnPushConstants {
+        kv_start: 0,
         n_heads, n_kv_heads, head_dim,
         seq_len, max_seq, scale,
     };
@@ -2808,6 +2836,7 @@ fn run_split_attn_seqlen(seq_len: u32, abs_threshold: f32) {
 
     // ---- Dispatch split worker ----
     let split_pc = FlashAttnSplitPushConstants {
+        kv_start: 0,
         n_heads, n_kv_heads, head_dim,
         seq_len, max_seq, scale,
         n_tiles,
@@ -2905,6 +2934,7 @@ fn test_flash_attn_matches_scalar_attn_seq200() {
     let v_b = fix.host_buffer_f32(&v, "v2");
     let o_b = fix.output_buffer_f32((n_heads * head_dim) as usize, "o_flash");
     let pc = ScalarAttnPushConstants {
+        kv_start: 0,
         n_heads, n_kv_heads, head_dim, seq_len, max_seq, scale,
     };
     fix.dispatch(
@@ -3090,6 +3120,7 @@ fn run_batch_attn(
     let v_h = fix.host_buffer_f32(&v, "batch_v");
     let o_h = fix.output_buffer_f32(q_count, "batch_o");
     let pc = FlashAttnBatchPushConstants {
+        kv_start: 0,
         n_heads,
         n_kv_heads,
         head_dim,
@@ -3205,6 +3236,7 @@ fn test_batch_attn_m1_matches_flash_attn() {
     let v_a = fix_a.host_buffer_f32(&v, "fa_v");
     let o_a = fix_a.output_buffer_f32(q_count, "fa_o");
     let pc_fa = ScalarAttnPushConstants {
+        kv_start: 0,
         n_heads, n_kv_heads, head_dim,
         seq_len: 1, max_seq, scale,
     };
@@ -3224,6 +3256,7 @@ fn test_batch_attn_m1_matches_flash_attn() {
     let v_b = fix_b.host_buffer_f32(&v, "fab_v");
     let o_b = fix_b.output_buffer_f32(q_count, "fab_o");
     let pc_fab = FlashAttnBatchPushConstants {
+        kv_start: 0,
         n_heads, n_kv_heads, head_dim,
         m: 1, n_kv: 1, q_start: 0, scale,
     };
@@ -3296,6 +3329,7 @@ fn test_batch_attn_causal_mask_isolates_queries() {
     let v1 = fix_1.host_buffer_f32(&v, "v1");
     let o1 = fix_1.output_buffer_f32(head_count, "o1");
     let pc1 = FlashAttnBatchPushConstants {
+        kv_start: 0,
         n_heads, n_kv_heads, head_dim,
         m: 1, n_kv: 1, q_start: 0, scale,
     };
@@ -3315,6 +3349,7 @@ fn test_batch_attn_causal_mask_isolates_queries() {
     let v4 = fix_4.host_buffer_f32(&v, "v4");
     let o4 = fix_4.output_buffer_f32(q_count_full, "o4");
     let pc4 = FlashAttnBatchPushConstants {
+        kv_start: 0,
         n_heads, n_kv_heads, head_dim,
         m: m_full, n_kv: m_full, q_start: 0, scale,
     };
