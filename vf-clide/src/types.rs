@@ -80,14 +80,33 @@ fn function_kind() -> String {
 
 /// A tool's risk class — the single source of truth for permission
 /// gating, declared **at the tool definition** (in each `*_tool()` fn),
-/// never in a separate map that could drift from the dispatch. `ReadOnly`
-/// tools (`read_file`, `search`) can be auto-approved with `--yes`;
-/// `Mutating` tools (`write_file`, `shell`) never are — they require an
-/// interactive `y/N` or the explicit `--allow-mutating` headless opt-in.
+/// never in a separate map that could drift from the dispatch.
+///
+/// Ordered tiers (`ReadOnly` < `Mutating` < `Exec`); each headless
+/// opt-in flag raises an auto-approve *ceiling* that implies the lower
+/// tiers (see `agent::Gate`):
+/// - `ReadOnly` — `read_file`, `search`. Auto-approved by `--yes`.
+/// - `Mutating` — `write_file` (writes, but **confined** to the workspace).
+///   Auto-approved by `--allow-mutating`.
+/// - `Exec` — `shell`. The **only** non-confinable tool, so the gate is
+///   its *sole* guard → its own top tier, auto-approved only by the
+///   loudly-named `--allow-shell`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolRisk {
     ReadOnly,
     Mutating,
+    Exec,
+}
+
+impl ToolRisk {
+    /// Numeric tier for ceiling comparison (higher = riskier).
+    pub fn rank(self) -> u8 {
+        match self {
+            ToolRisk::ReadOnly => 1,
+            ToolRisk::Mutating => 2,
+            ToolRisk::Exec => 3,
+        }
+    }
 }
 
 /// A tool definition sent in the request `tools` array. `risk` is local

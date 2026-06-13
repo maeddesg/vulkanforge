@@ -106,7 +106,10 @@ pub fn shell_tool() -> Tool {
             "properties": { "command": { "type": "string", "description": "The shell command to run" } },
             "required": ["command"]
         }),
-        ToolRisk::Mutating,
+        // `Exec` is its own top tier above `Mutating`: shell is the only
+        // tool the workspace confinement cannot fence in, so the gate is
+        // its SOLE guard (needs the loud `--allow-shell`, not `--allow-mutating`).
+        ToolRisk::Exec,
     )
 }
 
@@ -228,6 +231,18 @@ fn read_file_at(path: &Path) -> String {
         }
         Err(e) => format!("read_file error: {}: {e}", path.display()),
     }
+}
+
+/// Read the workspace `AGENTS.md` (project constitution override), confined
+/// to the root exactly like the file tools (`confined_path`). Returns
+/// `None` if it is missing, a directory, escapes the root (e.g. a symlink
+/// out), or isn't valid UTF-8 — the caller treats absence as "no override".
+pub fn read_agents_md(workspace: &Path) -> Option<String> {
+    let target = confined_path("AGENTS.md", workspace).ok()?;
+    if target.is_dir() {
+        return None;
+    }
+    std::fs::read_to_string(&target).ok()
 }
 
 // -----------------------------------------------------------------
@@ -380,10 +395,13 @@ pub fn execute_shell(arguments: &str, workspace: &Path) -> String {
         Ok(c) => c,
         Err(e) => return format!("shell {e}"),
     };
-    run_shell(&command, workspace)
+    run_shell(&command, workspace, SHELL_TIMEOUT)
 }
 
-fn run_shell(command: &str, cwd: &Path) -> String {
+/// Run `command` in `cwd`, capturing stdout/stderr/exit, capped + killed
+/// after `timeout`. `timeout` is a parameter (injectable) so the kill /
+/// no-hang path is unit-testable without waiting the production 30 s.
+fn run_shell(command: &str, cwd: &Path, timeout: Duration) -> String {
     let mut child = match Command::new("sh")
         .arg("-c")
         .arg(command)
@@ -410,7 +428,7 @@ fn run_shell(command: &str, cwd: &Path) -> String {
         match child.try_wait() {
             Ok(Some(s)) => break (Some(s), false),
             Ok(None) => {
-                if start.elapsed() >= SHELL_TIMEOUT {
+                if start.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
                     break (None, true);
@@ -436,7 +454,7 @@ fn run_shell(command: &str, cwd: &Path) -> String {
     if timed_out {
         return format!(
             "shell: TIMED OUT after {}s and was killed.\n--- stdout ---\n{out}\n--- stderr ---\n{err}",
-            SHELL_TIMEOUT.as_secs()
+            timeout.as_secs()
         );
     }
     let code = match status.and_then(|s| s.code()) {
@@ -494,8 +512,33 @@ mod tests {
         assert_eq!(read_file_tool().risk, ToolRisk::ReadOnly);
         assert_eq!(search_tool().risk, ToolRisk::ReadOnly);
         assert_eq!(write_file_tool().risk, ToolRisk::Mutating);
-        assert_eq!(shell_tool().risk, ToolRisk::Mutating);
+        assert_eq!(shell_tool().risk, ToolRisk::Exec); // own top tier (Slice 3)
         assert_eq!(all_tools().len(), 4);
+    }
+
+    // ---- AGENTS.md (constitution override), confined ----
+
+    #[test]
+    fn agents_md_present_is_read() {
+        let ws = workspace("agents_present");
+        std::fs::write(ws.join("AGENTS.md"), b"project rules").unwrap();
+        assert_eq!(read_agents_md(&ws).as_deref(), Some("project rules"));
+    }
+
+    #[test]
+    fn agents_md_missing_is_none() {
+        let ws = workspace("agents_missing");
+        assert!(read_agents_md(&ws).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agents_md_escaping_symlink_is_ignored() {
+        let ws = workspace("agents_symlink");
+        // AGENTS.md as a symlink pointing OUT of the workspace → confined
+        // read rejects it → treated as absent (no crash, no leak).
+        std::os::unix::fs::symlink("/etc/hostname", ws.join("AGENTS.md")).unwrap();
+        assert!(read_agents_md(&ws).is_none(), "escaping AGENTS.md symlink must be ignored");
     }
 
     #[test]
@@ -650,17 +693,16 @@ mod tests {
     }
 
     #[test]
-    fn shell_timeout_kills_and_does_not_hang() {
+    fn shell_injected_timeout_kills_and_does_not_hang() {
+        // Inject a 1 s timeout against a 30 s sleep → the kill / no-hang
+        // path runs for real (no need to wait the production 30 s): a
+        // structured TIMED OUT result comes back in ~1 s, not ~30 s.
         let ws = workspace("shell_timeout");
-        // A command that would run far longer than the timeout. We can't
-        // wait the full 30s in a unit test, so prove the mechanism with a
-        // short bound by checking try_wait/kill path indirectly: a 2s sleep
-        // returns normally well under the 30s cap (no hang); the real cap
-        // is exercised by SHELL_TIMEOUT in production.
         let start = Instant::now();
-        let out = execute_shell(&args(serde_json::json!({"command": "sleep 2; echo done"})), &ws);
-        assert!(out.contains("done"), "got: {out}");
-        assert!(start.elapsed() < SHELL_TIMEOUT, "should finish well under the cap");
+        let out = run_shell("sleep 30", &ws, Duration::from_secs(1));
+        let elapsed = start.elapsed();
+        assert!(out.contains("TIMED OUT"), "expected a timeout result, got: {out}");
+        assert!(elapsed < Duration::from_secs(10), "did not honor the timeout (took {elapsed:?})");
     }
 
     // ---- arg errors ----

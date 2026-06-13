@@ -73,6 +73,9 @@ pub struct Repl {
     /// Workspace root for the file tools (confinement). Set via
     /// [`Repl::with_workspace`]; defaults to `.` (agent unused otherwise).
     workspace: std::path::PathBuf,
+    /// Agent system prompt (constitution). Prepended as `messages[0]` in
+    /// agent mode only — the plain chat path is unaffected.
+    system: Option<String>,
 }
 
 impl Repl {
@@ -85,6 +88,7 @@ impl Repl {
             no_think: false,
             agent: false,
             workspace: std::path::PathBuf::from("."),
+            system: None,
         }
     }
 
@@ -107,13 +111,26 @@ impl Repl {
         self
     }
 
+    /// Set the agent constitution (system prompt); used in agent mode only.
+    pub fn with_system(mut self, system: Option<String>) -> Self {
+        self.system = system;
+        self
+    }
+
     /// Build the message list for one turn: optional memory context
     /// (no-op in Phase 1) + prior history + the new user input. This is
     /// the single point where the memory seam is consulted. When
     /// `no_think` is set, the `/no_think` directive is appended to the
     /// new user content (NOT a slash-command — it belongs in the message).
     pub fn build_messages(&self, user_input: &str) -> Vec<ChatMessage> {
-        let mut msgs = Vec::with_capacity(self.history.len() + 2);
+        let mut msgs = Vec::with_capacity(self.history.len() + 3);
+        // Agent constitution at the very front — agent mode only, so the
+        // plain chat path is byte-for-byte unchanged.
+        if self.agent {
+            if let Some(sys) = &self.system {
+                msgs.push(ChatMessage::system(sys.clone()));
+            }
+        }
         if let Some(ctx) = self.memory.context_for(self.project.as_deref(), &self.history) {
             msgs.push(ChatMessage::system(ctx));
         }
@@ -173,7 +190,7 @@ impl Repl {
             // visible warning), so no `--allow-mutating` is needed here.
             if self.agent {
                 let msgs = self.build_messages(&line);
-                let gate = crate::agent::Gate::new(crate::agent::Permission::Interactive, false);
+                let gate = crate::agent::Gate::interactive();
                 match crate::agent::run(&self.client, msgs, gate, &self.workspace).await {
                     Ok(crate::agent::LoopEnd::Final { content, finish_reason }) => {
                         let text = content.unwrap_or_default();
@@ -240,6 +257,27 @@ impl Repl {
 mod tests {
     use super::*;
     use crate::memory::NoopMemory;
+
+    #[test]
+    fn constitution_is_messages0_in_agent_mode_only() {
+        // Agent mode + a system prompt → it leads as messages[0].
+        let client = Client::new("http://localhost:0", "m");
+        let repl = Repl::new(client, Box::new(NoopMemory), None)
+            .with_agent(true)
+            .with_system(Some("CONSTITUTION".into()));
+        let msgs = repl.build_messages("hi");
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[0].content, "CONSTITUTION");
+        assert_eq!(msgs.last().unwrap().role, "user");
+
+        // Plain chat mode → NO system prepend (chat path unchanged).
+        let client2 = Client::new("http://localhost:0", "m");
+        let chat = Repl::new(client2, Box::new(NoopMemory), None)
+            .with_system(Some("CONSTITUTION".into())); // agent=false
+        let m2 = chat.build_messages("hi");
+        assert_eq!(m2.len(), 1);
+        assert_eq!(m2[0].role, "user");
+    }
 
     #[test]
     fn build_messages_accumulates_history() {

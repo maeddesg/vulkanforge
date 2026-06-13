@@ -62,24 +62,39 @@ struct Args {
     #[arg(long)]
     agent: bool,
 
-    /// Auto-approve **read-only** tool calls (`read_file`, `search`) in a
-    /// headless `--agent` run. Does NOT approve mutating tools
-    /// (`write_file`, `shell`) — those need `--allow-mutating`. In the
-    /// REPL, tool calls always prompt interactively regardless of `--yes`.
+    /// Auto-approve **read-only** tools (`read_file`, `search`) in a
+    /// headless `--agent` run. Does NOT approve `write_file` (needs
+    /// `--allow-mutating`) or `shell` (needs `--allow-shell`). In the REPL,
+    /// tool calls always prompt interactively regardless of `--yes`.
     #[arg(long)]
     yes: bool,
 
-    /// Permit **mutating** tools (`write_file`, `shell`) in a headless
-    /// `--agent` run. Separate from `--yes` on purpose: `--yes` waves safe
-    /// reads through, this one is the explicit "I accept writes/exec" opt-in.
+    /// Permit **`write_file`** (mutating, workspace-confined) headless.
+    /// Implies `--yes` (also auto-approves reads). Does NOT permit `shell`.
     #[arg(long)]
     allow_mutating: bool,
+
+    /// Permit **`shell`** (exec — NOT workspace-confinable, highest risk)
+    /// headless. Implies `--allow-mutating` + `--yes`. The loud, explicit
+    /// "I accept arbitrary command execution" opt-in.
+    #[arg(long)]
+    allow_shell: bool,
 
     /// Workspace root for the file tools (`read_file`/`write_file`/`search`).
     /// Paths are confined inside it (`..`/symlinks that escape are rejected).
     /// Default: the current directory. `shell` runs here but is NOT confined.
     #[arg(long)]
     workspace: Option<String>,
+
+    /// Override the built-in agent system prompt with the contents of this
+    /// file (replaces it entirely). Without it, the default is used and any
+    /// `AGENTS.md` in the workspace root is appended.
+    #[arg(long)]
+    system: Option<String>,
+
+    /// Disable the agent system prompt entirely (no system message).
+    #[arg(long)]
+    no_system: bool,
 }
 
 #[tokio::main]
@@ -93,19 +108,42 @@ async fn main() -> Result<()> {
     // confinement check compares canonical-to-canonical (resolves `..`
     // and symlinks in the root itself).
     let workspace = resolve_workspace(args.workspace.as_deref())?;
+    // Cumulative auto-approve ceiling from the opt-in flags (each implies
+    // the lower tiers).
+    let ceiling = headless_ceiling(args.yes, args.allow_mutating, args.allow_shell);
+    // The agent constitution (system prompt). Computed up front so a bad
+    // `--system` path errors before we connect.
+    let system = vf_clide::agent::system_prompt(&workspace, args.system.as_deref(), args.no_system)?;
 
     match args.prompt {
         Some(prompt) if args.agent => {
-            run_agent_headless(client, prompt, args.no_think, args.yes, args.allow_mutating, workspace, args.project).await
+            let gate = vf_clide::agent::Gate::headless(ceiling);
+            run_agent_headless(client, prompt, args.no_think, gate, workspace, system).await
         }
         Some(prompt) => run_headless(client, prompt, args.no_stream, args.no_think, args.project).await,
         None => {
             let mut repl = Repl::new(client, Box::new(NoopMemory), args.project)
                 .with_no_think(args.no_think)
                 .with_agent(args.agent)
-                .with_workspace(workspace);
+                .with_workspace(workspace)
+                .with_system(system);
             repl.run().await
         }
+    }
+}
+
+/// Map the cumulative opt-in flags to the headless auto-approve ceiling.
+/// `--allow-shell` ⊃ `--allow-mutating` ⊃ `--yes`; absent = deny all.
+fn headless_ceiling(yes: bool, allow_mutating: bool, allow_shell: bool) -> Option<vf_clide::types::ToolRisk> {
+    use vf_clide::types::ToolRisk;
+    if allow_shell {
+        Some(ToolRisk::Exec)
+    } else if allow_mutating {
+        Some(ToolRisk::Mutating)
+    } else if yes {
+        Some(ToolRisk::ReadOnly)
+    } else {
+        None
     }
 }
 
@@ -119,32 +157,28 @@ fn resolve_workspace(arg: Option<&str>) -> Result<std::path::PathBuf> {
         .map_err(|e| format!("--workspace {}: {e}", raw.display()).into())
 }
 
-/// Headless agent loop. `--yes` auto-approves read-only tool calls;
-/// `--allow-mutating` additionally permits write/shell. Without the
-/// relevant opt-in, a call is denied and the loop ends gracefully.
-#[allow(clippy::too_many_arguments)]
+/// Headless agent loop. The `gate` carries the cumulative auto-approve
+/// ceiling from `--yes`/`--allow-mutating`/`--allow-shell`; `system` is the
+/// constitution (prepended as the first message). A call above the ceiling
+/// is denied and the loop ends gracefully.
 async fn run_agent_headless(
     client: Client,
     prompt: String,
     no_think: bool,
-    yes: bool,
-    allow_mutating: bool,
+    gate: vf_clide::agent::Gate,
     workspace: std::path::PathBuf,
-    project: Option<String>,
+    system: Option<String>,
 ) -> Result<()> {
-    use vf_clide::agent::{self, Gate, LoopEnd, Permission, LOOP_CAP};
+    use vf_clide::agent::{self, LoopEnd, LOOP_CAP};
     use vf_clide::client::{empty_notice, truncation_notice};
 
-    let memory = NoopMemory;
     let mut msgs: Vec<ChatMessage> = Vec::new();
-    if let Some(ctx) = memory.context_for(project.as_deref(), &[]) {
-        msgs.push(ChatMessage::system(ctx));
+    if let Some(sys) = system {
+        msgs.push(ChatMessage::system(sys));
     }
     let content = if no_think { format!("{prompt} /no_think") } else { prompt };
     msgs.push(ChatMessage::user(content));
 
-    let mode = if yes { Permission::AutoApprove } else { Permission::DenyHeadless };
-    let gate = Gate::new(mode, allow_mutating);
     let max_tokens = client.max_tokens;
     match agent::run(&client, msgs, gate, &workspace).await? {
         LoopEnd::Final { content, finish_reason } => {
