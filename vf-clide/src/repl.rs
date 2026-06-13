@@ -10,6 +10,7 @@ use rustyline::DefaultEditor;
 
 use crate::client::{empty_notice, truncation_notice, Client, Result};
 use crate::memory::Memory;
+use crate::status::StatusBar;
 use crate::types::{strip_think, ChatMessage};
 
 /// Parsed REPL command. `None` from [`parse_command`] means "not a
@@ -145,15 +146,21 @@ impl Repl {
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        use std::io::IsTerminal;
+
         let mut rl = DefaultEditor::new().map_err(|e| format!("readline init: {e}"))?;
         println!(
             "vf-clide — model: {} · commands: /quit /clear /model <name> /max-tokens <N> /think /no-think",
             self.client.model
         );
+        // Pinned status line — only when stdout is a TTY (no-op otherwise).
+        let bar = StatusBar::new(std::io::stdout().is_terminal());
+        bar.enter();
         loop {
+            bar.set_action("idle");
             let line = match rl.readline("> ") {
                 Ok(l) => l,
-                Err(_) => break, // Ctrl-D / Ctrl-C → exit
+                Err(_) => break, // Ctrl-D / Ctrl-C at the prompt → exit
             };
             let line = line.trim().to_string();
             if line.is_empty() {
@@ -188,11 +195,21 @@ impl Repl {
             // Agent turn — tool-calling loop with interactive permission.
             // Interactive mode prompts y/N per call (mutating tools get a
             // visible warning), so no `--allow-mutating` is needed here.
+            // The loop pushes `thinking…` / `running <tool>(…)` to the bar.
             if self.agent {
                 let msgs = self.build_messages(&line);
                 let gate = crate::agent::Gate::interactive();
-                match crate::agent::run(&self.client, msgs, gate, &self.workspace).await {
-                    Ok(crate::agent::LoopEnd::Final { content, finish_reason }) => {
+                let fut = crate::agent::run(&self.client, msgs, gate, &self.workspace, Some(&bar));
+                let res = tokio::select! {
+                    r = fut => r,
+                    _ = tokio::signal::ctrl_c() => {
+                        println!("\n(interrupted)");
+                        bar.leave();
+                        std::process::exit(130);
+                    }
+                };
+                match res {
+                    Ok((crate::agent::LoopEnd::Final { content, finish_reason }, usage)) => {
                         let text = content.unwrap_or_default();
                         println!("{text}");
                         if let Some(m) = empty_notice(&text) {
@@ -204,8 +221,9 @@ impl Repl {
                         }
                         self.history.push(ChatMessage::user(line));
                         self.history.push(ChatMessage::assistant(strip_think(&text)));
+                        bar.record_turn(usage);
                     }
-                    Ok(crate::agent::LoopEnd::CapReached) => {
+                    Ok((crate::agent::LoopEnd::CapReached, usage)) => {
                         eprintln!(
                             "[agent] stopped: reached the tool-call loop cap ({}). \
                              The task may be incomplete.",
@@ -213,6 +231,7 @@ impl Repl {
                         );
                         // Keep the user turn in history so context isn't lost.
                         self.history.push(ChatMessage::user(line));
+                        bar.record_turn(usage);
                     }
                     Err(e) => eprintln!("error: {e}"),
                 }
@@ -220,15 +239,21 @@ impl Repl {
             }
 
             // Normal turn — stream the answer live.
+            bar.set_action("generating…");
             let msgs = self.build_messages(&line);
             let mut stdout = std::io::stdout();
-            let result = self
-                .client
-                .chat_stream(msgs, |t| {
-                    print!("{t}");
-                    let _ = stdout.flush();
-                })
-                .await;
+            let fut = self.client.chat_stream(msgs, |t| {
+                print!("{t}");
+                let _ = stdout.flush();
+            });
+            let result = tokio::select! {
+                r = fut => r,
+                _ = tokio::signal::ctrl_c() => {
+                    println!();
+                    bar.leave();
+                    std::process::exit(130);
+                }
+            };
             println!();
             match result {
                 Ok(o) => {
@@ -245,10 +270,12 @@ impl Repl {
                     // per-turn by build_messages). Strip prior-turn <think>.
                     self.history.push(ChatMessage::user(line));
                     self.history.push(ChatMessage::assistant(strip_think(&o.text)));
+                    bar.record_turn(o.usage.unwrap_or_default());
                 }
                 Err(e) => eprintln!("error: {e}"),
             }
         }
+        bar.leave();
         Ok(())
     }
 }

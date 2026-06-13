@@ -502,7 +502,6 @@ fn drain_capped(r: &mut impl Read) -> (Vec<u8>, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     /// A fresh, canonical temp workspace dir for one test.
     fn workspace(tag: &str) -> PathBuf {

@@ -16,5 +16,6 @@ pub mod agent;
 pub mod client;
 pub mod memory;
 pub mod repl;
+pub mod status;
 pub mod tools;
 pub mod types;

@@ -158,6 +158,56 @@ pub struct ChatRequest {
     /// plain chat path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Tool>>,
+    /// Streaming usage opt-in. Set `{include_usage:true}` only on the
+    /// stream path so the server emits a final `usage` chunk (verified:
+    /// VF sends `choices:[] + usage` before `[DONE]`). Omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
+}
+
+/// `stream_options` — asks the server to append token usage to the stream.
+#[derive(Debug, Serialize)]
+pub struct StreamOptions {
+    pub include_usage: bool,
+}
+
+/// Token usage reported by the server (all optional — a chunk/response may
+/// omit it). Present on the non-stream response and, with
+/// `stream_options.include_usage`, on the final streaming chunk.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+pub struct Usage {
+    #[serde(default)]
+    pub prompt_tokens: Option<u32>,
+    #[serde(default)]
+    pub completion_tokens: Option<u32>,
+    #[serde(default)]
+    pub total_tokens: Option<u32>,
+}
+
+/// Session-level token accumulator (REPL state). `add` folds one turn's
+/// usage in; `total` falls back to prompt+completion if the server didn't
+/// send a total. `estimated` flips if any turn's tokens were estimated
+/// (not currently used — VF reports real usage on both paths — but kept so
+/// the meter can honestly show `~` if a future server/path can't).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionUsage {
+    pub prompt: u64,
+    pub completion: u64,
+    pub total: u64,
+    pub turns: u32,
+    pub estimated: bool,
+}
+
+impl SessionUsage {
+    pub fn add(&mut self, u: &Usage) {
+        let p = u.prompt_tokens.unwrap_or(0);
+        let c = u.completion_tokens.unwrap_or(0);
+        let t = u.total_tokens.unwrap_or(p + c);
+        self.prompt += p as u64;
+        self.completion += c as u64;
+        self.total += t as u64;
+        self.turns += 1;
+    }
 }
 
 // ---- Non-streaming response (only the fields we read) ----
@@ -165,6 +215,8 @@ pub struct ChatRequest {
 #[derive(Debug, Deserialize)]
 pub struct ChatResponse {
     pub choices: Vec<Choice>,
+    #[serde(default)]
+    pub usage: Option<Usage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,6 +240,10 @@ pub struct RespMessage {
 pub struct ChatChunk {
     #[serde(default)]
     pub choices: Vec<ChunkChoice>,
+    /// Present only on the final chunk when `include_usage` was set
+    /// (then `choices` is empty).
+    #[serde(default)]
+    pub usage: Option<Usage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -243,6 +299,7 @@ mod tests {
             max_tokens: None,
             stream: true,
             tools: None,
+            stream_options: None,
         };
         let v: serde_json::Value = serde_json::to_value(&req).unwrap();
         assert_eq!(v["model"], "Qwen3-14B-Q4_K_M");
@@ -250,12 +307,53 @@ mod tests {
         assert_eq!(v["messages"][0]["content"], "Hi");
         assert_eq!(v["stream"], true);
         assert_eq!(v["temperature"], 0.0);
-        // max_tokens + tools omitted when None.
+        // max_tokens + tools + stream_options omitted when None.
         assert!(v.get("max_tokens").is_none());
         assert!(v.get("tools").is_none());
+        assert!(v.get("stream_options").is_none());
         // a plain user message has no tool fields on the wire.
         assert!(v["messages"][0].get("tool_call_id").is_none());
         assert!(v["messages"][0].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn non_stream_response_usage_parses() {
+        let json = r#"{"choices":[{"message":{"role":"assistant","content":"hi"},
+            "finish_reason":"stop"}],"usage":{"prompt_tokens":14,"completion_tokens":3,"total_tokens":17}}"#;
+        let r: ChatResponse = serde_json::from_str(json).unwrap();
+        let u = r.usage.unwrap();
+        assert_eq!(u.prompt_tokens, Some(14));
+        assert_eq!(u.completion_tokens, Some(3));
+        assert_eq!(u.total_tokens, Some(17));
+    }
+
+    #[test]
+    fn stream_final_usage_chunk_parses() {
+        // The verified VF final chunk: empty choices + usage, must NOT error.
+        let json = r#"{"id":"x","object":"chat.completion.chunk",
+            "choices":[],"usage":{"prompt_tokens":14,"completion_tokens":16,"total_tokens":30}}"#;
+        let c: ChatChunk = serde_json::from_str(json).unwrap();
+        assert!(c.choices.is_empty());
+        let u = c.usage.unwrap();
+        assert_eq!(u.completion_tokens, Some(16));
+        assert_eq!(u.total_tokens, Some(30));
+        // a normal content chunk has no usage
+        let c2: ChatChunk = serde_json::from_str(
+            r#"{"choices":[{"index":0,"delta":{"content":"hi"}}]}"#,
+        ).unwrap();
+        assert!(c2.usage.is_none());
+    }
+
+    #[test]
+    fn session_usage_accumulates() {
+        let mut s = SessionUsage::default();
+        s.add(&Usage { prompt_tokens: Some(10), completion_tokens: Some(5), total_tokens: Some(15) });
+        s.add(&Usage { prompt_tokens: Some(20), completion_tokens: Some(7), total_tokens: Some(27) });
+        assert_eq!((s.prompt, s.completion, s.total, s.turns), (30, 12, 42, 2));
+        // total falls back to prompt+completion when the server omits it.
+        let mut s2 = SessionUsage::default();
+        s2.add(&Usage { prompt_tokens: Some(4), completion_tokens: Some(6), total_tokens: None });
+        assert_eq!((s2.prompt, s2.completion, s2.total, s2.turns), (4, 6, 10, 1));
     }
 
     #[test]

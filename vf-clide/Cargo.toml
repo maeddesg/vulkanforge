@@ -1,6 +1,6 @@
 [package]
 name = "vf-clide"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.85"
 license = "GPL-3.0-only"
@@ -12,10 +12,13 @@ description = "Lean agentic CLI client for VulkanForge's OpenAI-compatible API (
 [workspace]
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 rustyline = "15"
+# Tiny helper to query terminal size for the pinned status line (no TUI
+# framework). Size is re-queried per repaint; no SIGWINCH handler needed.
+terminal_size = "0.4"

@@ -22,7 +22,8 @@ use crate::tools::{
     all_tools, execute_read_file, execute_search, execute_shell, execute_write_file, read_agents_md,
     READ_FILE, SEARCH, SHELL, WRITE_FILE,
 };
-use crate::types::{ChatMessage, Tool, ToolCall, ToolRisk};
+use crate::status::StatusBar;
+use crate::types::{ChatMessage, Tool, ToolCall, ToolRisk, Usage};
 
 /// Maximum tool-call iterations before stopping with a visible marker.
 pub const LOOP_CAP: usize = 8;
@@ -211,31 +212,55 @@ pub async fn run_loop<F, Fut>(
     gate: Gate,
     workspace: &Path,
     tools: &[Tool],
+    status: Option<&StatusBar>,
     cap: usize,
     mut send: F,
-) -> Result<LoopEnd>
+) -> Result<(LoopEnd, Usage)>
 where
     F: FnMut(Vec<ChatMessage>) -> Fut,
     Fut: std::future::Future<Output = Result<AgentTurn>>,
 {
+    // Accumulate token usage across every model call this turn made (the
+    // loop may issue several requests; each is billed, so summing them is
+    // the honest total work for the user turn).
+    let mut acc = Usage::default();
     for _ in 0..cap {
+        if let Some(s) = status {
+            s.set_action("thinking…");
+        }
         let turn = send(messages.clone()).await?;
+        fold_usage(&mut acc, &turn.usage);
         if turn.tool_calls.is_empty() {
-            return Ok(LoopEnd::Final {
-                content: turn.content,
-                finish_reason: turn.finish_reason,
-            });
+            return Ok((
+                LoopEnd::Final { content: turn.content, finish_reason: turn.finish_reason },
+                acc,
+            ));
         }
         // One assistant turn carrying all the calls...
         let assistant_text = turn.content.clone().unwrap_or_default();
         messages.push(ChatMessage::assistant_with_tool_calls(assistant_text, turn.tool_calls.clone()));
         // ...then one `tool` result per call, in order.
         for call in &turn.tool_calls {
+            if let Some(s) = status {
+                s.set_action(format!("running {}(…)", call.function.name));
+            }
             let result = handle_call(call, gate, workspace, tools);
             messages.push(ChatMessage::tool(call.id.clone(), result));
         }
     }
-    Ok(LoopEnd::CapReached)
+    Ok((LoopEnd::CapReached, acc))
+}
+
+/// Sum one model call's usage into the running accumulator (Option fields
+/// become `Some(running sum)`; `total` falls back to prompt+completion).
+fn fold_usage(acc: &mut Usage, u: &Option<Usage>) {
+    let Some(u) = u else { return };
+    let p = u.prompt_tokens.unwrap_or(0);
+    let c = u.completion_tokens.unwrap_or(0);
+    let t = u.total_tokens.unwrap_or(p + c);
+    acc.prompt_tokens = Some(acc.prompt_tokens.unwrap_or(0) + p);
+    acc.completion_tokens = Some(acc.completion_tokens.unwrap_or(0) + c);
+    acc.total_tokens = Some(acc.total_tokens.unwrap_or(0) + t);
 }
 
 /// Run the agent loop against a live server with the full tool set
@@ -246,9 +271,10 @@ pub async fn run(
     messages: Vec<ChatMessage>,
     gate: Gate,
     workspace: &Path,
-) -> Result<LoopEnd> {
+    status: Option<&StatusBar>,
+) -> Result<(LoopEnd, Usage)> {
     let tools = all_tools();
-    run_loop(messages, gate, workspace, &tools, LOOP_CAP, |msgs| {
+    run_loop(messages, gate, workspace, &tools, status, LOOP_CAP, |msgs| {
         client.chat_with_tools(msgs, &tools)
     })
     .await
@@ -428,11 +454,12 @@ mod tests {
     async fn loop_finishes_when_no_tool_calls() {
         let mut count = 0;
         let tools = all_tools();
-        let end = run_loop(
+        let (end, _usage) = run_loop(
             vec![ChatMessage::user("hi")],
             Gate::headless(Some(ToolRisk::ReadOnly)),
             &ws(),
             &tools,
+            None,
             LOOP_CAP,
             |_m| {
                 count += 1;
@@ -440,6 +467,7 @@ mod tests {
                     content: Some("done".into()),
                     tool_calls: vec![],
                     finish_reason: Some("stop".into()),
+                    usage: None,
                 }))
             },
         )
@@ -455,11 +483,12 @@ mod tests {
         let call = read_call(&p.display().to_string());
         let tools = all_tools();
         let mut count = 0;
-        let end = run_loop(
+        let (end, _usage) = run_loop(
             vec![ChatMessage::user("go")],
             Gate::headless(Some(ToolRisk::ReadOnly)),
             &ws(),
             &tools,
+            None,
             LOOP_CAP,
             |_m| {
                 count += 1;
@@ -468,6 +497,7 @@ mod tests {
                     content: None,
                     tool_calls: vec![call],
                     finish_reason: Some("tool_calls".into()),
+                    usage: None,
                 }))
             },
         )
@@ -489,6 +519,7 @@ mod tests {
             Gate::headless(Some(ToolRisk::ReadOnly)),
             &ws(),
             &tools,
+            None,
             LOOP_CAP,
             |msgs| {
                 iter += 1;
@@ -498,12 +529,14 @@ mod tests {
                         content: Some("final".into()),
                         tool_calls: vec![],
                         finish_reason: Some("stop".into()),
+                        usage: None,
                     }))
                 } else {
                     std::future::ready(Ok(AgentTurn {
                         content: None,
                         tool_calls: vec![call.clone()],
                         finish_reason: Some("tool_calls".into()),
+                        usage: None,
                     }))
                 }
             },
@@ -517,5 +550,47 @@ mod tests {
         assert_eq!(m[2].role, "tool");
         assert_eq!(m[2].tool_call_id.as_deref(), Some("call_x"));
         assert_eq!(m[2].content, "FILE-BODY");
+    }
+
+    #[tokio::test]
+    async fn loop_accumulates_usage_across_calls() {
+        // One tool roundtrip then a final answer; each model call reports
+        // usage → the returned turn usage is the sum of all calls.
+        let p = tmp("usage", "BODY");
+        let call = read_call(&p.display().to_string());
+        let tools = all_tools();
+        let mut iter = 0;
+        let (_end, usage) = run_loop(
+            vec![ChatMessage::user("go")],
+            Gate::headless(Some(ToolRisk::ReadOnly)),
+            &ws(),
+            &tools,
+            None,
+            LOOP_CAP,
+            |_m| {
+                iter += 1;
+                let turn = if iter == 1 {
+                    AgentTurn {
+                        content: None,
+                        tool_calls: vec![call.clone()],
+                        finish_reason: Some("tool_calls".into()),
+                        usage: Some(Usage { prompt_tokens: Some(10), completion_tokens: Some(2), total_tokens: Some(12) }),
+                    }
+                } else {
+                    AgentTurn {
+                        content: Some("ok".into()),
+                        tool_calls: vec![],
+                        finish_reason: Some("stop".into()),
+                        usage: Some(Usage { prompt_tokens: Some(20), completion_tokens: Some(3), total_tokens: Some(23) }),
+                    }
+                };
+                std::future::ready(Ok(turn))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(usage.prompt_tokens, Some(30));
+        assert_eq!(usage.completion_tokens, Some(5));
+        assert_eq!(usage.total_tokens, Some(35));
     }
 }

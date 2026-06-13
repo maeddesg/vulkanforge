@@ -7,7 +7,7 @@
 
 use futures_util::StreamExt;
 
-use crate::types::{ChatChunk, ChatMessage, ChatRequest, ChatResponse, Tool, ToolCall};
+use crate::types::{ChatChunk, ChatMessage, ChatRequest, ChatResponse, StreamOptions, Tool, ToolCall, Usage};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -18,6 +18,9 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + S
 pub struct ChatOutcome {
     pub text: String,
     pub finish_reason: Option<String>,
+    /// Server-reported token usage (non-stream always; stream when
+    /// `include_usage` was set). `None` if the server omitted it.
+    pub usage: Option<Usage>,
 }
 
 /// Result of one agent turn (a `tools`-enabled completion): the
@@ -28,6 +31,8 @@ pub struct AgentTurn {
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: Option<String>,
+    /// Server-reported token usage for this turn (`None` if omitted).
+    pub usage: Option<Usage>,
 }
 
 /// If generation stopped at the token cap (`finish_reason == "length"`),
@@ -94,10 +99,11 @@ impl Client {
             max_tokens: self.max_tokens,
             stream,
             tools: None,
+            stream_options: None,
         }
     }
 
-    /// Non-streaming completion → text + finish_reason.
+    /// Non-streaming completion → text + finish_reason + usage.
     pub async fn chat_once(&self, messages: Vec<ChatMessage>) -> Result<ChatOutcome> {
         let req = self.build_request(messages, false);
         let resp = self.http.post(self.endpoint()).json(&req).send().await?;
@@ -107,10 +113,11 @@ impl Client {
             return Err(format!("server returned {status}: {body}").into());
         }
         let parsed: ChatResponse = resp.json().await?;
+        let usage = parsed.usage;
         let choice = parsed.choices.into_iter().next();
         let finish_reason = choice.as_ref().and_then(|c| c.finish_reason.clone());
         let text = choice.and_then(|c| c.message.content).unwrap_or_default();
-        Ok(ChatOutcome { text, finish_reason })
+        Ok(ChatOutcome { text, finish_reason, usage })
     }
 
     /// One agent turn: non-streaming completion **with `tools`**, returning
@@ -131,6 +138,7 @@ impl Client {
             return Err(format!("server returned {status}: {body}").into());
         }
         let parsed: ChatResponse = resp.json().await?;
+        let usage = parsed.usage;
         let choice = parsed
             .choices
             .into_iter()
@@ -138,7 +146,7 @@ impl Client {
             .ok_or("server returned no choices")?;
         let finish_reason = choice.finish_reason;
         let tool_calls = choice.message.tool_calls.unwrap_or_default();
-        Ok(AgentTurn { content: choice.message.content, tool_calls, finish_reason })
+        Ok(AgentTurn { content: choice.message.content, tool_calls, finish_reason, usage })
     }
 
     /// Streaming completion. `on_token` is called for each content delta
@@ -148,7 +156,10 @@ impl Client {
         messages: Vec<ChatMessage>,
         mut on_token: impl FnMut(&str),
     ) -> Result<ChatOutcome> {
-        let req = self.build_request(messages, true);
+        let mut req = self.build_request(messages, true);
+        // Ask the server to append a final `usage` chunk (verified: VF
+        // sends `choices:[] + usage` before `[DONE]`).
+        req.stream_options = Some(StreamOptions { include_usage: true });
         let resp = self.http.post(self.endpoint()).json(&req).send().await?;
         let status = resp.status();
         if !status.is_success() {
@@ -158,6 +169,7 @@ impl Client {
 
         let mut full = String::new();
         let mut finish: Option<String> = None;
+        let mut usage: Option<Usage> = None;
         let mut buf = String::new();
         let mut stream = resp.bytes_stream();
         'outer: while let Some(chunk) = stream.next().await {
@@ -167,23 +179,25 @@ impl Client {
             while let Some(pos) = buf.find("\n\n") {
                 let event: String = buf[..pos].to_string();
                 buf.drain(..pos + 2);
-                if handle_event(&event, &mut on_token, &mut full, &mut finish) {
+                if handle_event(&event, &mut on_token, &mut full, &mut finish, &mut usage) {
                     break 'outer; // `[DONE]`
                 }
             }
         }
-        Ok(ChatOutcome { text: full, finish_reason: finish })
+        Ok(ChatOutcome { text: full, finish_reason: finish, usage })
     }
 }
 
 /// Process one SSE event block. Returns `true` on the `[DONE]` marker.
-/// Appends content deltas (via `on_token` + `full`) and records the last
-/// non-null `finish_reason` seen.
+/// Appends content deltas (via `on_token` + `full`), records the last
+/// non-null `finish_reason`, and captures the final `usage` chunk (which
+/// carries empty `choices` + `usage`).
 fn handle_event(
     event: &str,
     on_token: &mut impl FnMut(&str),
     full: &mut String,
     finish: &mut Option<String>,
+    usage: &mut Option<Usage>,
 ) -> bool {
     for line in event.lines() {
         let line = line.trim_start();
@@ -193,6 +207,10 @@ fn handle_event(
             return true;
         }
         if let Ok(parsed) = serde_json::from_str::<ChatChunk>(data) {
+            // Final usage chunk: empty choices + usage — capture, don't error.
+            if let Some(u) = parsed.usage {
+                *usage = Some(u);
+            }
             if let Some(choice) = parsed.choices.into_iter().next() {
                 if let Some(fr) = choice.finish_reason {
                     *finish = Some(fr);
@@ -228,6 +246,8 @@ mod tests {
         assert_eq!(r.temperature, Some(0.0));
         assert_eq!(r.messages.len(), 1);
         assert!(r.tools.is_none());
+        // build_request itself doesn't set stream_options — chat_stream does.
+        assert!(r.stream_options.is_none());
     }
 
     #[test]
@@ -243,16 +263,19 @@ mod tests {
         let mut got = String::new();
         let mut full = String::new();
         let mut finish = None;
+        let mut usage = None;
         let done = handle_event(
             "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}",
             &mut |t| got.push_str(t),
             &mut full,
             &mut finish,
+            &mut usage,
         );
         assert!(!done);
         assert_eq!(got, "Hel");
         assert_eq!(full, "Hel");
         assert!(finish.is_none());
+        assert!(usage.is_none());
 
         // Final chunk carries finish_reason.
         let _ = handle_event(
@@ -260,10 +283,21 @@ mod tests {
             &mut |_t| {},
             &mut full,
             &mut finish,
+            &mut usage,
         );
         assert_eq!(finish.as_deref(), Some("length"));
 
-        let done = handle_event("data: [DONE]", &mut |_t| {}, &mut full, &mut finish);
+        // The verified final usage chunk (empty choices + usage) is captured.
+        let _ = handle_event(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":14,\"completion_tokens\":16,\"total_tokens\":30}}",
+            &mut |_t| {},
+            &mut full,
+            &mut finish,
+            &mut usage,
+        );
+        assert_eq!(usage.unwrap().completion_tokens, Some(16));
+
+        let done = handle_event("data: [DONE]", &mut |_t| {}, &mut full, &mut finish, &mut usage);
         assert!(done);
     }
 
@@ -271,7 +305,8 @@ mod tests {
     fn handle_event_ignores_non_data_lines() {
         let mut full = String::new();
         let mut finish = None;
-        let done = handle_event(": keep-alive comment", &mut |_t| {}, &mut full, &mut finish);
+        let mut usage = None;
+        let done = handle_event(": keep-alive comment", &mut |_t| {}, &mut full, &mut finish, &mut usage);
         assert!(!done);
         assert!(full.is_empty());
     }

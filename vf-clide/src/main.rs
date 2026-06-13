@@ -180,7 +180,9 @@ async fn run_agent_headless(
     msgs.push(ChatMessage::user(content));
 
     let max_tokens = client.max_tokens;
-    match agent::run(&client, msgs, gate, &workspace).await? {
+    // Headless stays byte-clean → no status bar, discard the turn usage.
+    let (end, _usage) = agent::run(&client, msgs, gate, &workspace, None).await?;
+    match end {
         LoopEnd::Final { content, finish_reason } => {
             let text = content.unwrap_or_default();
             println!("{text}");
