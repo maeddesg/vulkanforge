@@ -1041,6 +1041,39 @@ Logs umfassen:
 - TTFT (Zeit Request-Empfang bis erstes SSE-Chunk)
 - 4xx/5xx mit error-type
 
+### 5.8 Memory-Subsystem (v1.0)
+
+Server-seitiges Gedächtnis, **embedded** im API-Prozess (`src/server/memory.rs` + `handlers/memory.rs`).
+VF-native `/memory/*`-Endpoints (getrennt von `/v1/*`): `POST /memory/remember`, `POST /memory/recall`,
+`POST`/`GET /memory/projects`. `AppState.memory: Option<Arc<MemoryStore>>` (None → 503, Inference läuft weiter).
+
+**Bausteine.** Eine `sg.db` ([SQLiteGraph](https://github.com/oldnordic/sqlitegraph) — Nodes + Edges + per-Projekt-
+HNSW-Indizes) + CPU-Embedder ([fastembed](https://github.com/maeddesg/fastembed-rs), Nomic-Embed v1.5-Q, 768-dim,
+INT8/VNNI). Beide git-deps **gepinnt**: SG rev `d8219a8` (3.2.5), fastembed rev `3a9588a` (5.16.2).
+
+**Scoping & Persistenz.** Pro `project_key` ein persistenter HNSW-Index (768/cosine/m16/ef200); ein reservierter
+`__global__`-Default für scope-lose Calls. Recall trifft **nur** den Projekt-Index → physische Isolation, kein
+Cross-Project-Leak. Persistent über Neustart (Vektoren restaurieren aus der DB **ohne Re-Embed**).
+
+**Nebenläufigkeit.** Eigene Ressource (CPU/SQLite): `MemoryStore` hat eigene `Mutex` (Single-Writer), nimmt **nie**
+den GPU-`permit`; Handler laufen über `spawn_blocking`, der teure embed-Schritt außerhalb des graph-Locks. Teardown
+(neben `ServerSession::teardown`, aber getrennt — kein `device_wait_idle`): HNSW-Topologie-persist + WAL-Checkpoint.
+
+**Realisierungs-/Upgrade-Disziplin (wichtig).**
+- Der HNSW-Index vergibt die **Vektor-id selbst** (kein public id-spezifizierender Insert) → der Graph-`node_id`
+  liegt in der **Vektor-Metadata** und wird beim Recall via `search → get_vector(vid) → node_id → get_entity`
+  zurückgeholt.
+- find/list gehen über **raw-SQL auf dem public `graph.pool`** gegen die Tabelle `graph_entities(id,kind,name,data)`
+  (Cypher-Subset bewusst vermieden — siehe `results/pre_memory_analyse.md`). **Beim Anheben der SG-rev MUSS diese
+  Tabellen-Form re-verifiziert werden**, sonst brechen find/list still.
+- `statistics().vector_count` ist nach Reopen stale → **nicht** für Korrektheit/Kapazität nutzen.
+
+**Kosten.** Statisch gelinktes ONNX-Runtime (via `ort`) + bundled SQLite (rusqlite) → Release-Binär ~25 → ~59 MB,
+Cargo.lock ~250 → ~384 Pakete. Erst-Start lädt das Nomic-ONNX nach `~/.vulkanforge/embed-cache` (danach offline).
+
+**Out of scope (Stufe B+).** Lifecycle (draft→…→archived), touch-on-read, delete/archive, reiche Edge-Taxonomie,
+vf-clide-Client-Integration.
+
 ---
 
 ## §6 Chat-Template-Integration

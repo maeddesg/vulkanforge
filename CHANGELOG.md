@@ -1,5 +1,39 @@
 # Changelog
 
+## v1.0 — server-side memory (2026-06-14)
+
+**Major release.** VulkanForge gains a **server-side memory subsystem**: a persistent, project-scoped,
+semantic store embedded in the API process. Write notes on purpose (`remember`), read them back by meaning
+(`recall`); the record survives server restarts and model swaps. Supported-config inference output is unchanged —
+this release **adds** a subsystem and does **not** touch the decode/prefill path.
+
+- **`MemoryStore`, embedded in the API process.** [SQLiteGraph](https://github.com/oldnordic/sqlitegraph) (3.2.5,
+  GPL-3.0) holds nodes + edges + per-project HNSW vector indexes in one SQLite file; the
+  [fastembed](https://github.com/maeddesg/fastembed-rs) embedder (5.16.2, ONNX Runtime) computes embeddings on the
+  **CPU** (Nomic-Embed v1.5-Q, 768-dim, INT8 → AVX-512/VNNI). The memory path is a separate resource — it runs off
+  the async runtime via `spawn_blocking` and **never takes the GPU concurrency permit**, so a `recall` never waits
+  behind a generation.
+- **VF-native `/memory/*` endpoints** (separate namespace from `/v1/*`, not OpenAI):
+  `POST /memory/remember` `{project_key?, kind, text, name?, metadata?}` → `{id}`;
+  `POST /memory/recall` `{project_key?, query, k?}` → `{hits:[{id, kind, name, text, status, score}]}`;
+  `POST`/`GET /memory/projects`. `project_key` is optional → a shared global scope.
+- **Project isolation by construction.** Each project gets its **own** persistent HNSW index
+  (768-dim, cosine, m=16, ef_construction=200); a recall in one project *physically cannot* return another's
+  notes. Persistent across restarts — vectors restore from the SQLite store with **no re-embedding**.
+- **Honest realization note.** The HNSW index auto-assigns its own vector id, so the graph node id is carried in
+  the vector's metadata and recovered on recall (`search → get_vector → node_id → get_entity`); project/list
+  lookups use raw SQL on the graph's connection pool (the Cypher subset is intentionally avoided).
+- **Clean lifecycle.** The store eager-loads the embedder at startup (first ever start fetches the ONNX model from
+  HuggingFace into `~/.vulkanforge/embed-cache`, then runs offline); shutdown flushes the HNSW topology and
+  WAL-checkpoints. If the embedder can't be loaded, `/memory/*` returns 503 and the inference server still runs.
+- **Scope (this release writes and reads only).** No lifecycle transitions (draft→confirmed→…→archived), no
+  delete/archive, no auto-injection, and no vf-clide client integration yet — those are the next milestone. See the
+  wiki's *Memory* page for what it is, what it isn't, and the roadmap.
+
+**Cost (honest).** The two native deps add real surface: the release binary grows ~25 MB → ~59 MB (statically
+linked ONNX Runtime + bundled SQLite), the lockfile ~250 → ~384 packages, and a first clean build takes a few extra
+minutes. Versions: engine `0.9.2 → 1.0.0`; vf-clide unchanged at `0.3.1`. Tag `v1.0`.
+
 ## v0.9.4 — vf-clide REPL permission ceiling + denial wording (2026-06-14)
 
 **vf-clide UX release (0.3.1).** No engine change. Two changes to the agent's permission UX:
