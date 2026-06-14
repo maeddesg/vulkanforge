@@ -1009,6 +1009,23 @@ tokio::select! {
 }
 ```
 
+**GPU-Teardown nach dem Shutdown (v0.9.2 Bugfix).** Wenn `axum::serve(...)` zurückkehrt, sind alle in-flight
+Requests fertig (jeder `one_shot` fence-wartet); der Router — der einzige weitere `AppState`-Ref — wird mit der
+serve-Future gedroppt. `serve_inner` holt danach via `Arc::try_unwrap` das alleinige Eigentum zurück und ruft
+`ServerSession::teardown()`. Die GPU-Ressourcen (`Forward`, `LoadedModel`, `CommandContext`, `PipelineRegistry`,
+`KvCache`) haben **kein `Drop`** — ihr Cleanup ist explizit. Reihenfolge:
+
+1. **`device_wait_idle()` zuerst** — ein Ctrl+C/SIGTERM kann landen, während eine Submission noch läuft; Ressourcen
+   freizugeben, die eine laufende Submission referenziert, ist UB.
+2. Die `.destroy()`-Kette in Reverse-Construction-Order **bei lebendem Device** (`forward` inkl. KV-Cache →
+   `cmd_ctx` → `model` → `registry`).
+3. Den gpu-allocator `Allocator` **vor** dem `VulkanDevice` droppen (`vkFreeMemory` muss gegen ein lebendes Device
+   laufen). `ServerSession` deklariert `allocator` deshalb **vor** `dev` als Drop-Order-Sicherheitsnetz.
+
+Ohne diesen Pfad fiel der `Arc<AppState>` ungeordnet auseinander: die `.destroy()`-Kette lief nie (→
+`vkDestroyDevice` meldete hunderte leaked objects) und der Allocator gab Speicher gegen ein bereits zerstörtes
+Device frei → **SIGSEGV**. Jetzt: 0 leaked objects, sauberer Exit, kein Crash (Ctrl+C **und** SIGTERM).
+
 ### 5.7 Logging
 
 `tower-http::TraceLayer` + `tracing-subscriber` (Reuse falls VF schon

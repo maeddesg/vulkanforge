@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.9.2 — vf-clide token meter + clean server shutdown (2026-06-14)
+
+**Feature + bugfix release.** `vf-clide` gains live token accounting and a pinned status line; the engine's
+`vulkanforge serve` now shuts down cleanly. Supported-config inference output is unchanged — there is **no
+decode/prefill/behavior change**.
+
+- **vf-clide 0.3.0 — token accounting.** The client now surfaces real token usage on every path: the
+  non-streaming response, the tool-calling loop, and the streaming path (via `stream_options.include_usage`,
+  which the server emits as a final `usage` chunk). No local tokenizer, no estimation — the numbers are the
+  server's own counts.
+- **vf-clide 0.3.0 — pinned status line.** The REPL pins a bottom status line (raw ANSI scroll region, no TUI
+  framework) showing a token meter — `↑prompt ↓completion (total) · session …` — plus the current action
+  (`idle` / `generating…` / `thinking…` / `running <tool>(…)`). It is a no-op when stdout isn't a TTY, so
+  **headless `-p` output stays byte-for-byte unchanged** and fully scriptable.
+- **Engine 0.9.2 — clean `serve` shutdown (bugfix).** Ctrl+C / SIGTERM on `vulkanforge serve` previously left
+  the GPU objects undestroyed (the validation layer reported hundreds of leaked objects) and then freed memory
+  against an already-destroyed device → **SIGSEGV**. The shutdown path now waits for the device to go idle
+  (`device_wait_idle`), runs the explicit resource-teardown chain in order while the device is still alive, and
+  drops the memory allocator before the device. Result: **0 leaked objects, clean exit, no crash** on both
+  Ctrl+C and SIGTERM. Shutdown-path only — steady-state decode is untouched.
+
+Versions: engine `0.9.0 → 0.9.2`, vf-clide `0.2.1 → 0.3.0`. (`v0.9.1` was a vf-clide-only security patch; the
+engine stayed at `0.9.0` through it.)
+
+## v0.9.1 — vf-clide search confinement (security, 2026-06-13)
+
+**Security patch (vf-clide 0.2.1).** The agent's `search` tool followed symlinks that pointed out of the
+workspace, so a symlink under the workspace root could make `search` read files outside it (read-only, but still
+an escape of the workspace confinement). `search` now uses `symlink_metadata` and skips symlinks entirely
+(closing the hole and avoiding link cycles); the other file tools were already confined. No engine change.
+**Update recommended.**
+
 ## v0.9.0 — agentic vf-clide (2026-06-13)
 
 **Feature release.** The `vf-clide` client becomes an agentic coding client; the engine gets a

@@ -18,6 +18,12 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
 
 ## Highlights
 
+- **`vf-clide` token meter + clean `serve` shutdown (v0.9.2)** — `vf-clide` (0.3.0) now shows **live token
+  usage** (real server counts on the non-streaming, tool-calling, and streaming paths) and a **pinned status
+  line** with a token meter and the current action — a no-op off-TTY, so **headless `-p` stays byte-for-byte
+  unchanged**. Engine bugfix: Ctrl+C / SIGTERM on `vulkanforge serve` used to leak GPU objects and **SIGSEGV**;
+  shutdown now idles the device, runs the resource teardown in order, and exits cleanly with **0 leaked
+  objects** (shutdown-path only — decode is untouched). See `CHANGELOG.md`.
 - **Agentic `vf-clide` + engine test-infra hardening (v0.9.0)** — the `vf-clide` client grows from a chat
   client into an **agentic coding client**: an opt-in `--agent` tool loop with **read_file / write_file /
   search / shell**, a **three-tier permission model** (ReadOnly / Mutating / Exec, opt-in via
