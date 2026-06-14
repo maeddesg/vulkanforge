@@ -37,28 +37,39 @@ workspace rather than guessing; prefer reading or searching before writing, and 
 make minimal, targeted changes. Keep your responses concise.\n\n\
 Respect the permission model: some tools need explicit user permission and a call \
 may be denied. If a tool call is denied, do NOT claim you performed the action — \
-briefly state what you intended to do, that it was denied, and how to proceed \
-(e.g. re-run granting the needed permission). Never invent file contents or \
-command output you did not actually receive from a tool.";
+briefly state what you intended to do, that it was denied, and how to proceed. \
+There are two distinct kinds of denial, resolved differently:\n\
+- Permission denial (a tool above the current approval level, e.g. write_file or \
+shell): lifted only by the user re-running vf-clide with the matching flag \
+(--allow-mutating for write_file, --allow-shell for shell). Suggest that — never \
+ask for operating-system or filesystem permissions.\n\
+- Workspace-confinement denial (a path outside the project workspace): absolute. \
+No flag overrides it; do not request elevated permissions or call the target \
+system-critical — work within the workspace instead.\n\n\
+Never invent file contents or command output you did not actually receive from a tool.";
 
 /// How a tool call gets approved (interaction style).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Permission {
-    /// REPL / TTY: prompt `y/N` per call (riskier tiers get louder warnings).
+    /// REPL / TTY: auto-approve calls at or below the gate ceiling, prompt
+    /// `y/N` for calls *above* it (riskier tiers get louder warnings).
     Interactive,
-    /// Headless: auto-approve a call iff its risk tier ≤ the gate ceiling.
+    /// Headless: auto-approve a call iff its risk tier ≤ the gate ceiling,
+    /// otherwise deny (no prompt — the flags are the only opt-in).
     Headless,
 }
 
-/// The permission gate: interaction [`Permission`] mode + (headless only)
-/// the auto-approve **ceiling** — the highest [`ToolRisk`] tier approved
-/// without a prompt. Opt-in flags raise the ceiling **cumulatively**, each
-/// implying the lower tiers:
+/// The permission gate: interaction [`Permission`] mode + the auto-approve
+/// **ceiling** — the highest [`ToolRisk`] tier approved without a prompt.
+/// The ceiling applies in **both** modes: a call at or below it is
+/// auto-approved (and still printed, so the human sees every tool); a call
+/// above it is **prompted** in the REPL and **denied** headless. Opt-in
+/// flags raise the ceiling **cumulatively**, each implying the lower tiers:
 /// `--yes` → `ReadOnly`, `--allow-mutating` → `Mutating`,
 /// `--allow-shell` → `Exec`. So `--allow-shell` also auto-approves
 /// reads+writes, and `--allow-mutating` also auto-approves reads (this
 /// removes the Slice-2 "mutating-yes / reads-no" inconsistency). `None`
-/// ceiling = deny everything headless.
+/// ceiling = prompt-everything (REPL) / deny-everything (headless).
 #[derive(Debug, Clone, Copy)]
 pub struct Gate {
     pub mode: Permission,
@@ -66,9 +77,11 @@ pub struct Gate {
 }
 
 impl Gate {
-    /// Interactive (REPL) gate — always prompts; ceiling unused.
-    pub fn interactive() -> Self {
-        Self { mode: Permission::Interactive, auto_ceiling: None }
+    /// Interactive (REPL) gate: auto-approve up to `ceiling`, prompt above
+    /// it. The flag ceiling is honored here too — consistent with headless,
+    /// not laxer (confinement still bounds read/write independently).
+    pub fn interactive(ceiling: Option<ToolRisk>) -> Self {
+        Self { mode: Permission::Interactive, auto_ceiling: ceiling }
     }
     /// Headless gate auto-approving up to `ceiling` (None = deny all).
     pub fn headless(ceiling: Option<ToolRisk>) -> Self {
@@ -85,25 +98,53 @@ pub enum LoopEnd {
     CapReached,
 }
 
-/// Decide a single tool call given its **risk tier** (from the tool
-/// definition). `true` = run the tool. Headless approves iff
-/// `risk ≤ ceiling`; Interactive prompts (louder warning for higher tiers).
+/// What to do with a tool call, independent of any I/O: run it without
+/// asking (`Auto`), ask the user (`Prompt`), or refuse it (`Deny`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    Auto,
+    Prompt,
+    Deny,
+}
+
+/// Pure decision from mode + ceiling + the call's risk tier — no stdin, no
+/// I/O, so the whole truth table is unit-testable. A call at or below the
+/// ceiling is `Auto` in **both** modes (the human still sees it via the
+/// printed auto-approve line, but only confirms calls *above* the ceiling).
+/// Above the ceiling: the REPL prompts, headless denies (the cumulative
+/// `--yes`/`--allow-*` flags are the only headless opt-in). Headless never
+/// returns `Prompt`; Interactive never returns `Deny`.
+pub fn decide(mode: Permission, ceiling: Option<ToolRisk>, risk: ToolRisk) -> Decision {
+    let at_or_below_ceiling = ceiling.is_some_and(|c| risk.rank() <= c.rank());
+    if at_or_below_ceiling {
+        Decision::Auto
+    } else {
+        match mode {
+            Permission::Interactive => Decision::Prompt,
+            Permission::Headless => Decision::Deny,
+        }
+    }
+}
+
+/// Resolve a single tool call to run/skip and perform the side effects
+/// (print the auto / deny line, or prompt y/N). `true` = run the tool. The
+/// decision itself is the pure [`decide`]; this only wraps it with I/O. The
+/// risk tier comes from the tool definition. Auto-approved calls print in
+/// **both** modes so the human always sees every tool that ran.
 pub fn approve(gate: Gate, name: &str, risk: ToolRisk, args: &str) -> bool {
-    match gate.mode {
-        Permission::Interactive => prompt_yn(name, risk, args),
-        Permission::Headless => {
-            let approved = gate.auto_ceiling.is_some_and(|c| risk.rank() <= c.rank());
-            if approved {
-                eprintln!("[agent] auto-approved ({}): {name}({args})", tier_label(risk));
-                true
-            } else {
-                eprintln!(
-                    "[agent] DENIED — \"{name}\" is {} and needs {} (headless); not executed: {name}({args})",
-                    tier_label(risk),
-                    needed_flag(risk)
-                );
-                false
-            }
+    match decide(gate.mode, gate.auto_ceiling, risk) {
+        Decision::Auto => {
+            eprintln!("[agent] auto-approved ({}): {name}({args})", tier_label(risk));
+            true
+        }
+        Decision::Prompt => prompt_yn(name, risk, args),
+        Decision::Deny => {
+            eprintln!(
+                "[agent] DENIED — \"{name}\" is {} and needs {} (headless); not executed: {name}({args})",
+                tier_label(risk),
+                needed_flag(risk)
+            );
+            false
         }
     }
 }
@@ -314,6 +355,68 @@ mod tests {
 
     fn ws() -> std::path::PathBuf {
         std::env::temp_dir().canonicalize().unwrap()
+    }
+
+    // ---- pure decision truth table (no stdin) ----
+
+    #[test]
+    fn decide_repl_honors_ceiling_auto_below_prompt_above() {
+        use Decision::*;
+        use Permission::Interactive as I;
+        use ToolRisk::*;
+        // no flags (ceiling None): prompt for every tier.
+        assert_eq!(decide(I, None, ReadOnly), Prompt);
+        assert_eq!(decide(I, None, Mutating), Prompt);
+        assert_eq!(decide(I, None, Exec), Prompt);
+        // --yes (ReadOnly): read auto, write/shell prompt.
+        assert_eq!(decide(I, Some(ReadOnly), ReadOnly), Auto);
+        assert_eq!(decide(I, Some(ReadOnly), Mutating), Prompt);
+        assert_eq!(decide(I, Some(ReadOnly), Exec), Prompt);
+        // --allow-mutating: read+write auto, shell prompt.
+        assert_eq!(decide(I, Some(Mutating), ReadOnly), Auto);
+        assert_eq!(decide(I, Some(Mutating), Mutating), Auto);
+        assert_eq!(decide(I, Some(Mutating), Exec), Prompt);
+        // --allow-shell: everything auto.
+        assert_eq!(decide(I, Some(Exec), ReadOnly), Auto);
+        assert_eq!(decide(I, Some(Exec), Mutating), Auto);
+        assert_eq!(decide(I, Some(Exec), Exec), Auto);
+        // REPL never denies.
+        for ceil in [None, Some(ReadOnly), Some(Mutating), Some(Exec)] {
+            for risk in [ReadOnly, Mutating, Exec] {
+                assert_ne!(decide(I, ceil, risk), Deny, "REPL must never deny");
+            }
+        }
+    }
+
+    #[test]
+    fn decide_headless_denies_above_ceiling_unchanged() {
+        use Decision::*;
+        use Permission::Headless as H;
+        use ToolRisk::*;
+        // auto at/below ceiling, DENY above — same as before this change.
+        assert_eq!(decide(H, Some(ReadOnly), ReadOnly), Auto);
+        assert_eq!(decide(H, Some(ReadOnly), Mutating), Deny);
+        assert_eq!(decide(H, Some(ReadOnly), Exec), Deny);
+        assert_eq!(decide(H, Some(Mutating), Mutating), Auto);
+        assert_eq!(decide(H, Some(Mutating), Exec), Deny);
+        assert_eq!(decide(H, Some(Exec), Exec), Auto);
+        assert_eq!(decide(H, None, ReadOnly), Deny); // no flag → deny all
+        // headless NEVER prompts.
+        for ceil in [None, Some(ReadOnly), Some(Mutating), Some(Exec)] {
+            for risk in [ReadOnly, Mutating, Exec] {
+                assert_ne!(decide(H, ceil, risk), Prompt, "headless must never prompt");
+            }
+        }
+    }
+
+    #[test]
+    fn constitution_distinguishes_denial_kinds() {
+        // The wording must name both flags (permission denial) AND tell the
+        // model NOT to ask for OS/filesystem rights (confinement denial).
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("--allow-mutating"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("--allow-shell"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("Workspace-confinement denial"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("operating-system or filesystem permissions"));
     }
 
     // ---- tiered ceiling gate ----

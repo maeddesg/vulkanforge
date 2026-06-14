@@ -11,7 +11,7 @@ use rustyline::DefaultEditor;
 use crate::client::{empty_notice, truncation_notice, Client, Result};
 use crate::memory::Memory;
 use crate::status::StatusBar;
-use crate::types::{strip_think, ChatMessage};
+use crate::types::{strip_think, ChatMessage, ToolRisk};
 
 /// Parsed REPL command. `None` from [`parse_command`] means "not a
 /// command — treat the line as a chat prompt".
@@ -77,6 +77,10 @@ pub struct Repl {
     /// Agent system prompt (constitution). Prepended as `messages[0]` in
     /// agent mode only — the plain chat path is unaffected.
     system: Option<String>,
+    /// Auto-approve ceiling from the cumulative `--yes`/`--allow-*` flags.
+    /// In the REPL, calls at or below it are auto-approved (still printed);
+    /// calls above it prompt `y/N`. `None` = prompt for everything.
+    ceiling: Option<ToolRisk>,
 }
 
 impl Repl {
@@ -90,6 +94,7 @@ impl Repl {
             agent: false,
             workspace: std::path::PathBuf::from("."),
             system: None,
+            ceiling: None,
         }
     }
 
@@ -115,6 +120,13 @@ impl Repl {
     /// Set the agent constitution (system prompt); used in agent mode only.
     pub fn with_system(mut self, system: Option<String>) -> Self {
         self.system = system;
+        self
+    }
+
+    /// Set the cumulative auto-approve ceiling (`--yes`/`--allow-*`). Honored
+    /// in the REPL: at/below it = auto-approve (printed), above it = prompt.
+    pub fn with_ceiling(mut self, ceiling: Option<ToolRisk>) -> Self {
+        self.ceiling = ceiling;
         self
     }
 
@@ -198,7 +210,7 @@ impl Repl {
             // The loop pushes `thinking…` / `running <tool>(…)` to the bar.
             if self.agent {
                 let msgs = self.build_messages(&line);
-                let gate = crate::agent::Gate::interactive();
+                let gate = crate::agent::Gate::interactive(self.ceiling);
                 let fut = crate::agent::run(&self.client, msgs, gate, &self.workspace, Some(&bar));
                 let res = tokio::select! {
                     r = fut => r,

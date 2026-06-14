@@ -62,21 +62,23 @@ struct Args {
     #[arg(long)]
     agent: bool,
 
-    /// Auto-approve **read-only** tools (`read_file`, `search`) in a
-    /// headless `--agent` run. Does NOT approve `write_file` (needs
-    /// `--allow-mutating`) or `shell` (needs `--allow-shell`). In the REPL,
-    /// tool calls always prompt interactively regardless of `--yes`.
+    /// Auto-approve **read-only** tools (`read_file`, `search`) in `--agent`
+    /// mode. Does NOT approve `write_file` (needs `--allow-mutating`) or
+    /// `shell` (needs `--allow-shell`). In the REPL, reads are then
+    /// auto-approved (still printed) and write/shell still prompt `y/N`;
+    /// headless, calls above the tier are denied.
     #[arg(long)]
     yes: bool,
 
-    /// Permit **`write_file`** (mutating, workspace-confined) headless.
-    /// Implies `--yes` (also auto-approves reads). Does NOT permit `shell`.
+    /// Permit **`write_file`** (mutating, workspace-confined) without a
+    /// prompt. Implies `--yes` (also auto-approves reads). Does NOT permit
+    /// `shell`. In the REPL `shell` still prompts; headless it is denied.
     #[arg(long)]
     allow_mutating: bool,
 
     /// Permit **`shell`** (exec — NOT workspace-confinable, highest risk)
-    /// headless. Implies `--allow-mutating` + `--yes`. The loud, explicit
-    /// "I accept arbitrary command execution" opt-in.
+    /// without a prompt. Implies `--allow-mutating` + `--yes`. The loud,
+    /// explicit "I accept arbitrary command execution" opt-in.
     #[arg(long)]
     allow_shell: bool,
 
@@ -109,8 +111,9 @@ async fn main() -> Result<()> {
     // and symlinks in the root itself).
     let workspace = resolve_workspace(args.workspace.as_deref())?;
     // Cumulative auto-approve ceiling from the opt-in flags (each implies
-    // the lower tiers).
-    let ceiling = headless_ceiling(args.yes, args.allow_mutating, args.allow_shell);
+    // the lower tiers). Applies to BOTH modes: headless auto-approve, and
+    // REPL auto-approve-below / prompt-above.
+    let ceiling = auto_ceiling(args.yes, args.allow_mutating, args.allow_shell);
     // The agent constitution (system prompt). Computed up front so a bad
     // `--system` path errors before we connect.
     let system = vf_clide::agent::system_prompt(&workspace, args.system.as_deref(), args.no_system)?;
@@ -126,15 +129,18 @@ async fn main() -> Result<()> {
                 .with_no_think(args.no_think)
                 .with_agent(args.agent)
                 .with_workspace(workspace)
-                .with_system(system);
+                .with_system(system)
+                .with_ceiling(ceiling);
             repl.run().await
         }
     }
 }
 
-/// Map the cumulative opt-in flags to the headless auto-approve ceiling.
-/// `--allow-shell` ⊃ `--allow-mutating` ⊃ `--yes`; absent = deny all.
-fn headless_ceiling(yes: bool, allow_mutating: bool, allow_shell: bool) -> Option<vf_clide::types::ToolRisk> {
+/// Map the cumulative opt-in flags to the auto-approve ceiling (used by
+/// both the headless gate and the REPL gate).
+/// `--allow-shell` ⊃ `--allow-mutating` ⊃ `--yes`; absent = `None`
+/// (headless: deny all; REPL: prompt for everything).
+fn auto_ceiling(yes: bool, allow_mutating: bool, allow_shell: bool) -> Option<vf_clide::types::ToolRisk> {
     use vf_clide::types::ToolRisk;
     if allow_shell {
         Some(ToolRisk::Exec)
