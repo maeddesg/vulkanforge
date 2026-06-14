@@ -94,6 +94,10 @@ pub fn run(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn serve_inner(state: Arc<AppState>, args: &ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Keep a clone so we can recover sole ownership for an ordered GPU
+    // teardown once axum's graceful shutdown returns. `build_router` moves
+    // the other clone into the router's `with_state`.
+    let teardown_state = Arc::clone(&state);
     let app = build_router(state, args.cors);
     let addr = format!("{}:{}", args.host, args.port);
     eprintln!("VulkanForge API server listening on http://{addr}");
@@ -105,7 +109,45 @@ async fn serve_inner(state: Arc<AppState>, args: &ServeArgs) -> Result<(), Box<d
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+
+    // Graceful shutdown returned: axum stopped accepting new connections and
+    // awaited every in-flight request (each fence-waits inside `one_shot`),
+    // then the serve future dropped the router — the only other `AppState`
+    // ref. Recover sole ownership and tear the GPU state down explicitly and
+    // in order (`device_wait_idle` → `.destroy()` chain → allocator → device).
+    // Without this the `Arc`/`AppState` drop runs `ServerSession`'s field
+    // drop, which never calls the `.destroy()` chain (every child object
+    // leaks → `vkDestroyDevice` flags them) and used to free memory against a
+    // destroyed device → SIGSEGV.
+    teardown_gpu_state(teardown_state);
     Ok(())
+}
+
+/// Recover sole ownership of the GPU state and run [`ServerSession::teardown`].
+///
+/// Falls back to the implicit `Drop` (no UAF — `ServerSession`'s
+/// allocator-before-device field order is the safety net) and a loud log if
+/// some `AppState` reference unexpectedly outlived graceful shutdown, rather
+/// than panicking during shutdown.
+fn teardown_gpu_state(state: Arc<AppState>) {
+    match Arc::try_unwrap(state) {
+        Ok(app_state) => {
+            let session = app_state
+                .session
+                .into_inner()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            session.teardown();
+            eprintln!("VulkanForge: GPU teardown complete.");
+        }
+        Err(state) => {
+            eprintln!(
+                "VulkanForge: shutdown — {} extra AppState reference(s) still live; \
+                 skipping explicit GPU teardown (relying on Drop; allocator-before-device \
+                 field order avoids a UAF, but child objects may leak).",
+                Arc::strong_count(&state) - 1
+            );
+        }
+    }
 }
 
 async fn shutdown_signal() {

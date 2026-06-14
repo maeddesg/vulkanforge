@@ -107,8 +107,18 @@ impl AppState {
 /// gets `reset()` between requests so v0.4 stays stateless
 /// (Decision §3 — no prefix-cache, fresh KV per call).
 pub struct ServerSession {
-    pub dev: VulkanDevice,
+    // Field DECLARATION order is also the implicit DROP order (Rust drops
+    // fields top-to-bottom). `allocator` must be declared BEFORE `dev` so
+    // that, on any *implicit* drop (a panic-unwind, or the
+    // `Arc::try_unwrap` fallback in `teardown_gpu_state`), the gpu-allocator
+    // `Allocator` frees its `VkDeviceMemory` blocks *while the device is
+    // still alive*. The reverse order (`dev` first) calls `vkDestroyDevice`
+    // and then `vkFreeMemory` against a dead device → use-after-free →
+    // SIGSEGV. The explicit, ordered [`ServerSession::teardown`] is the
+    // primary shutdown path; this ordering is the safety net for the paths
+    // that bypass it.
     pub allocator: Allocator,
+    pub dev: VulkanDevice,
     pub registry: PipelineRegistry,
     pub cmd_ctx: CommandContext,
     pub model: LoadedModel,
@@ -257,6 +267,65 @@ impl ServerSession {
     pub fn kv_invalidate(&mut self) {
         self.cached_tokens.clear();
         self.chat.forward.kv_cache.reset();
+    }
+
+    /// Ordered GPU teardown for the server shutdown path.
+    ///
+    /// Mirrors the CLI chat teardown (`main.rs::run_chat` :996): the GPU
+    /// resources here (`Forward`, `LoadedModel`, `CommandContext`,
+    /// `PipelineRegistry`, `KvCache`) have **no `Drop` impl** — cleanup is
+    /// explicit via their `.destroy()` methods (see `buffers.rs` head
+    /// comment). The server never wired that chain into shutdown, so
+    /// dropping the `Arc<AppState>` left every child object alive →
+    /// `vkDestroyDevice` flagged thousands of leaked objects, and the
+    /// allocator's own `Drop` then freed memory against a destroyed device.
+    ///
+    /// Order:
+    /// 1. `device_wait_idle` FIRST — a Ctrl+C / SIGTERM can land while a
+    ///    submission is still in flight; freeing resources a running
+    ///    submission references is UB. Cheap, once.
+    /// 2. Explicit `.destroy()` chain in reverse-construction order, all
+    ///    while the device is alive (`forward.destroy` also frees the KV
+    ///    cache it owns; `model.destroy` frees the weight buffers + bucket
+    ///    backings).
+    /// 3. Drop the gpu-allocator `Allocator` (every allocation is freed
+    ///    now) BEFORE the device — `vkFreeMemory` inside its `Drop` must run
+    ///    against a live device.
+    /// 4. `VulkanDevice` last: its `Drop` calls `vkDestroyDevice`, which now
+    ///    sees zero leaked children.
+    pub fn teardown(self) {
+        // Move every field out so we control drop order explicitly (the
+        // `.destroy()` methods consume `self`). The host-only fields
+        // (`gguf`/`cfg`/`tokenizer`/`template`/`cached_tokens`) have no GPU
+        // resources and drop here harmlessly.
+        let ServerSession {
+            mut allocator,
+            dev,
+            registry,
+            cmd_ctx,
+            model,
+            chat,
+            ..
+        } = self;
+
+        // 1. Idle the GPU before freeing anything it may still be reading.
+        //    Log but don't abort on error — still free what we can.
+        if let Err(e) = unsafe { dev.device.device_wait_idle() } {
+            eprintln!(
+                "VulkanForge: device_wait_idle on shutdown failed: {e:?} (continuing teardown)"
+            );
+        }
+
+        // 2. Reverse-construction-order destroy, device still alive.
+        chat.forward.destroy(&dev.device, &mut allocator);
+        cmd_ctx.destroy(&dev.device);
+        model.destroy(&dev.device, &mut allocator);
+        registry.destroy(&dev.device);
+
+        // 3. Allocator before device.
+        drop(allocator);
+        // 4. Device last (Drop → vkDestroyDevice).
+        drop(dev);
     }
 }
 
