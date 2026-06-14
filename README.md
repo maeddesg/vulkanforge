@@ -18,6 +18,12 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
 
 ## Highlights
 
+- **`vf-clide` REPL permission ceiling + denial wording (v0.9.4)** — `vf-clide` (0.3.1): in the agent **REPL**,
+  tool calls at or below the active `--yes` / `--allow-mutating` / `--allow-shell` ceiling are now
+  **auto-approved** (still printed) and only calls **above** it prompt `y/N` — consistent with headless, not
+  laxer (workspace confinement still bounds reads/writes independently; **headless `-p` is unchanged**, denying
+  above the ceiling). The agent constitution now separates a *permission* denial (lifted by re-running with
+  `--allow-*`) from an absolute *workspace-confinement* denial. No engine change. See `CHANGELOG.md`.
 - **`vf-clide` token meter + clean `serve` shutdown (v0.9.2)** — `vf-clide` (0.3.0) now shows **live token
   usage** (real server counts on the non-streaming, tool-calling, and streaming paths) and a **pinned status
   line** with a token meter and the current action — a no-op off-TTY, so **headless `-p` stays byte-for-byte

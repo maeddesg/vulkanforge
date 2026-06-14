@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.9.4 — vf-clide REPL permission ceiling + denial wording (2026-06-14)
+
+**vf-clide UX release (0.3.1).** No engine change. Two changes to the agent's permission UX:
+
+- **The `--yes` / `--allow-mutating` / `--allow-shell` ceiling now applies in the interactive REPL too.** A tool
+  call at or below the active ceiling is **auto-approved** (still printed, so you see every tool that ran), and
+  only a call **above** it prompts `y/N`. Previously the REPL prompted for *every* call and the flags were
+  honored headless-only — so `--agent --yes` now stops asking about reads, `--allow-mutating` stops asking about
+  writes, etc., while anything above the ceiling still asks. **Headless `-p` is unchanged** (calls above the
+  ceiling are denied, not prompted).
+- **The agent constitution now distinguishes the two kinds of denial** so the model stops suggesting it needs
+  "elevated permissions" or that a target is "system-critical": a *permission* denial (a tool above the current
+  ceiling) is lifted only by re-running with `--allow-mutating` / `--allow-shell`, never OS/filesystem rights; a
+  *workspace-confinement* denial (a path outside the workspace) is absolute — no flag overrides it.
+
+Versions: engine `0.9.2` (unchanged), vf-clide `0.3.0 → 0.3.1`. Tag `v0.9.4`.
+
 ## v0.9.2 — vf-clide token meter + clean server shutdown (2026-06-14)
 
 **Feature + bugfix release.** `vf-clide` gains live token accounting and a pinned status line; the engine's
