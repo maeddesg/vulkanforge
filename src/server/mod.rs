@@ -11,6 +11,7 @@ pub mod auto_ctx;
 pub mod cancel;
 pub mod error;
 pub mod handlers;
+pub mod memory;
 pub mod routes;
 pub mod sampling;
 pub mod serve;

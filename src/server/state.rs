@@ -82,6 +82,13 @@ pub struct AppState {
     /// clients otherwise see empty content for Qwen3-style models
     /// when the `<think>` block consumes the whole reply).
     pub default_think_filter: bool,
+
+    /// Server-side memory subsystem (Stufe A). `None` when memory failed to
+    /// initialize (e.g. the embedder model couldn't be fetched on a first,
+    /// offline start) — the `/memory/*` handlers then return 503 instead of
+    /// bricking the inference server. Its own resource (SQLite/CPU): handlers
+    /// run it via `spawn_blocking` and it NEVER takes the GPU `permit`.
+    pub memory: Option<Arc<crate::server::memory::MemoryStore>>,
 }
 
 impl AppState {
@@ -90,6 +97,7 @@ impl AppState {
         model_path: PathBuf,
         session: ServerSession,
         default_think_filter: bool,
+        memory: Option<Arc<crate::server::memory::MemoryStore>>,
     ) -> Self {
         Self {
             model_id,
@@ -98,6 +106,7 @@ impl AppState {
             permit: Arc::new(Semaphore::new(1)),
             session: Mutex::new(session),
             default_think_filter,
+            memory,
         }
     }
 }

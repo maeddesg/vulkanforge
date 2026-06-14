@@ -79,11 +79,26 @@ pub fn run(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| derive_model_id(&args.model));
 
     let session = load_gguf_session(&args)?;
+
+    // Stufe A — bring up the server-side memory store (SQLiteGraph + embedder,
+    // embedded). Eager-loads the embedder so the first request doesn't pay it.
+    // A failure here (e.g. the model can't be fetched on a first, offline
+    // start) is logged and the server runs WITHOUT memory (`/memory/*` → 503)
+    // rather than refusing to serve inference.
+    let memory = match crate::server::memory::MemoryStore::new(memory_db_path()) {
+        Ok(m) => Some(std::sync::Arc::new(m)),
+        Err(e) => {
+            eprintln!("VulkanForge: memory subsystem DISABLED — init failed: {e}");
+            None
+        }
+    };
+
     let state = Arc::new(AppState::new(
         model_id,
         args.model.clone(),
         session,
         !args.no_think_filter,
+        memory,
     ));
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -110,17 +125,35 @@ async fn serve_inner(state: Arc<AppState>, args: &ServeArgs) -> Result<(), Box<d
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
-    // Graceful shutdown returned: axum stopped accepting new connections and
-    // awaited every in-flight request (each fence-waits inside `one_shot`),
-    // then the serve future dropped the router — the only other `AppState`
-    // ref. Recover sole ownership and tear the GPU state down explicitly and
-    // in order (`device_wait_idle` → `.destroy()` chain → allocator → device).
-    // Without this the `Arc`/`AppState` drop runs `ServerSession`'s field
-    // drop, which never calls the `.destroy()` chain (every child object
-    // leaks → `vkDestroyDevice` flags them) and used to free memory against a
+    // Graceful shutdown returned. First flush the memory store (CPU/SQLite —
+    // no `device_wait_idle`; persist HNSW topology + WAL-checkpoint), then the
+    // GPU teardown. Order is independent (disjoint resources) but memory-first
+    // is tidy.
+    if let Some(mem) = &teardown_state.memory {
+        mem.shutdown();
+    }
+
+    // axum stopped accepting new connections and awaited every in-flight
+    // request (each fence-waits inside `one_shot`), then the serve future
+    // dropped the router — the only other `AppState` ref. Recover sole
+    // ownership and tear the GPU state down explicitly and in order
+    // (`device_wait_idle` → `.destroy()` chain → allocator → device). Without
+    // this the `Arc`/`AppState` drop runs `ServerSession`'s field drop, which
+    // never calls the `.destroy()` chain (every child object leaks →
+    // `vkDestroyDevice` flags them) and used to free memory against a
     // destroyed device → SIGSEGV.
     teardown_gpu_state(teardown_state);
     Ok(())
+}
+
+/// Resolve the memory-store db path: `$VF_MEMORY_DB` if set, else
+/// `~/.vulkanforge/memory.db` (a sibling `embed-cache/` holds the model).
+fn memory_db_path() -> PathBuf {
+    if let Ok(p) = std::env::var("VF_MEMORY_DB") {
+        return PathBuf::from(p);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".vulkanforge").join("memory.db")
 }
 
 /// Recover sole ownership of the GPU state and run [`ServerSession::teardown`].

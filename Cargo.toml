@@ -30,6 +30,17 @@ uuid = { version = "1", features = ["v4"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio-stream = "0.1"
 
+# Stufe A — server-side memory subsystem (SQLiteGraph + fastembed, embedded
+# in the API process; see src/server/memory.rs). Both git-deps pinned to the
+# verified revs from results/pre_memory_analyse.md. GPL-3.0 (SG) is compatible
+# with this crate's GPL-3.0; fastembed is Apache-2.0. These add heavy native
+# surface — SQLite C compile (rusqlite bundled) + the ONNX Runtime binary
+# (pulled by `ort` at build time) — see the Stufe-A report for the build-time /
+# binary-size delta. Used only by the `/memory/*` handlers; the inference path
+# does not touch them.
+sqlitegraph = { git = "https://github.com/oldnordic/sqlitegraph", rev = "d8219a83de4d22ed71d218c0d57407b1c672de39", package = "sqlitegraph" }
+fastembed = { git = "https://github.com/maeddesg/fastembed-rs", rev = "3a9588ac52c0d825118b44775526caac02175193", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"] }
+
 [build-dependencies]
 shaderc = "0.8"
 

@@ -38,6 +38,13 @@ pub fn build_router(state: Arc<AppState>, cors_enabled: bool) -> Router {
         .route("/models", get(handlers::models::list))
         // Operations
         .route("/health", get(handlers::health::check))
+        // VF-native memory subsystem (Stufe A) — NOT OpenAI; separate namespace.
+        .route("/memory/remember", post(handlers::memory::remember))
+        .route("/memory/recall", post(handlers::memory::recall))
+        .route(
+            "/memory/projects",
+            post(handlers::memory::create_project).get(handlers::memory::list_projects),
+        )
         .layer(cors_layer)
         .with_state(state)
 }
