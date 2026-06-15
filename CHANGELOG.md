@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — memory is now opt-in (2026-06-15)
+## v1.0.1 — memory is now opt-in (2026-06-15)
 
 **The server-side memory subsystem is now optional, gated twice, and off by default.** No inference-path change;
 the v1.0 memory behavior is unchanged once enabled — only put behind opt-in gates so the standard build is lean
@@ -22,8 +22,10 @@ again.
 **Validation.** Lean default build: lib `306/306`, correctness `83/83`, regression `26 + 1 ignored` (unchanged
 from v1.0 — the feature is orthogonal to decode); `cargo tree` carries none of sqlitegraph/fastembed/ort/rusqlite.
 `--features memory`: `tests/memory.rs` `6/6`. Runtime: lean + `--memory` → friendly error; memory build without
-the flag → `/memory/*` 503 + no embedder load + no `sg.db`; with `--memory` → `remember`/`recall` work. Versions
-set at release.
+the flag → `/memory/*` 503 + no embedder load + no `sg.db`; with `--memory` → `remember`/`recall` work.
+
+**Versions.** Engine `1.0.0 → 1.0.1`; vf-clide unchanged at `0.3.1`. Tag `v1.0.1`. Lean default still builds on
+Rust 1.85+; `--features memory` needs Rust 1.89+ (the edition-2024 `sqlitegraph` declares `rust-version = 1.89`).
 
 ## v1.0 — server-side memory (2026-06-14)
 
