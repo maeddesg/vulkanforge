@@ -36,6 +36,10 @@ pub enum Command {
     Recall(String),
     /// `/remember <text>` — store a manual note (`kind:"Note"`).
     Remember(String),
+    /// `/archive <id>` — drop a note from recall (kept as an archived record).
+    Archive(i64),
+    /// `/forget <id>` — hard-delete a note from recall AND the graph.
+    Forget(i64),
     /// A `/`-line that isn't a known command (or a malformed one). The
     /// string is a human-readable hint; the REPL prints it and does not
     /// send the line to the model.
@@ -73,6 +77,14 @@ pub fn parse_command(line: &str) -> Option<Command> {
         "/remember" => match arg {
             Some(t) => Command::Remember(t),
             None => Command::Unknown("usage: /remember <text>".into()),
+        },
+        "/archive" => match arg.and_then(|a| a.parse::<i64>().ok()) {
+            Some(id) => Command::Archive(id),
+            None => Command::Unknown("usage: /archive <id>  (id from /recall)".into()),
+        },
+        "/forget" => match arg.and_then(|a| a.parse::<i64>().ok()) {
+            Some(id) => Command::Forget(id),
+            None => Command::Unknown("usage: /forget <id>  (id from /recall)".into()),
         },
         other => Command::Unknown(format!("unknown command: {other}")),
     })
@@ -214,12 +226,13 @@ impl Repl {
     }
 
     /// `/recall <query>`: display the current project's matches (no auto-inject).
+    /// Shows the note `id` per hit so it can be targeted by `/archive`/`/forget`.
     async fn recall(&self, query: &str) {
         match self.client.memory_recall(self.project.as_deref(), query, 5).await {
             Ok(MemCall::Ok(resp)) if resp.hits.is_empty() => println!("(no matches)"),
             Ok(MemCall::Ok(resp)) => {
                 for h in resp.hits {
-                    println!("  [{} · {:.2}] {}", h.kind, h.score, snippet(&h.text));
+                    println!("  #{} [{} · {:.2}] {}", h.id, h.kind, h.score, snippet(&h.text));
                 }
             }
             Ok(MemCall::Disabled) => println!("({MEMORY_OFF_HINT})"),
@@ -227,10 +240,30 @@ impl Repl {
         }
     }
 
-    /// `/remember <text>`: store a manual note (`kind:"Note"`).
+    /// `/remember <text>`: store a manual note (`kind:"Note"`). Honest about a
+    /// dedup hit (says "already known" instead of "stored").
     async fn remember(&self, text: &str) {
         match self.client.memory_remember(self.project.as_deref(), "Note", text).await {
+            Ok(MemCall::Ok(resp)) if resp.deduped => println!("(already known, id {})", resp.id),
             Ok(MemCall::Ok(resp)) => println!("(stored, id {})", resp.id),
+            Ok(MemCall::Disabled) => println!("({MEMORY_OFF_HINT})"),
+            Err(e) => eprintln!("error: {e}"),
+        }
+    }
+
+    /// `/archive <id>`: drop a note from recall, keep it as an archived record.
+    async fn archive(&self, id: i64) {
+        match self.client.memory_archive(self.project.as_deref(), id).await {
+            Ok(MemCall::Ok(_)) => println!("(archived id {id} — out of recall, kept as a record)"),
+            Ok(MemCall::Disabled) => println!("({MEMORY_OFF_HINT})"),
+            Err(e) => eprintln!("error: {e}"),
+        }
+    }
+
+    /// `/forget <id>`: hard-delete a note from recall and the graph.
+    async fn forget(&self, id: i64) {
+        match self.client.memory_delete(self.project.as_deref(), id).await {
+            Ok(MemCall::Ok(_)) => println!("(forgotten id {id} — deleted from memory)"),
             Ok(MemCall::Disabled) => println!("({MEMORY_OFF_HINT})"),
             Err(e) => eprintln!("error: {e}"),
         }
@@ -247,7 +280,7 @@ impl Repl {
         );
         println!(
             "commands: /quit /clear /model <name> /max-tokens <N> /think /no-think · \
-             memory: /project [key] /recall <query> /remember <text>",
+             memory: /project [key] /recall <query> /remember <text> /archive <id> /forget <id>",
         );
         // Pinned status line — only when stdout is a TTY (no-op otherwise).
         let bar = StatusBar::new(std::io::stdout().is_terminal());
@@ -294,6 +327,8 @@ impl Repl {
                     }
                     Command::Recall(query) => self.recall(&query).await,
                     Command::Remember(text) => self.remember(&text).await,
+                    Command::Archive(id) => self.archive(id).await,
+                    Command::Forget(id) => self.forget(id).await,
                     Command::Unknown(hint) => println!("({hint})"),
                 }
                 continue;
@@ -507,6 +542,15 @@ mod tests {
         assert_eq!(parse_command("/remember dispatch reduction did not help"),
             Some(Command::Remember("dispatch reduction did not help".into())));
         assert!(matches!(parse_command("/remember"), Some(Command::Unknown(_))));
+    }
+
+    #[test]
+    fn archive_and_forget_parse_numeric_id() {
+        assert_eq!(parse_command("/archive 7"), Some(Command::Archive(7)));
+        assert_eq!(parse_command("/forget 42"), Some(Command::Forget(42)));
+        // missing or non-numeric id → usage hint, not a crash.
+        assert!(matches!(parse_command("/archive"), Some(Command::Unknown(_))));
+        assert!(matches!(parse_command("/forget abc"), Some(Command::Unknown(_))));
     }
 
     #[test]

@@ -47,6 +47,11 @@ pub struct RememberReq {
 #[derive(Serialize)]
 pub struct RememberResp {
     pub id: i64,
+    /// `true` when the note was a near-duplicate of an existing active note —
+    /// then `id` is that existing node and nothing new was stored (Stufe B-3
+    /// dedup). Surfaced so the caller can say "already known" instead of
+    /// "remembered".
+    pub deduped: bool,
 }
 
 pub async fn remember(
@@ -54,7 +59,7 @@ pub async fn remember(
     Json(req): Json<RememberReq>,
 ) -> Result<Json<RememberResp>, ApiError> {
     let mem = store(&state)?;
-    let id = run_blocking(move || {
+    let outcome = run_blocking(move || {
         mem.remember(
             req.project_key.as_deref(),
             &req.kind,
@@ -64,7 +69,48 @@ pub async fn remember(
         )
     })
     .await?;
-    Ok(Json(RememberResp { id }))
+    Ok(Json(RememberResp { id: outcome.id, deduped: outcome.deduped }))
+}
+
+/// Request for the curation endpoints (`/memory/archive`, `/memory/delete`):
+/// a target note `id` in an optional `project_key` scope.
+#[derive(Deserialize)]
+pub struct IdReq {
+    pub project_key: Option<String>,
+    pub id: i64,
+}
+#[derive(Serialize)]
+pub struct ArchiveResp {
+    pub id: i64,
+    pub status: String,
+}
+#[derive(Serialize)]
+pub struct DeleteResp {
+    pub id: i64,
+    pub deleted: bool,
+}
+
+/// `POST /memory/archive` — drop the note's vector from recall, keep the node
+/// as an `archived` record (Stufe B-3).
+pub async fn archive(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<IdReq>,
+) -> Result<Json<ArchiveResp>, ApiError> {
+    let mem = store(&state)?;
+    let id = req.id;
+    run_blocking(move || mem.archive(req.project_key.as_deref(), req.id)).await?;
+    Ok(Json(ArchiveResp { id, status: "archived".to_string() }))
+}
+
+/// `POST /memory/delete` — hard-remove the note from recall AND the graph.
+pub async fn delete(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<IdReq>,
+) -> Result<Json<DeleteResp>, ApiError> {
+    let mem = store(&state)?;
+    let id = req.id;
+    run_blocking(move || mem.delete(req.project_key.as_deref(), req.id)).await?;
+    Ok(Json(DeleteResp { id, deleted: true }))
 }
 
 #[derive(Deserialize)]

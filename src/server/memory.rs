@@ -39,6 +39,14 @@ pub const GLOBAL_SCOPE: &str = "__global__";
 const EMBED_DIM: usize = 768;
 const PROJECT_KIND: &str = "Project";
 
+/// Dedup-on-remember threshold (cosine **similarity** = `1 − distance`). A new
+/// note whose nearest existing active note is at least this similar is treated
+/// as a near-duplicate and NOT stored again. Deliberately conservative
+/// (near-identical only) — better to let a borderline duplicate through than to
+/// silently swallow a genuinely distinct note. Iterative; tune from real use
+/// (cf. the B-2 trigger-frequency note).
+const DEDUP_SIMILARITY: f32 = 0.92;
+
 /// One recall result (vector hit enriched with its graph node).
 #[derive(Debug, Clone, Serialize)]
 pub struct Hit {
@@ -56,6 +64,15 @@ pub struct Hit {
 pub struct ProjectInfo {
     pub id: i64,
     pub project_key: String,
+}
+
+/// Result of [`MemoryStore::remember`]. `deduped` = the note was a
+/// near-duplicate of an existing active note, so `id` is that **existing**
+/// node and nothing new was stored (surfaced to the caller, never silent).
+#[derive(Debug, Clone, Serialize)]
+pub struct RememberOutcome {
+    pub id: i64,
+    pub deduped: bool,
 }
 
 /// The embedded memory store: one shared `sg.db` (nodes + edges + per-project
@@ -183,8 +200,10 @@ impl MemoryStore {
         Ok(())
     }
 
-    /// Store a nugget: embed → graph node → CONTAINS edge → vector (carrying
-    /// `node_id` in its metadata). Returns the new content node id.
+    /// Store a nugget: embed → (dedup check) → graph node → CONTAINS edge →
+    /// vector (carrying `node_id` in its metadata). Returns the node id and
+    /// whether it was deduped against an existing near-identical active note
+    /// (then no new node was created).
     pub fn remember(
         &self,
         project_key: Option<&str>,
@@ -192,7 +211,7 @@ impl MemoryStore {
         text: &str,
         name: Option<&str>,
         metadata: Option<Value>,
-    ) -> Result<i64, String> {
+    ) -> Result<RememberOutcome, String> {
         if kind.trim().is_empty() {
             return Err("memory: remember requires a non-empty `kind`".into());
         }
@@ -200,13 +219,28 @@ impl MemoryStore {
             return Err("memory: remember requires non-empty `text`".into());
         }
         let key = Self::scope(project_key);
-        // Embed FIRST, outside the graph lock (the expensive ~20 ms step).
+        // Embed FIRST, outside the graph lock (the expensive ~20 ms step). The
+        // SAME embedding is reused for the dedup search AND the insert below —
+        // never embed twice.
         let emb = self.embed(format!("search_document: {text}"))?;
         if emb.len() != EMBED_DIM {
             return Err(format!("memory: embedder returned {} dims, expected {EMBED_DIM}", emb.len()));
         }
 
         let graph = self.graph.lock().map_err(|_| "memory: graph lock poisoned")?;
+
+        // Dedup-on-remember: if the project index already holds a near-identical
+        // note, return it instead of storing a duplicate. The index contains
+        // only ACTIVE vectors (archive + delete both remove the vector), so a
+        // hit is necessarily an active note. Conservative threshold; the
+        // `deduped` flag surfaces this to the caller (never silently swallowed).
+        if let Some((existing, sim)) = Self::nearest_similarity(&graph, &key, &emb)? {
+            if sim >= DEDUP_SIMILARITY {
+                // Light "reinforce" touch (bump updated_at); NOT the B-3b decay.
+                Self::touch_updated_at(&graph, existing);
+                return Ok(RememberOutcome { id: existing, deduped: true });
+            }
+        }
 
         // Content node. data carries the searchable text + lifecycle stub fields.
         let label = name.map(|s| s.to_string()).unwrap_or_else(|| {
@@ -260,7 +294,7 @@ impl MemoryStore {
             .map_err(|e| format!("memory: index op {key}: {e}"))?
             .map_err(|e| format!("memory: vector add/persist {key}: {e}"))?;
 
-        Ok(node_id)
+        Ok(RememberOutcome { id: node_id, deduped: false })
     }
 
     /// Recall: embed query → search the project's index → enrich each hit's
@@ -318,6 +352,201 @@ impl MemoryStore {
             }
         }
         Ok(hits)
+    }
+
+    // ---- Curation (Stufe B-3): dedup helpers + archive + delete ----
+
+    /// Nearest existing note's `(node_id, cosine similarity)` for `emb` in the
+    /// project index, or `None` if the index doesn't exist yet. Used for
+    /// dedup-on-remember; the index holds only **active** vectors (archive and
+    /// delete both remove the vector), so a hit is necessarily an active note.
+    fn nearest_similarity(
+        graph: &SqliteGraph,
+        key: &str,
+        emb: &[f32],
+    ) -> Result<Option<(i64, f32)>, String> {
+        let res = graph.get_hnsw_index_ref(key, |idx| match idx.search(emb, 1) {
+            Err(e) => Err(format!("dedup search: {e}")),
+            Ok(hits) => Ok(hits.into_iter().next().and_then(|(vid, dist)| {
+                idx.get_vector(vid)
+                    .ok()
+                    .flatten()
+                    .and_then(|(_v, meta)| meta.get("node_id").and_then(|x| x.as_i64()))
+                    .map(|nid| (nid, 1.0 - dist))
+            })),
+        });
+        match res {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(format!("memory: {e} ({key})")),
+            Err(_index_missing) => Ok(None),
+        }
+    }
+
+    /// Rebuild the project index from its surviving vectors, **dropping** the
+    /// one belonging to `exclude_node_id`. The curation removal primitive
+    /// (used by both archive and delete).
+    ///
+    /// **Why a rebuild, not `delete_vector`:** SQLiteGraph's `delete_vector`
+    /// does **not** re-elect an HNSW entry point when it removes the current
+    /// one, so deleting the entry-point vector leaves a non-empty index that
+    /// `search` rejects with "Index not initialized" (verified against rev
+    /// `d8219a8` — a gap the earlier scoping smoke didn't exercise; SG is used
+    /// as-is, the workaround lives here). Reading the survivors' **stored**
+    /// embeddings (`get_vector`, no re-embed), dropping the index
+    /// (`delete_index` CASCADE-clears its `hnsw_vectors`), recreating it and
+    /// re-inserting re-elects a valid entry point. O(N) per curation op — but
+    /// curation is rare and user-driven.
+    fn reindex_without(graph: &SqliteGraph, key: &str, exclude_node_id: i64) -> Result<(), String> {
+        let conn = graph.pool.get().map_err(|e| format!("memory: pool: {e}"))?;
+        // The index id (also used for a belt-and-suspenders orphan sweep).
+        // No index yet → nothing to remove.
+        let index_id: i64 = match conn
+            .query_row("SELECT id FROM hnsw_indexes WHERE name = ?1", (key,), |r| r.get::<_, i64>(0))
+            .ok()
+        {
+            Some(id) => id,
+            None => return Ok(()),
+        };
+        let vids: Vec<i64> = {
+            let mut stmt = conn
+                .prepare("SELECT id FROM hnsw_vectors WHERE index_id = ?1 ORDER BY id")
+                .map_err(|e| format!("memory: reindex list prepare: {e}"))?;
+            let rows = stmt
+                .query_map((index_id,), |r| r.get::<_, i64>(0))
+                .map_err(|e| format!("memory: reindex list query: {e}"))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|e| format!("memory: reindex list row: {e}"))?);
+            }
+            out
+        };
+        drop(conn); // release the pooled connection before re-locking the index map
+
+        // Read survivors' stored embeddings. `get_vector` is a storage lookup
+        // (no entry point needed), so it works even on a headless index.
+        let mut survivors: Vec<(Vec<f32>, i64)> = Vec::with_capacity(vids.len());
+        graph
+            .get_hnsw_index_ref(key, |idx| {
+                for vid in &vids {
+                    if let Ok(Some((vec, meta))) = idx.get_vector(*vid as u64) {
+                        if let Some(nid) = meta.get("node_id").and_then(|x| x.as_i64()) {
+                            if nid != exclude_node_id {
+                                survivors.push((vec, nid));
+                            }
+                        }
+                    }
+                }
+            })
+            .map_err(|e| format!("memory: reindex read {key}: {e}"))?;
+
+        // Drop the index (CASCADE clears its vectors) + an explicit orphan sweep
+        // (in case the FK cascade is off), then recreate it empty.
+        graph
+            .delete_hnsw_index(key)
+            .map_err(|e| format!("memory: reindex drop {key}: {e}"))?;
+        if let Ok(conn) = graph.pool.get() {
+            let _ = conn.execute("DELETE FROM hnsw_vectors WHERE index_id = ?1", (index_id,));
+        }
+        let _ = graph
+            .hnsw_index_persistent(key, hnsw_cfg())
+            .map_err(|e| format!("memory: reindex recreate {key}: {e}"))?;
+
+        // Re-insert survivors → re-elects a valid entry point.
+        graph
+            .get_hnsw_index_mut(key, |idx| -> Result<(), String> {
+                for (vec, nid) in &survivors {
+                    idx.insert_vector(vec, Some(json!({ "node_id": nid })))
+                        .map_err(|e| format!("reinsert: {e}"))?;
+                }
+                idx.persist_topology().map_err(|e| format!("persist: {e}"))
+            })
+            .map_err(|e| format!("memory: reindex index op {key}: {e}"))?
+            .map_err(|e| format!("memory: reindex reinsert {key}: {e}"))?;
+        Ok(())
+    }
+
+    /// Raw `COUNT(*)` of vectors in the project index — the **honest** capacity
+    /// signal. `statistics().vector_count` is stale-on-reopen
+    /// (`results/recall_scoping_smoke.md`), so correctness/capacity must use
+    /// this raw count (or recall behavior), **never** the cached counter.
+    pub fn raw_vector_count(&self, project_key: Option<&str>) -> Result<i64, String> {
+        let key = Self::scope(project_key);
+        let graph = self.graph.lock().map_err(|_| "memory: graph lock poisoned")?;
+        let conn = graph.pool.get().map_err(|e| format!("memory: pool: {e}"))?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM hnsw_vectors v \
+             JOIN hnsw_indexes i ON v.index_id = i.id WHERE i.name = ?1",
+            (key.as_str(),),
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(|e| format!("memory: raw vector count {key}: {e}"))
+    }
+
+    /// Light "reinforce" touch on a dedup hit: bump `updated_at`. NOT the full
+    /// touch-on-read / staleness decay (that is B-3b). Best-effort — a failure
+    /// here must never fail the remember.
+    fn touch_updated_at(graph: &SqliteGraph, id: i64) {
+        if let Ok(mut node) = graph.get_entity(id) {
+            if let Value::Object(map) = &mut node.data {
+                map.insert("updated_at".to_string(), json!(now_iso()));
+            }
+            let _ = graph.update_entity(&node);
+        }
+    }
+
+    /// Archive a note: remove its vector from the project index (so it no longer
+    /// surfaces in recall) but **keep the node** in the graph with
+    /// `status="archived"` — a record. The node + text remain, so this is
+    /// reversible by design (unarchive is a later slice).
+    pub fn archive(&self, project_key: Option<&str>, id: i64) -> Result<(), String> {
+        let key = Self::scope(project_key);
+        let graph = self.graph.lock().map_err(|_| "memory: graph lock poisoned")?;
+        let mut node = graph
+            .get_entity(id)
+            .map_err(|_| format!("memory: archive: note {id} not found"))?;
+        // 1) out of recall: rebuild the index without this node's vector.
+        Self::reindex_without(&graph, &key, id)?;
+        // 2) mark the node archived (record stays in the graph).
+        if let Value::Object(map) = &mut node.data {
+            map.insert("status".to_string(), json!("archived"));
+            map.insert("archived_at".to_string(), json!(now_iso()));
+        }
+        graph
+            .update_entity(&node)
+            .map_err(|e| format!("memory: archive update {id}: {e}"))?;
+        Ok(())
+    }
+
+    /// Hard delete: remove the vector from the index AND the node (its edges
+    /// cascade via `delete_entity`) from the graph — gone from recall and the
+    /// record. The delete is hard (`DELETE FROM`, no bloat); verify reductions
+    /// with [`raw_vector_count`], never `statistics().vector_count`.
+    pub fn delete(&self, project_key: Option<&str>, id: i64) -> Result<(), String> {
+        let key = Self::scope(project_key);
+        let graph = self.graph.lock().map_err(|_| "memory: graph lock poisoned")?;
+        // Clear error if the note doesn't exist, before doing rebuild work.
+        graph
+            .get_entity(id)
+            .map_err(|_| format!("memory: delete: note {id} not found"))?;
+        // Gone from recall: rebuild the index without this node's vector.
+        Self::reindex_without(&graph, &key, id)?;
+        // Gone from the graph too (its edges cascade via delete_entity).
+        graph
+            .delete_entity(id)
+            .map_err(|e| format!("memory: delete node {id}: {e}"))?;
+        Ok(())
+    }
+
+    /// Fetch a single note by id **regardless of status** — archived notes
+    /// don't surface in recall, so this is how to inspect one (e.g. confirm an
+    /// archive kept the record, or a future "show note" command). `score` is
+    /// `1.0` (no query was run). `None` if the node is missing (e.g. deleted).
+    pub fn get(&self, id: i64) -> Option<Hit> {
+        let graph = self.graph.lock().ok()?;
+        let node = graph.get_entity(id).ok()?;
+        let text = node.data.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let status = node.data.get("status").and_then(|v| v.as_str()).unwrap_or("active").to_string();
+        Some(Hit { id: node.id, kind: node.kind, name: node.name, text, status, score: 1.0 })
     }
 
     /// Idempotent: create the project structure node + its index (no error on

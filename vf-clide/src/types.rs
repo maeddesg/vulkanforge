@@ -223,10 +223,39 @@ pub struct RememberRequest {
     pub text: String,
 }
 
-/// `POST /memory/remember` response: the new content node id.
+/// `POST /memory/remember` response: the content node id, and whether it was
+/// a near-duplicate of an existing note (Stufe B-3 dedup) — then `id` is the
+/// existing node and nothing new was stored.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RememberResponse {
     pub id: i64,
+    #[serde(default)]
+    pub deduped: bool,
+}
+
+/// `POST /memory/archive` | `POST /memory/delete` request — a target note `id`
+/// in an optional `project_key` scope (Stufe B-3 curation).
+#[derive(Debug, Serialize)]
+pub struct CurateRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+    pub id: i64,
+}
+
+/// `POST /memory/archive` response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArchiveResponse {
+    pub id: i64,
+    #[serde(default)]
+    pub status: String,
+}
+
+/// `POST /memory/delete` response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeleteResponse {
+    pub id: i64,
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 /// `GET /memory/projects` response.

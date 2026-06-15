@@ -433,6 +433,11 @@ async fn execute_remember(client: &Client, project: Option<&str>, args: &str) ->
     }
     let kind = if parsed.kind.trim().is_empty() { "Note" } else { parsed.kind.trim() };
     match client.memory_remember(project, kind, &parsed.text).await {
+        // Dedup hit (Stufe B-3): honest "already known", not a second store.
+        Ok(MemCall::Ok(resp)) if resp.deduped => {
+            eprintln!("[agent] already known [{kind}] (id {}): {}", resp.id, short(&parsed.text));
+            format!("Already in memory as [{kind}] (id {}); not stored again.", resp.id)
+        }
         Ok(MemCall::Ok(resp)) => {
             eprintln!("[agent] remembered [{kind}]: {}", short(&parsed.text));
             format!("Stored as [{kind}] (id {}).", resp.id)

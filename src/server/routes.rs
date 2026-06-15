@@ -52,7 +52,11 @@ pub fn build_router(state: Arc<AppState>, cors_enabled: bool) -> Router {
             .route(
                 "/memory/projects",
                 post(handlers::memory::create_project).get(handlers::memory::list_projects),
-            );
+            )
+            // Curation (Stufe B-3): archive (out of recall, kept as record) +
+            // delete (hard).
+            .route("/memory/archive", post(handlers::memory::archive))
+            .route("/memory/delete", post(handlers::memory::delete));
     }
 
     router.layer(cors_layer).with_state(state)

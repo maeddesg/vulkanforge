@@ -10,8 +10,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::types::{
-    ChatChunk, ChatMessage, ChatRequest, ChatResponse, ProjectsResponse, RecallRequest,
-    RecallResponse, RememberRequest, RememberResponse, StreamOptions, Tool, ToolCall, Usage,
+    ArchiveResponse, ChatChunk, ChatMessage, ChatRequest, ChatResponse, CurateRequest,
+    DeleteResponse, ProjectsResponse, RecallRequest, RecallResponse, RememberRequest,
+    RememberResponse, StreamOptions, Tool, ToolCall, Usage,
 };
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -251,6 +252,26 @@ impl Client {
     pub async fn memory_projects(&self) -> Result<MemCall<ProjectsResponse>> {
         let resp = self.http.get(self.memory_url("projects")).send().await?;
         self.memory_parse(resp).await
+    }
+
+    /// `POST /memory/archive` — drop a note from recall, keep it as a record.
+    pub async fn memory_archive(
+        &self,
+        project_key: Option<&str>,
+        id: i64,
+    ) -> Result<MemCall<ArchiveResponse>> {
+        let body = CurateRequest { project_key: project_key.map(str::to_string), id };
+        self.memory_post("archive", &body).await
+    }
+
+    /// `POST /memory/delete` — hard-remove a note from recall and the graph.
+    pub async fn memory_delete(
+        &self,
+        project_key: Option<&str>,
+        id: i64,
+    ) -> Result<MemCall<DeleteResponse>> {
+        let body = CurateRequest { project_key: project_key.map(str::to_string), id };
+        self.memory_post("delete", &body).await
     }
 
     async fn memory_post<B: Serialize, T: DeserializeOwned>(
