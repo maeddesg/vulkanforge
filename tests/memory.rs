@@ -1,11 +1,16 @@
 //! Stufe-A memory subsystem integration tests (real embeddings + SQLiteGraph).
 //!
+//! The whole subsystem is behind the `memory` Cargo feature (default OFF), so
+//! this test crate compiles to nothing unless built with `--features memory`.
+//! Run: `cargo test --release --features memory --test memory -- --test-threads=1`.
+//!
 //! These exercise the `remember → recall` loop, project isolation, the global
 //! default scope, persistence across a store restart, get-or-create
 //! idempotency, and the node-id ↔ recall coupling. They need the Nomic ONNX
 //! model; if it can't be loaded (offline first run), each test **self-skips**
 //! with a printed note rather than failing — so the lib/CI gate stays clean.
 //! Run single-threaded (each test owns a SQLite file): `--test-threads=1`.
+#![cfg(feature = "memory")]
 
 use vulkanforge::server::memory::MemoryStore;
 

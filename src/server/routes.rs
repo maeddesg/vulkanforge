@@ -27,7 +27,8 @@ pub fn build_router(state: Arc<AppState>, cors_enabled: bool) -> Router {
         CorsLayer::new()
     };
 
-    Router::new()
+    #[allow(unused_mut)] // `mut` is only used when the `memory` feature adds routes.
+    let mut router = Router::new()
         // Primary OpenAI-standard paths
         .route("/v1/chat/completions", post(handlers::chat::completions))
         .route("/v1/completions", post(handlers::completions::completions))
@@ -37,14 +38,22 @@ pub fn build_router(state: Arc<AppState>, cors_enabled: bool) -> Router {
         .route("/completions", post(handlers::completions::completions))
         .route("/models", get(handlers::models::list))
         // Operations
-        .route("/health", get(handlers::health::check))
-        // VF-native memory subsystem (Stufe A) — NOT OpenAI; separate namespace.
-        .route("/memory/remember", post(handlers::memory::remember))
-        .route("/memory/recall", post(handlers::memory::recall))
-        .route(
-            "/memory/projects",
-            post(handlers::memory::create_project).get(handlers::memory::list_projects),
-        )
-        .layer(cors_layer)
-        .with_state(state)
+        .route("/health", get(handlers::health::check));
+
+    // VF-native memory subsystem (Stufe A) — NOT OpenAI; separate namespace.
+    // Registered only when compiled with `--features memory`; on a lean build
+    // these paths simply don't exist (404). Runtime activation is a second gate
+    // (`serve --memory`): when off, the handlers themselves return 503.
+    #[cfg(feature = "memory")]
+    {
+        router = router
+            .route("/memory/remember", post(handlers::memory::remember))
+            .route("/memory/recall", post(handlers::memory::recall))
+            .route(
+                "/memory/projects",
+                post(handlers::memory::create_project).get(handlers::memory::list_projects),
+            );
+    }
+
+    router.layer(cors_layer).with_state(state)
 }

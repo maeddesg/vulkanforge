@@ -38,8 +38,21 @@ tokio-stream = "0.1"
 # (pulled by `ort` at build time) — see the Stufe-A report for the build-time /
 # binary-size delta. Used only by the `/memory/*` handlers; the inference path
 # does not touch them.
-sqlitegraph = { git = "https://github.com/oldnordic/sqlitegraph", rev = "d8219a83de4d22ed71d218c0d57407b1c672de39", package = "sqlitegraph" }
-fastembed = { git = "https://github.com/maeddesg/fastembed-rs", rev = "3a9588ac52c0d825118b44775526caac02175193", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"] }
+#
+# Both are `optional` and pulled in ONLY by the `memory` feature (default OFF) —
+# the default build is lean (~25 MB, no ONNX Runtime / no bundled SQLite). Build
+# with `--features memory` to compile the subsystem in, then activate it at
+# runtime with `serve --memory`.
+sqlitegraph = { git = "https://github.com/oldnordic/sqlitegraph", rev = "d8219a83de4d22ed71d218c0d57407b1c672de39", package = "sqlitegraph", optional = true }
+fastembed = { git = "https://github.com/maeddesg/fastembed-rs", rev = "3a9588ac52c0d825118b44775526caac02175193", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"], optional = true }
+
+[features]
+# Default build is lean: NO memory subsystem, NO heavy native deps.
+default = []
+# Opt-in server-side memory subsystem (compile gate). Pulls in SQLiteGraph +
+# fastembed and compiles `src/server/memory.rs`, the `/memory/*` handlers, and
+# their wiring. Runtime activation is a second gate: `serve --memory`.
+memory = ["dep:sqlitegraph", "dep:fastembed"]
 
 [build-dependencies]
 shaderc = "0.8"

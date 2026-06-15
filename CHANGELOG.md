@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased — memory is now opt-in (2026-06-15)
+
+**The server-side memory subsystem is now optional, gated twice, and off by default.** No inference-path change;
+the v1.0 memory behavior is unchanged once enabled — only put behind opt-in gates so the standard build is lean
+again.
+
+- **Compile gate — Cargo feature `memory` (default OFF).** The two heavy native deps (SQLiteGraph + fastembed /
+  ONNX Runtime) are now `optional` and pulled in only by `--features memory`. The **default build is lean again**:
+  the release binary drops back to **~25 MB** (from ~58 MB with the feature) and the compiled dependency graph
+  drops from ~261 to ~106 crates — no ONNX Runtime, no bundled SQLite, no `/memory/*` routes compiled. Build the
+  subsystem in with `cargo build --release --features memory`.
+- **Runtime gate — `serve --memory` (default OFF).** Even on a memory-enabled binary, a fresh `serve` no longer
+  brings memory up automatically. Pass `--memory` (or set `VULKANFORGE_MEMORY=1`) to activate it. Without it the
+  store is **never initialized** — no embedder load, no `sg.db` opened — and `/memory/*` returns 503, so an
+  inference-only run carries zero memory overhead. **Behavior change:** unlike v1.0, memory is not on by default.
+- **Clear errors on a lean build.** Passing `--memory` (or the env) to a binary built without the feature fails
+  fast — before the model loads — with a `rebuild with --features memory` message, instead of silently ignoring
+  the flag.
+
+**Validation.** Lean default build: lib `306/306`, correctness `83/83`, regression `26 + 1 ignored` (unchanged
+from v1.0 — the feature is orthogonal to decode); `cargo tree` carries none of sqlitegraph/fastembed/ort/rusqlite.
+`--features memory`: `tests/memory.rs` `6/6`. Runtime: lean + `--memory` → friendly error; memory build without
+the flag → `/memory/*` 503 + no embedder load + no `sg.db`; with `--memory` → `remember`/`recall` work. Versions
+set at release.
+
 ## v1.0 — server-side memory (2026-06-14)
 
 **Major release.** VulkanForge gains a **server-side memory subsystem**: a persistent, project-scoped,

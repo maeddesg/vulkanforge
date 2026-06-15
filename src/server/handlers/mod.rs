@@ -9,5 +9,6 @@
 pub mod chat;
 pub mod completions;
 pub mod health;
+#[cfg(feature = "memory")]
 pub mod memory;
 pub mod models;

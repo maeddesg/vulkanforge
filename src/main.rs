@@ -234,6 +234,13 @@ enum Commands {
         /// still wins over this CLI default.
         #[arg(long)]
         no_think_filter: bool,
+        /// Activate the server-side memory subsystem (`/memory/*` endpoints).
+        /// Default off: a fresh `serve` has no memory and `/memory/*` returns
+        /// 503 (no embedder load, no `sg.db` opened). Requires a binary built
+        /// with `--features memory`; on a lean build this flag fails with a
+        /// clear "rebuild" message. Env alias: `VULKANFORGE_MEMORY=1`.
+        #[arg(long)]
+        memory: bool,
     },
 }
 
@@ -317,6 +324,7 @@ fn main() {
             ctx_size,
             served_model_name,
             no_think_filter,
+            memory,
         } => vulkanforge::server::serve::run(vulkanforge::server::serve::ServeArgs {
             model: model.unwrap_or_else(default_model_path),
             host,
@@ -326,6 +334,7 @@ fn main() {
             ctx_size,
             served_model_name,
             no_think_filter,
+            memory,
         }),
     };
     if let Err(e) = result {

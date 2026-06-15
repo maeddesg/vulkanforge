@@ -18,17 +18,21 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
 
 ## Highlights
 
-- **Server-side memory (v1.0)** — `vulkanforge serve` now has a **persistent, project-scoped, semantic memory**
-  embedded in the API process. VF-native endpoints write notes on purpose and read them back by meaning:
+- **Server-side memory (opt-in, off by default)** — `vulkanforge serve` can host a **persistent, project-scoped,
+  semantic memory** embedded in the API process. It is gated **twice** and off by default: build with
+  `cargo build --release --features memory`, then activate at runtime with `serve --memory` (or
+  `VULKANFORGE_MEMORY=1`). VF-native endpoints write notes on purpose and read them back by meaning:
   `POST /memory/remember`, `POST /memory/recall` (`{hits:[{id,kind,name,text,status,score}]}`),
   `POST`/`GET /memory/projects`. [SQLiteGraph](https://github.com/oldnordic/sqlitegraph) (nodes + edges +
   per-project HNSW indexes in one SQLite file) + a CPU embedder ([fastembed](https://github.com/maeddesg/fastembed-rs),
   Nomic-Embed v1.5-Q, 768-dim, AVX-512/VNNI). Each project gets its own index — recall in one project **cannot**
   return another's notes — and the store survives restarts (vectors restore with no re-embed). The memory path
-  never takes the GPU permit. **First start** downloads the ONNX model into `~/.vulkanforge/embed-cache` (then
-  offline); the two native deps add ~34 MB to the binary (static ONNX Runtime + bundled SQLite). What it is, what
-  it isn't, and the roadmap: the wiki's **[Memory](https://github.com/maeddesg/vulkanforge/wiki/Memory)** page.
-  See `CHANGELOG.md`.
+  never takes the GPU permit. **Cost is opt-in too:** the default build stays lean (**~25 MB**, no extra deps); only
+  `--features memory` pulls in the two native deps (**+~34 MB**: static ONNX Runtime + bundled SQLite), and only an
+  *activated* store loads the embedder or opens a DB — first start downloads the ONNX model into
+  `~/.vulkanforge/embed-cache` (then offline). Without `--memory`, `/memory/*` returns 503 and inference runs with
+  zero memory overhead. What it is, what it isn't, and the roadmap: the wiki's
+  **[Memory](https://github.com/maeddesg/vulkanforge/wiki/Memory)** page. See `CHANGELOG.md`.
 - **`vf-clide` REPL permission ceiling + denial wording (v0.9.4)** — `vf-clide` (0.3.1): in the agent **REPL**,
   tool calls at or below the active `--yes` / `--allow-mutating` / `--allow-shell` ceiling are now
   **auto-approved** (still printed) and only calls **above** it prompt `y/N` — consistent with headless, not

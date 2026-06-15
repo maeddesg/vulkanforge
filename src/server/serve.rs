@@ -52,6 +52,21 @@ pub struct ServeArgs {
     /// instead of being stripped to an empty content string.
     /// Per-request override via `chat_template_kwargs` still wins.
     pub no_think_filter: bool,
+    /// Activate the server-side memory subsystem (`/memory/*`). Default OFF:
+    /// without it (and without `VULKANFORGE_MEMORY=1`) the store is never
+    /// initialized — no embedder load, no `sg.db` opened — and `/memory/*`
+    /// returns 503. Requires a binary built with `--features memory`; on a
+    /// lean build this flag produces a clear "rebuild" error instead of being
+    /// silently ignored.
+    pub memory: bool,
+}
+
+/// Whether memory activation was requested at runtime: the `--memory` flag or
+/// `VULKANFORGE_MEMORY=1`. Always evaluated (in both feature configs); on a
+/// lean build a `true` here becomes a clear "rebuild with --features memory"
+/// error rather than a silent no-op.
+fn memory_requested(args: &ServeArgs) -> bool {
+    args.memory || std::env::var("VULKANFORGE_MEMORY").as_deref() == Ok("1")
 }
 
 pub fn run(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -78,19 +93,46 @@ pub fn run(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .unwrap_or_else(|| derive_model_id(&args.model));
 
+    let memory_on = memory_requested(&args);
+
+    // Lean build: `--memory` / `VULKANFORGE_MEMORY=1` was requested but the
+    // subsystem isn't compiled in. Fail clearly with how to fix it — BEFORE the
+    // expensive model load — rather than silently ignoring the flag (clap still
+    // accepts it in both configs).
+    #[cfg(not(feature = "memory"))]
+    if memory_on {
+        return Err(
+            "this binary was built without memory support. Rebuild with \
+             `cargo build --release --features memory` to use `serve --memory` \
+             (or the VULKANFORGE_MEMORY=1 env)."
+                .into(),
+        );
+    }
+
     let session = load_gguf_session(&args)?;
 
     // Stufe A — bring up the server-side memory store (SQLiteGraph + embedder,
-    // embedded). Eager-loads the embedder so the first request doesn't pay it.
-    // A failure here (e.g. the model can't be fetched on a first, offline
-    // start) is logged and the server runs WITHOUT memory (`/memory/*` → 503)
-    // rather than refusing to serve inference.
-    let memory = match crate::server::memory::MemoryStore::new(memory_db_path()) {
-        Ok(m) => Some(std::sync::Arc::new(m)),
-        Err(e) => {
-            eprintln!("VulkanForge: memory subsystem DISABLED — init failed: {e}");
-            None
+    // embedded) ONLY when requested at runtime. Off by default: not requested →
+    // `None`, so no embedder load and no `sg.db` opened (a clean, overhead-free
+    // inference path). When requested, eager-load the embedder so the first
+    // request doesn't pay it; a failure (e.g. the model can't be fetched on a
+    // first, offline start) is logged and the server runs WITHOUT memory
+    // (`/memory/*` → 503) rather than refusing to serve inference.
+    #[cfg(feature = "memory")]
+    let memory = if memory_on {
+        match crate::server::memory::MemoryStore::new(memory_db_path()) {
+            Ok(m) => Some(std::sync::Arc::new(m)),
+            Err(e) => {
+                eprintln!("VulkanForge: memory subsystem DISABLED — init failed: {e}");
+                None
+            }
         }
+    } else {
+        eprintln!(
+            "VulkanForge: memory subsystem off — start with --memory (or \
+             VULKANFORGE_MEMORY=1) to enable; /memory/* returns 503."
+        );
+        None
     };
 
     let state = Arc::new(AppState::new(
@@ -98,6 +140,7 @@ pub fn run(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.model.clone(),
         session,
         !args.no_think_filter,
+        #[cfg(feature = "memory")]
         memory,
     ));
 
@@ -128,7 +171,9 @@ async fn serve_inner(state: Arc<AppState>, args: &ServeArgs) -> Result<(), Box<d
     // Graceful shutdown returned. First flush the memory store (CPU/SQLite —
     // no `device_wait_idle`; persist HNSW topology + WAL-checkpoint), then the
     // GPU teardown. Order is independent (disjoint resources) but memory-first
-    // is tidy.
+    // is tidy. Compiled only under the `memory` feature; otherwise there is no
+    // store to flush.
+    #[cfg(feature = "memory")]
     if let Some(mem) = &teardown_state.memory {
         mem.shutdown();
     }
@@ -148,6 +193,8 @@ async fn serve_inner(state: Arc<AppState>, args: &ServeArgs) -> Result<(), Box<d
 
 /// Resolve the memory-store db path: `$VF_MEMORY_DB` if set, else
 /// `~/.vulkanforge/memory.db` (a sibling `embed-cache/` holds the model).
+/// Only used (and compiled) under the `memory` feature.
+#[cfg(feature = "memory")]
 fn memory_db_path() -> PathBuf {
     if let Ok(p) = std::env::var("VF_MEMORY_DB") {
         return PathBuf::from(p);

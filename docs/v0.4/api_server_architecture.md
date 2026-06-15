@@ -1041,11 +1041,23 @@ Logs umfassen:
 - TTFT (Zeit Request-Empfang bis erstes SSE-Chunk)
 - 4xx/5xx mit error-type
 
-### 5.8 Memory-Subsystem (v1.0)
+### 5.8 Memory-Subsystem (opt-in, default off)
 
 Server-seitiges Gedächtnis, **embedded** im API-Prozess (`src/server/memory.rs` + `handlers/memory.rs`).
 VF-native `/memory/*`-Endpoints (getrennt von `/v1/*`): `POST /memory/remember`, `POST /memory/recall`,
 `POST`/`GET /memory/projects`. `AppState.memory: Option<Arc<MemoryStore>>` (None → 503, Inference läuft weiter).
+
+**Opt-in — zwei Gates (default OFF).** Das Subsystem ist doppelt gegated, damit der Standard-Build schlank bleibt:
+1. **Compile-Gate:** Cargo-Feature `memory` (default aus). Macht `sqlitegraph` + `fastembed` `optional` und cfg-gated
+   das Modul, das `AppState.memory`-Feld, die `/memory/*`-Routen, den serve-Init/Teardown und `tests/memory.rs`. Ohne
+   das Feature ist **null** Memory-Code/-Dep im Build (cargo tree: kein sqlitegraph/fastembed/ort/rusqlite; Binär ~25
+   statt ~58 MB; Build-Graph ~106 statt ~261 Crates). Bauen mit `cargo build --release --features memory`.
+2. **Runtime-Gate:** `serve --memory` (od. `VULKANFORGE_MEMORY=1`), default aus. Nur dann wird `MemoryStore::new`
+   gerufen → **ohne Flag kein Embedder-Load, kein `sg.db`-open** (Inference-Pfad overhead-frei), `/memory/*` → 503.
+   `--memory` auf einem ohne Feature gebauten Binär bricht früh mit klarer „rebuild with --features memory"-Meldung
+   ab (vor dem Modell-Load), statt das Flag still zu ignorieren.
+
+Das deckt die „deliberate notebook"-Philosophie auch baulich: Gedächtnis ist eine bewusste Aktivierung, kein Default.
 
 **Bausteine.** Eine `sg.db` ([SQLiteGraph](https://github.com/oldnordic/sqlitegraph) — Nodes + Edges + per-Projekt-
 HNSW-Indizes) + CPU-Embedder ([fastembed](https://github.com/maeddesg/fastembed-rs), Nomic-Embed v1.5-Q, 768-dim,
@@ -1068,8 +1080,12 @@ den GPU-`permit`; Handler laufen über `spawn_blocking`, der teure embed-Schritt
   Tabellen-Form re-verifiziert werden**, sonst brechen find/list still.
 - `statistics().vector_count` ist nach Reopen stale → **nicht** für Korrektheit/Kapazität nutzen.
 
-**Kosten.** Statisch gelinktes ONNX-Runtime (via `ort`) + bundled SQLite (rusqlite) → Release-Binär ~25 → ~59 MB,
-Cargo.lock ~250 → ~384 Pakete. Erst-Start lädt das Nomic-ONNX nach `~/.vulkanforge/embed-cache` (danach offline).
+**Kosten (nur mit `--features memory`).** Statisch gelinktes ONNX-Runtime (via `ort`) + bundled SQLite (rusqlite) →
+Release-Binär **~25 → ~58 MB**, compilierter Dep-Graph **~106 → ~261 Crates**. Der **Default-Build trägt nichts
+davon** — er ist wieder schlank (~25 MB). Hinweis: `Cargo.lock` bleibt bei ~384 `[[package]]`-Einträgen (das
+Lockfile ist die **Vereinigung aller Features** — optionale Deps werden immer eingetragen, auch wenn das Feature aus
+ist; reduziert wird der *Build-Graph*, nicht die Lockfile-Länge). Eine *aktivierte* Memory (Runtime-Gate an) lädt
+beim Erst-Start das Nomic-ONNX nach `~/.vulkanforge/embed-cache` (danach offline).
 
 **Out of scope (Stufe B+).** Lifecycle (draft→…→archived), touch-on-read, delete/archive, reiche Edge-Taxonomie,
 vf-clide-Client-Integration.
