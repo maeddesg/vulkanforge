@@ -306,7 +306,14 @@ impl Repl {
             if self.agent {
                 let msgs = self.build_messages(&line);
                 let gate = crate::agent::Gate::interactive(self.ceiling);
-                let fut = crate::agent::run(&self.client, msgs, gate, &self.workspace, Some(&bar));
+                let fut = crate::agent::run(
+                    &self.client,
+                    msgs,
+                    gate,
+                    &self.workspace,
+                    self.project.as_deref(),
+                    Some(&bar),
+                );
                 let res = tokio::select! {
                     r = fut => r,
                     _ = tokio::signal::ctrl_c() => {

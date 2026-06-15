@@ -31,6 +31,11 @@ pub const READ_FILE: &str = "read_file";
 pub const WRITE_FILE: &str = "write_file";
 pub const SEARCH: &str = "search";
 pub const SHELL: &str = "shell";
+/// Memory tools (Stufe B-2). Dispatched on their own axis (async, via the
+/// HTTP memory client), **before** the file/shell permission gate — they
+/// never touch files or the shell, so they are visible but not ceiling-gated.
+pub const RECALL: &str = "recall";
+pub const REMEMBER: &str = "remember";
 
 /// Cap on returned file / shell content (256 KB). Larger output is
 /// truncated with a clear marker rather than flooding the context / OOM.
@@ -111,6 +116,53 @@ pub fn shell_tool() -> Tool {
         // its SOLE guard (needs the loud `--allow-shell`, not `--allow-mutating`).
         ToolRisk::Exec,
     )
+}
+
+// -----------------------------------------------------------------
+// Memory tools (Stufe B-2) — definitions only. They are NOT executed here
+// (execution is async, via the HTTP memory client in `agent.rs`) and are NOT
+// gated by the file/shell ceiling (a separate axis — see `agent::dispatch_memory`).
+// The `risk` field is a required placeholder (`ReadOnly`); it is never read,
+// because memory calls are intercepted before the permission gate.
+
+pub fn recall_tool() -> Tool {
+    Tool::function(
+        RECALL,
+        "Search the project's long-term memory for relevant past decisions, learnings, or \
+         bugs. Use when prior context would meaningfully help — not for trivia.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "What to look for (natural language)" },
+                "k": { "type": "integer", "description": "Max notes to return (default 5)" }
+            },
+            "required": ["query"]
+        }),
+        ToolRisk::ReadOnly,
+    )
+}
+
+pub fn remember_tool() -> Tool {
+    Tool::function(
+        REMEMBER,
+        "Store a durable decision, learning, or bug worth recalling in future sessions. Use \
+         sparingly — only things genuinely worth keeping, not routine actions.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "kind": { "type": "string", "description": "Decision | Learning | Bug | Benchmark | Artifact | Concept | Note" },
+                "text": { "type": "string", "description": "The content to remember" }
+            },
+            "required": ["kind", "text"]
+        }),
+        ToolRisk::ReadOnly,
+    )
+}
+
+/// The two memory tool definitions, added to the agent's tool set **only**
+/// when the server reports memory enabled (the startup probe in `agent::run`).
+pub fn memory_tools() -> Vec<Tool> {
+    vec![recall_tool(), remember_tool()]
 }
 
 // -----------------------------------------------------------------

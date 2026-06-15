@@ -17,13 +17,15 @@
 use std::io::Write;
 use std::path::Path;
 
-use crate::client::{AgentTurn, Client, Result};
+use serde::Deserialize;
+
+use crate::client::{AgentTurn, Client, MemCall, Result};
 use crate::tools::{
-    all_tools, execute_read_file, execute_search, execute_shell, execute_write_file, read_agents_md,
-    READ_FILE, SEARCH, SHELL, WRITE_FILE,
+    all_tools, execute_read_file, execute_search, execute_shell, execute_write_file, memory_tools,
+    read_agents_md, READ_FILE, RECALL, REMEMBER, SEARCH, SHELL, WRITE_FILE,
 };
 use crate::status::StatusBar;
-use crate::types::{ChatMessage, Tool, ToolCall, ToolRisk, Usage};
+use crate::types::{ChatMessage, MemoryHit, Tool, ToolCall, ToolRisk, Usage};
 
 /// Maximum tool-call iterations before stopping with a visible marker.
 pub const LOOP_CAP: usize = 8;
@@ -46,6 +48,9 @@ ask for operating-system or filesystem permissions.\n\
 - Workspace-confinement denial (a path outside the project workspace): absolute. \
 No flag overrides it; do not request elevated permissions or call the target \
 system-critical — work within the workspace instead.\n\n\
+If memory tools (recall, remember) are available, use them judiciously: recall \
+relevant prior context before significant work, and remember durable decisions, \
+learnings, or bugs worth keeping across sessions — not routine actions.\n\n\
 Never invent file contents or command output you did not actually receive from a tool.";
 
 /// How a tool call gets approved (interaction style).
@@ -248,7 +253,7 @@ pub(crate) fn handle_call(call: &ToolCall, gate: Gate, workspace: &Path, tools: 
 /// messages — one assistant turn carrying all calls, then one `tool`
 /// result per call — and re-sends, until the model stops calling tools or
 /// the cap is hit.
-pub async fn run_loop<F, Fut>(
+pub async fn run_loop<F, Fut, M, MFut>(
     mut messages: Vec<ChatMessage>,
     gate: Gate,
     workspace: &Path,
@@ -256,10 +261,13 @@ pub async fn run_loop<F, Fut>(
     status: Option<&StatusBar>,
     cap: usize,
     mut send: F,
+    mut mem_call: M,
 ) -> Result<(LoopEnd, Usage)>
 where
     F: FnMut(Vec<ChatMessage>) -> Fut,
     Fut: std::future::Future<Output = Result<AgentTurn>>,
+    M: FnMut(ToolCall) -> MFut,
+    MFut: std::future::Future<Output = Option<String>>,
 {
     // Accumulate token usage across every model call this turn made (the
     // loop may issue several requests; each is billed, so summing them is
@@ -285,7 +293,15 @@ where
             if let Some(s) = status {
                 s.set_action(format!("running {}(…)", call.function.name));
             }
-            let result = handle_call(call, gate, workspace, tools);
+            // Memory tools (recall/remember) dispatch on their own axis —
+            // async, via the HTTP client, BEFORE the file/shell gate (they
+            // touch neither files nor the shell). The closure returns
+            // Some(result) iff it handled the call; None falls through to the
+            // gated file/shell dispatch.
+            let result = match mem_call(call.clone()).await {
+                Some(r) => r,
+                None => handle_call(call, gate, workspace, tools),
+            };
             messages.push(ChatMessage::tool(call.id.clone(), result));
         }
     }
@@ -304,21 +320,157 @@ fn fold_usage(acc: &mut Usage, u: &Option<Usage>) {
     acc.total_tokens = Some(acc.total_tokens.unwrap_or(0) + t);
 }
 
-/// Run the agent loop against a live server with the full tool set
-/// (`read_file`, `write_file`, `search`, `shell`). Returns how it ended;
-/// the caller renders the result.
+/// Run the agent loop against a live server with the file/shell tool set
+/// (`read_file`, `write_file`, `search`, `shell`) plus — when the server
+/// reports memory enabled — the memory tools (`recall`, `remember`).
+/// `project` is the memory scope (the workspace-derived `project_key`).
+/// Returns how it ended; the caller renders the result.
 pub async fn run(
     client: &Client,
     messages: Vec<ChatMessage>,
     gate: Gate,
     workspace: &Path,
+    project: Option<&str>,
     status: Option<&StatusBar>,
 ) -> Result<(LoopEnd, Usage)> {
-    let tools = all_tools();
-    run_loop(messages, gate, workspace, &tools, status, LOOP_CAP, |msgs| {
-        client.chat_with_tools(msgs, &tools)
-    })
+    // Startup probe: offer the memory tools only if the server has memory on.
+    // `GET /memory/projects` → 200 = enabled; 503 / transport error = not
+    // offered, so the model never makes a doomed memory call.
+    let memory_enabled = matches!(client.memory_projects().await, Ok(MemCall::Ok(_)));
+    let tools = agent_tools(memory_enabled);
+    run_loop(
+        messages,
+        gate,
+        workspace,
+        &tools,
+        status,
+        LOOP_CAP,
+        |msgs| client.chat_with_tools(msgs, &tools),
+        |call| dispatch_memory(client, project, call),
+    )
     .await
+}
+
+/// The agent's tool set: the file/shell tools, plus the memory tools when the
+/// server reports memory enabled (the startup probe in [`run`]).
+pub fn agent_tools(memory_enabled: bool) -> Vec<Tool> {
+    let mut tools = all_tools();
+    if memory_enabled {
+        tools.extend(memory_tools());
+    }
+    tools
+}
+
+/// Whether `name` is a memory tool (handled on the separate async axis, not
+/// the file/shell permission gate).
+fn is_memory_tool(name: &str) -> bool {
+    matches!(name, RECALL | REMEMBER)
+}
+
+/// Dispatch a memory tool call via the HTTP client. `Some(result)` for
+/// `recall`/`remember` (handled here, **before** the file/shell gate);
+/// `None` for any other tool (falls through to the gated dispatch). The names
+/// are recognized even if the server turns out memory-off (race): the call
+/// then returns a clean "memory not enabled" result, never a crash. Every
+/// memory action prints a visible marker (philosophy: results are visible).
+async fn dispatch_memory(client: &Client, project: Option<&str>, call: ToolCall) -> Option<String> {
+    let name = call.function.name.as_str();
+    if !is_memory_tool(name) {
+        return None;
+    }
+    let args = call.function.arguments.as_str();
+    Some(match name {
+        RECALL => execute_recall(client, project, args).await,
+        REMEMBER => execute_remember(client, project, args).await,
+        _ => unreachable!("guarded by is_memory_tool"),
+    })
+}
+
+async fn execute_recall(client: &Client, project: Option<&str>, args: &str) -> String {
+    #[derive(Deserialize)]
+    struct RecallArgs {
+        query: String,
+        #[serde(default)]
+        k: Option<u32>,
+    }
+    let parsed: RecallArgs = match serde_json::from_str(args) {
+        Ok(a) => a,
+        Err(e) => return format!("Tool error: invalid recall arguments: {e}"),
+    };
+    if parsed.query.trim().is_empty() {
+        return "Tool error: recall requires a non-empty query.".to_string();
+    }
+    let k = parsed.k.unwrap_or(5).clamp(1, 10);
+    match client.memory_recall(project, &parsed.query, k).await {
+        Ok(MemCall::Ok(resp)) => {
+            eprintln!("[agent] recalled {} note(s) for \"{}\"", resp.hits.len(), parsed.query);
+            format_recall(&resp.hits)
+        }
+        Ok(MemCall::Disabled) => {
+            eprintln!("[agent] recall: memory is not enabled on this server");
+            "Memory is not enabled on this server; no notes are available.".to_string()
+        }
+        Err(e) => {
+            eprintln!("[agent] recall failed: {e}");
+            format!("Tool error: recall failed: {e}")
+        }
+    }
+}
+
+async fn execute_remember(client: &Client, project: Option<&str>, args: &str) -> String {
+    #[derive(Deserialize)]
+    struct RememberArgs {
+        #[serde(default)]
+        kind: String,
+        text: String,
+    }
+    let parsed: RememberArgs = match serde_json::from_str(args) {
+        Ok(a) => a,
+        Err(e) => return format!("Tool error: invalid remember arguments: {e}"),
+    };
+    if parsed.text.trim().is_empty() {
+        return "Tool error: remember requires non-empty text.".to_string();
+    }
+    let kind = if parsed.kind.trim().is_empty() { "Note" } else { parsed.kind.trim() };
+    match client.memory_remember(project, kind, &parsed.text).await {
+        Ok(MemCall::Ok(resp)) => {
+            eprintln!("[agent] remembered [{kind}]: {}", short(&parsed.text));
+            format!("Stored as [{kind}] (id {}).", resp.id)
+        }
+        Ok(MemCall::Disabled) => {
+            eprintln!("[agent] remember: memory is not enabled on this server");
+            "Memory is not enabled on this server; nothing was stored.".to_string()
+        }
+        Err(e) => {
+            eprintln!("[agent] remember failed: {e}");
+            format!("Tool error: remember failed: {e}")
+        }
+    }
+}
+
+/// Format recall hits as a machine-readable tool result — **full text** (the
+/// model needs the content, not a snippet); empty → an explicit "no notes" line.
+fn format_recall(hits: &[MemoryHit]) -> String {
+    if hits.is_empty() {
+        return "No relevant notes found in project memory.".to_string();
+    }
+    let mut out = format!("Found {} note(s) in project memory:\n", hits.len());
+    for (i, h) in hits.iter().enumerate() {
+        out.push_str(&format!("[{}] ({}, score {:.2}) {}\n", i + 1, h.kind, h.score, h.text.trim()));
+    }
+    out
+}
+
+/// One-line preview of remembered text for the visible marker (the full text
+/// still goes to the store).
+fn short(s: &str) -> String {
+    let t = s.trim().replace('\n', " ");
+    if t.chars().count() > 80 {
+        let head: String = t.chars().take(79).collect();
+        format!("{head}…")
+    } else {
+        t
+    }
 }
 
 #[cfg(test)]
@@ -573,6 +725,7 @@ mod tests {
                     usage: None,
                 }))
             },
+            |_call| std::future::ready(None::<String>),
         )
         .await
         .unwrap();
@@ -603,6 +756,7 @@ mod tests {
                     usage: None,
                 }))
             },
+            |_call| std::future::ready(None::<String>),
         )
         .await
         .unwrap();
@@ -643,6 +797,7 @@ mod tests {
                     }))
                 }
             },
+            |_call| std::future::ready(None::<String>),
         )
         .await
         .unwrap();
@@ -689,11 +844,86 @@ mod tests {
                 };
                 std::future::ready(Ok(turn))
             },
+            |_call| std::future::ready(None::<String>),
         )
         .await
         .unwrap();
         assert_eq!(usage.prompt_tokens, Some(30));
         assert_eq!(usage.completion_tokens, Some(5));
         assert_eq!(usage.total_tokens, Some(35));
+    }
+
+    // ---- memory tools (Stufe B-2) ----
+
+    #[test]
+    fn agent_tools_includes_memory_only_when_enabled() {
+        let names = |ts: &[Tool]| ts.iter().map(|t| t.function.name.clone()).collect::<Vec<_>>();
+        let off = names(&agent_tools(false));
+        assert!(!off.iter().any(|n| n == RECALL || n == REMEMBER), "memory off → not offered: {off:?}");
+        assert!(off.iter().any(|n| n == READ_FILE), "file tools always present");
+        let on = names(&agent_tools(true));
+        assert!(on.iter().any(|n| n == RECALL), "memory on → recall offered");
+        assert!(on.iter().any(|n| n == REMEMBER), "memory on → remember offered");
+        assert_eq!(on.len(), off.len() + 2, "exactly the two memory tools added");
+    }
+
+    #[test]
+    fn is_memory_tool_recognizes_recall_and_remember() {
+        assert!(is_memory_tool(RECALL));
+        assert!(is_memory_tool(REMEMBER));
+        assert!(!is_memory_tool(READ_FILE));
+        assert!(!is_memory_tool(SHELL));
+        assert!(!is_memory_tool("delete_everything"));
+    }
+
+    #[test]
+    fn format_recall_includes_full_text_and_count() {
+        assert_eq!(format_recall(&[]), "No relevant notes found in project memory.");
+        let hits = vec![
+            MemoryHit { id: 1, kind: "Decision".into(), name: "n".into(),
+                text: "MTP parked because MoE was net-negative".into(), status: "active".into(), score: 0.83 },
+            MemoryHit { id: 2, kind: "Bug".into(), name: "n".into(),
+                text: "gfx1201 barrier reduction did not help".into(), status: "active".into(), score: 0.71 },
+        ];
+        let out = format_recall(&hits);
+        assert!(out.contains("Found 2 note(s)"));
+        assert!(out.contains("(Decision, score 0.83)"));
+        assert!(out.contains("MTP parked because MoE was net-negative"), "full text, not a snippet");
+        assert!(out.contains("gfx1201 barrier reduction did not help"));
+    }
+
+    #[tokio::test]
+    async fn memory_dispatch_intercepts_before_the_gate() {
+        // A recall call under a DENY-ALL file/shell gate must still run — memory
+        // is a separate axis, intercepted by the mem closure before handle_call.
+        let tools = agent_tools(true);
+        let call = named_call("recall", "{\"query\":\"x\"}");
+        let mut iter = 0;
+        let (end, _u) = run_loop(
+            vec![ChatMessage::user("go")],
+            Gate::headless(None), // deny everything on the file/shell axis
+            &ws(),
+            &tools,
+            None,
+            LOOP_CAP,
+            |_m| {
+                iter += 1;
+                let c = call.clone();
+                let turn = if iter == 1 {
+                    AgentTurn { content: None, tool_calls: vec![c], finish_reason: Some("tool_calls".into()), usage: None }
+                } else {
+                    AgentTurn { content: Some("done".into()), tool_calls: vec![], finish_reason: Some("stop".into()), usage: None }
+                };
+                std::future::ready(Ok(turn))
+            },
+            // Stand-in for dispatch_memory: handle recall/remember, else None.
+            |c: ToolCall| std::future::ready(
+                is_memory_tool(&c.function.name).then(|| "Found 1 note(s) in project memory:\n[1] (Note, score 0.9) hi\n".to_string())
+            ),
+        ).await.unwrap();
+        // The recall was handled (not denied) → the loop did the roundtrip and
+        // then finished normally.
+        assert_eq!(iter, 2, "recall handled on the memory axis → roundtrip + final");
+        assert_eq!(end, LoopEnd::Final { content: Some("done".into()), finish_reason: Some("stop".into()) });
     }
 }

@@ -120,20 +120,23 @@ async fn main() -> Result<()> {
     // `--system` path errors before we connect.
     let system = vf_clide::agent::system_prompt(&workspace, args.system.as_deref(), args.no_system)?;
 
+    // Session memory scope (Stufe B-1/B-2): an explicit `--project` wins;
+    // otherwise derive a deterministic key from the canonical workspace so a
+    // directory's memory persists across sessions. Used by the REPL memory
+    // commands (B-1) and the agent `recall`/`remember` tools (B-2), in both
+    // the REPL and headless agent paths.
+    let project = args
+        .project
+        .clone()
+        .unwrap_or_else(|| vf_clide::memory::derive_project_key(&workspace));
+
     match args.prompt {
         Some(prompt) if args.agent => {
             let gate = vf_clide::agent::Gate::headless(ceiling);
-            run_agent_headless(client, prompt, args.no_think, gate, workspace, system).await
+            run_agent_headless(client, prompt, args.no_think, gate, workspace, system, project).await
         }
         Some(prompt) => run_headless(client, prompt, args.no_stream, args.no_think, args.project).await,
         None => {
-            // Session memory scope (Stufe B-1): an explicit `--project` wins;
-            // otherwise derive a deterministic key from the canonical
-            // workspace so a directory's memory persists across sessions.
-            let project = args
-                .project
-                .clone()
-                .unwrap_or_else(|| vf_clide::memory::derive_project_key(&workspace));
             let mut repl = Repl::new(client, Box::new(NoopMemory), Some(project))
                 .with_no_think(args.no_think)
                 .with_agent(args.agent)
@@ -183,6 +186,7 @@ async fn run_agent_headless(
     gate: vf_clide::agent::Gate,
     workspace: std::path::PathBuf,
     system: Option<String>,
+    project: String,
 ) -> Result<()> {
     use vf_clide::agent::{self, LoopEnd, LOOP_CAP};
     use vf_clide::client::{empty_notice, truncation_notice};
@@ -195,8 +199,10 @@ async fn run_agent_headless(
     msgs.push(ChatMessage::user(content));
 
     let max_tokens = client.max_tokens;
-    // Headless stays byte-clean → no status bar, discard the turn usage.
-    let (end, _usage) = agent::run(&client, msgs, gate, &workspace, None).await?;
+    // Headless stays byte-clean on stdout → no status bar, discard the turn
+    // usage. Memory tools (B-2) are available here too (probe-gated in `run`);
+    // their visible markers go to stderr, so stdout stays clean.
+    let (end, _usage) = agent::run(&client, msgs, gate, &workspace, Some(&project), None).await?;
     match end {
         LoopEnd::Final { content, finish_reason } => {
             let text = content.unwrap_or_default();
