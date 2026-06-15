@@ -71,9 +71,30 @@ cd vulkanforge
 cargo build --release
 ```
 
-The release binary lands at `target/release/vulkanforge` (~14 MB
+The release binary lands at `target/release/vulkanforge` (a lean
 static binary, no runtime dependencies beyond the system Vulkan
 loader).
+
+**Memory (optional).** The server-side memory subsystem (see the
+*Memory* wiki page) is behind a Cargo feature, default off. Build it
+in with:
+
+```bash
+cargo build --release --features memory   # needs Rust 1.89+
+```
+
+The memory feature pulls in the edition-2024 `sqlitegraph`
+(`rust-version = 1.89`) plus `ort` (1.88), so it needs **Rust 1.89+**
+(the lean build still works on 1.85+). It also pulls in the ONNX
+Runtime (downloaded by `ort` at build time) and bundled SQLite
+(`rusqlite`, a C compile) — adding ~34 MB to the binary and several
+minutes to the first build. The default `cargo build --release`
+includes neither. Memory is *also* off at runtime until
+`vulkanforge serve --memory` (or `VULKANFORGE_MEMORY=1`); without it
+`/memory/*` returns 503 and no embedder/database is loaded. The store
+lives at `~/.vulkanforge/memory.db` (override `VF_MEMORY_DB`), with
+the embedding model cached in `~/.vulkanforge/embed-cache/`; the
+embedder runs on the CPU (no VRAM).
 
 ## Environment variables
 
@@ -92,6 +113,8 @@ Boolean flags accept `1` / `0`, `true` / `false`, case-insensitive.
 | `VULKANFORGE_DISABLE_ASYNC_DECODE` | `0` | Debug: serial decode loop instead of pipelined `pre_record` + `submit` + `wait` |
 | `VF_PROMPT`                    | unset   | Single-shot chat: `chat` reads this string and exits after one response          |
 | `VF_LMHEAD_HARNESS`            | `1`     | Use the dedicated F16 lm_head pipeline (Sprint 29). Set `0` for the registry path |
+| `VULKANFORGE_MEMORY`           | `0`     | Activate the server-side memory subsystem on `serve` (env alias for `--memory`). Needs a `--features memory` build; default off → `/memory/*` returns 503, no embedder/DB loaded |
+| `VF_MEMORY_DB`                 | `~/.vulkanforge/memory.db` | Path to the memory SQLite store (memory feature; sibling `embed-cache/` holds the model) |
 
 ### CPU `lm_head` offload (`VF_CPU_LM_HEAD=1`)
 
