@@ -2,13 +2,16 @@
 //! Interactive REPL: streamed chat with in-session history.
 //!
 //! Commands: `/quit` (`/q`, `/exit`), `/clear` (drop history),
-//! `/model <name>` (switch model). Anything else is sent to the model.
+//! `/model <name>` (switch model), and the memory commands (Stufe B-1):
+//! `/project [key]` (show + list / switch scope), `/recall <query>`
+//! (manual semantic recall — displays hits, no auto-inject), `/remember
+//! <text>` (store a note). Anything else is sent to the model.
 
 use std::io::Write;
 
 use rustyline::DefaultEditor;
 
-use crate::client::{empty_notice, truncation_notice, Client, Result};
+use crate::client::{empty_notice, truncation_notice, Client, MemCall, Result};
 use crate::memory::Memory;
 use crate::status::StatusBar;
 use crate::types::{strip_think, ChatMessage, ToolRisk};
@@ -25,6 +28,14 @@ pub enum Command {
     /// (underscore) is appended to message *content*, never parsed here.
     Think(bool),
     MaxTokens(u32),
+    /// `/project` (no arg → show current scope + list known projects) or
+    /// `/project <key>` (switch the session's memory scope).
+    Project(Option<String>),
+    /// `/recall <query>` — manual semantic recall against the current
+    /// project's memory; displays hits (no auto-inject — that is B-2).
+    Recall(String),
+    /// `/remember <text>` — store a manual note (`kind:"Note"`).
+    Remember(String),
     /// A `/`-line that isn't a known command (or a malformed one). The
     /// string is a human-readable hint; the REPL prints it and does not
     /// send the line to the model.
@@ -54,8 +65,33 @@ pub fn parse_command(line: &str) -> Option<Command> {
             Some(n) if n > 0 => Command::MaxTokens(n),
             _ => Command::Unknown("usage: /max-tokens <N>".into()),
         },
+        "/project" => Command::Project(arg),
+        "/recall" => match arg {
+            Some(q) => Command::Recall(q),
+            None => Command::Unknown("usage: /recall <query>".into()),
+        },
+        "/remember" => match arg {
+            Some(t) => Command::Remember(t),
+            None => Command::Unknown("usage: /remember <text>".into()),
+        },
         other => Command::Unknown(format!("unknown command: {other}")),
     })
+}
+
+/// Shown when a `/memory/*` call returns 503 — memory is off by default
+/// (opt-in since v1.0.1), which is a normal state, not an error.
+const MEMORY_OFF_HINT: &str = "memory is not enabled on this server (start it with `serve --memory`)";
+
+/// One-line preview of a recalled note: newlines flattened, capped at ~80
+/// chars with an ellipsis so long notes don't wrap the terminal.
+fn snippet(text: &str) -> String {
+    let t = text.trim().replace('\n', " ");
+    if t.chars().count() > 80 {
+        let head: String = t.chars().take(79).collect();
+        format!("{head}…")
+    } else {
+        t
+    }
 }
 
 /// REPL state: a client, the memory seam, optional project name, and the
@@ -157,13 +193,61 @@ impl Repl {
         msgs
     }
 
+    /// `/project` (no arg): show the current scope + list the projects the
+    /// server already knows.
+    async fn show_project(&self) {
+        println!("project: {}", self.project.as_deref().unwrap_or("(none)"));
+        match self.client.memory_projects().await {
+            Ok(MemCall::Ok(resp)) => {
+                if resp.projects.is_empty() {
+                    println!("  (no projects stored yet)");
+                } else {
+                    for p in resp.projects {
+                        let here = Some(p.project_key.as_str()) == self.project.as_deref();
+                        println!("  {} {}", if here { "*" } else { " " }, p.project_key);
+                    }
+                }
+            }
+            Ok(MemCall::Disabled) => println!("({MEMORY_OFF_HINT})"),
+            Err(e) => eprintln!("error: {e}"),
+        }
+    }
+
+    /// `/recall <query>`: display the current project's matches (no auto-inject).
+    async fn recall(&self, query: &str) {
+        match self.client.memory_recall(self.project.as_deref(), query, 5).await {
+            Ok(MemCall::Ok(resp)) if resp.hits.is_empty() => println!("(no matches)"),
+            Ok(MemCall::Ok(resp)) => {
+                for h in resp.hits {
+                    println!("  [{} · {:.2}] {}", h.kind, h.score, snippet(&h.text));
+                }
+            }
+            Ok(MemCall::Disabled) => println!("({MEMORY_OFF_HINT})"),
+            Err(e) => eprintln!("error: {e}"),
+        }
+    }
+
+    /// `/remember <text>`: store a manual note (`kind:"Note"`).
+    async fn remember(&self, text: &str) {
+        match self.client.memory_remember(self.project.as_deref(), "Note", text).await {
+            Ok(MemCall::Ok(resp)) => println!("(stored, id {})", resp.id),
+            Ok(MemCall::Disabled) => println!("({MEMORY_OFF_HINT})"),
+            Err(e) => eprintln!("error: {e}"),
+        }
+    }
+
     pub async fn run(&mut self) -> Result<()> {
         use std::io::IsTerminal;
 
         let mut rl = DefaultEditor::new().map_err(|e| format!("readline init: {e}"))?;
         println!(
-            "vf-clide — model: {} · commands: /quit /clear /model <name> /max-tokens <N> /think /no-think",
-            self.client.model
+            "vf-clide — model: {} · project: {}",
+            self.client.model,
+            self.project.as_deref().unwrap_or("(none)"),
+        );
+        println!(
+            "commands: /quit /clear /model <name> /max-tokens <N> /think /no-think · \
+             memory: /project [key] /recall <query> /remember <text>",
         );
         // Pinned status line — only when stdout is a TTY (no-op otherwise).
         let bar = StatusBar::new(std::io::stdout().is_terminal());
@@ -199,6 +283,17 @@ impl Repl {
                         self.client.max_tokens = Some(n);
                         println!("(max-tokens → {n})");
                     }
+                    // Memory commands (Stufe B-1) — direct user actions, so no
+                    // permission ceiling (the ceiling guards autonomous tool/
+                    // shell calls, not what the user types). They call the
+                    // server's `/memory/*` endpoints and display the result.
+                    Command::Project(None) => self.show_project().await,
+                    Command::Project(Some(key)) => {
+                        self.project = Some(key.clone());
+                        println!("(project → {key})");
+                    }
+                    Command::Recall(query) => self.recall(&query).await,
+                    Command::Remember(text) => self.remember(&text).await,
                     Command::Unknown(hint) => println!("({hint})"),
                 }
                 continue;
@@ -383,5 +478,37 @@ mod tests {
     #[test]
     fn unknown_slash_command() {
         assert!(matches!(parse_command("/bogus"), Some(Command::Unknown(_))));
+    }
+
+    #[test]
+    fn project_command_show_and_switch() {
+        assert_eq!(parse_command("/project"), Some(Command::Project(None)));
+        assert_eq!(parse_command("/project foo"), Some(Command::Project(Some("foo".into()))));
+        assert_eq!(parse_command("/project   spaced "), Some(Command::Project(Some("spaced".into()))));
+    }
+
+    #[test]
+    fn recall_command_needs_a_query() {
+        assert_eq!(parse_command("/recall do fewer barriers help?"),
+            Some(Command::Recall("do fewer barriers help?".into())));
+        assert!(matches!(parse_command("/recall"), Some(Command::Unknown(_))));
+        assert!(matches!(parse_command("/recall   "), Some(Command::Unknown(_))));
+    }
+
+    #[test]
+    fn remember_command_needs_text() {
+        assert_eq!(parse_command("/remember dispatch reduction did not help"),
+            Some(Command::Remember("dispatch reduction did not help".into())));
+        assert!(matches!(parse_command("/remember"), Some(Command::Unknown(_))));
+    }
+
+    #[test]
+    fn snippet_caps_long_text_and_flattens_newlines() {
+        assert_eq!(snippet("short  line"), "short  line");
+        assert_eq!(snippet("a\nb"), "a b");
+        let long = "x".repeat(200);
+        let s = snippet(&long);
+        assert!(s.chars().count() <= 80);
+        assert!(s.ends_with('…'));
     }
 }

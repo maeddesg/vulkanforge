@@ -51,8 +51,10 @@ struct Args {
     #[arg(long)]
     no_think: bool,
 
-    /// Project name — memory seam. Phase 1 parses and threads it through
-    /// but it is a no-op (see `memory::NoopMemory`).
+    /// Memory scope (`project_key`) for the REPL `/recall`/`/remember`
+    /// commands. Default: derived deterministically from `--workspace`
+    /// (so a directory's memory persists across sessions). This flag
+    /// overrides that derived key with an explicit one.
     #[arg(long)]
     project: Option<String>,
 
@@ -125,7 +127,14 @@ async fn main() -> Result<()> {
         }
         Some(prompt) => run_headless(client, prompt, args.no_stream, args.no_think, args.project).await,
         None => {
-            let mut repl = Repl::new(client, Box::new(NoopMemory), args.project)
+            // Session memory scope (Stufe B-1): an explicit `--project` wins;
+            // otherwise derive a deterministic key from the canonical
+            // workspace so a directory's memory persists across sessions.
+            let project = args
+                .project
+                .clone()
+                .unwrap_or_else(|| vf_clide::memory::derive_project_key(&workspace));
+            let mut repl = Repl::new(client, Box::new(NoopMemory), Some(project))
                 .with_no_think(args.no_think)
                 .with_agent(args.agent)
                 .with_workspace(workspace)

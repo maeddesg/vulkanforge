@@ -171,6 +171,78 @@ pub struct StreamOptions {
     pub include_usage: bool,
 }
 
+// =========================================================================
+// Memory subsystem wire types (VF-native `/memory/*`, NOT OpenAI).
+// Shapes verified live against `serve --memory` (Stufe B-1): remember →
+// `{id}`, recall → `{hits:[{id,kind,name,text,status,score}]}`, projects
+// POST → `{id,project_key}`, GET → `{projects:[{id,project_key}]}`.
+// =========================================================================
+
+/// `POST /memory/recall` request. `project_key` omitted → the server's
+/// global scope. The server applies the `search_query:` embedding prefix
+/// itself, so the client sends the raw query.
+#[derive(Debug, Serialize)]
+pub struct RecallRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+    pub query: String,
+    pub k: u32,
+}
+
+/// `POST /memory/recall` response: ranked hits (highest score first).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecallResponse {
+    #[serde(default)]
+    pub hits: Vec<MemoryHit>,
+}
+
+/// One recall hit. `score` is cosine **similarity** in `[0,1]` (higher =
+/// closer). Fields default-tolerant so a future server field doesn't break us.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryHit {
+    pub id: i64,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub score: f32,
+}
+
+/// `POST /memory/remember` request. Stufe B-1 writes manual notes with
+/// `kind:"Note"`; richer classification comes with the agent tools (B-2).
+#[derive(Debug, Serialize)]
+pub struct RememberRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+    pub kind: String,
+    pub text: String,
+}
+
+/// `POST /memory/remember` response: the new content node id.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RememberResponse {
+    pub id: i64,
+}
+
+/// `GET /memory/projects` response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProjectsResponse {
+    #[serde(default)]
+    pub projects: Vec<ProjectInfo>,
+}
+
+/// One project scope known to the server.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProjectInfo {
+    pub id: i64,
+    pub project_key: String,
+}
+
 /// Token usage reported by the server (all optional — a chunk/response may
 /// omit it). Present on the non-stream response and, with
 /// `stream_options.include_usage`, on the final streaming chunk.

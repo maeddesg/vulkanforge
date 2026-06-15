@@ -6,10 +6,32 @@
 //! sends chat only — no `tools` parameter (that is Phase 2).
 
 use futures_util::StreamExt;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
-use crate::types::{ChatChunk, ChatMessage, ChatRequest, ChatResponse, StreamOptions, Tool, ToolCall, Usage};
+use crate::types::{
+    ChatChunk, ChatMessage, ChatRequest, ChatResponse, ProjectsResponse, RecallRequest,
+    RecallResponse, RememberRequest, RememberResponse, StreamOptions, Tool, ToolCall, Usage,
+};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Outcome of a `/memory/*` call. A thin client must treat the three states
+/// distinctly: transport failure (`Err` — the server is unreachable), memory
+/// **off** (`Disabled` — HTTP 503, a normal opt-in state since memory is
+/// off by default, **never** an error), and success (`Ok`).
+#[derive(Debug)]
+pub enum MemCall<T> {
+    Ok(T),
+    Disabled,
+}
+
+/// Whether an HTTP status means "memory subsystem not enabled" — the server
+/// returns **503** for `/memory/*` when started without `--memory`. Pure, so
+/// the 503-vs-transport branch is unit-testable without a live server.
+pub fn is_memory_disabled(status: u16) -> bool {
+    status == 503
+}
 
 /// Result of a completion: the visible text plus the server's
 /// `finish_reason` (`"stop"` | `"length"` | …), needed so the caller can
@@ -186,6 +208,76 @@ impl Client {
         }
         Ok(ChatOutcome { text: full, finish_reason: finish, usage })
     }
+
+    // ---- Memory subsystem (VF-native `/memory/*`, opt-in on the server) ----
+
+    fn memory_url(&self, path: &str) -> String {
+        format!("{}/memory/{}", self.base_url, path)
+    }
+
+    /// `POST /memory/recall`. `Ok(MemCall::Disabled)` on 503 (memory off);
+    /// `Err` only on transport / other HTTP errors. The server applies the
+    /// `search_query:` prefix, so `query` is the raw user text.
+    pub async fn memory_recall(
+        &self,
+        project_key: Option<&str>,
+        query: &str,
+        k: u32,
+    ) -> Result<MemCall<RecallResponse>> {
+        let body = RecallRequest {
+            project_key: project_key.map(str::to_string),
+            query: query.to_string(),
+            k,
+        };
+        self.memory_post("recall", &body).await
+    }
+
+    /// `POST /memory/remember`. Stufe B-1 stores manual notes (`kind:"Note"`).
+    pub async fn memory_remember(
+        &self,
+        project_key: Option<&str>,
+        kind: &str,
+        text: &str,
+    ) -> Result<MemCall<RememberResponse>> {
+        let body = RememberRequest {
+            project_key: project_key.map(str::to_string),
+            kind: kind.to_string(),
+            text: text.to_string(),
+        };
+        self.memory_post("remember", &body).await
+    }
+
+    /// `GET /memory/projects` — the scopes the server already knows.
+    pub async fn memory_projects(&self) -> Result<MemCall<ProjectsResponse>> {
+        let resp = self.http.get(self.memory_url("projects")).send().await?;
+        self.memory_parse(resp).await
+    }
+
+    async fn memory_post<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<MemCall<T>> {
+        let resp = self.http.post(self.memory_url(path)).json(body).send().await?;
+        self.memory_parse(resp).await
+    }
+
+    /// Map a `/memory/*` HTTP response to a [`MemCall`]: 503 → `Disabled`
+    /// (memory off), other non-success → `Err`, success → parse the body.
+    async fn memory_parse<T: DeserializeOwned>(
+        &self,
+        resp: reqwest::Response,
+    ) -> Result<MemCall<T>> {
+        let status = resp.status();
+        if is_memory_disabled(status.as_u16()) {
+            return Ok(MemCall::Disabled);
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("memory: server returned {status}: {body}").into());
+        }
+        Ok(MemCall::Ok(resp.json().await?))
+    }
 }
 
 /// Process one SSE event block. Returns `true` on the `[DONE]` marker.
@@ -325,5 +417,22 @@ mod tests {
         assert!(empty_notice("Hello").is_none());
         // a short but present answer must NOT trip the empty marker
         assert!(empty_notice("4").is_none());
+    }
+
+    #[test]
+    fn memory_disabled_only_on_503() {
+        // 503 = memory off (a normal opt-in state); everything else is not.
+        assert!(is_memory_disabled(503));
+        assert!(!is_memory_disabled(200));
+        assert!(!is_memory_disabled(404));
+        assert!(!is_memory_disabled(500));
+        assert!(!is_memory_disabled(502));
+    }
+
+    #[test]
+    fn memory_url_joins_base_and_path() {
+        let c = Client::new("http://localhost:8080/", "m");
+        assert_eq!(c.memory_url("recall"), "http://localhost:8080/memory/recall");
+        assert_eq!(c.memory_url("projects"), "http://localhost:8080/memory/projects");
     }
 }
