@@ -6,11 +6,13 @@
 the v1.0 memory behavior is unchanged once enabled — only put behind opt-in gates so the standard build is lean
 again.
 
-- **Compile gate — Cargo feature `memory` (default OFF).** The two heavy native deps (SQLiteGraph + fastembed /
-  ONNX Runtime) are now `optional` and pulled in only by `--features memory`. The **default build is lean again**:
-  the release binary drops back to **~25 MB** (from ~58 MB with the feature) and the compiled dependency graph
-  drops from ~261 to ~106 crates — no ONNX Runtime, no bundled SQLite, no `/memory/*` routes compiled. Build the
-  subsystem in with `cargo build --release --features memory`.
+- **Compile gate — Cargo feature `memory` (default OFF).** The two crates VulkanForge uses for memory —
+  **SQLiteGraph** (which brings its SQLite storage via `rusqlite`, a bundled C compile) and **fastembed** (which
+  brings the ONNX Runtime via `ort`) — are now `optional` and pulled in only by `--features memory`. The
+  **default build is lean again**: the release binary drops back to **~25 MB** (from ~58 MB with the feature) and
+  the compiled dependency graph drops from ~261 to ~106 crates — no SQLiteGraph or fastembed (so no rusqlite/SQLite,
+  no ort/ONNX Runtime), no `/memory/*` routes compiled. Build the subsystem in with
+  `cargo build --release --features memory`.
 - **Runtime gate — `serve --memory` (default OFF).** Even on a memory-enabled binary, a fresh `serve` no longer
   brings memory up automatically. Pass `--memory` (or set `VULKANFORGE_MEMORY=1`) to activate it. Without it the
   store is **never initialized** — no embedder load, no `sg.db` opened — and `/memory/*` returns 503, so an
@@ -57,9 +59,9 @@ this release **adds** a subsystem and does **not** touch the decode/prefill path
   delete/archive, no auto-injection, and no vf-clide client integration yet — those are the next milestone. See the
   wiki's *Memory* page for what it is, what it isn't, and the roadmap.
 
-**Cost (honest).** The two native deps add real surface: the release binary grows ~25 MB → ~59 MB (statically
-linked ONNX Runtime + bundled SQLite), the lockfile ~250 → ~384 packages, and a first clean build takes a few extra
-minutes. Versions: engine `0.9.2 → 1.0.0`; vf-clide unchanged at `0.3.1`. Tag `v1.0`.
+**Cost (honest).** The two deps VulkanForge uses — **SQLiteGraph** (its SQLite storage via bundled `rusqlite`) and
+**fastembed** (the ONNX Runtime via `ort`) — add real surface: the release binary grows ~25 MB → ~59 MB, the
+lockfile ~250 → ~384 packages, and a first clean build takes a few extra minutes. Versions: engine `0.9.2 → 1.0.0`; vf-clide unchanged at `0.3.1`. Tag `v1.0`.
 
 ## v0.9.4 — vf-clide REPL permission ceiling + denial wording (2026-06-14)
 

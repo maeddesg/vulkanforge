@@ -28,7 +28,8 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
   Nomic-Embed v1.5-Q, 768-dim, AVX-512/VNNI). Each project gets its own index — recall in one project **cannot**
   return another's notes — and the store survives restarts (vectors restore with no re-embed). The memory path
   never takes the GPU permit. **Cost is opt-in too:** the default build stays lean (**~25 MB**, no extra deps); only
-  `--features memory` pulls in the two native deps (**+~34 MB**: static ONNX Runtime + bundled SQLite), and only an
+  `--features memory` pulls in its two deps — **SQLiteGraph** (bundled SQLite via `rusqlite`) + **fastembed** (the
+  ONNX Runtime via `ort`) — (**+~34 MB**), and only an
   *activated* store loads the embedder or opens a DB — first start downloads the ONNX model into
   `~/.vulkanforge/embed-cache` (then offline). Without `--memory`, `/memory/*` returns 503 and inference runs with
   zero memory overhead. What it is, what it isn't, and the roadmap: the wiki's

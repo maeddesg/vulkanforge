@@ -33,16 +33,17 @@ tokio-stream = "0.1"
 # Stufe A — server-side memory subsystem (SQLiteGraph + fastembed, embedded
 # in the API process; see src/server/memory.rs). Both git-deps pinned to the
 # verified revs from results/pre_memory_analyse.md. GPL-3.0 (SG) is compatible
-# with this crate's GPL-3.0; fastembed is Apache-2.0. These add heavy native
-# surface — SQLite C compile (rusqlite bundled) + the ONNX Runtime binary
-# (pulled by `ort` at build time) — see the Stufe-A report for the build-time /
-# binary-size delta. Used only by the `/memory/*` handlers; the inference path
-# does not touch them.
+# with this crate's GPL-3.0; fastembed is Apache-2.0. These two crates are what
+# VulkanForge directly uses; each brings heavy native surface of its own:
+# SQLiteGraph pulls in SQLite via `rusqlite` (bundled C compile), and fastembed
+# pulls in the ONNX Runtime via `ort` (downloaded binary). See the Stufe-A report
+# for the build-time / binary-size delta. Used only by the `/memory/*` handlers;
+# the inference path does not touch them.
 #
 # Both are `optional` and pulled in ONLY by the `memory` feature (default OFF) —
-# the default build is lean (~25 MB, no ONNX Runtime / no bundled SQLite). Build
-# with `--features memory` to compile the subsystem in, then activate it at
-# runtime with `serve --memory`.
+# the default build is lean (~25 MB, neither SQLiteGraph nor fastembed, so no
+# rusqlite/SQLite and no ort/ONNX Runtime). Build with `--features memory` to
+# compile the subsystem in, then activate it at runtime with `serve --memory`.
 sqlitegraph = { git = "https://github.com/oldnordic/sqlitegraph", rev = "d8219a83de4d22ed71d218c0d57407b1c672de39", package = "sqlitegraph", optional = true }
 fastembed = { git = "https://github.com/maeddesg/fastembed-rs", rev = "3a9588ac52c0d825118b44775526caac02175193", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"], optional = true }
 

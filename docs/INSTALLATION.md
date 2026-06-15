@@ -84,11 +84,13 @@ cargo build --release --features memory   # needs Rust 1.89+
 ```
 
 The memory feature pulls in the edition-2024 `sqlitegraph`
-(`rust-version = 1.89`) plus `ort` (1.88), so it needs **Rust 1.89+**
-(the lean build still works on 1.85+). It also pulls in the ONNX
-Runtime (downloaded by `ort` at build time) and bundled SQLite
-(`rusqlite`, a C compile) — adding ~34 MB to the binary and several
-minutes to the first build. The default `cargo build --release`
+(`rust-version = 1.89`) plus fastembed's `ort` (1.88), so it needs
+**Rust 1.89+** (the lean build still works on 1.85+). Those two
+crates are what VulkanForge uses directly; each brings heavy native
+surface of its own — SQLiteGraph pulls in SQLite via `rusqlite`
+(a bundled C compile), and fastembed pulls in the ONNX Runtime via
+`ort` (downloaded at build time) — adding ~34 MB to the binary and
+several minutes to the first build. The default `cargo build --release`
 includes neither. Memory is *also* off at runtime until
 `vulkanforge serve --memory` (or `VULKANFORGE_MEMORY=1`); without it
 `/memory/*` returns 503 and no embedder/database is loaded. The store

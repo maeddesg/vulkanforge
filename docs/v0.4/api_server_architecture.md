@@ -1080,8 +1080,9 @@ den GPU-`permit`; Handler laufen über `spawn_blocking`, der teure embed-Schritt
   Tabellen-Form re-verifiziert werden**, sonst brechen find/list still.
 - `statistics().vector_count` ist nach Reopen stale → **nicht** für Korrektheit/Kapazität nutzen.
 
-**Kosten (nur mit `--features memory`).** Statisch gelinktes ONNX-Runtime (via `ort`) + bundled SQLite (rusqlite) →
-Release-Binär **~25 → ~58 MB**, compilierter Dep-Graph **~106 → ~261 Crates**. Der **Default-Build trägt nichts
+**Kosten (nur mit `--features memory`).** Die zwei direkt genutzten Crates — **SQLiteGraph** (bringt SQLite via
+`rusqlite`, gebündelter C-Compile) + **fastembed** (bringt das ONNX-Runtime via `ort`) → Release-Binär
+**~25 → ~58 MB**, compilierter Dep-Graph **~106 → ~261 Crates**. Der **Default-Build trägt nichts
 davon** — er ist wieder schlank (~25 MB). Hinweis: `Cargo.lock` bleibt bei ~384 `[[package]]`-Einträgen (das
 Lockfile ist die **Vereinigung aller Features** — optionale Deps werden immer eingetragen, auch wenn das Feature aus
 ist; reduziert wird der *Build-Graph*, nicht die Lockfile-Länge). Eine *aktivierte* Memory (Runtime-Gate an) lädt
