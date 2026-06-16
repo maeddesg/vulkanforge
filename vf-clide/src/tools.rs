@@ -88,11 +88,13 @@ pub fn write_file_tool() -> Tool {
 pub fn search_tool() -> Tool {
     Tool::function(
         SEARCH,
-        "Search the workspace for a substring; returns file:line matches (capped).",
+        "Search the workspace FILES/CODE for a substring; returns file:line matches (capped). \
+         This searches files on disk, NOT the project's memory — use `recall` for remembered \
+         notes, decisions, or past context.",
         serde_json::json!({
             "type": "object",
             "properties": {
-                "query": { "type": "string", "description": "Substring to search for" },
+                "query": { "type": "string", "description": "Substring to search for in workspace files" },
                 "path": { "type": "string", "description": "Optional subdirectory (within the workspace) to limit the search" }
             },
             "required": ["query"]
@@ -128,12 +130,14 @@ pub fn shell_tool() -> Tool {
 pub fn recall_tool() -> Tool {
     Tool::function(
         RECALL,
-        "Search the project's long-term memory for relevant past decisions, learnings, or \
-         bugs. Use when prior context would meaningfully help — not for trivia.",
+        "Search this project's stored long-term MEMORY (notes, decisions, learnings, bugs saved \
+         in THIS project) for relevant past context. Use for questions about earlier decisions, \
+         conventions, or context — e.g. \"what did we decide / what was our rule for …\". This is \
+         NOT a file search: use `search` for file or code contents.",
         serde_json::json!({
             "type": "object",
             "properties": {
-                "query": { "type": "string", "description": "What to look for (natural language)" },
+                "query": { "type": "string", "description": "What to look for in memory (natural language)" },
                 "k": { "type": "integer", "description": "Max notes to return (default 5)" }
             },
             "required": ["query"]
@@ -577,6 +581,20 @@ mod tests {
         assert_eq!(write_file_tool().risk, ToolRisk::Mutating);
         assert_eq!(shell_tool().risk, ToolRisk::Exec); // own top tier (Slice 3)
         assert_eq!(all_tools().len(), 4);
+    }
+
+    #[test]
+    fn recall_and_search_descriptions_are_disambiguated() {
+        // B-2 finding #1: the agent used `search` (files) for a memory question.
+        // Each tool's description must point AT the other so they can't be confused.
+        let recall = recall_tool().function.description.to_lowercase();
+        let search = search_tool().function.description.to_lowercase();
+        assert!(recall.contains("memory"), "recall must say memory: {recall}");
+        assert!(recall.contains("search") && recall.contains("file"),
+            "recall must point at `search` for files: {recall}");
+        assert!(search.contains("file"), "search must say files: {search}");
+        assert!(search.contains("recall") && search.contains("memory"),
+            "search must point at `recall` for memory: {search}");
     }
 
     // ---- AGENTS.md (constitution override), confined ----

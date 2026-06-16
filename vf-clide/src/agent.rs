@@ -220,6 +220,107 @@ pub fn system_prompt(
     Ok(Some(prompt))
 }
 
+/// Whether project memory is available this session and, when on, whether the
+/// **active scope** already holds notes. Drives the wording in
+/// [`self_state_prompt`]: the proactive-recall nudge fires only for a scope
+/// that already has notes, so a fresh/empty project never triggers Over-Recall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryAwareness {
+    /// Server reports memory off (no recall/remember tools offered).
+    Off,
+    /// Memory on. `scope_has_notes` = the active `project_key` already appears
+    /// in `GET /memory/projects` (i.e. it has ≥1 stored note).
+    On { scope_has_notes: bool },
+}
+
+/// One permission line for the self-state block, mode-aware via [`decide`]:
+/// `Auto` → allowed, `Prompt` (REPL) → allowed-with-confirmation, `Deny`
+/// (headless above ceiling) → denied + the flag that lifts it.
+fn perm_line(gate: Gate, risk: ToolRisk, label: &str) -> String {
+    let status = match decide(gate.mode, gate.auto_ceiling, risk) {
+        Decision::Auto => "allowed".to_string(),
+        // Above the ceiling in the REPL: NOT pre-authorized — the user must
+        // approve each call. (Sharper than a bare "allowed": it is gated.)
+        Decision::Prompt => "confirm-gated (you approve each call; not pre-authorized)".to_string(),
+        Decision::Deny => format!("denied — needs {} at startup", needed_flag(risk)),
+    };
+    format!("- {label}: {status}\n")
+}
+
+/// Build the dynamic **self-state** block appended to the constitution so the
+/// agent has an accurate self-image (the B-2 real-use finding: it otherwise
+/// guesses its tools/permissions/memory limits):
+/// - its CURRENT tool permissions (so it never claims it lacks a permission it
+///   has — finding #3 — nor offers one it doesn't);
+/// - the active memory scope + that `recall` reads MEMORY while `search` reads
+///   FILES (finding #1), id-citation discipline (finding #5), and that
+///   curation is **user-only** (finding #4 — it must not invent a delete);
+/// - a **scoped** proactive-recall nudge, emitted only when the scope already
+///   has notes (findings #1/#2), so empty scopes don't cause Over-Recall.
+/// Pure → unit-testable.
+pub fn self_state_prompt(gate: Gate, project: Option<&str>, mem: MemoryAwareness) -> String {
+    let mut s = String::from("\n\n# Current session state\n");
+    s.push_str(
+        "Your tool permissions right now (do NOT claim a tool needs a permission it already has, \
+         and do NOT offer one it lacks):\n",
+    );
+    s.push_str(&perm_line(gate, ToolRisk::ReadOnly, "read_file / search (read-only, workspace-confined)"));
+    s.push_str(&perm_line(gate, ToolRisk::Mutating, "write_file (workspace-confined)"));
+    s.push_str(&perm_line(
+        gate,
+        ToolRisk::Exec,
+        "shell (un-confined: a command can touch paths outside the workspace)",
+    ));
+    match mem {
+        MemoryAwareness::Off => {
+            s.push_str("\nProject memory is not available this session (no recall/remember).\n");
+        }
+        MemoryAwareness::On { scope_has_notes } => {
+            let scope = project.unwrap_or("(global)");
+            s.push_str(&format!("\nProject memory (scope `{scope}`):\n"));
+            s.push_str(
+                "- Use `recall` to read this project's stored notes (past decisions, conventions, \
+                 context) and `remember` to store durable ones. `recall` reads MEMORY — it is NOT \
+                 `search`, which reads workspace FILES.\n",
+            );
+            s.push_str(
+                "- When you reference a recalled note, cite its exact id from the recall result \
+                 (e.g. `id 5`); never invent an id.\n",
+            );
+            s.push_str(
+                "- Curation is user-only: `/archive <id>` and `/forget <id>` are REPL commands the \
+                 user runs. You cannot archive or delete notes and must not invent a deletion \
+                 method; if asked to forget or delete a note, tell the user to run `/forget <id>` \
+                 (or `/archive <id>`).\n",
+            );
+            if scope_has_notes {
+                s.push_str(
+                    "- This project already has stored memory. For questions about prior decisions, \
+                     conventions, or \"what did we…/why did we…/what was our rule for…\", call \
+                     `recall` BEFORE searching files or answering from general knowledge.\n",
+                );
+            }
+        }
+    }
+    s
+}
+
+/// Append [`self_state_prompt`] to the leading `system` message in place. Only
+/// an existing system message is augmented — so `--no-system` (no constitution)
+/// stays honored: with no system message, nothing is injected.
+fn inject_self_state(
+    messages: &mut [ChatMessage],
+    gate: Gate,
+    project: Option<&str>,
+    mem: MemoryAwareness,
+) {
+    if let Some(first) = messages.first_mut() {
+        if first.role == "system" {
+            first.content.push_str(&self_state_prompt(gate, project, mem));
+        }
+    }
+}
+
 /// Permission + dispatch for one tool call → the tool-result string.
 /// The risk tier is read from the tool **definition** (`tools`), so the
 /// gate can't drift from the schema. A denied call returns a denial result
@@ -327,16 +428,29 @@ fn fold_usage(acc: &mut Usage, u: &Option<Usage>) {
 /// Returns how it ended; the caller renders the result.
 pub async fn run(
     client: &Client,
-    messages: Vec<ChatMessage>,
+    mut messages: Vec<ChatMessage>,
     gate: Gate,
     workspace: &Path,
     project: Option<&str>,
     status: Option<&StatusBar>,
 ) -> Result<(LoopEnd, Usage)> {
-    // Startup probe: offer the memory tools only if the server has memory on.
-    // `GET /memory/projects` → 200 = enabled; 503 / transport error = not
-    // offered, so the model never makes a doomed memory call.
-    let memory_enabled = matches!(client.memory_projects().await, Ok(MemCall::Ok(_)));
+    // Startup probe: `GET /memory/projects` → 200 = memory on (offer the
+    // tools); 503 / transport error = not offered, so the model never makes a
+    // doomed memory call. The returned scope list also tells us whether THIS
+    // project already has notes (→ a worthwhile proactive recall; awareness is
+    // count/presence-only, never note content — the philosophy boundary).
+    let probe = client.memory_projects().await;
+    let memory_enabled = matches!(probe, Ok(MemCall::Ok(_)));
+    let awareness = match &probe {
+        Ok(MemCall::Ok(resp)) => MemoryAwareness::On {
+            scope_has_notes: project
+                .is_some_and(|p| resp.projects.iter().any(|pi| pi.project_key == p)),
+        },
+        _ => MemoryAwareness::Off,
+    };
+    // Give the agent an accurate self-image: append the live permissions +
+    // memory scope/boundaries to the constitution before the loop starts.
+    inject_self_state(&mut messages, gate, project, awareness);
     let tools = agent_tools(memory_enabled);
     run_loop(
         messages,
@@ -460,8 +574,12 @@ fn format_recall(hits: &[MemoryHit]) -> String {
         return "No relevant notes found in project memory.".to_string();
     }
     let mut out = format!("Found {} note(s) in project memory:\n", hits.len());
-    for (i, h) in hits.iter().enumerate() {
-        out.push_str(&format!("[{}] ({}, score {:.2}) {}\n", i + 1, h.kind, h.score, h.text.trim()));
+    for h in hits {
+        // The REAL note id (not a positional index) so the model cites it
+        // correctly — B-2 finding #5: it reported the position ("id 1") for a
+        // note whose true id was 5, because the position was all this result
+        // exposed.
+        out.push_str(&format!("[id {}] ({}, score {:.2}) {}\n", h.id, h.kind, h.score, h.text.trim()));
     }
     out
 }
@@ -882,19 +1000,119 @@ mod tests {
     }
 
     #[test]
-    fn format_recall_includes_full_text_and_count() {
+    fn format_recall_shows_real_id_not_position() {
         assert_eq!(format_recall(&[]), "No relevant notes found in project memory.");
         let hits = vec![
-            MemoryHit { id: 1, kind: "Decision".into(), name: "n".into(),
+            MemoryHit { id: 5, kind: "Decision".into(), name: "n".into(),
                 text: "MTP parked because MoE was net-negative".into(), status: "active".into(), score: 0.83 },
-            MemoryHit { id: 2, kind: "Bug".into(), name: "n".into(),
+            MemoryHit { id: 9, kind: "Bug".into(), name: "n".into(),
                 text: "gfx1201 barrier reduction did not help".into(), status: "active".into(), score: 0.71 },
         ];
         let out = format_recall(&hits);
         assert!(out.contains("Found 2 note(s)"));
         assert!(out.contains("(Decision, score 0.83)"));
+        // The REAL ids, not the positional index (B-2 #5): note 1 has id 5.
+        assert!(out.contains("[id 5]"), "must show the real id: {out}");
+        assert!(out.contains("[id 9]"), "must show the real id: {out}");
+        assert!(!out.contains("[1]") && !out.contains("[2]"), "must NOT use the positional index: {out}");
         assert!(out.contains("MTP parked because MoE was net-negative"), "full text, not a snippet");
         assert!(out.contains("gfx1201 barrier reduction did not help"));
+    }
+
+    // ---- self-state (B-2 tuning): permissions + memory awareness ----
+
+    #[test]
+    fn self_state_reports_real_permissions() {
+        use ToolRisk::*;
+        // --allow-shell (Exec ceiling), headless: every tool allowed; never
+        // claims it needs the flag it already has (finding #3). shell carries
+        // the un-confined caveat; confined tools say so.
+        let shell = self_state_prompt(Gate::headless(Some(Exec)), Some("proj"), MemoryAwareness::Off);
+        assert!(shell.contains("shell (un-confined"), "shell flagged un-confined: {shell}");
+        assert!(
+            shell.contains("shell (un-confined: a command can touch paths outside the workspace): allowed"),
+            "{shell}"
+        );
+        assert!(!shell.contains("needs --allow-shell"), "must not claim a permission it has: {shell}");
+        assert!(shell.contains("write_file (workspace-confined): allowed"), "{shell}");
+        // --yes (ReadOnly ceiling), headless: read allowed, write+shell denied
+        // and the lifting flag named.
+        let yes = self_state_prompt(Gate::headless(Some(ReadOnly)), Some("proj"), MemoryAwareness::Off);
+        assert!(yes.contains("read_file / search (read-only, workspace-confined): allowed"), "{yes}");
+        assert!(yes.contains("write_file (workspace-confined): denied — needs --allow-mutating"), "{yes}");
+        assert!(
+            yes.contains("shell (un-confined: a command can touch paths outside the workspace): denied — needs --allow-shell"),
+            "{yes}"
+        );
+    }
+
+    #[test]
+    fn self_state_write_is_confirm_gated_in_repl_below_ceiling() {
+        use ToolRisk::*;
+        // REPL with --yes (ReadOnly ceiling): write_file/shell sit ABOVE the
+        // ceiling → confirm-gated, NOT a bare "allowed" (Schritt-0 sharpening).
+        let repl = self_state_prompt(Gate::interactive(Some(ReadOnly)), Some("p"), MemoryAwareness::Off);
+        assert!(repl.contains("write_file (workspace-confined): confirm-gated"), "{repl}");
+        assert!(
+            repl.contains("shell (un-confined: a command can touch paths outside the workspace): confirm-gated"),
+            "{repl}"
+        );
+        assert!(repl.contains("you approve each call"), "{repl}");
+        // read-only is at the ceiling → genuinely allowed.
+        assert!(repl.contains("read_file / search (read-only, workspace-confined): allowed"), "{repl}");
+    }
+
+    #[test]
+    fn self_state_memory_off_says_unavailable() {
+        let s = self_state_prompt(Gate::headless(Some(ToolRisk::Exec)), Some("proj"), MemoryAwareness::Off);
+        assert!(s.contains("memory is not available"), "{s}");
+        // no curation / nudge guidance when memory is off.
+        assert!(!s.contains("/forget"), "{s}");
+        assert!(!s.contains("BEFORE searching"), "{s}");
+    }
+
+    #[test]
+    fn self_state_memory_on_has_scope_boundaries_and_id_rule() {
+        let s = self_state_prompt(
+            Gate::interactive(Some(ToolRisk::Exec)),
+            Some("vulkanforge-1a2b3c4d"),
+            MemoryAwareness::On { scope_has_notes: true },
+        );
+        assert!(s.contains("scope `vulkanforge-1a2b3c4d`"), "{s}");
+        assert!(s.contains("recall") && s.contains("remember"));
+        assert!(s.contains("reads MEMORY") && s.contains("reads workspace FILES"), "recall-vs-search (#1): {s}");
+        assert!(s.contains("cite its exact id"), "id rule (#5): {s}");
+        assert!(
+            s.contains("/forget") && s.contains("user-only") && s.contains("not invent"),
+            "curation user-only (#4): {s}"
+        );
+    }
+
+    #[test]
+    fn self_state_scoped_nudge_only_when_scope_has_notes() {
+        let g = Gate::headless(Some(ToolRisk::Exec));
+        let with = self_state_prompt(g, Some("p"), MemoryAwareness::On { scope_has_notes: true });
+        let without = self_state_prompt(g, Some("p"), MemoryAwareness::On { scope_has_notes: false });
+        assert!(with.contains("call `recall` BEFORE"), "notes present → proactive nudge: {with}");
+        assert!(!without.contains("call `recall` BEFORE"), "empty scope → no Over-Recall nudge: {without}");
+        // both still expose recall/remember + the user-only curation boundary.
+        assert!(without.contains("recall") && without.contains("/forget"), "{without}");
+    }
+
+    #[test]
+    fn inject_self_state_augments_system_only() {
+        let g = Gate::headless(Some(ToolRisk::Exec));
+        // System present → appended in place (constitution kept, not replaced).
+        let mut with_sys = vec![ChatMessage::system("CONSTITUTION"), ChatMessage::user("hi")];
+        inject_self_state(&mut with_sys, g, Some("p"), MemoryAwareness::On { scope_has_notes: false });
+        assert!(with_sys[0].content.starts_with("CONSTITUTION"), "appended, not replaced");
+        assert!(with_sys[0].content.contains("Current session state"), "self-state appended");
+        assert_eq!(with_sys[1].content, "hi", "user message untouched");
+        // No system message (--no-system) → nothing injected.
+        let mut no_sys = vec![ChatMessage::user("hi")];
+        inject_self_state(&mut no_sys, g, Some("p"), MemoryAwareness::Off);
+        assert_eq!(no_sys.len(), 1);
+        assert_eq!(no_sys[0].content, "hi", "no system message → untouched (honors --no-system)");
     }
 
     #[tokio::test]
