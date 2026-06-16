@@ -1,5 +1,44 @@
 # Changelog
 
+## v1.0.2 — agent memory access + self-state, 1.96 cleanup (2026-06-16)
+
+**Client-side memory access and an accurate agent self-image.** The v1.0/v1.0.1 server-side memory store is now
+reachable from `vf-clide` — by the REPL and the agent loop — and the agent is told its real tools, permissions, and
+memory scope instead of guessing them. No inference-path change; decode logits are bit-identical to v1.0.1.
+
+- **Added — agent memory access (opt-in, `serve --memory`).** `vf-clide` reaches the project-scoped store through
+  `recall`/`remember` agent tools (offered only when the server reports memory enabled) and the REPL commands
+  `/project` `/recall` `/remember`. Project isolation and the CPU/VNNI embedder (no VRAM) are unchanged from v1.0.
+  The client stays thin — zero SQLiteGraph/fastembed/ort dependencies.
+- **Added — memory curation (user-only).** `/archive <id>` drops a note from recall but keeps the record;
+  `/forget <id>` hard-deletes it; `remember` de-duplicates near-identical notes instead of storing twice. Curation
+  is **user-driven only** — the agent cannot archive or delete, and is told so.
+- **Added — accurate agent self-state.** The agent's system prompt now carries its **live** tool permissions
+  (from the actual gate: allowed / confirm-gated / denied-needs-flag, with `shell` flagged un-confined), the active
+  memory scope, the user-only curation boundary, and a **scoped** proactive-recall nudge (only for memory-type
+  questions, only when the scope already has notes — no over-recall). Presence-aware: a fresh session learns the
+  project *has* memory without any note content being injected.
+- **Fixed — recall vs. file-search.** `recall` (project memory) and `search` (workspace files) now describe
+  themselves so they can't be confused — a memory question no longer triggers a file search.
+- **Fixed — recall cites the real note id.** `recall` results show each note's true id (`[id 7]`) instead of the
+  enumeration index, so the agent references the correct note.
+- **Fixed — self-state permission wording.** `shell` is described as **un-confined** (a command can touch paths
+  outside the workspace); `write_file` is **confirm-gated** without `--allow-mutating`, not silently "allowed".
+- **Changed — rust 1.96 lib warnings silenced (114 → 0)**, with and without `--features memory`. Warning-only; no
+  `unsafe` block was removed (kept for MSRV portability — removing them would raise the floor to 1.96). Decode
+  logits are **bit-identical** before/after (verified by a greedy `VF_LOGIT_DUMP` diff).
+- **Notes.** Memory design and philosophy (tool-driven, visible, not auto-injected; curation user-only): the wiki
+  **[Memory Design](https://github.com/maeddesg/vulkanforge/wiki/Memory-Design)** page.
+
+**Validation.** Engine unchanged → `cargo build --release` **0 warnings**, lib `306/306`, correctness `83/83`,
+regression `26 + 1 ignored`; `--features memory` `tests/memory.rs` `10/10`. `vf-clide` `92/92`; `cargo tree` carries
+no SQLiteGraph/fastembed/ort. Agent behavior live-verified end-to-end (cross-session recall, permission awareness,
+user-only forget, no over-recall) on Qwen3-8B @ `serve --memory`.
+
+**Versions.** Engine `1.0.1 → 1.0.2`. `vf-clide` gains the memory client + self-state (REPL commands, agent tools,
+curation, accurate self-state) — version set by mg at release. Lean default still builds on Rust 1.85+;
+`--features memory` needs Rust 1.89+.
+
 ## v1.0.1 — memory is now opt-in (2026-06-15)
 
 **The server-side memory subsystem is now optional, gated twice, and off by default.** No inference-path change;

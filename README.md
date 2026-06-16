@@ -34,6 +34,10 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
   `~/.vulkanforge/embed-cache` (then offline). Without `--memory`, `/memory/*` returns 503 and inference runs with
   zero memory overhead. What it is, what it isn't, and the roadmap: the wiki's
   **[Memory](https://github.com/maeddesg/vulkanforge/wiki/Memory)** page. See `CHANGELOG.md`.
+  **Client access (`vf-clide`):** the agent reaches this store through `recall`/`remember` tools (tool-driven and
+  visible, never silently auto-injected), and the REPL exposes `/recall` `/remember` `/archive` `/forget`. Curation
+  (archive/forget) is **user-only**. The agent's system prompt carries its live tools, permissions, and memory scope,
+  so it doesn't guess them. (Memory tools appear only when the server reports memory enabled.)
 - **`vf-clide` REPL permission ceiling + denial wording (v0.9.4)** — `vf-clide` (0.3.1): in the agent **REPL**,
   tool calls at or below the active `--yes` / `--allow-mutating` / `--allow-shell` ceiling are now
   **auto-approved** (still printed) and only calls **above** it prompt `y/N` — consistent with headless, not
