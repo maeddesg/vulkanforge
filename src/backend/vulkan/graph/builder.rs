@@ -31,7 +31,7 @@ use crate::backend::vulkan::forward::layer_plan::{
 use crate::backend::vulkan::gguf::ModelConfig;
 
 use super::node::{
-    Binding, BufferHandle, ByteRange, DispatchNode, MemAccess, NodeId, SubDispatch,
+    Binding, BufferHandle, DispatchNode, MemAccess, SubDispatch,
 };
 use super::VulkanGraph;
 
@@ -629,6 +629,9 @@ impl<'a> GraphBuilder<'a> {
         });
     }
 
+    // Parked element-wise binary-op dispatch helper for the in-progress
+    // Qwen3.6 SSM path (Sprint SG-1.4); no caller wired yet.
+    #[allow(dead_code)]
     fn add_binary(
         &mut self, layer: u32,
         a: BufferHandle, b: BufferHandle, out: BufferHandle,
@@ -681,6 +684,9 @@ impl<'a> GraphBuilder<'a> {
     const N_GROUP_KV: u64 = 16;          // Q + K groups
     const D_STATE: u64 = 128;
     const N_V_HEADS: u64 = 48;           // V heads / β / α head count
+    // Parked Qwen3.6 SSM helper constant (Sprint SG-1.4); V_SLICE_BYTES is
+    // currently derived from CONV_CHANNELS_BYTES, so this has no reader yet.
+    #[allow(dead_code)]
     const D_HEAD_V: u64 = 128;
     const D_CONV: u64 = 4;
 
@@ -1556,6 +1562,9 @@ impl<'a> GraphBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `NodeId` is referenced only by the tests below; importing it here (not
+    // at module scope) keeps the non-test build free of an unused-import lint.
+    use super::super::node::NodeId;
 
     fn dummy_qwen3_cfg() -> ModelConfig {
         use crate::backend::vulkan::gguf::RopeVariant;

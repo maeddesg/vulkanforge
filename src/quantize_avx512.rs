@@ -22,6 +22,10 @@
 //! `_max_ps` — for non-NaN floats these are order-independent.
 
 #![cfg(target_arch = "x86_64")]
+// `unsafe` required on rust <1.96 (calling `#[target_feature]` intrinsics
+// was unsafe), redundant on rust >=1.96. Kept for toolchain portability —
+// removing the blocks would bump the MSRV to 1.96.
+#![allow(unused_unsafe)]
 
 use std::arch::x86_64::*;
 

@@ -2612,7 +2612,7 @@ impl BatchExec {
     /// processes token 0 only — multi-token correctness lands when
     /// scratch grows to seq_len.
     pub(super) fn b_step_attn_qkv_proj(
-        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, _layer: u32,
     ) {
         let spec = cfg.qwen35.as_ref().expect(
             "b_step_attn_qkv_proj emitted for non-qwen35 config",
@@ -2636,7 +2636,7 @@ impl BatchExec {
     /// Sprint G-2d (v0.4.6) — batch counterpart of
     /// [`DecodeExec::step_attn_gate_z_proj`].
     pub(super) fn b_step_attn_gate_z_proj(
-        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, _layer: u32,
     ) {
         let spec = cfg.qwen35.as_ref().expect(
             "b_step_attn_gate_z_proj emitted for non-qwen35 config",
@@ -2658,7 +2658,7 @@ impl BatchExec {
     /// Sprint G-2d (v0.4.6) — batch counterpart of
     /// [`DecodeExec::step_ssm_beta_proj`].
     pub(super) fn b_step_ssm_beta_proj(
-        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, _layer: u32,
     ) {
         let spec = cfg.qwen35.as_ref().expect(
             "b_step_ssm_beta_proj emitted for non-qwen35 config",
@@ -2976,7 +2976,7 @@ impl BatchExec {
     /// tokens 1..N consumes stale/zero data (smoke-only correctness,
     /// matches the G-2b plan's decode-sized scratch).
     pub(super) fn b_step_ssm_out_proj(
-        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, layer: u32,
+        &self, fwd: &mut Forward, cfg: &ModelConfig, ctx: &ExecCtx, _layer: u32,
     ) {
         let spec = cfg.qwen35.as_ref().expect(
             "b_step_ssm_out_proj emitted for non-qwen35 config",

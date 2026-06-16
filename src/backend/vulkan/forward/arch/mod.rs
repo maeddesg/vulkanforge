@@ -23,7 +23,7 @@ pub(super) mod qwen35;
 
 pub(super) use common::{
     GemmKind, compute_barrier, is_f32_layer_weight, is_fp8_layer_weight, layer_dims,
-    layer_weight, layer_weight_with_offset, layer_weight_indexed_shader, layer_weight_mm_id_shader,
+    layer_weight, layer_weight_with_offset, layer_weight_indexed_shader,
     layer_weight_mmq_id_shader, layer_weight_opt, layer_weight_scale_block,
     layer_weight_scale_buf, layer_weight_scale_scalar, layer_weight_shader,
     layer_weight_shader_gemm, n_kv_heads_for, named_weight_with_offset,

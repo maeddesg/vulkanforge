@@ -605,6 +605,9 @@ pub(crate) fn layer_weight_mmq_id_shader(
 ///
 /// No subgroup parameter yet — 61D ships the stock builds only;
 /// subgroup variants can be added later if they prove faster.
+// Parked Sprint-61D grouped expert-FFN-down scaffolding; no caller until the
+// grouped path is wired (sibling of MoeRouterGpu's 61C host caches).
+#[allow(dead_code)]
 pub(crate) fn mm_id_shader_for(ggml_type: GgmlType) -> ShaderId {
     match ggml_type {
         GgmlType::Q3K  => ShaderId::MulMmQ3KMatId,
@@ -620,6 +623,9 @@ pub(crate) fn mm_id_shader_for(ggml_type: GgmlType) -> ShaderId {
 }
 
 /// Sprint 61D — model-driven mul_mm MUL_MAT_ID shader selector.
+// Parked grouped expert-FFN-down scaffolding; no caller until the grouped
+// path is wired.
+#[allow(dead_code)]
 pub(crate) fn layer_weight_mm_id_shader(
     model: &LoadedModel,
     layer: u32,

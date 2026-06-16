@@ -714,7 +714,7 @@ impl Forward {
 
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
-        let mut mk = |alloc: &mut Allocator, floats: usize, name: &str| {
+        let mk = |alloc: &mut Allocator, floats: usize, name: &str| {
             GpuBuffer::new(&dev.device, alloc, (floats as u64) * 4, usage, MemoryLocation::CpuToGpu, name)
         };
         // Path A (N_max tokens), shared state, path B (1 token).
@@ -871,7 +871,7 @@ impl Forward {
 
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
-        let mut mk = |alloc: &mut Allocator, floats: usize, name: &str| {
+        let mk = |alloc: &mut Allocator, floats: usize, name: &str| {
             GpuBuffer::new(&dev.device, alloc, (floats as u64) * 4, usage, MemoryLocation::CpuToGpu, name)
         };
         let mut w_b = mk(allocator, nr * nc, "convv_w")?;
@@ -1026,6 +1026,9 @@ impl Forward {
     /// b_step bodies use: batched reads token-t slots via offsets, decode
     /// copies token t into a 1-token slot (offset 0). Mismatch pattern:
     /// pos0-ok/from-pos1 = state-carry bug; wrong-position = offset bug.
+    // Intentional N-suffix locals (`qN`/`kN`/`conv_oN`/`gdnN`/`coNh`/`dNh` =
+    // "N tokens", paired with the `…1` single-token buffers) for readability.
+    #[allow(non_snake_case)]
     pub fn gdn_serial_verify(
         &mut self,
         dev: &VulkanDevice,
@@ -1044,7 +1047,7 @@ impl Forward {
         let scale = 1.0f32 / (s_v as f32).sqrt();
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
-        let mut mk = |a: &mut Allocator, floats: usize, name: &str| {
+        let mk = |a: &mut Allocator, floats: usize, name: &str| {
             GpuBuffer::new(&dev.device, a, (floats as u64) * 4, usage, MemoryLocation::CpuToGpu, name)
         };
         let cosf = |a: &[f32], b: &[f32]| -> (f64, f64) {

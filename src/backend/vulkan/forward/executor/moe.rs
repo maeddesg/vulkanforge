@@ -15,7 +15,7 @@ use super::{
     MOE_LAYER0_LOGGED,
 };
 use super::super::arch::{
-    compute_barrier, layer_weight, layer_weight_with_offset, layer_weight_indexed_shader, layer_weight_mm_id_shader,
+    compute_barrier, layer_weight, layer_weight_with_offset, layer_weight_indexed_shader,
     layer_weight_mmq_id_shader, layer_weight_shader, transfer_to_compute_barrier,
 };
 use super::super::state::Forward;

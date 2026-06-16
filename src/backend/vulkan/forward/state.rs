@@ -279,16 +279,22 @@ pub struct MoeRouterGpu {
     /// order as `grouped_data_ids`. Computed alongside data_ids by the
     /// CPU counting-sort. Used by the per-slot FMA loop (host-side
     /// scalar from this vec, passed as push-constant).
+    // Parked Sprint-61C grouped-MMQ host-side caches: populated only on the
+    // not-yet-wired grouped MoE path, so currently never read.
+    #[allow(dead_code)]
     pub grouped_weights_host: std::sync::Mutex<Vec<f32>>,
     /// Companion host-side cache of `grouped_data_ids` so the FMA
     /// per-slot loop knows which token to accumulate into without
     /// another GPU readback.
+    #[allow(dead_code)]
     pub grouped_data_ids_host: std::sync::Mutex<Vec<u32>>,
     /// Cached `moe_intermediate` size used to dimension the scratch
     /// buffers above. Loader fills it during init_moe_router_gpu.
+    #[allow(dead_code)]
     pub moe_intermediate: u32,
     /// Cached `max_seq` (= max_prefill_tokens) used to dimension the
     /// scratch buffers above.
+    #[allow(dead_code)]
     pub max_seq: u32,
 }
 

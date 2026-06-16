@@ -1072,7 +1072,6 @@ impl LoadedModel {
                             dev.physical_device, &mut props2,
                         )
                     };
-                    drop(props2);
                     if maint3.max_memory_allocation_size > 0 {
                         maint3.max_memory_allocation_size
                     } else {

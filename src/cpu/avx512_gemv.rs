@@ -36,6 +36,10 @@
 //! scalar implementation when absent.
 
 #![cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+// `unsafe` required on rust <1.96 (calling `#[target_feature]` intrinsics
+// was unsafe), redundant on rust >=1.96. Kept for toolchain portability —
+// removing the blocks would bump the MSRV to 1.96.
+#![allow(unused_unsafe)]
 
 use crate::cpu::q6k::{Q6KBlock, QK_K};
 
