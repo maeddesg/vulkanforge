@@ -23,7 +23,8 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
   `cargo build --release --features memory`, then activate at runtime with `serve --memory` (or
   `VULKANFORGE_MEMORY=1`). VF-native endpoints write notes on purpose and read them back by meaning:
   `POST /memory/remember`, `POST /memory/recall` (`{hits:[{id,kind,name,text,status,score}]}`),
-  `POST`/`GET /memory/projects`. [SQLiteGraph](https://github.com/oldnordic/sqlitegraph) (nodes + edges +
+  `POST`/`GET /memory/projects`, and curation `POST /memory/archive` · `/unarchive` · `/delete` (a missing id
+  returns **404**, not 500). [SQLiteGraph](https://github.com/oldnordic/sqlitegraph) (nodes + edges +
   per-project HNSW indexes in one SQLite file) + a CPU embedder ([fastembed](https://github.com/maeddesg/fastembed-rs),
   Nomic-Embed v1.5-Q, 768-dim, AVX-512/VNNI). Each project gets its own index — recall in one project **cannot**
   return another's notes — and the store survives restarts (vectors restore with no re-embed). The memory path
@@ -34,9 +35,12 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
   `~/.vulkanforge/embed-cache` (then offline). Without `--memory`, `/memory/*` returns 503 and inference runs with
   zero memory overhead. What it is, what it isn't, and the roadmap: the wiki's
   **[Memory](https://github.com/maeddesg/vulkanforge/wiki/Memory)** page. See `CHANGELOG.md`.
-  **Client access (`vf-clide`):** the agent reaches this store through `recall`/`remember` tools (tool-driven and
-  visible, never silently auto-injected), and the REPL exposes `/recall` `/remember` `/archive` `/forget`. Curation
-  (archive/forget) is **user-only**. The agent's system prompt carries its live tools, permissions, and memory scope,
+  **Client access (`vf-clide`):** the agent reaches this store through `recall`/`remember`/`archive` tools
+  (tool-driven and visible, never silently auto-injected), and the REPL exposes `/recall` `/remember` `/archive`
+  `/unarchive` `/forget`. The agent may `archive` a note it recalled this session — through an always-on
+  confirmation that shows the note's **real** stored text (never the model's claim) and a required reason; archiving
+  is **reversible** (`/unarchive <id>` restores a note). **`/unarchive` and `/forget` stay user-only** — the agent
+  has no un-archive or delete tool. The agent's system prompt carries its live tools, permissions, and memory scope,
   so it doesn't guess them. (Memory tools appear only when the server reports memory enabled.)
 - **`vf-clide` REPL permission ceiling + denial wording (v0.9.4)** — `vf-clide` (0.3.1): in the agent **REPL**,
   tool calls at or below the active `--yes` / `--allow-mutating` / `--allow-shell` ceiling are now

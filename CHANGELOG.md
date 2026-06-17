@@ -1,5 +1,36 @@
 # Changelog
 
+## v1.0.3 — agent-side curation, un-archive, and a 404 for missing notes (2026-06-17)
+
+**The agent can now curate memory safely, archives are reversible, and the curation API speaks the right HTTP
+status.** No inference-path change — the decode path is byte-identical, so there are no new benchmarks to report.
+
+- **Added — agent-side `archive` (curation the agent can do).** The agent may now `archive` a note, but only one it
+  recalled **this session**, and only through an **always-on confirmation** — the prompt renders the note's **real
+  stored text** (never the model's free-text claim, so a wrong id paired with an invented description is caught by
+  eye) plus a required reason. It runs on the memory axis (not the file/shell ceiling), so even `--allow-shell`
+  doesn't auto-approve it; headless (no TTY) denies it. `forget` (hard delete) stays **user-only** — the agent has
+  no delete tool and is told so.
+- **Added — `/unarchive <id>` (archive is reversible).** Archiving drops a note's vector from recall but keeps the
+  node as an `archived` record; `/unarchive` restores it to active and back into recall. Because archive removes the
+  vector, un-archive **re-embeds the stored text** — the embedder is deterministic, so it reproduces the original
+  vector — and re-inserts it through the remember path with the node-id link intact. Idempotent (un-archiving an
+  active note is a no-op, no duplicate vector) and it survives a restart. `/unarchive` is **user-only** — like
+  `/forget`, recovery is a human action, not an agent tool.
+- **Fixed — curation endpoints return 404 for a missing id.** `POST /memory/archive` · `/unarchive` · `/delete`
+  now answer **404 Not Found** (not 500) when the target id doesn't exist — a typed store error distinguishes "your
+  id was wrong" from "the server broke". Real server faults (lock/DB/IO/embedder) still return 500; the error
+  message is unchanged.
+
+**Validation.** Decode unchanged → no benchmark. `cargo build --release --features memory` **0 warnings**; lib
+**306/306** (lean) and **307** with `--features memory` (adds the curation-status mapping test); `tests/memory.rs`
+**14/14** (real embedder — includes the archive→unarchive→recall round-trip and the typed not-found). `vf-clide`
+**105/105**; `cargo tree` still carries no SQLiteGraph/fastembed/ort. `cargo test --release --no-run` clean (both
+crates).
+
+**Versions.** Engine `1.0.2 → 1.0.3`; `vf-clide` `0.3.1 → 0.3.2` (gains the agent `archive` tool and the REPL
+`/unarchive` command). Lean default still builds on Rust 1.85+; `--features memory` needs Rust 1.89+.
+
 ## v1.0.2 — agent memory access + self-state, 1.96 cleanup (2026-06-16)
 
 **Client-side memory access and an accurate agent self-image.** The v1.0/v1.0.1 server-side memory store is now

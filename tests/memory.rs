@@ -169,6 +169,97 @@ fn archive_removes_from_recall_but_keeps_node() {
 }
 
 #[test]
+fn unarchive_restores_to_recall_round_trip() {
+    // The core round-trip: remember → recall finds · archive → recall misses ·
+    // unarchive → recall finds AGAIN, with the right node, content and a sane
+    // score. A wrong re-insert / lost node_id link fails the LAST recall.
+    let store = store_or_skip!("unarchive_rt");
+    let id = store
+        .remember(Some("u"), "Decision", "Park MTP because MoE turned out net-negative", None, None)
+        .expect("remember").id;
+    let q = "what about multi-token prediction?";
+    assert!(store.recall(Some("u"), q, 5).expect("recall").iter().any(|h| h.id == id),
+        "recallable before archive");
+    store.archive(Some("u"), id).expect("archive");
+    assert!(store.recall(Some("u"), q, 5).expect("recall").iter().all(|h| h.id != id),
+        "archived note out of recall");
+    assert_eq!(store.raw_vector_count(Some("u")).expect("count"), 0, "vector gone after archive");
+
+    store.unarchive(Some("u"), id).expect("unarchive");
+    // Vector is back + node is active again.
+    assert_eq!(store.raw_vector_count(Some("u")).expect("count"), 1, "vector restored after unarchive");
+    assert_eq!(store.get(id).expect("node").status, "active", "status back to active");
+    // recall finds it again — same id, right content, sensible score.
+    let hits = store.recall(Some("u"), q, 5).expect("recall after unarchive");
+    let hit = hits.iter().find(|h| h.id == id).expect("unarchived note recallable again");
+    assert!(hit.text.contains("Park MTP"), "right content (node_id link intact): {hit:?}");
+    assert!(hit.score > 0.0 && hit.score <= 1.0001, "sane score: {}", hit.score);
+}
+
+#[test]
+fn unarchive_is_idempotent_and_errors_cleanly() {
+    let store = store_or_skip!("unarchive_idem");
+    let id = store
+        .remember(Some("u2"), "Note", "a single distinct note to bounce around", None, None)
+        .expect("remember").id;
+    // Un-archiving an ACTIVE note is a no-op: no duplicate vector, no error.
+    store.unarchive(Some("u2"), id).expect("unarchive of active note is a no-op");
+    assert_eq!(store.raw_vector_count(Some("u2")).expect("count"), 1, "no duplicate vector for an active note");
+    assert_eq!(store.recall(Some("u2"), "distinct note", 5).expect("recall").iter().filter(|h| h.id == id).count(), 1,
+        "exactly one recall hit for the note (no dup)");
+    // Archive then double-unarchive: second unarchive is a no-op (still 1).
+    store.archive(Some("u2"), id).expect("archive");
+    store.unarchive(Some("u2"), id).expect("unarchive 1");
+    store.unarchive(Some("u2"), id).expect("unarchive 2 (no-op)");
+    assert_eq!(store.raw_vector_count(Some("u2")).expect("count"), 1, "double unarchive adds no duplicate");
+    // A non-existent id errors cleanly (no panic).
+    assert!(store.unarchive(Some("u2"), 999_999).is_err(), "unarchive of a missing id must error");
+}
+
+#[test]
+fn curation_missing_id_is_typed_not_found() {
+    // Each id-targeting curation op must report a MISSING id as the typed
+    // `CurateError::NotFound` (→ the handler maps it to 404), not a flat
+    // internal error (→ 500). Real faults stay `Internal`.
+    use vulkanforge::server::memory::CurateError;
+    let store = store_or_skip!("curate_not_found");
+    // A present note so the project/index exist — the error is purely "no id".
+    let _ = store.remember(Some("nf"), "Note", "a present note about gfx1201", None, None).expect("remember");
+    let missing = 999_999;
+    for (op, res) in [
+        ("archive", store.archive(Some("nf"), missing)),
+        ("unarchive", store.unarchive(Some("nf"), missing)),
+        ("delete", store.delete(Some("nf"), missing)),
+    ] {
+        match res {
+            Err(CurateError::NotFound(id)) => assert_eq!(id, missing, "{op} reports the missing id"),
+            other => panic!("{op} of a missing id must be CurateError::NotFound, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn unarchive_persists_across_restart() {
+    let path = db_for("unarchive_persist");
+    let id;
+    {
+        let store = match MemoryStore::new(path.clone()) {
+            Ok(s) => s,
+            Err(e) => { eprintln!("SKIP unarchive_persist: {e}"); return; }
+        };
+        id = store.remember(Some("p"), "Note", "delta note archived then restored", None, None).expect("a").id;
+        store.archive(Some("p"), id).expect("archive");
+        store.unarchive(Some("p"), id).expect("unarchive");
+        store.shutdown();
+    }
+    let re = MemoryStore::new(path).expect("reopen");
+    assert_eq!(re.raw_vector_count(Some("p")).expect("count"), 1, "restored vector survives restart");
+    assert_eq!(re.get(id).expect("node").status, "active", "status active after restart");
+    assert!(re.recall(Some("p"), "delta note", 5).expect("recall").iter().any(|h| h.id == id),
+        "unarchived note recallable after restart");
+}
+
+#[test]
 fn delete_is_hard_and_raw_count_drops() {
     let store = store_or_skip!("delete");
     let a = store.remember(Some("x"), "Note", "first distinct note about shaders", None, None).expect("a").id;

@@ -14,6 +14,8 @@
 //! non-confinable tool, so it gets its own top tier (`Exec`) — its sole
 //! guard is the gate (`--allow-shell`), never the workspace root.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
@@ -22,7 +24,7 @@ use serde::Deserialize;
 use crate::client::{AgentTurn, Client, MemCall, Result};
 use crate::tools::{
     all_tools, execute_read_file, execute_search, execute_shell, execute_write_file, memory_tools,
-    read_agents_md, READ_FILE, RECALL, REMEMBER, SEARCH, SHELL, WRITE_FILE,
+    read_agents_md, ARCHIVE, READ_FILE, RECALL, REMEMBER, SEARCH, SHELL, WRITE_FILE,
 };
 use crate::status::StatusBar;
 use crate::types::{ChatMessage, MemoryHit, Tool, ToolCall, ToolRisk, Usage};
@@ -182,6 +184,13 @@ fn prompt_yn(name: &str, risk: ToolRisk, args: &str) -> bool {
     }
     eprint!("[agent] allow {name}({args})? [y/N] ");
     let _ = std::io::stderr().flush();
+    read_yes_no()
+}
+
+/// Read a `y/N` answer from stdin. EOF / read error / anything other than an
+/// explicit yes → `false` (deny by default). The prompt itself is printed by
+/// the caller (so it can render a tool- or archive-specific warning first).
+fn read_yes_no() -> bool {
     let mut line = String::new();
     match std::io::stdin().read_line(&mut line) {
         Ok(0) | Err(_) => false, // EOF / no input → deny (default)
@@ -253,8 +262,9 @@ fn perm_line(gate: Gate, risk: ToolRisk, label: &str) -> String {
 /// - its CURRENT tool permissions (so it never claims it lacks a permission it
 ///   has — finding #3 — nor offers one it doesn't);
 /// - the active memory scope + that `recall` reads MEMORY while `search` reads
-///   FILES (finding #1), id-citation discipline (finding #5), and that
-///   curation is **user-only** (finding #4 — it must not invent a delete);
+///   FILES (finding #1), id-citation discipline (finding #5), and the curation
+///   boundary (it may `archive` a note it recalled this session — the user
+///   confirms — while `forget`/delete stays user-only, finding #4);
 /// - a **scoped** proactive-recall nudge, emitted only when the scope already
 ///   has notes (findings #1/#2), so empty scopes don't cause Over-Recall.
 /// Pure → unit-testable.
@@ -288,10 +298,16 @@ pub fn self_state_prompt(gate: Gate, project: Option<&str>, mem: MemoryAwareness
                  (e.g. `id 5`); never invent an id.\n",
             );
             s.push_str(
-                "- Curation is user-only: `/archive <id>` and `/forget <id>` are REPL commands the \
-                 user runs. You cannot archive or delete notes and must not invent a deletion \
-                 method; if asked to forget or delete a note, tell the user to run `/forget <id>` \
-                 (or `/archive <id>`).\n",
+                "- You can `archive` a note you recalled THIS session: call `archive` with its \
+                 exact id and a short reason. The user confirms it first (seeing the note's real \
+                 content), and you can only archive a note you actually recalled this session — \
+                 so use it for a clearly stale or superseded note. Archiving is reversible: the \
+                 user can restore a note with `/unarchive <id>`.\n",
+            );
+            s.push_str(
+                "- `forget` (permanent delete) is user-only: you have no delete tool and must not \
+                 invent one. If asked to forget or delete a note, tell the user to run \
+                 `/forget <id>`.\n",
             );
             if scope_has_notes {
                 s.push_str(
@@ -452,6 +468,13 @@ pub async fn run(
     // memory scope/boundaries to the constitution before the loop starts.
     inject_self_state(&mut messages, gate, project, awareness);
     let tools = agent_tools(memory_enabled);
+    // Session recall cache: `recall` results land here keyed by note id, so
+    // `archive` can be bound to notes the agent actually recalled THIS session
+    // (anti-hallucination — see [`plan_archive`]) and the confirm can render
+    // the note's REAL content, never the model's free-text claim. Lives for
+    // the whole turn; interior-mutable so the recall (writer) and archive
+    // (reader) sides share it across the loop without a borrow conflict.
+    let cache: RecallCache = RefCell::new(HashMap::new());
     run_loop(
         messages,
         gate,
@@ -460,7 +483,7 @@ pub async fn run(
         status,
         LOOP_CAP,
         |msgs| client.chat_with_tools(msgs, &tools),
-        |call| dispatch_memory(client, project, call),
+        |call| dispatch_memory(client, project, gate, &cache, call),
     )
     .await
 }
@@ -476,31 +499,63 @@ pub fn agent_tools(memory_enabled: bool) -> Vec<Tool> {
 }
 
 /// Whether `name` is a memory tool (handled on the separate async axis, not
-/// the file/shell permission gate).
+/// the file/shell permission gate). `recall`/`remember` run unconfirmed;
+/// `archive` is on the same axis but gated **confirm-always**.
 fn is_memory_tool(name: &str) -> bool {
-    matches!(name, RECALL | REMEMBER)
+    matches!(name, RECALL | REMEMBER | ARCHIVE)
 }
 
+/// One recalled note kept in the session [`RecallCache`]: the fields needed to
+/// render an honest archive confirmation (the note's REAL content) and to
+/// prove the agent actually recalled it this session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedNote {
+    kind: String,
+    name: String,
+    text: String,
+}
+
+/// Per-turn `id → note` cache of everything `recall` returned this session.
+/// Interior-mutable so the recall (writer) and archive (reader) sides share it
+/// across the loop. A `RefCell` (not a `Mutex`) is fine: the agent loop is a
+/// single task and the cache is only touched between `.await`s, never across one.
+type RecallCache = RefCell<HashMap<i64, CachedNote>>;
+
 /// Dispatch a memory tool call via the HTTP client. `Some(result)` for
-/// `recall`/`remember` (handled here, **before** the file/shell gate);
-/// `None` for any other tool (falls through to the gated dispatch). The names
-/// are recognized even if the server turns out memory-off (race): the call
-/// then returns a clean "memory not enabled" result, never a crash. Every
+/// `recall`/`remember`/`archive` (handled here, **before** the file/shell
+/// gate); `None` for any other tool (falls through to the gated dispatch). The
+/// names are recognized even if the server turns out memory-off (race): the
+/// call then returns a clean "memory not enabled" result, never a crash. Every
 /// memory action prints a visible marker (philosophy: results are visible).
-async fn dispatch_memory(client: &Client, project: Option<&str>, call: ToolCall) -> Option<String> {
+/// `gate` is used only by `archive` (confirm-always — the ceiling never lifts it).
+async fn dispatch_memory(
+    client: &Client,
+    project: Option<&str>,
+    gate: Gate,
+    cache: &RecallCache,
+    call: ToolCall,
+) -> Option<String> {
     let name = call.function.name.as_str();
     if !is_memory_tool(name) {
         return None;
     }
     let args = call.function.arguments.as_str();
     Some(match name {
-        RECALL => execute_recall(client, project, args).await,
+        RECALL => execute_recall(client, project, cache, args).await,
         REMEMBER => execute_remember(client, project, args).await,
+        // The production confirm: render the warning to stderr (done inside
+        // execute_archive) then read a real y/N from stdin.
+        ARCHIVE => execute_archive(client, project, gate, cache, args, read_yes_no).await,
         _ => unreachable!("guarded by is_memory_tool"),
     })
 }
 
-async fn execute_recall(client: &Client, project: Option<&str>, args: &str) -> String {
+async fn execute_recall(
+    client: &Client,
+    project: Option<&str>,
+    cache: &RecallCache,
+    args: &str,
+) -> String {
     #[derive(Deserialize)]
     struct RecallArgs {
         query: String,
@@ -518,6 +573,17 @@ async fn execute_recall(client: &Client, project: Option<&str>, args: &str) -> S
     match client.memory_recall(project, &parsed.query, k).await {
         Ok(MemCall::Ok(resp)) => {
             eprintln!("[agent] recalled {} note(s) for \"{}\"", resp.hits.len(), parsed.query);
+            // Ground future `archive` calls: cache each hit's id → real content
+            // (scoped borrow_mut, dropped before returning — no await held).
+            {
+                let mut c = cache.borrow_mut();
+                for h in &resp.hits {
+                    c.insert(
+                        h.id,
+                        CachedNote { kind: h.kind.clone(), name: h.name.clone(), text: h.text.clone() },
+                    );
+                }
+            }
             format_recall(&resp.hits)
         }
         Ok(MemCall::Disabled) => {
@@ -563,6 +629,136 @@ async fn execute_remember(client: &Client, project: Option<&str>, args: &str) ->
         Err(e) => {
             eprintln!("[agent] remember failed: {e}");
             format!("Tool error: remember failed: {e}")
+        }
+    }
+}
+
+/// The pre-server outcome of an `archive` request — what to do *before* any
+/// `/memory/archive` call. Keeps the cache/gate logic pure (no I/O), so the
+/// confirm-always and grounding rules are unit-testable without stdin or a
+/// live server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArchivePlan {
+    /// The id wasn't recalled this session (or an empty reason) — refuse
+    /// outright; never reaches the server (anti-hallucination guard).
+    Refused(String),
+    /// Headless (no TTY to confirm) — deny, consistent with the above-ceiling
+    /// headless rule; never reaches the server.
+    Denied(String),
+    /// REPL — ask the user to confirm (showing this note's REAL content) before
+    /// the server call. Carries the cached note so the confirm can't be spoofed
+    /// by the model's arguments.
+    Confirm(CachedNote),
+}
+
+/// Decide what to do with an `archive(id)` request from cache + gate alone —
+/// **no I/O**. The permission ceiling is deliberately ignored: `archive` is
+/// **confirm-always** in the REPL (even under `--allow-shell`) and denied
+/// headless. The id must be in the session recall cache, binding `archive` to
+/// notes the agent actually recalled (so a hallucinated id is refused, and no
+/// per-id server lookup is needed).
+fn plan_archive(gate: Gate, cache: &HashMap<i64, CachedNote>, id: i64) -> ArchivePlan {
+    let Some(note) = cache.get(&id) else {
+        return ArchivePlan::Refused(format!(
+            "id {id} was not recalled this session — recall it first."
+        ));
+    };
+    match gate.mode {
+        // No TTY headless → can't confirm → deny (never auto-archive a note).
+        Permission::Headless => ArchivePlan::Denied(format!(
+            "archive needs an interactive confirmation (none headless); id {id} not archived."
+        )),
+        // REPL → confirm-always, regardless of the ceiling.
+        Permission::Interactive => ArchivePlan::Confirm(note.clone()),
+    }
+}
+
+/// Render the archive confirmation shown to the user. Uses the cached note's
+/// **real** `name`/`text` (never the model's free-text claim) so a wrong id
+/// paired with a plausible invented description is caught by eye. Ends with the
+/// `[y/N]` prompt (no trailing newline) so the answer lands on the same line.
+fn render_archive_confirm(id: i64, note: &CachedNote, reason: &str) -> String {
+    let label = if !note.name.trim().is_empty() {
+        note.name.trim()
+    } else if !note.kind.trim().is_empty() {
+        note.kind.trim()
+    } else {
+        "note"
+    };
+    format!(
+        "[agent] ⚠ ARCHIVE note {id} — \"{label}\": {}\n        reason: {}\n        Drops it from \
+         future recall but keeps it as an archived record (no hard delete) — reversible: the user \
+         can restore it with `/unarchive {id}`.\n[agent] archive note {id}? [y/N] ",
+        short(&note.text),
+        reason.trim(),
+    )
+}
+
+/// `archive` agent tool (Stufe B-3 curation) — drop a recalled note from future
+/// recall, kept as an archived record. On the memory axis (before the file/shell
+/// gate) but **confirm-always**: REPL asks y/N (even under `--allow-shell`),
+/// headless denies. Bound to ids recalled this session via `cache`. `confirm`
+/// reads the y/N answer (injected for tests); the warning itself is rendered
+/// here to stderr so stdout stays byte-clean.
+async fn execute_archive(
+    client: &Client,
+    project: Option<&str>,
+    gate: Gate,
+    cache: &RecallCache,
+    args: &str,
+    mut confirm: impl FnMut() -> bool,
+) -> String {
+    #[derive(Deserialize)]
+    struct ArchiveArgs {
+        id: i64,
+        #[serde(default)]
+        reason: String,
+    }
+    let parsed: ArchiveArgs = match serde_json::from_str(args) {
+        Ok(a) => a,
+        Err(e) => return format!("Tool error: invalid archive arguments: {e}"),
+    };
+    if parsed.reason.trim().is_empty() {
+        return "Tool error: archive requires a non-empty reason.".to_string();
+    }
+    // Pure decision from cache + gate (scoped borrow, dropped before any await).
+    let plan = plan_archive(gate, &cache.borrow(), parsed.id);
+    let note = match plan {
+        ArchivePlan::Refused(why) => {
+            eprintln!("[agent] archive refused: {why}");
+            return format!("Cannot archive: {why}");
+        }
+        ArchivePlan::Denied(why) => {
+            eprintln!("[agent] archive denied: {why}");
+            return format!("Archive not done: {why}");
+        }
+        ArchivePlan::Confirm(note) => note,
+    };
+    // Show the REAL note + the agent's reason, then read y/N.
+    eprint!("{}", render_archive_confirm(parsed.id, &note, &parsed.reason));
+    let _ = std::io::stderr().flush();
+    if !confirm() {
+        eprintln!("[agent] archive declined — id {} not archived", parsed.id);
+        return format!(
+            "Archive of note {} was declined by the user; nothing was changed.",
+            parsed.id
+        );
+    }
+    match client.memory_archive(project, parsed.id).await {
+        Ok(MemCall::Ok(_)) => {
+            eprintln!("[agent] archived note {}", parsed.id);
+            format!(
+                "Archived note {} (dropped from recall; kept as an archived record).",
+                parsed.id
+            )
+        }
+        Ok(MemCall::Disabled) => {
+            eprintln!("[agent] archive: memory is not enabled on this server");
+            "Memory is not enabled on this server; nothing was archived.".to_string()
+        }
+        Err(e) => {
+            eprintln!("[agent] archive failed: {e}");
+            format!("Tool error: archive failed: {e}")
         }
     }
 }
@@ -987,15 +1183,20 @@ mod tests {
         let on = names(&agent_tools(true));
         assert!(on.iter().any(|n| n == RECALL), "memory on → recall offered");
         assert!(on.iter().any(|n| n == REMEMBER), "memory on → remember offered");
-        assert_eq!(on.len(), off.len() + 2, "exactly the two memory tools added");
+        assert!(on.iter().any(|n| n == ARCHIVE), "memory on → archive offered (B-3)");
+        // forget/delete is NOT an agent tool — hard delete stays user-only.
+        assert!(!on.iter().any(|n| n == "forget" || n == "delete"), "no delete tool: {on:?}");
+        assert_eq!(on.len(), off.len() + 3, "exactly the three memory tools added");
     }
 
     #[test]
-    fn is_memory_tool_recognizes_recall_and_remember() {
+    fn is_memory_tool_recognizes_recall_remember_archive() {
         assert!(is_memory_tool(RECALL));
         assert!(is_memory_tool(REMEMBER));
+        assert!(is_memory_tool(ARCHIVE));
         assert!(!is_memory_tool(READ_FILE));
         assert!(!is_memory_tool(SHELL));
+        assert!(!is_memory_tool("forget"));
         assert!(!is_memory_tool("delete_everything"));
     }
 
@@ -1082,10 +1283,36 @@ mod tests {
         assert!(s.contains("recall") && s.contains("remember"));
         assert!(s.contains("reads MEMORY") && s.contains("reads workspace FILES"), "recall-vs-search (#1): {s}");
         assert!(s.contains("cite its exact id"), "id rule (#5): {s}");
+        // Curation boundary (#4): agent MAY archive a recalled note (confirmed);
+        // forget/delete stays user-only and it must not invent a delete.
         assert!(
-            s.contains("/forget") && s.contains("user-only") && s.contains("not invent"),
-            "curation user-only (#4): {s}"
+            s.contains("`archive`") && s.contains("recalled THIS session"),
+            "archive is offered: {s}"
         );
+        assert!(
+            s.contains("`forget`") && s.contains("user-only") && s.contains("not invent"),
+            "forget user-only / no invented delete (#4): {s}"
+        );
+        assert!(s.contains("/forget"), "points at the user command: {s}");
+    }
+
+    #[test]
+    fn self_state_distinguishes_archive_from_forget() {
+        // The agent's two curation truths must be unambiguous: it CAN archive
+        // (with confirmation) but CANNOT delete (user-only).
+        let s = self_state_prompt(
+            Gate::interactive(Some(ToolRisk::ReadOnly)),
+            Some("proj"),
+            MemoryAwareness::On { scope_has_notes: false },
+        );
+        // archive: presented as an available, confirmed action.
+        assert!(s.contains("You can `archive`"), "archive presented as allowed: {s}");
+        // forget: explicitly user-only, no delete tool.
+        assert!(
+            s.contains("`forget` (permanent delete) is user-only"),
+            "forget marked user-only: {s}"
+        );
+        assert!(s.contains("no delete tool"), "states it has no delete tool: {s}");
     }
 
     #[test]
@@ -1148,5 +1375,171 @@ mod tests {
         // then finished normally.
         assert_eq!(iter, 2, "recall handled on the memory axis → roundtrip + final");
         assert_eq!(end, LoopEnd::Final { content: Some("done".into()), finish_reason: Some("stop".into()) });
+    }
+
+    // ---- archive (Stufe B-3 curation): confirm-always, grounded, honest ----
+
+    fn note(kind: &str, name: &str, text: &str) -> CachedNote {
+        CachedNote { kind: kind.into(), name: name.into(), text: text.into() }
+    }
+
+    fn cache_with(id: i64, n: CachedNote) -> RecallCache {
+        let c = RefCell::new(HashMap::new());
+        c.borrow_mut().insert(id, n);
+        c
+    }
+
+    #[test]
+    fn plan_archive_is_confirm_always_in_repl_even_under_allow_shell() {
+        let c = HashMap::from([(7, note("Decision", "MTP", "parked"))]);
+        // REPL, regardless of ceiling (None / --yes / --allow-shell) → Confirm.
+        for ceil in [None, Some(ToolRisk::ReadOnly), Some(ToolRisk::Exec)] {
+            assert_eq!(
+                plan_archive(Gate::interactive(ceil), &c, 7),
+                ArchivePlan::Confirm(note("Decision", "MTP", "parked")),
+                "REPL archive must confirm-always (ceiling {ceil:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_archive_headless_denies_even_under_allow_shell() {
+        let c = HashMap::from([(7, note("Decision", "MTP", "parked"))]);
+        for ceil in [None, Some(ToolRisk::Exec)] {
+            assert!(
+                matches!(plan_archive(Gate::headless(ceil), &c, 7), ArchivePlan::Denied(_)),
+                "headless archive must deny (ceiling {ceil:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_archive_refuses_id_not_recalled_this_session() {
+        let c = HashMap::new(); // nothing recalled
+        let plan = plan_archive(Gate::interactive(Some(ToolRisk::Exec)), &c, 7);
+        match plan {
+            ArchivePlan::Refused(why) => assert!(why.contains("recall it first"), "{why}"),
+            other => panic!("ungrounded id must be Refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_archive_confirm_shows_real_content_not_agent_claim() {
+        let n = note("Decision", "MTP", "MTP parked because MoE was net-negative");
+        // The model's reason DIVERGES from the note's real text on purpose.
+        let out = render_archive_confirm(7, &n, "the user said this note is about coffee");
+        assert!(out.contains("ARCHIVE note 7"), "{out}");
+        assert!(out.contains("\"MTP\""), "shows the real label: {out}");
+        assert!(out.contains("MTP parked because MoE was net-negative"), "shows the REAL text: {out}");
+        // the agent's claim appears only as a labeled 'reason:', never as the
+        // note's content — so a wrong id + invented description is caught by eye.
+        assert!(out.contains("reason: the user said this note is about coffee"), "{out}");
+        // Honest, now-reversible wording: kept as a record + restorable via /unarchive.
+        assert!(out.contains("no hard delete") && out.contains("/unarchive 7"), "reversible wording: {out}");
+        assert!(out.trim_end().ends_with("[y/N]"), "ends with the prompt: {out}");
+    }
+
+    fn dead_client() -> Client {
+        // port 0 never connects — any actual server call returns Err, so a
+        // result that is NOT an error proves the server was never called.
+        Client::new("http://localhost:0", "m")
+    }
+
+    #[tokio::test]
+    async fn execute_archive_confirm_always_declines_under_exec_ceiling_no_server_call() {
+        // REPL with --allow-shell (Exec ceiling): archive must STILL ask (not
+        // auto-run). The injected confirm says No → declined, server untouched.
+        let c = cache_with(7, note("Decision", "MTP", "parked"));
+        let out = execute_archive(
+            &dead_client(),
+            Some("p"),
+            Gate::interactive(Some(ToolRisk::Exec)),
+            &c,
+            r#"{"id":7,"reason":"stale"}"#,
+            || false,
+        )
+        .await;
+        assert!(out.contains("declined"), "confirm-always then No → declined: {out}");
+        assert!(!out.contains("failed"), "server must not have been called: {out}");
+    }
+
+    #[tokio::test]
+    async fn execute_archive_declined_does_not_archive() {
+        let c = cache_with(7, note("Decision", "MTP", "parked"));
+        let out = execute_archive(
+            &dead_client(),
+            Some("p"),
+            Gate::interactive(None),
+            &c,
+            r#"{"id":7,"reason":"stale"}"#,
+            || false,
+        )
+        .await;
+        assert!(out.contains("declined") && out.contains("nothing was changed"), "{out}");
+        assert!(!out.contains("failed"), "no server call on decline: {out}");
+    }
+
+    #[tokio::test]
+    async fn execute_archive_refuses_ungrounded_id_without_server_call() {
+        let c: RecallCache = RefCell::new(HashMap::new()); // nothing recalled
+        // confirm says yes, but it must never get there — id isn't grounded.
+        let out = execute_archive(
+            &dead_client(),
+            Some("p"),
+            Gate::interactive(Some(ToolRisk::Exec)),
+            &c,
+            r#"{"id":7,"reason":"stale"}"#,
+            || true,
+        )
+        .await;
+        assert!(out.contains("recall it first"), "ungrounded id refused: {out}");
+        assert!(!out.contains("failed"), "no server call on refusal: {out}");
+    }
+
+    #[tokio::test]
+    async fn execute_archive_headless_denied_no_hang() {
+        let c = cache_with(7, note("Decision", "MTP", "parked"));
+        let out = execute_archive(
+            &dead_client(),
+            Some("p"),
+            Gate::headless(Some(ToolRisk::Exec)), // even --allow-shell headless
+            &c,
+            r#"{"id":7,"reason":"stale"}"#,
+            || true,
+        )
+        .await;
+        assert!(out.contains("not archived") && out.contains("interactive"), "{out}");
+        assert!(!out.contains("failed"), "no server call when denied: {out}");
+    }
+
+    #[tokio::test]
+    async fn execute_archive_requires_a_reason() {
+        let c = cache_with(7, note("Decision", "MTP", "parked"));
+        let out = execute_archive(
+            &dead_client(),
+            Some("p"),
+            Gate::interactive(Some(ToolRisk::Exec)),
+            &c,
+            r#"{"id":7,"reason":"  "}"#,
+            || true,
+        )
+        .await;
+        assert!(out.contains("non-empty reason"), "empty reason rejected: {out}");
+    }
+
+    #[tokio::test]
+    async fn recall_caches_ids_for_later_archive_grounding() {
+        // Stand-in proof that the recall→cache→archive binding is wired: after a
+        // recall populates the cache, plan_archive accepts that id (and only it).
+        let c: RecallCache = RefCell::new(HashMap::new());
+        c.borrow_mut().insert(5, note("Bug", "x", "y")); // emulate a recall write
+        assert!(matches!(
+            plan_archive(Gate::interactive(None), &c.borrow(), 5),
+            ArchivePlan::Confirm(_)
+        ));
+        assert!(matches!(
+            plan_archive(Gate::interactive(None), &c.borrow(), 6),
+            ArchivePlan::Refused(_)
+        ));
     }
 }

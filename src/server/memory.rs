@@ -75,6 +75,38 @@ pub struct RememberOutcome {
     pub deduped: bool,
 }
 
+/// Error from an id-targeting curation op (`archive`/`unarchive`/`delete`).
+/// Lets the handler map a **client** error (the id doesn't exist → 404 Not
+/// Found) apart from a real **server** fault (lock/DB/IO/embedder → 500)
+/// WITHOUT fragile string-matching on the message. Other store methods keep a
+/// flat `String` error (always a 500); only the curation ops need this split.
+#[derive(Debug)]
+pub enum CurateError {
+    /// No note with this id in the (optional) scope — a client error (404).
+    NotFound(i64),
+    /// Any other failure (lock poisoned, DB/IO, embedder, index op) — 500.
+    Internal(String),
+}
+
+impl std::fmt::Display for CurateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CurateError::NotFound(id) => write!(f, "memory: note {id} not found"),
+            CurateError::Internal(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Any `String` store error folds into `Internal`, so `?` keeps working inside
+/// the curation methods (their helpers — `reindex_without`, `embed`,
+/// `ensure_index`, `update_entity` — all return `Result<_, String>`). Only an
+/// explicit `CurateError::NotFound(id)` becomes a 404.
+impl From<String> for CurateError {
+    fn from(e: String) -> Self {
+        CurateError::Internal(e)
+    }
+}
+
 /// The embedded memory store: one shared `sg.db` (nodes + edges + per-project
 /// HNSW indexes) plus the Nomic embedder, both owned by the API process.
 pub struct MemoryStore {
@@ -497,13 +529,13 @@ impl MemoryStore {
     /// Archive a note: remove its vector from the project index (so it no longer
     /// surfaces in recall) but **keep the node** in the graph with
     /// `status="archived"` — a record. The node + text remain, so this is
-    /// reversible by design (unarchive is a later slice).
-    pub fn archive(&self, project_key: Option<&str>, id: i64) -> Result<(), String> {
+    /// reversible: see [`unarchive`](Self::unarchive).
+    pub fn archive(&self, project_key: Option<&str>, id: i64) -> Result<(), CurateError> {
         let key = Self::scope(project_key);
-        let graph = self.graph.lock().map_err(|_| "memory: graph lock poisoned")?;
+        let graph = self.graph.lock().map_err(|_| "memory: graph lock poisoned".to_string())?;
         let mut node = graph
             .get_entity(id)
-            .map_err(|_| format!("memory: archive: note {id} not found"))?;
+            .map_err(|_| CurateError::NotFound(id))?;
         // 1) out of recall: rebuild the index without this node's vector.
         Self::reindex_without(&graph, &key, id)?;
         // 2) mark the node archived (record stays in the graph).
@@ -521,19 +553,98 @@ impl MemoryStore {
     /// cascade via `delete_entity`) from the graph — gone from recall and the
     /// record. The delete is hard (`DELETE FROM`, no bloat); verify reductions
     /// with [`raw_vector_count`], never `statistics().vector_count`.
-    pub fn delete(&self, project_key: Option<&str>, id: i64) -> Result<(), String> {
+    pub fn delete(&self, project_key: Option<&str>, id: i64) -> Result<(), CurateError> {
         let key = Self::scope(project_key);
-        let graph = self.graph.lock().map_err(|_| "memory: graph lock poisoned")?;
+        let graph = self.graph.lock().map_err(|_| "memory: graph lock poisoned".to_string())?;
         // Clear error if the note doesn't exist, before doing rebuild work.
         graph
             .get_entity(id)
-            .map_err(|_| format!("memory: delete: note {id} not found"))?;
+            .map_err(|_| CurateError::NotFound(id))?;
         // Gone from recall: rebuild the index without this node's vector.
         Self::reindex_without(&graph, &key, id)?;
         // Gone from the graph too (its edges cascade via delete_entity).
         graph
             .delete_entity(id)
             .map_err(|e| format!("memory: delete node {id}: {e}"))?;
+        Ok(())
+    }
+
+    /// Un-archive a note: the exact inverse of [`archive`](Self::archive) —
+    /// flip `status` `archived → active` and re-insert its vector into the
+    /// project index so it surfaces in recall again.
+    ///
+    /// **Why re-embed (not re-insert a kept vector):** `archive` drops the
+    /// vector from the store (`reindex_without` excludes it and the recreated
+    /// index no longer holds it — `raw_vector_count` → 0), so the embedding is
+    /// **not** preserved. The node + its `text` are. The embedder is
+    /// deterministic (greedy INT8 ONNX), so re-embedding `search_document:
+    /// {text}` reproduces the original vector; we re-insert it through the same
+    /// path as [`remember`](Self::remember), with the **node_id link intact**
+    /// (the node was never deleted), so recall recovers the right note.
+    ///
+    /// **Idempotent:** an already-active note (or one never archived) is a
+    /// no-op — it does NOT re-insert (that would leave a duplicate vector for
+    /// one node). A missing note is a clean error, never a panic.
+    pub fn unarchive(&self, project_key: Option<&str>, id: i64) -> Result<(), CurateError> {
+        let key = Self::scope(project_key);
+
+        // 1) Read the note's text + status under the graph lock, then release it
+        //    BEFORE embedding (the embedder lock is never held with the graph
+        //    lock — same discipline as remember). Idempotent no-op if not
+        //    archived (so we never add a second vector for one node).
+        let text = {
+            let graph = self.graph.lock().map_err(|_| "memory: graph lock poisoned".to_string())?;
+            let node = graph
+                .get_entity(id)
+                .map_err(|_| CurateError::NotFound(id))?;
+            let status = node.data.get("status").and_then(|v| v.as_str()).unwrap_or("active");
+            if status != "archived" {
+                return Ok(()); // already active / never archived → no-op
+            }
+            node.data.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string()
+        };
+        if text.trim().is_empty() {
+            return Err(CurateError::Internal(format!(
+                "memory: unarchive: note {id} has no text to restore"
+            )));
+        }
+
+        // 2) Re-embed the stored text (archive dropped the vector). Same prefix
+        //    as remember → the deterministic embedder reproduces the vector.
+        let emb = self.embed(format!("search_document: {text}"))?;
+        if emb.len() != EMBED_DIM {
+            return Err(CurateError::Internal(format!(
+                "memory: embedder returned {} dims, expected {EMBED_DIM}",
+                emb.len()
+            )));
+        }
+
+        // 3) Re-insert the vector (node_id link intact) + flip status to active.
+        let graph = self.graph.lock().map_err(|_| "memory: graph lock poisoned".to_string())?;
+        // Re-check under the lock (guards a racing unarchive): still archived?
+        let mut node = graph
+            .get_entity(id)
+            .map_err(|_| CurateError::NotFound(id))?;
+        let status = node.data.get("status").and_then(|v| v.as_str()).unwrap_or("active");
+        if status != "archived" {
+            return Ok(()); // another writer restored it meanwhile → no-op
+        }
+        Self::ensure_index(&graph, &key)?;
+        graph
+            .get_hnsw_index_mut(&key, |idx| {
+                let _vid = idx.insert_vector(&emb, Some(json!({ "node_id": id })))?;
+                idx.persist_topology()
+            })
+            .map_err(|e| format!("memory: index op {key}: {e}"))?
+            .map_err(|e| format!("memory: vector add/persist {key}: {e}"))?;
+        if let Value::Object(map) = &mut node.data {
+            map.insert("status".to_string(), json!("active"));
+            map.insert("unarchived_at".to_string(), json!(now_iso()));
+            map.remove("archived_at");
+        }
+        graph
+            .update_entity(&node)
+            .map_err(|e| format!("memory: unarchive update {id}: {e}"))?;
         Ok(())
     }
 

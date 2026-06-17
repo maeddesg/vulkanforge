@@ -31,11 +31,14 @@ pub const READ_FILE: &str = "read_file";
 pub const WRITE_FILE: &str = "write_file";
 pub const SEARCH: &str = "search";
 pub const SHELL: &str = "shell";
-/// Memory tools (Stufe B-2). Dispatched on their own axis (async, via the
+/// Memory tools (Stufe B-2/B-3). Dispatched on their own axis (async, via the
 /// HTTP memory client), **before** the file/shell permission gate — they
 /// never touch files or the shell, so they are visible but not ceiling-gated.
+/// `recall`/`remember` run unconfirmed; `archive` (B-3 curation) is gated
+/// **confirm-always** on that same axis (the user approves each archive).
 pub const RECALL: &str = "recall";
 pub const REMEMBER: &str = "remember";
+pub const ARCHIVE: &str = "archive";
 
 /// Cap on returned file / shell content (256 KB). Larger output is
 /// truncated with a clear marker rather than flooding the context / OOM.
@@ -121,11 +124,15 @@ pub fn shell_tool() -> Tool {
 }
 
 // -----------------------------------------------------------------
-// Memory tools (Stufe B-2) — definitions only. They are NOT executed here
-// (execution is async, via the HTTP memory client in `agent.rs`) and are NOT
-// gated by the file/shell ceiling (a separate axis — see `agent::dispatch_memory`).
-// The `risk` field is a required placeholder (`ReadOnly`); it is never read,
-// because memory calls are intercepted before the permission gate.
+// Memory tools — definitions only. They are NOT executed here (execution is
+// async, via the HTTP memory client in `agent.rs`) and are NOT gated by the
+// file/shell ceiling (a separate axis — see `agent::dispatch_memory`):
+// `recall`/`remember` run unconfirmed; `archive` (Stufe B-3 curation) is gated
+// **confirm-always** on that same axis — the user approves each archive,
+// seeing the note's real content, and the ceiling never lifts it. The `risk`
+// field is a required placeholder (`ReadOnly`) and is never read, because
+// memory calls are intercepted before the permission gate. `forget`
+// (permanent delete) is deliberately NOT an agent tool — it stays user-only.
 
 pub fn recall_tool() -> Tool {
     Tool::function(
@@ -163,10 +170,34 @@ pub fn remember_tool() -> Tool {
     )
 }
 
-/// The two memory tool definitions, added to the agent's tool set **only**
-/// when the server reports memory enabled (the startup probe in `agent::run`).
+pub fn archive_tool() -> Tool {
+    Tool::function(
+        ARCHIVE,
+        "Archive a project-memory note you recalled THIS session: it drops out of future \
+         recall but is kept as an archived record (NOT a hard delete). Pass the note's exact \
+         `id` (from a `recall` result this session) and a short `reason`. The user is asked to \
+         confirm — seeing the note's real content — before anything happens, so only archive a \
+         note you actually recalled. You cannot permanently delete a note; that is user-only.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "integer", "description": "The note id to archive (from a recall result this session)" },
+                "reason": { "type": "string", "description": "Why this note should be archived (e.g. stale, superseded)" }
+            },
+            "required": ["id", "reason"]
+        }),
+        // Placeholder — never read. `archive` is gated confirm-always on the
+        // memory axis (see `agent::execute_archive`), not by the ceiling.
+        ToolRisk::ReadOnly,
+    )
+}
+
+/// The memory tool definitions (`recall`, `remember`, `archive`), added to the
+/// agent's tool set **only** when the server reports memory enabled (the
+/// startup probe in `agent::run`). `forget` is intentionally absent — a hard,
+/// irreversible delete stays a user-only REPL command.
 pub fn memory_tools() -> Vec<Tool> {
-    vec![recall_tool(), remember_tool()]
+    vec![recall_tool(), remember_tool(), archive_tool()]
 }
 
 // -----------------------------------------------------------------
@@ -581,6 +612,34 @@ mod tests {
         assert_eq!(write_file_tool().risk, ToolRisk::Mutating);
         assert_eq!(shell_tool().risk, ToolRisk::Exec); // own top tier (Slice 3)
         assert_eq!(all_tools().len(), 4);
+    }
+
+    #[test]
+    fn memory_tools_are_recall_remember_archive_no_forget() {
+        // B-3 curation: `archive` is an agent tool; `forget`/`delete` are NOT
+        // (hard delete stays user-only).
+        let names: Vec<String> = memory_tools().iter().map(|t| t.function.name.clone()).collect();
+        assert_eq!(names, vec![RECALL, REMEMBER, ARCHIVE]);
+        // No delete and no unarchive tool — both are user-only REPL recovery.
+        assert!(
+            !names.iter().any(|n| n == "forget" || n == "delete" || n == "unarchive"),
+            "no delete/unarchive tool: {names:?}"
+        );
+    }
+
+    #[test]
+    fn archive_tool_schema_requires_id_and_reason() {
+        let t = archive_tool();
+        assert_eq!(t.function.name, ARCHIVE);
+        let req = &t.function.parameters["required"];
+        assert!(req.as_array().unwrap().iter().any(|x| x == "id"), "id required");
+        assert!(req.as_array().unwrap().iter().any(|x| x == "reason"), "reason required");
+        // The description tells the model it must have recalled the note + that
+        // delete is user-only (so it doesn't try to hard-delete).
+        let d = t.function.description.to_lowercase();
+        assert!(d.contains("recall"), "must reference recall: {d}");
+        assert!(d.contains("archive") && d.contains("not") && d.contains("delete"),
+            "must distinguish archive from delete: {d}");
     }
 
     #[test]

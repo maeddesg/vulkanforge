@@ -258,6 +258,15 @@ pub struct DeleteResponse {
     pub deleted: bool,
 }
 
+/// `POST /memory/unarchive` response (the inverse of archive; `status` is back
+/// to `active`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct UnarchiveResponse {
+    pub id: i64,
+    #[serde(default)]
+    pub status: String,
+}
+
 /// `GET /memory/projects` response.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProjectsResponse {

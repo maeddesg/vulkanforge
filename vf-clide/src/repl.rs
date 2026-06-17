@@ -38,6 +38,9 @@ pub enum Command {
     Remember(String),
     /// `/archive <id>` — drop a note from recall (kept as an archived record).
     Archive(i64),
+    /// `/unarchive <id>` — restore an archived note to recall (inverse of
+    /// `/archive`). User-driven recovery; the agent has no such tool.
+    Unarchive(i64),
     /// `/forget <id>` — hard-delete a note from recall AND the graph.
     Forget(i64),
     /// A `/`-line that isn't a known command (or a malformed one). The
@@ -81,6 +84,10 @@ pub fn parse_command(line: &str) -> Option<Command> {
         "/archive" => match arg.and_then(|a| a.parse::<i64>().ok()) {
             Some(id) => Command::Archive(id),
             None => Command::Unknown("usage: /archive <id>  (id from /recall)".into()),
+        },
+        "/unarchive" => match arg.and_then(|a| a.parse::<i64>().ok()) {
+            Some(id) => Command::Unarchive(id),
+            None => Command::Unknown("usage: /unarchive <id>  (id from /recall)".into()),
         },
         "/forget" => match arg.and_then(|a| a.parse::<i64>().ok()) {
             Some(id) => Command::Forget(id),
@@ -260,6 +267,16 @@ impl Repl {
         }
     }
 
+    /// `/unarchive <id>`: restore an archived note to active + recall (inverse
+    /// of `/archive`).
+    async fn unarchive(&self, id: i64) {
+        match self.client.memory_unarchive(self.project.as_deref(), id).await {
+            Ok(MemCall::Ok(_)) => println!("(unarchived id {id} — restored to recall)"),
+            Ok(MemCall::Disabled) => println!("({MEMORY_OFF_HINT})"),
+            Err(e) => eprintln!("error: {e}"),
+        }
+    }
+
     /// `/forget <id>`: hard-delete a note from recall and the graph.
     async fn forget(&self, id: i64) {
         match self.client.memory_delete(self.project.as_deref(), id).await {
@@ -280,7 +297,8 @@ impl Repl {
         );
         println!(
             "commands: /quit /clear /model <name> /max-tokens <N> /think /no-think · \
-             memory: /project [key] /recall <query> /remember <text> /archive <id> /forget <id>",
+             memory: /project [key] /recall <query> /remember <text> /archive <id> \
+             /unarchive <id> /forget <id>",
         );
         // Pinned status line — only when stdout is a TTY (no-op otherwise).
         let bar = StatusBar::new(std::io::stdout().is_terminal());
@@ -328,6 +346,7 @@ impl Repl {
                     Command::Recall(query) => self.recall(&query).await,
                     Command::Remember(text) => self.remember(&text).await,
                     Command::Archive(id) => self.archive(id).await,
+                    Command::Unarchive(id) => self.unarchive(id).await,
                     Command::Forget(id) => self.forget(id).await,
                     Command::Unknown(hint) => println!("({hint})"),
                 }
@@ -545,11 +564,14 @@ mod tests {
     }
 
     #[test]
-    fn archive_and_forget_parse_numeric_id() {
+    fn archive_unarchive_and_forget_parse_numeric_id() {
         assert_eq!(parse_command("/archive 7"), Some(Command::Archive(7)));
+        assert_eq!(parse_command("/unarchive 7"), Some(Command::Unarchive(7)));
         assert_eq!(parse_command("/forget 42"), Some(Command::Forget(42)));
         // missing or non-numeric id → usage hint, not a crash.
         assert!(matches!(parse_command("/archive"), Some(Command::Unknown(_))));
+        assert!(matches!(parse_command("/unarchive"), Some(Command::Unknown(_))));
+        assert!(matches!(parse_command("/unarchive xy"), Some(Command::Unknown(_))));
         assert!(matches!(parse_command("/forget abc"), Some(Command::Unknown(_))));
     }
 

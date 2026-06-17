@@ -12,7 +12,7 @@ use serde::de::DeserializeOwned;
 use crate::types::{
     ArchiveResponse, ChatChunk, ChatMessage, ChatRequest, ChatResponse, CurateRequest,
     DeleteResponse, ProjectsResponse, RecallRequest, RecallResponse, RememberRequest,
-    RememberResponse, StreamOptions, Tool, ToolCall, Usage,
+    RememberResponse, StreamOptions, Tool, ToolCall, UnarchiveResponse, Usage,
 };
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -272,6 +272,17 @@ impl Client {
     ) -> Result<MemCall<DeleteResponse>> {
         let body = CurateRequest { project_key: project_key.map(str::to_string), id };
         self.memory_post("delete", &body).await
+    }
+
+    /// `POST /memory/unarchive` — restore an archived note to active + recall
+    /// (the inverse of `memory_archive`; user-driven recovery).
+    pub async fn memory_unarchive(
+        &self,
+        project_key: Option<&str>,
+        id: i64,
+    ) -> Result<MemCall<UnarchiveResponse>> {
+        let body = CurateRequest { project_key: project_key.map(str::to_string), id };
+        self.memory_post("unarchive", &body).await
     }
 
     async fn memory_post<B: Serialize, T: DeserializeOwned>(
