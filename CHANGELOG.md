@@ -1,5 +1,48 @@
 # Changelog
 
+## v1.0.4 — KV prefix-reuse on by default, recall diagnostics, note typing, and memory edges (2026-06-18)
+
+**The memory subsystem gains a connection layer (typed edges + a why-graph) and recall gains diagnostics, an
+opt-in relevance threshold, and note types — while a default-on KV prefix-reuse removes a redundant prefill on
+memory-augmented turns.** Recall stays byte-identical when no edges exist and no opt-ins are active.
+
+- **Changed — KV prefix-reuse is now ON by default** (`VF_KV_PREFIX_REUSE=0` to force the old stateless path back).
+  A memory-augmented turn makes two requests (recall tool-call, then the answer) that share a long prompt prefix;
+  the prior path re-prefilled that prefix on the second request. Reuse keeps the resident KV `[0..lcp)` and prefills
+  only the suffix. The reused-KV path is **logit byte-identical** to a fresh prefill — proven by a standing gate
+  (`tests/kv_reuse_ident.rs`: clean-prefix, divergent-prefix/no-stale-leak, and an over-reuse "teeth" case), on both
+  the F16 and FP8-KV paths. **Measured (Qwen3-8B, warm steady-state median):** the redundant within-turn prefill —
+  ~460 ms of re-prefilling the shared ~1.5k-token prefix — is eliminated (drops to ~80 ms for the genuinely-new
+  suffix). On an isolated GPU with no competing load.
+- **Added — `recall --explain` (retrieval diagnostics).** A user-only diagnostic view: the returned hits, the
+  near-miss candidates that fell just outside, the cut reason per near-miss (`superseded` / `type` / `threshold` /
+  `top-k`), the cutoff values, and the score separation. Default recall is unchanged (the explain block is opt-in).
+- **Added — opt-in relevance threshold (`VF_RECALL_MARGIN`, off by default).** When set, recall keeps only notes
+  scoring within a margin of the top hit (adaptive, relative-to-top — the cosine scale isn't calibrated across
+  queries). Unset → pure top-k, byte-identical to before. The default is mg's to flip; shipped off.
+- **Added — note typing (`invariant` / `working` / `episodic` / `decision` / `failure`, default `untyped`).**
+  `--type` on `/remember`, `/retype <id> <type>`, and a `--type` filter on recall. The type is an explicit,
+  user-set, non-embedding signal — it disambiguates reliably where similarity can't (adjacent-domain notes share a
+  score band but differ in type). Old notes default to `untyped` (no backfill). The agent does not set types; the
+  user curates them.
+- **Added — `SUPERSEDES` edges (versioning).** `/supersede <new> <old>` (and `/unsupersede` to release) marks a note
+  stale; superseded notes are suppressed from default recall, chains resolve to the un-superseded head, and recall
+  **backfills to `k`** so suppression doesn't silently shrink the result. `--include-superseded` shows them — they
+  are suppressed, never deleted.
+- **Added — `DERIVES_FROM` edges + `/why` (the why-graph).** `/derive <A> from <B> [<C> …]` (and `/underive`) records
+  that a note is anchored in its evidence; `/why <id>` walks those links backward into a justification tree
+  (cycle-guarded, depth-capped). `DERIVES_FROM` **never changes recall results** — it is additive awareness, surfaced
+  in `--explain` and `/why` only. Default recall is byte-identical even with `DERIVES_FROM` edges present.
+
+**Validation.** `cargo build --features memory` **0 rustc warnings**; lib **306** (lean) / **308** (`--features
+memory`); `tests/memory.rs` **24/24** (real embedder); `vf-clide` **111/111**; `cargo tree` still carries no
+SQLiteGraph/fastembed/ort in the lean build or the client. `cargo test --release --no-run` clean (both crates).
+Edges use the native SQLiteGraph edge API (`oldnordic` @ `d8219a8`, unchanged pin) — mutations through the API
+(cache-consistent), reads index-backed (`idx_edges_from/to/type`).
+
+**Versions.** Engine `1.0.3 → 1.0.4`; `vf-clide` `0.3.2 → 0.3.3` (gains the recall/typing/edge REPL commands). Lean
+default builds on Rust 1.85+; `--features memory` needs Rust 1.89+.
+
 ## v1.0.3 — agent-side curation, un-archive, and a 404 for missing notes (2026-06-17)
 
 **The agent can now curate memory safely, archives are reversible, and the curation API speaks the right HTTP

@@ -14,7 +14,7 @@ use rustyline::DefaultEditor;
 use crate::client::{empty_notice, truncation_notice, Client, MemCall, Result};
 use crate::memory::Memory;
 use crate::status::StatusBar;
-use crate::types::{strip_think, ChatMessage, ToolRisk};
+use crate::types::{strip_think, ChatMessage, RecallResponse, ToolRisk};
 
 /// Parsed REPL command. `None` from [`parse_command`] means "not a
 /// command — treat the line as a chat prompt".
@@ -31,11 +31,30 @@ pub enum Command {
     /// `/project` (no arg → show current scope + list known projects) or
     /// `/project <key>` (switch the session's memory scope).
     Project(Option<String>),
-    /// `/recall <query>` — manual semantic recall against the current
-    /// project's memory; displays hits (no auto-inject — that is B-2).
-    Recall(String),
-    /// `/remember <text>` — store a manual note (`kind:"Note"`).
-    Remember(String),
+    /// `/recall <query> [--explain] [--type <T>] [--include-superseded]` —
+    /// manual semantic recall against the current project's memory; displays
+    /// hits (no auto-inject — that is B-2). `--explain` adds the diagnostics
+    /// view; `--type <T>` filters to one layer type; `--include-superseded`
+    /// surfaces stale (superseded) notes that are otherwise suppressed.
+    Recall { query: String, explain: bool, note_type: Option<String>, include_superseded: bool },
+    /// `/remember [--type <T>] <text>` — store a manual note (`kind:"Note"`).
+    /// `--type` sets the layer type (else untyped).
+    Remember { text: String, note_type: Option<String> },
+    /// `/retype <id> <T>` — set an existing note's layer type (user curation).
+    Retype { id: i64, note_type: String },
+    /// `/supersede <new_id> <old_id>` — record that `new_id` replaces `old_id`
+    /// (old becomes stale, suppressed from recall). User curation.
+    Supersede { new_id: i64, old_id: i64 },
+    /// `/unsupersede <new_id> <old_id>` — release a supersession (old returns
+    /// to recall). Inverse of `/supersede`.
+    Unsupersede { new_id: i64, old_id: i64 },
+    /// `/derive <A> from <B> [<C> …]` — record that A is anchored in B[,C…]
+    /// (Why-Graph). Never changes recall.
+    Derive { from_id: i64, to_ids: Vec<i64> },
+    /// `/underive <A> from <B>` — release a derivation. Inverse of `/derive`.
+    Underive { from_id: i64, to_id: i64 },
+    /// `/why <id>` — print the Why-Graph justification tree for a note.
+    Why { id: i64 },
     /// `/archive <id>` — drop a note from recall (kept as an archived record).
     Archive(i64),
     /// `/unarchive <id>` — restore an archived note to recall (inverse of
@@ -73,13 +92,65 @@ pub fn parse_command(line: &str) -> Option<Command> {
             _ => Command::Unknown("usage: /max-tokens <N>".into()),
         },
         "/project" => Command::Project(arg),
-        "/recall" => match arg {
-            Some(q) => Command::Recall(q),
-            None => Command::Unknown("usage: /recall <query>".into()),
-        },
+        "/recall" => {
+            let (query, explain, note_type, include_superseded) =
+                parse_recall_flags(arg.as_deref().unwrap_or(""));
+            if query.is_empty() {
+                Command::Unknown(
+                    "usage: /recall <query> [--explain] [--type <T>] [--include-superseded]".into(),
+                )
+            } else {
+                Command::Recall { query, explain, note_type, include_superseded }
+            }
+        }
         "/remember" => match arg {
-            Some(t) => Command::Remember(t),
-            None => Command::Unknown("usage: /remember <text>".into()),
+            // Optional leading `--type <T>`; the rest is the note text verbatim
+            // (text whitespace preserved — only a leading type flag is stripped).
+            Some(a) => match a.strip_prefix("--type ") {
+                Some(rest) => {
+                    let mut it = rest.splitn(2, char::is_whitespace);
+                    let t = it.next().unwrap_or("").trim().to_string();
+                    let text = it.next().map(|s| s.trim().to_string()).unwrap_or_default();
+                    if t.is_empty() || text.is_empty() {
+                        Command::Unknown("usage: /remember [--type <T>] <text>".into())
+                    } else {
+                        Command::Remember { text, note_type: Some(t) }
+                    }
+                }
+                None => Command::Remember { text: a, note_type: None },
+            },
+            None => Command::Unknown("usage: /remember [--type <T>] <text>".into()),
+        },
+        "/retype" => {
+            let parts: Vec<&str> = arg.as_deref().unwrap_or("").split_whitespace().collect();
+            match (parts.first().and_then(|s| s.parse::<i64>().ok()), parts.get(1)) {
+                (Some(id), Some(t)) => Command::Retype { id, note_type: (*t).to_string() },
+                _ => Command::Unknown("usage: /retype <id> <type>  (id from /recall)".into()),
+            }
+        }
+        "/supersede" => match two_ids(arg.as_deref()) {
+            Some((new_id, old_id)) => Command::Supersede { new_id, old_id },
+            None => Command::Unknown("usage: /supersede <new_id> <old_id>  (new replaces old)".into()),
+        },
+        "/unsupersede" => match two_ids(arg.as_deref()) {
+            Some((new_id, old_id)) => Command::Unsupersede { new_id, old_id },
+            None => Command::Unknown("usage: /unsupersede <new_id> <old_id>".into()),
+        },
+        "/derive" => match parse_derive(arg.as_deref()) {
+            Some((from_id, to_ids)) => Command::Derive { from_id, to_ids },
+            None => Command::Unknown("usage: /derive <id> from <id> [<id> …]  (A anchored in B…)".into()),
+        },
+        "/underive" => {
+            // `/underive <A> from <B>` (single link).
+            let toks: Vec<&str> = arg.as_deref().unwrap_or("").split_whitespace().collect();
+            match (toks.first().and_then(|s| s.parse::<i64>().ok()), toks.get(1), toks.get(2).and_then(|s| s.parse::<i64>().ok())) {
+                (Some(from_id), Some(&"from"), Some(to_id)) => Command::Underive { from_id, to_id },
+                _ => Command::Unknown("usage: /underive <id> from <id>".into()),
+            }
+        }
+        "/why" => match arg.as_deref().and_then(|a| a.trim().parse::<i64>().ok()) {
+            Some(id) => Command::Why { id },
+            None => Command::Unknown("usage: /why <id>  (id from /recall)".into()),
         },
         "/archive" => match arg.and_then(|a| a.parse::<i64>().ok()) {
             Some(id) => Command::Archive(id),
@@ -101,6 +172,91 @@ pub fn parse_command(line: &str) -> Option<Command> {
 /// (opt-in since v1.0.1), which is a normal state, not an error.
 const MEMORY_OFF_HINT: &str = "memory is not enabled on this server (start it with `serve --memory`)";
 
+/// Parse `/recall` flags out of the arg: `--explain` (bool), `--type <T>`
+/// (value), `--include-superseded` (bool). Returns `(query, explain, note_type,
+/// include_superseded)` with all flags removed from the query text. Query
+/// whitespace is collapsed (it's embedded — insensitive).
+fn parse_recall_flags(arg: &str) -> (String, bool, Option<String>, bool) {
+    let toks: Vec<&str> = arg.split_whitespace().collect();
+    let mut explain = false;
+    let mut note_type = None;
+    let mut include_superseded = false;
+    let mut rest: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        match toks[i] {
+            "--explain" => explain = true,
+            "--include-superseded" => include_superseded = true,
+            "--type" => {
+                note_type = toks.get(i + 1).map(|s| s.to_string());
+                i += 1; // also consume the value token
+            }
+            other => rest.push(other),
+        }
+        i += 1;
+    }
+    (rest.join(" "), explain, note_type, include_superseded)
+}
+
+/// Parse two whitespace-separated note ids (`<new_id> <old_id>`) for the
+/// supersede commands. `None` if either is missing or not an integer.
+fn two_ids(arg: Option<&str>) -> Option<(i64, i64)> {
+    let p: Vec<&str> = arg.unwrap_or("").split_whitespace().collect();
+    Some((p.first()?.parse().ok()?, p.get(1)?.parse().ok()?))
+}
+
+/// Parse `<A> from <B> [<C> …]` for the derive commands → `(A, [B, C, …])`.
+/// `None` if `A` isn't an int, the `from` keyword is missing, or no source ids.
+fn parse_derive(arg: Option<&str>) -> Option<(i64, Vec<i64>)> {
+    let toks: Vec<&str> = arg.unwrap_or("").split_whitespace().collect();
+    let from = toks.first()?.parse::<i64>().ok()?;
+    if *toks.get(1)? != "from" {
+        return None;
+    }
+    let tos: Vec<i64> = toks[2..].iter().filter_map(|s| s.parse().ok()).collect();
+    if tos.is_empty() {
+        return None;
+    }
+    Some((from, tos))
+}
+
+/// `" · derives from #3, #7"` for the `--explain` line, or `""` when the note
+/// has no `DERIVES_FROM` edges. Awareness only — recall is unchanged.
+fn derives_suffix(derives_from: &[i64]) -> String {
+    if derives_from.is_empty() {
+        String::new()
+    } else {
+        let ids: Vec<String> = derives_from.iter().map(|id| format!("#{id}")).collect();
+        format!("  · derives from {}", ids.join(", "))
+    }
+}
+
+/// Render a `/why` justification tree as an indented outline. Each line is a
+/// note (`#id [type] snippet`) with `(cycle)` / `(…depth cap)` markers.
+fn format_why(tree: &crate::types::WhyNode) -> String {
+    fn walk(out: &mut String, n: &crate::types::WhyNode, depth: usize) {
+        use std::fmt::Write;
+        let indent = "  ".repeat(depth);
+        let mark = if n.cycle {
+            "  (cycle — already shown)"
+        } else if n.truncated {
+            "  (… depth cap)"
+        } else {
+            ""
+        };
+        let _ = writeln!(out, "{indent}#{} [{}] {}{mark}", n.id, n.note_type, snippet(&n.text));
+        for child in &n.derives_from {
+            walk(out, child, depth + 1);
+        }
+    }
+    let mut out = String::new();
+    walk(&mut out, tree, 0);
+    if tree.derives_from.is_empty() && !tree.cycle && !tree.truncated {
+        out.push_str("  (no derivation recorded — nothing this note is anchored in)\n");
+    }
+    out
+}
+
 /// One-line preview of a recalled note: newlines flattened, capped at ~80
 /// chars with an ellipsis so long notes don't wrap the terminal.
 fn snippet(text: &str) -> String {
@@ -111,6 +267,77 @@ fn snippet(text: &str) -> String {
     } else {
         t
     }
+}
+
+/// Render the `recall --explain` retrieval-diagnostics view: the embedded
+/// query + explicit cutoff, the RETURNED hits (rank · score · id), the
+/// NEAR-MISS candidates that fell just outside the cutoff, and the score
+/// separation between them. Surfaces existing signal only — no new scoring.
+/// Pure (returns the block) so the format is unit-testable.
+fn format_explain(query: &str, resp: &RecallResponse) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let Some(ex) = resp.explain.as_ref() else {
+        // Server returned no explain block (e.g. a pre-explain server). Be
+        // honest rather than rendering an empty diagnostic.
+        let _ = writeln!(out, "recall \"{query}\": server did not return explain data (needs a newer engine)");
+        return out;
+    };
+    let threshold = match ex.threshold {
+        Some(t) => format!("{t:.3}"),
+        None => "none (pure top-k ranking)".to_string(),
+    };
+    let _ = writeln!(out, "recall \"{}\"  (query embedded · {}-dim)", query, ex.query_dim);
+    let _ = writeln!(out, "cutoff: top-k = {}   threshold: {}", ex.top_k, threshold);
+
+    let _ = writeln!(out, "RETURNED ({}):", resp.hits.len());
+    if resp.hits.is_empty() {
+        let _ = writeln!(out, "  (nothing — the index is empty for this scope)");
+    } else {
+        for (i, h) in resp.hits.iter().enumerate() {
+            let _ = writeln!(
+                out, "  {:>2}. [{} · {:.3}]  {}   (id {}){}",
+                i + 1, h.note_type, h.score, snippet(&h.text), h.id, derives_suffix(&h.derives_from),
+            );
+        }
+    }
+
+    if ex.near_miss.is_empty() {
+        let _ = writeln!(out, "NEAR-MISS: none (nothing fell outside the cut for this scope)");
+    } else {
+        let _ = writeln!(out, "NEAR-MISS ({}):", ex.near_miss.len());
+        for (i, nm) in ex.near_miss.iter().enumerate() {
+            let h = &nm.hit;
+            let rank = resp.hits.len() + i + 1;
+            // Label the gate that cut it: below the relevance threshold, or
+            // beyond the top-k cap. (Server sends "threshold" / "top-k".)
+            // Label the gate that cut it. For `superseded`, name the superseder.
+            let cut = match (nm.cut.as_str(), h.superseded_by) {
+                ("superseded", Some(by)) => format!("superseded by #{by}"),
+                ("", _) => "top-k".to_string(),
+                (other, _) => other.to_string(),
+            };
+            let _ = writeln!(
+                out, "  {:>2}. [{} · {:.3}]  {}   (id {}, cut: {}){}",
+                rank, h.note_type, h.score, snippet(&h.text), h.id, cut, derives_suffix(&h.derives_from),
+            );
+        }
+    }
+
+    match ex.separation {
+        Some(gap) => {
+            let verdict = if gap >= 0.05 {
+                "clean separation"
+            } else {
+                "tight — cutoff sits in a dense region"
+            };
+            let _ = writeln!(out, "separation: {gap:.3}  (last hit \u{2212} first near-miss) \u{2014} {verdict}");
+        }
+        None => {
+            let _ = writeln!(out, "separation: n/a (need both a returned hit and a near-miss)");
+        }
+    }
+    out
 }
 
 /// REPL state: a client, the memory seam, optional project name, and the
@@ -232,14 +459,25 @@ impl Repl {
         }
     }
 
-    /// `/recall <query>`: display the current project's matches (no auto-inject).
-    /// Shows the note `id` per hit so it can be targeted by `/archive`/`/forget`.
-    async fn recall(&self, query: &str) {
-        match self.client.memory_recall(self.project.as_deref(), query, 5).await {
-            Ok(MemCall::Ok(resp)) if resp.hits.is_empty() => println!("(no matches)"),
+    /// `/recall <query> [--explain] [--type <T>]`: display the current
+    /// project's matches (no auto-inject). Shows `id` + layer `type` per hit so
+    /// it can be targeted by `/archive`/`/forget`/`/retype`. `--explain` renders
+    /// the retrieval-diagnostics view; `--type <T>` filters to one layer type.
+    async fn recall(&self, query: &str, explain: bool, note_type: Option<&str>, include_superseded: bool) {
+        let call = self
+            .client
+            .memory_recall_opts(self.project.as_deref(), query, 5, explain, note_type, include_superseded)
+            .await;
+        match call {
             Ok(MemCall::Ok(resp)) => {
-                for h in resp.hits {
-                    println!("  #{} [{} · {:.2}] {}", h.id, h.kind, h.score, snippet(&h.text));
+                if explain {
+                    print!("{}", format_explain(query, &resp));
+                } else if resp.hits.is_empty() {
+                    println!("(no matches)");
+                } else {
+                    for h in &resp.hits {
+                        println!("  #{} [{} · {:.2}] {}", h.id, h.note_type, h.score, snippet(&h.text));
+                    }
                 }
             }
             Ok(MemCall::Disabled) => println!("({MEMORY_OFF_HINT})"),
@@ -247,12 +485,75 @@ impl Repl {
         }
     }
 
-    /// `/remember <text>`: store a manual note (`kind:"Note"`). Honest about a
-    /// dedup hit (says "already known" instead of "stored").
-    async fn remember(&self, text: &str) {
-        match self.client.memory_remember(self.project.as_deref(), "Note", text).await {
+    /// `/remember [--type <T>] <text>`: store a manual note (`kind:"Note"`),
+    /// optionally typed. Honest about a dedup hit ("already known").
+    async fn remember(&self, text: &str, note_type: Option<&str>) {
+        match self.client.memory_remember_typed(self.project.as_deref(), "Note", text, note_type).await {
             Ok(MemCall::Ok(resp)) if resp.deduped => println!("(already known, id {})", resp.id),
-            Ok(MemCall::Ok(resp)) => println!("(stored, id {})", resp.id),
+            Ok(MemCall::Ok(resp)) => match note_type {
+                Some(t) => println!("(stored, id {}, type {t})", resp.id),
+                None => println!("(stored, id {})", resp.id),
+            },
+            Ok(MemCall::Disabled) => println!("({MEMORY_OFF_HINT})"),
+            Err(e) => eprintln!("error: {e}"),
+        }
+    }
+
+    /// `/retype <id> <T>`: set a note's layer type (user curation, pure
+    /// metadata). Surfaces the server's typed errors (unknown type → 400,
+    /// missing id → 404) as the printed error.
+    async fn retype(&self, id: i64, note_type: &str) {
+        match self.client.memory_retype(self.project.as_deref(), id, note_type).await {
+            Ok(MemCall::Ok(resp)) => println!("(retyped id {} → {})", resp.id, resp.note_type),
+            Ok(MemCall::Disabled) => println!("({MEMORY_OFF_HINT})"),
+            Err(e) => eprintln!("error: {e}"),
+        }
+    }
+
+    /// `/supersede <new> <old>`: record that `new` replaces `old` — `old`
+    /// becomes stale and drops out of recall (reversible via `/unsupersede`).
+    async fn supersede(&self, new_id: i64, old_id: i64) {
+        match self.client.memory_supersede(self.project.as_deref(), new_id, old_id).await {
+            Ok(MemCall::Ok(_)) => println!("(superseded: #{old_id} replaced by #{new_id} — out of recall, recoverable)"),
+            Ok(MemCall::Disabled) => println!("({MEMORY_OFF_HINT})"),
+            Err(e) => eprintln!("error: {e}"),
+        }
+    }
+
+    /// `/unsupersede <new> <old>`: release the supersession — `old` returns to
+    /// recall (inverse of `/supersede`).
+    async fn unsupersede(&self, new_id: i64, old_id: i64) {
+        match self.client.memory_unsupersede(self.project.as_deref(), new_id, old_id).await {
+            Ok(MemCall::Ok(_)) => println!("(unsuperseded: #{old_id} restored to recall)"),
+            Ok(MemCall::Disabled) => println!("({MEMORY_OFF_HINT})"),
+            Err(e) => eprintln!("error: {e}"),
+        }
+    }
+
+    /// `/derive <A> from <B> [<C> …]`: record that A is anchored in B[,C…]
+    /// (Why-Graph). Never changes recall — additive awareness only.
+    async fn derive(&self, from_id: i64, to_ids: Vec<i64>) {
+        let label: Vec<String> = to_ids.iter().map(|id| format!("#{id}")).collect();
+        match self.client.memory_derive(self.project.as_deref(), from_id, to_ids).await {
+            Ok(MemCall::Ok(_)) => println!("(#{from_id} derives from {} — recorded, recall unchanged)", label.join(", ")),
+            Ok(MemCall::Disabled) => println!("({MEMORY_OFF_HINT})"),
+            Err(e) => eprintln!("error: {e}"),
+        }
+    }
+
+    /// `/underive <A> from <B>`: release a derivation (inverse of `/derive`).
+    async fn underive(&self, from_id: i64, to_id: i64) {
+        match self.client.memory_underive(self.project.as_deref(), from_id, to_id).await {
+            Ok(MemCall::Ok(_)) => println!("(released: #{from_id} no longer derives from #{to_id})"),
+            Ok(MemCall::Disabled) => println!("({MEMORY_OFF_HINT})"),
+            Err(e) => eprintln!("error: {e}"),
+        }
+    }
+
+    /// `/why <id>`: print the Why-Graph justification tree (read-only).
+    async fn why(&self, id: i64) {
+        match self.client.memory_why(self.project.as_deref(), id).await {
+            Ok(MemCall::Ok(tree)) => print!("{}", format_why(&tree)),
             Ok(MemCall::Disabled) => println!("({MEMORY_OFF_HINT})"),
             Err(e) => eprintln!("error: {e}"),
         }
@@ -297,8 +598,11 @@ impl Repl {
         );
         println!(
             "commands: /quit /clear /model <name> /max-tokens <N> /think /no-think · \
-             memory: /project [key] /recall <query> /remember <text> /archive <id> \
-             /unarchive <id> /forget <id>",
+             memory: /project [key] /recall <query> [--explain] [--type <T>] \
+             [--include-superseded] /remember [--type <T>] <text> /retype <id> <T> \
+             /supersede <new> <old> /unsupersede <new> <old> \
+             /derive <id> from <id…> /underive <id> from <id> /why <id> \
+             /archive <id> /unarchive <id> /forget <id>",
         );
         // Pinned status line — only when stdout is a TTY (no-op otherwise).
         let bar = StatusBar::new(std::io::stdout().is_terminal());
@@ -343,8 +647,18 @@ impl Repl {
                         self.project = Some(key.clone());
                         println!("(project → {key})");
                     }
-                    Command::Recall(query) => self.recall(&query).await,
-                    Command::Remember(text) => self.remember(&text).await,
+                    Command::Recall { query, explain, note_type, include_superseded } => {
+                        self.recall(&query, explain, note_type.as_deref(), include_superseded).await
+                    }
+                    Command::Remember { text, note_type } => {
+                        self.remember(&text, note_type.as_deref()).await
+                    }
+                    Command::Retype { id, note_type } => self.retype(id, &note_type).await,
+                    Command::Supersede { new_id, old_id } => self.supersede(new_id, old_id).await,
+                    Command::Unsupersede { new_id, old_id } => self.unsupersede(new_id, old_id).await,
+                    Command::Derive { from_id, to_ids } => self.derive(from_id, to_ids).await,
+                    Command::Underive { from_id, to_id } => self.underive(from_id, to_id).await,
+                    Command::Why { id } => self.why(id).await,
                     Command::Archive(id) => self.archive(id).await,
                     Command::Unarchive(id) => self.unarchive(id).await,
                     Command::Forget(id) => self.forget(id).await,
@@ -551,15 +865,174 @@ mod tests {
     #[test]
     fn recall_command_needs_a_query() {
         assert_eq!(parse_command("/recall do fewer barriers help?"),
-            Some(Command::Recall("do fewer barriers help?".into())));
+            Some(Command::Recall { query: "do fewer barriers help?".into(), explain: false, note_type: None, include_superseded: false }));
         assert!(matches!(parse_command("/recall"), Some(Command::Unknown(_))));
         assert!(matches!(parse_command("/recall   "), Some(Command::Unknown(_))));
     }
 
     #[test]
+    fn recall_flags_parse_and_strip_from_query() {
+        // `--explain` anywhere flips the flag and is removed from the query.
+        assert_eq!(
+            parse_command("/recall magic number --explain"),
+            Some(Command::Recall { query: "magic number".into(), explain: true, note_type: None, include_superseded: false }),
+        );
+        // `--type <T>` consumes its value and is stripped from the query.
+        assert_eq!(
+            parse_command("/recall design --type decision --explain"),
+            Some(Command::Recall { query: "design".into(), explain: true, note_type: Some("decision".into()), include_superseded: false }),
+        );
+        assert_eq!(
+            parse_command("/recall --type working kernel speed"),
+            Some(Command::Recall { query: "kernel speed".into(), explain: false, note_type: Some("working".into()), include_superseded: false }),
+        );
+        // `--include-superseded` is a bool flag, stripped from the query.
+        assert_eq!(
+            parse_command("/recall old design --include-superseded --type decision"),
+            Some(Command::Recall { query: "old design".into(), explain: false, note_type: Some("decision".into()), include_superseded: true }),
+        );
+        // Without flags they stay default.
+        assert_eq!(
+            parse_command("/recall magic number"),
+            Some(Command::Recall { query: "magic number".into(), explain: false, note_type: None, include_superseded: false }),
+        );
+        // Flags with no query is a usage error, not an empty recall.
+        assert!(matches!(parse_command("/recall --explain"), Some(Command::Unknown(_))));
+        assert!(matches!(parse_command("/recall --type decision"), Some(Command::Unknown(_))));
+    }
+
+    #[test]
+    fn supersede_commands_parse_two_ids() {
+        assert_eq!(parse_command("/supersede 9 5"), Some(Command::Supersede { new_id: 9, old_id: 5 }));
+        assert_eq!(parse_command("/unsupersede 9 5"), Some(Command::Unsupersede { new_id: 9, old_id: 5 }));
+        assert!(matches!(parse_command("/supersede 9"), Some(Command::Unknown(_))));
+        assert!(matches!(parse_command("/supersede a b"), Some(Command::Unknown(_))));
+    }
+
+    #[test]
+    fn derive_underive_why_parse() {
+        // /derive <A> from <B> [<C> …]
+        assert_eq!(parse_command("/derive 5 from 3 7"), Some(Command::Derive { from_id: 5, to_ids: vec![3, 7] }));
+        assert_eq!(parse_command("/derive 5 from 3"), Some(Command::Derive { from_id: 5, to_ids: vec![3] }));
+        assert!(matches!(parse_command("/derive 5 3 7"), Some(Command::Unknown(_))), "missing 'from'");
+        assert!(matches!(parse_command("/derive 5 from"), Some(Command::Unknown(_))), "no sources");
+        // /underive <A> from <B>
+        assert_eq!(parse_command("/underive 5 from 3"), Some(Command::Underive { from_id: 5, to_id: 3 }));
+        assert!(matches!(parse_command("/underive 5 3"), Some(Command::Unknown(_))));
+        // /why <id>
+        assert_eq!(parse_command("/why 5"), Some(Command::Why { id: 5 }));
+        assert!(matches!(parse_command("/why"), Some(Command::Unknown(_))));
+        assert!(matches!(parse_command("/why abc"), Some(Command::Unknown(_))));
+    }
+
+    #[test]
+    fn format_why_renders_indented_tree_with_markers() {
+        use crate::types::WhyNode;
+        let leaf = |id: i64, text: &str| WhyNode {
+            id, kind: "fact".into(), note_type: "working".into(), name: String::new(),
+            text: text.into(), derives_from: vec![], cycle: false, truncated: false,
+        };
+        let tree = WhyNode {
+            id: 1, kind: "fact".into(), note_type: "decision".into(), name: String::new(),
+            text: "the decision".into(),
+            derives_from: vec![leaf(2, "premise two"), leaf(3, "premise three")],
+            cycle: false, truncated: false,
+        };
+        let out = format_why(&tree);
+        assert!(out.contains("#1 [decision] the decision"), "root: {out}");
+        assert!(out.contains("  #2 [working] premise two"), "indented child: {out}");
+        assert!(out.contains("  #3 [working] premise three"), "second child: {out}");
+
+        // Cycle + truncated markers + the empty case.
+        let cyc = WhyNode { cycle: true, ..leaf(9, "loop node") };
+        assert!(format_why(&cyc).contains("(cycle"), "cycle marker");
+        let trunc = WhyNode { truncated: true, ..leaf(9, "deep node") };
+        assert!(format_why(&trunc).contains("depth cap"), "truncated marker");
+        assert!(format_why(&leaf(9, "lonely")).contains("no derivation recorded"), "empty case");
+    }
+
+    #[test]
+    fn remember_type_and_retype_parse() {
+        // /remember --type <T> <text> sets the type; text is preserved verbatim.
+        assert_eq!(
+            parse_command("/remember --type decision we chose margin 0.15"),
+            Some(Command::Remember { text: "we chose margin 0.15".into(), note_type: Some("decision".into()) }),
+        );
+        // Without --type → untyped.
+        assert_eq!(
+            parse_command("/remember plain note"),
+            Some(Command::Remember { text: "plain note".into(), note_type: None }),
+        );
+        // --type without text → usage error.
+        assert!(matches!(parse_command("/remember --type decision"), Some(Command::Unknown(_))));
+        // /retype <id> <T>.
+        assert_eq!(
+            parse_command("/retype 7 invariant"),
+            Some(Command::Retype { id: 7, note_type: "invariant".into() }),
+        );
+        assert!(matches!(parse_command("/retype 7"), Some(Command::Unknown(_))));
+        assert!(matches!(parse_command("/retype abc decision"), Some(Command::Unknown(_))));
+    }
+
+    #[test]
+    fn format_explain_renders_hits_near_miss_cutoff_and_separation() {
+        use crate::types::{ExplainInfo, MemoryHit, NearMiss, RecallResponse};
+        let hit = |id: i64, score: f32, text: &str| MemoryHit {
+            id, kind: "fact".into(), name: String::new(), text: text.into(),
+            status: "active".into(), note_type: "decision".into(), superseded_by: None,
+            derives_from: Vec::new(), score,
+        };
+        let nm = |id: i64, score: f32, text: &str, cut: &str| NearMiss {
+            hit: hit(id, score, text), cut: cut.into(),
+        };
+        // With an active threshold: shows the value + per-near-miss cut label.
+        let superseded = NearMiss {
+            hit: MemoryHit { superseded_by: Some(7), ..hit(8, 0.90, "An old superseded decision") },
+            cut: "superseded".into(),
+        };
+        let resp = RecallResponse {
+            hits: vec![hit(1, 0.96, "The magic number is 391"), hit(2, 0.81, "Another relevant note")],
+            explain: Some(ExplainInfo {
+                top_k: 2,
+                threshold: Some(0.80),
+                query_dim: 768,
+                near_miss: vec![
+                    superseded,
+                    nm(3, 0.69, "A noisy note below threshold", "threshold"),
+                    nm(4, 0.85, "A relevant note beyond the cap", "top-k"),
+                ],
+                separation: Some(0.12),
+            }),
+        };
+        let out = format_explain("magic number", &resp);
+        assert!(out.contains("768-dim"), "shows embedded query dim: {out}");
+        assert!(out.contains("top-k = 2"), "shows the cutoff: {out}");
+        assert!(out.contains("threshold: 0.800"), "shows the real threshold value: {out}");
+        assert!(out.contains("RETURNED (2)"), "lists returned hits: {out}");
+        assert!(out.contains("cut: superseded by #7"), "names the superseder: {out}");
+        assert!(out.contains("cut: threshold"), "labels the threshold cut: {out}");
+        assert!(out.contains("cut: top-k"), "labels the top-k cut: {out}");
+        assert!(out.contains("(id 3"), "near-miss carries its id: {out}");
+        assert!(out.contains("separation: 0.120"), "shows the gap: {out}");
+        assert!(out.contains("clean separation"), "0.12 gap → clean verdict: {out}");
+
+        // No threshold (margin off) → honest "none" + no near-misses line.
+        let resp2 = RecallResponse {
+            hits: vec![hit(1, 0.96, "only note")],
+            explain: Some(ExplainInfo {
+                top_k: 5, threshold: None, query_dim: 768, near_miss: vec![], separation: None,
+            }),
+        };
+        let out2 = format_explain("q", &resp2);
+        assert!(out2.contains("none (pure top-k ranking)"), "honest about no threshold: {out2}");
+        assert!(out2.contains("NEAR-MISS: none"), "explicit no-near-miss line: {out2}");
+        assert!(out2.contains("separation: n/a"), "n/a separation when no near-miss: {out2}");
+    }
+
+    #[test]
     fn remember_command_needs_text() {
         assert_eq!(parse_command("/remember dispatch reduction did not help"),
-            Some(Command::Remember("dispatch reduction did not help".into())));
+            Some(Command::Remember { text: "dispatch reduction did not help".into(), note_type: None }));
         assert!(matches!(parse_command("/remember"), Some(Command::Unknown(_))));
     }
 

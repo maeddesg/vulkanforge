@@ -1044,8 +1044,11 @@ Logs umfassen:
 ### 5.8 Memory-Subsystem (opt-in, default off)
 
 Server-seitiges Gedächtnis, **embedded** im API-Prozess (`src/server/memory.rs` + `handlers/memory.rs`).
-VF-native `/memory/*`-Endpoints (getrennt von `/v1/*`): `POST /memory/remember`, `POST /memory/recall`,
-`POST`/`GET /memory/projects`. `AppState.memory: Option<Arc<MemoryStore>>` (None → 503, Inference läuft weiter).
+VF-native `/memory/*`-Endpoints (getrennt von `/v1/*`): `POST /memory/remember` (optional `type`),
+`POST /memory/recall` (optional `explain`/`type`/`include_superseded`), `POST`/`GET /memory/projects`, Kuration
+`POST /memory/archive` · `/unarchive` · `/delete` · `/retype` (fehlende id → **404** via typisiertem `CurateError`),
+und die **Verbindungs-Schicht** `POST /memory/supersede` · `/unsupersede` · `/derive` · `/underive` · `/why`.
+`AppState.memory: Option<Arc<MemoryStore>>` (None → 503, Inference läuft weiter).
 
 **Opt-in — zwei Gates (default OFF).** Das Subsystem ist doppelt gegated, damit der Standard-Build schlank bleibt:
 1. **Compile-Gate:** Cargo-Feature `memory` (default aus). Macht `sqlitegraph` + `fastembed` `optional` und cfg-gated
@@ -1070,6 +1073,26 @@ Cross-Project-Leak. Persistent über Neustart (Vektoren restaurieren aus der DB 
 **Nebenläufigkeit.** Eigene Ressource (CPU/SQLite): `MemoryStore` hat eigene `Mutex` (Single-Writer), nimmt **nie**
 den GPU-`permit`; Handler laufen über `spawn_blocking`, der teure embed-Schritt außerhalb des graph-Locks. Teardown
 (neben `ServerSession::teardown`, aber getrennt — kein `device_wait_idle`): HNSW-Topologie-persist + WAL-Checkpoint.
+
+**Schichten & Verbindungen (v1.0.4).** Über reines top-k-recall hinaus, alle additiv (recall ohne Kanten/Opt-ins =
+byte-identisch zu vorher):
+- **Typisierung.** `type` (`invariant`/`working`/`episodic`/`decision`/`failure`, Default `untyped`) als
+  Node-Metadata (`data["type"]`, kein Backfill — Read-Default). User-gesetzt (`--type`/`/retype`); ein `type`-Filter
+  in recall ist ein **nicht-embedding-Signal**, das benachbarte Domänen zuverlässig trennt, wo Similarity nicht kann.
+- **`SUPERSEDES`-Kante** (Versionierung). Eine Notiz, die Ziel einer `SUPERSEDES`-Kante ist, gilt als stale und wird
+  im Default-recall unterdrückt (Ketten lösen zum un-superseded Head auf). Reversibel (`/unsupersede`,
+  `--include-superseded`; nie gelöscht). **Backfill:** wird ein top-k-Slot durch Suppression frei, zieht recall einen
+  tieferen Kandidaten-Pool (`k+Puffer`) und füllt auf `k` auf — Fast-Skip ohne SUPERSEDES-Kante (kein Extra-Read,
+  byte-id).
+- **`DERIVES_FROM`-Kante + `/why`** (Why-Graph). `A DERIVES_FROM B` = A verankert in B (Evidenz/Prämisse). **Ändert
+  recall NIE** — additive Awareness, sichtbar nur in `--explain` (`derives_from`) und im `/why`-Trace (rückwärts über
+  ausgehende Kanten, path-Cycle-Guard + Depth-Cap). Default-recall byte-identisch auch *mit* `DERIVES_FROM`-Kanten.
+- **Kanten-Mechanik.** Native SG-Edge-API (`insert_edge`/`delete_edge` — **immer** über die API wegen
+  `invalidate_caches`; Reads roh-SQL auf `graph_edges`, index-gestützt: `idx_edges_from/to/type`). **Agent erstellt
+  keine Kanten/Typen** — er trägt Notizen bei, der User kuriert (`/supersede`/`/derive`/`/retype` user-only).
+- **`recall --explain`.** Diagnose-View (returned / near-miss / cut-reason `superseded`→`type`→`threshold`→`top-k` /
+  separation), über-fetcht `k+5`. Opt-in `VF_RECALL_MARGIN` (default off): relative-to-top-Threshold (`score ≥
+  top_score − margin`), unset → pure top-k.
 
 **Realisierungs-/Upgrade-Disziplin (wichtig).**
 - Der HNSW-Index vergibt die **Vektor-id selbst** (kein public id-spezifizierender Insert) → der Graph-`node_id`

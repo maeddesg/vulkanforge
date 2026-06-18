@@ -31,11 +31,17 @@ use crate::backend::vulkan::loader::LoadedModel;
 use crate::backend::vulkan::pipeline_registry::PipelineRegistry;
 use crate::backend::vulkan::tokenizer::Tokenizer;
 
-/// Gated cross-request KV prefix-reuse switch (`VF_KV_PREFIX_REUSE`,
-/// default OFF). Checked per-request so the OFF path stays zero-overhead
-/// and bit-identical to the v0.4 stateless behavior.
+/// Gated cross-request KV prefix-reuse switch (`VF_KV_PREFIX_REUSE`).
+/// Default **ON**: the byte-identity gate (`tests/kv_reuse_ident.rs`) proves
+/// the reused-KV path produces logits bit-identical to a fresh prefill —
+/// clean prefix, divergent prefix (no stale-KV leak), and an over-reuse case
+/// that confirms the `lcp` boundary is load-bearing. Set
+/// `VF_KV_PREFIX_REUSE=0` to force the zero-overhead, bit-identical v0.4
+/// stateless path back on (field escape-hatch — no rebuild needed). Only the
+/// literal `"0"` disables it; unset or any other value keeps reuse on.
+/// Checked per-request.
 pub fn kv_prefix_reuse_enabled() -> bool {
-    std::env::var("VF_KV_PREFIX_REUSE").as_deref() == Ok("1")
+    std::env::var("VF_KV_PREFIX_REUSE").as_deref() != Ok("0")
 }
 
 /// Longest common token prefix length — exact id match, position by
@@ -156,7 +162,8 @@ impl ServerSession {
     /// Run a generation for the full token sequence `full_tokens` with
     /// gated cross-request KV prefix reuse.
     ///
-    /// `reuse == false` (the v0.4 default): reset the KV and prefill the
+    /// `reuse == false` (the v0.4 stateless path, now reachable via the
+    /// `VF_KV_PREFIX_REUSE=0` escape-hatch): reset the KV and prefill the
     /// whole sequence from position 0 — **bit-identical** to the
     /// pre-reuse stateless behavior.
     ///
@@ -392,10 +399,12 @@ mod tests {
     }
 
     #[test]
-    fn reuse_env_flag_default_off() {
-        // Without the env set, reuse must be OFF (bit-identical v0.4 path).
-        // (Can't safely mutate process env in parallel tests; assert the
-        // parse contract: only "1" enables.)
-        assert!(!kv_prefix_reuse_enabled() || std::env::var("VF_KV_PREFIX_REUSE").as_deref() == Ok("1"));
+    fn reuse_env_flag_default_on() {
+        // Reuse defaults ON (byte-ident gate green, tests/kv_reuse_ident.rs).
+        // The escape-hatch is the literal "0", which forces the bit-identical
+        // v0.4 stateless path. (Can't safely mutate process env in parallel
+        // tests; assert the parse contract: enabled iff env != "0".)
+        let forced_off = std::env::var("VF_KV_PREFIX_REUSE").as_deref() == Ok("0");
+        assert_eq!(kv_prefix_reuse_enabled(), !forced_off);
     }
 }

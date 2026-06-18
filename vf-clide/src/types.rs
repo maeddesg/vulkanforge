@@ -187,13 +187,57 @@ pub struct RecallRequest {
     pub project_key: Option<String>,
     pub query: String,
     pub k: u32,
+    /// Opt-in retrieval diagnostics (`/recall … --explain`). Omitted from the
+    /// wire when `None` → the request is byte-identical to plain recall.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explain: Option<bool>,
+    /// Opt-in type filter (`/recall … --type <T>`). Omitted when `None`.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "type")]
+    pub note_type: Option<String>,
+    /// Opt-in: include superseded (stale) notes (`--include-superseded`).
+    /// Omitted when `None` → request unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_superseded: Option<bool>,
 }
 
-/// `POST /memory/recall` response: ranked hits (highest score first).
+/// `POST /memory/recall` response: ranked hits (highest score first). With
+/// `--explain`, the server also fills `explain` (near-misses + cutoff); absent
+/// on a plain recall, so `explain` is `None`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RecallResponse {
     #[serde(default)]
     pub hits: Vec<MemoryHit>,
+    #[serde(default)]
+    pub explain: Option<ExplainInfo>,
+}
+
+/// Near-miss + cutoff diagnostics from `recall --explain` (server-explain-mode:
+/// the server searches wider than `top_k` to surface these — a plain recall
+/// never computes them). `threshold` is the adaptive relevance cutoff
+/// (`top_score − margin`) when a margin is active, else `None` (pure top-k).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExplainInfo {
+    #[serde(default)]
+    pub top_k: usize,
+    #[serde(default)]
+    pub threshold: Option<f32>,
+    #[serde(default)]
+    pub query_dim: usize,
+    #[serde(default)]
+    pub near_miss: Vec<NearMiss>,
+    #[serde(default)]
+    pub separation: Option<f32>,
+}
+
+/// A cut candidate from `recall --explain`: the note plus the gate that
+/// excluded it (`cut` = `"threshold"` below the relevance cutoff, or `"top-k"`
+/// beyond the cap). The note fields are flattened into the same object.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NearMiss {
+    #[serde(flatten)]
+    pub hit: MemoryHit,
+    #[serde(default)]
+    pub cut: String,
 }
 
 /// One recall hit. `score` is cosine **similarity** in `[0,1]` (higher =
@@ -209,8 +253,24 @@ pub struct MemoryHit {
     pub text: String,
     #[serde(default)]
     pub status: String,
+    /// Layer type (`invariant`/`working`/…/`untyped`). Defaults to `untyped`
+    /// if a (pre-typing) server omits it. Serialised as `type` on the wire.
+    #[serde(default = "untyped", rename = "type")]
+    pub note_type: String,
+    /// If set, the id of a note that supersedes this one (this note is stale).
+    /// Present only on `--explain` near-misses cut as `superseded`.
+    #[serde(default)]
+    pub superseded_by: Option<i64>,
+    /// Ids this note derives from (its justification). Populated only on the
+    /// `--explain` path; empty in default recall.
+    #[serde(default)]
+    pub derives_from: Vec<i64>,
     #[serde(default)]
     pub score: f32,
+}
+
+fn untyped() -> String {
+    "untyped".to_string()
 }
 
 /// `POST /memory/remember` request. Stufe B-1 writes manual notes with
@@ -221,6 +281,105 @@ pub struct RememberRequest {
     pub project_key: Option<String>,
     pub kind: String,
     pub text: String,
+    /// Optional layer type (`/remember --type <T>`). Omitted when `None` →
+    /// the note is untyped.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "type")]
+    pub note_type: Option<String>,
+}
+
+/// `POST /memory/retype` request — set a note's layer type (user curation).
+#[derive(Debug, Serialize)]
+pub struct RetypeRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+    pub id: i64,
+    #[serde(rename = "type")]
+    pub note_type: String,
+}
+
+/// `POST /memory/retype` response: the note id and its new type.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetypeResponse {
+    pub id: i64,
+    #[serde(default = "untyped", rename = "type")]
+    pub note_type: String,
+}
+
+/// `POST /memory/supersede` | `/memory/unsupersede` request — `new_id`
+/// supersedes `old_id` (user curation).
+#[derive(Debug, Serialize)]
+pub struct SupersedeRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+    pub new_id: i64,
+    pub old_id: i64,
+}
+
+/// `POST /memory/supersede` | `/memory/unsupersede` response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SupersedeResponse {
+    pub new_id: i64,
+    pub old_id: i64,
+    #[serde(default)]
+    pub superseded: bool,
+}
+
+/// `POST /memory/derive` request — `from_id DERIVES_FROM to_ids` (Why-Graph).
+#[derive(Debug, Serialize)]
+pub struct DeriveRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+    pub from_id: i64,
+    pub to_ids: Vec<i64>,
+}
+
+/// `POST /memory/underive` request — release `from_id DERIVES_FROM to_id`.
+#[derive(Debug, Serialize)]
+pub struct UnderiveRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+    pub from_id: i64,
+    pub to_id: i64,
+}
+
+/// `POST /memory/derive` | `/memory/underive` response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeriveResponse {
+    pub from_id: i64,
+    #[serde(default)]
+    pub to_ids: Vec<i64>,
+    #[serde(default)]
+    pub derived: bool,
+}
+
+/// `POST /memory/why` request — the Why-Graph trace for a note.
+#[derive(Debug, Serialize)]
+pub struct WhyRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+    pub id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth: Option<usize>,
+}
+
+/// One node of the `/why` justification tree (recursive).
+#[derive(Debug, Clone, Deserialize)]
+pub struct WhyNode {
+    pub id: i64,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default = "untyped", rename = "type")]
+    pub note_type: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub derives_from: Vec<WhyNode>,
+    #[serde(default)]
+    pub cycle: bool,
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// `POST /memory/remember` response: the content node id, and whether it was

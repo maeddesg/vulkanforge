@@ -1205,9 +1205,11 @@ mod tests {
         assert_eq!(format_recall(&[]), "No relevant notes found in project memory.");
         let hits = vec![
             MemoryHit { id: 5, kind: "Decision".into(), name: "n".into(),
-                text: "MTP parked because MoE was net-negative".into(), status: "active".into(), score: 0.83 },
+                text: "MTP parked because MoE was net-negative".into(), status: "active".into(),
+                note_type: "untyped".into(), superseded_by: None, derives_from: Vec::new(), score: 0.83 },
             MemoryHit { id: 9, kind: "Bug".into(), name: "n".into(),
-                text: "gfx1201 barrier reduction did not help".into(), status: "active".into(), score: 0.71 },
+                text: "gfx1201 barrier reduction did not help".into(), status: "active".into(),
+                note_type: "untyped".into(), superseded_by: None, derives_from: Vec::new(), score: 0.71 },
         ];
         let out = format_recall(&hits);
         assert!(out.contains("Found 2 note(s)"));

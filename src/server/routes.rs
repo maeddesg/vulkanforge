@@ -57,7 +57,16 @@ pub fn build_router(state: Arc<AppState>, cors_enabled: bool) -> Router {
             // delete (hard) + unarchive (restore an archived note to recall).
             .route("/memory/archive", post(handlers::memory::archive))
             .route("/memory/delete", post(handlers::memory::delete))
-            .route("/memory/unarchive", post(handlers::memory::unarchive));
+            .route("/memory/unarchive", post(handlers::memory::unarchive))
+            // Schicht-Enabler: set a note's layer type (pure metadata).
+            .route("/memory/retype", post(handlers::memory::retype))
+            // Connections: SUPERSEDES edge (+ release) — stale-suppression.
+            .route("/memory/supersede", post(handlers::memory::supersede))
+            .route("/memory/unsupersede", post(handlers::memory::unsupersede))
+            // Why-Graph: DERIVES_FROM edge (+ release) + the /why trace.
+            .route("/memory/derive", post(handlers::memory::derive))
+            .route("/memory/underive", post(handlers::memory::underive))
+            .route("/memory/why", post(handlers::memory::why));
     }
 
     router.layer(cors_layer).with_state(state)

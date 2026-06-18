@@ -22,9 +22,13 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
   semantic memory** embedded in the API process. It is gated **twice** and off by default: build with
   `cargo build --release --features memory`, then activate at runtime with `serve --memory` (or
   `VULKANFORGE_MEMORY=1`). VF-native endpoints write notes on purpose and read them back by meaning:
-  `POST /memory/remember`, `POST /memory/recall` (`{hits:[{id,kind,name,text,status,score}]}`),
-  `POST`/`GET /memory/projects`, and curation `POST /memory/archive` · `/unarchive` · `/delete` (a missing id
-  returns **404**, not 500). [SQLiteGraph](https://github.com/oldnordic/sqlitegraph) (nodes + edges +
+  `POST /memory/remember` (optional `type`), `POST /memory/recall` (`{hits:[{id,kind,name,text,status,type,score}]}`;
+  optional `explain` for diagnostics, `type` filter, `include_superseded`), `POST`/`GET /memory/projects`, curation
+  `POST /memory/archive` · `/unarchive` · `/delete` · `/retype` (a missing id returns **404**, not 500), and a
+  **connection layer** — `POST /memory/supersede` · `/unsupersede` (versioning: a superseded note is suppressed from
+  recall, which **backfills to `k`**), `POST /memory/derive` · `/underive` · `/why` (a why-graph of `DERIVES_FROM`
+  links that **never changes recall results**). An opt-in relevance threshold (`VF_RECALL_MARGIN`, off by default)
+  trims recall to notes near the top hit. [SQLiteGraph](https://github.com/oldnordic/sqlitegraph) (nodes + edges +
   per-project HNSW indexes in one SQLite file) + a CPU embedder ([fastembed](https://github.com/maeddesg/fastembed-rs),
   Nomic-Embed v1.5-Q, 768-dim, AVX-512/VNNI). Each project gets its own index — recall in one project **cannot**
   return another's notes — and the store survives restarts (vectors restore with no re-embed). The memory path
@@ -36,12 +40,16 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
   zero memory overhead. What it is, what it isn't, and the roadmap: the wiki's
   **[Memory](https://github.com/maeddesg/vulkanforge/wiki/Memory)** page. See `CHANGELOG.md`.
   **Client access (`vf-clide`):** the agent reaches this store through `recall`/`remember`/`archive` tools
-  (tool-driven and visible, never silently auto-injected), and the REPL exposes `/recall` `/remember` `/archive`
-  `/unarchive` `/forget`. The agent may `archive` a note it recalled this session — through an always-on
-  confirmation that shows the note's **real** stored text (never the model's claim) and a required reason; archiving
-  is **reversible** (`/unarchive <id>` restores a note). **`/unarchive` and `/forget` stay user-only** — the agent
-  has no un-archive or delete tool. The agent's system prompt carries its live tools, permissions, and memory scope,
-  so it doesn't guess them. (Memory tools appear only when the server reports memory enabled.)
+  (tool-driven and visible, never silently auto-injected), and the REPL exposes the full set:
+  `/project · /recall <q> [--explain] [--type <T>] [--include-superseded] · /remember [--type <T>] <text> ·
+  /retype <id> <T> · /supersede <new> <old> · /unsupersede <new> <old> · /derive <A> from <B> [<C> …] ·
+  /underive <A> from <B> · /why <id> · /archive <id> · /unarchive <id> · /forget <id>`. The agent may `archive` a
+  note it recalled this session — through an always-on confirmation that shows the note's **real** stored text
+  (never the model's claim) and a required reason; archiving is **reversible** (`/unarchive <id>` restores a note).
+  **Curation and the connection layer (`/unarchive`, `/forget`, `/retype`, `/supersede`, `/derive`, …) stay
+  user-only** — the agent never creates edges or types; it contributes notes, the user curates. The agent's system
+  prompt carries its live tools, permissions, and memory scope, so it doesn't guess them. (Memory tools appear only
+  when the server reports memory enabled.)
 - **`vf-clide` REPL permission ceiling + denial wording (v0.9.4)** — `vf-clide` (0.3.1): in the agent **REPL**,
   tool calls at or below the active `--yes` / `--allow-mutating` / `--allow-shell` ceiling are now
   **auto-approved** (still printed) and only calls **above** it prompt `y/N` — consistent with headless, not
@@ -320,7 +328,8 @@ flag is a default-on candidate for 14B FP8 on Zen 4.
 | CPU `lm_head` offload| `VF_CPU_LM_HEAD=1`         | AVX-512F + BW + VL (Zen 4 / Ice Lake+) | −970 MB VRAM, 14B +32 % decode |
 | On-the-fly Q4_K      | `VF_QUANTIZE_ON_LOAD=1`    | SafeTensors model with FP32 / BF16 weights | Quantize 2D weights to Q4_K_M at load; ~7× VRAM compression on quantized tensors, routes through the Q4_K shader pipeline. Gemma-4-E2B: decode +54 %, power −41 %, tok/s/W 1.39 |
 | FP8 KV-cache         | `VULKANFORGE_KV_FP8=1`     | Mesa 26.1+ (heterogeneous head_dim auto-handled) | −50 % KV-cache VRAM. Gemma-4-26B-A4B: 880 → 440 MB. |
-| KV prefix-reuse (API server, **default OFF**) | `VF_KV_PREFIX_REUSE=1` | `vulkanforge serve` (chat + completions) | Cross-request KV reuse: keeps the last request's KV and re-prefills only the suffix after the longest common token prefix → multi-turn / agentic (growing context) skips re-prefilling the shared history. Value-preserving (byte-identical to full re-prefill @temp 0). Single retained session (last request); errors/cancel invalidate. OFF = v0.4 stateless behavior, bit-identical. |
+| KV prefix-reuse (API server, **default ON** since v1.0.4) | `VF_KV_PREFIX_REUSE=0` to disable | `vulkanforge serve` (chat + completions) | Cross-request KV reuse: keeps the last request's KV and re-prefills only the suffix after the longest common token prefix → multi-turn / agentic / memory-augmented turns skip re-prefilling the shared history. **Logit byte-identical** to a full re-prefill (proven by `tests/kv_reuse_ident.rs`, F16 + FP8-KV). Single retained session (last request); errors/cancel invalidate. `=0` forces the v0.4 stateless path back, bit-identical. |
+| Relevance threshold (recall) | `VF_RECALL_MARGIN=<f>` (off by default) | `--features memory` | Trims recall to notes scoring within `<f>` (cosine) of the top hit (adaptive, relative-to-top). Unset → pure top-k, unchanged. |
 | MTP timing instrumentation (**default OFF**) | `VF_MTP_TIMER=1` | Qwen3.6-27B-MTP (`VF_MTP=1`) | Per-phase wall-clock + submit breakdown for the (parked, gated-off) MTP self-spec decode loop. Measurement only; MTP itself stays default-OFF. |
 
 > Debug/test-only env flags (never set in production): `VF_KV_REUSE_DEBUG=1`
@@ -521,8 +530,8 @@ forcing, and char-incremental argument streaming are planned. Requests **without
 
 - **In:** Streaming + non-streaming chat, multi-turn history,
   **`/v1/completions`** (raw-prompt), **OpenAI function/tool calling**
-  (Qwen3/Hermes), **cross-request KV prefix-reuse** (`VF_KV_PREFIX_REUSE=1`,
-  opt-in), `frequency_penalty` → repetition-penalty mapping,
+  (Qwen3/Hermes), **cross-request KV prefix-reuse** (on by default since
+  v1.0.4; `VF_KV_PREFIX_REUSE=0` to disable), `frequency_penalty` → repetition-penalty mapping,
   `stream_options.include_usage`, `developer` role alias for `system`,
   `chat_template_kwargs.enable_thinking` toggle for `<think>` filtering.
 - **Out:** Vision content, embeddings, auth, SafeTensors directory models
@@ -565,8 +574,9 @@ latency is high because VulkanForge re-prefills the agent's large system prompt
 each turn — prefill is the current bottleneck (per-turn latency in the tens of
 seconds, dominated by prefill, not generation). Recommended model: **Qwen3-8B
 Q4_K_M**. The 27B (Q3_K_S) is impractical for agentic use today (prefill cost +
-aggressive quantization). Set **`VF_KV_PREFIX_REUSE=1`** to speed up multi-turn
-(opt-in; mitigates later turns, not the first).
+aggressive quantization). **`VF_KV_PREFIX_REUSE`** (on by default since v1.0.4)
+speeds up multi-turn / memory-augmented turns by reusing the shared prefix's KV
+(mitigates later turns, not the first); set `=0` to disable.
 
 > **v0.5.8 — Gemma-4 (MoE) now coherent on serve.** Earlier serve builds produced
 > garbage on Gemma-4 specifically (the API path skipped the GPU MoE-router init the

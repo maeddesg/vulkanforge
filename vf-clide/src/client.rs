@@ -12,7 +12,9 @@ use serde::de::DeserializeOwned;
 use crate::types::{
     ArchiveResponse, ChatChunk, ChatMessage, ChatRequest, ChatResponse, CurateRequest,
     DeleteResponse, ProjectsResponse, RecallRequest, RecallResponse, RememberRequest,
-    RememberResponse, StreamOptions, Tool, ToolCall, UnarchiveResponse, Usage,
+    DeriveRequest, DeriveResponse, RememberResponse, RetypeRequest, RetypeResponse, StreamOptions,
+    SupersedeRequest, SupersedeResponse, Tool, ToolCall, UnarchiveResponse, UnderiveRequest, Usage,
+    WhyNode, WhyRequest,
 };
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -225,27 +227,144 @@ impl Client {
         query: &str,
         k: u32,
     ) -> Result<MemCall<RecallResponse>> {
+        self.memory_recall_opts(project_key, query, k, false, None, false).await
+    }
+
+    /// `POST /memory/recall` with `explain: true` — the retrieval-diagnostics
+    /// view (`/recall … --explain`). The server searches wider than `k` and
+    /// returns the near-misses + cutoff in `RecallResponse::explain`.
+    pub async fn memory_recall_explain(
+        &self,
+        project_key: Option<&str>,
+        query: &str,
+        k: u32,
+    ) -> Result<MemCall<RecallResponse>> {
+        self.memory_recall_opts(project_key, query, k, true, None, false).await
+    }
+
+    /// `POST /memory/recall` with optional `explain` + `type` filter +
+    /// `include_superseded`. The single source for the recall variants;
+    /// `(false, None, false)` is byte-identical to plain recall (all flags
+    /// omitted from the wire).
+    pub async fn memory_recall_opts(
+        &self,
+        project_key: Option<&str>,
+        query: &str,
+        k: u32,
+        explain: bool,
+        note_type: Option<&str>,
+        include_superseded: bool,
+    ) -> Result<MemCall<RecallResponse>> {
         let body = RecallRequest {
             project_key: project_key.map(str::to_string),
             query: query.to_string(),
             k,
+            explain: explain.then_some(true),
+            note_type: note_type.map(str::to_string),
+            include_superseded: include_superseded.then_some(true),
         };
         self.memory_post("recall", &body).await
     }
 
     /// `POST /memory/remember`. Stufe B-1 stores manual notes (`kind:"Note"`).
+    /// Untyped — the agent path stays untyped (no agent-typing).
     pub async fn memory_remember(
         &self,
         project_key: Option<&str>,
         kind: &str,
         text: &str,
     ) -> Result<MemCall<RememberResponse>> {
+        self.memory_remember_typed(project_key, kind, text, None).await
+    }
+
+    /// `POST /memory/remember` with an optional user-set layer `type`
+    /// (`/remember --type <T>`). `None` → untyped.
+    pub async fn memory_remember_typed(
+        &self,
+        project_key: Option<&str>,
+        kind: &str,
+        text: &str,
+        note_type: Option<&str>,
+    ) -> Result<MemCall<RememberResponse>> {
         let body = RememberRequest {
             project_key: project_key.map(str::to_string),
             kind: kind.to_string(),
             text: text.to_string(),
+            note_type: note_type.map(str::to_string),
         };
         self.memory_post("remember", &body).await
+    }
+
+    /// `POST /memory/retype` — set a note's layer type (user curation).
+    pub async fn memory_retype(
+        &self,
+        project_key: Option<&str>,
+        id: i64,
+        note_type: &str,
+    ) -> Result<MemCall<RetypeResponse>> {
+        let body = RetypeRequest {
+            project_key: project_key.map(str::to_string),
+            id,
+            note_type: note_type.to_string(),
+        };
+        self.memory_post("retype", &body).await
+    }
+
+    /// `POST /memory/supersede` — record `new_id SUPERSEDES old_id` (user
+    /// curation); `old_id` is suppressed from default recall (reversible).
+    pub async fn memory_supersede(
+        &self,
+        project_key: Option<&str>,
+        new_id: i64,
+        old_id: i64,
+    ) -> Result<MemCall<SupersedeResponse>> {
+        let body = SupersedeRequest { project_key: project_key.map(str::to_string), new_id, old_id };
+        self.memory_post("supersede", &body).await
+    }
+
+    /// `POST /memory/unsupersede` — release `new_id SUPERSEDES old_id`; `old_id`
+    /// returns to recall.
+    pub async fn memory_unsupersede(
+        &self,
+        project_key: Option<&str>,
+        new_id: i64,
+        old_id: i64,
+    ) -> Result<MemCall<SupersedeResponse>> {
+        let body = SupersedeRequest { project_key: project_key.map(str::to_string), new_id, old_id };
+        self.memory_post("unsupersede", &body).await
+    }
+
+    /// `POST /memory/derive` — `from_id DERIVES_FROM to_ids` (Why-Graph). Never
+    /// changes recall.
+    pub async fn memory_derive(
+        &self,
+        project_key: Option<&str>,
+        from_id: i64,
+        to_ids: Vec<i64>,
+    ) -> Result<MemCall<DeriveResponse>> {
+        let body = DeriveRequest { project_key: project_key.map(str::to_string), from_id, to_ids };
+        self.memory_post("derive", &body).await
+    }
+
+    /// `POST /memory/underive` — release `from_id DERIVES_FROM to_id`.
+    pub async fn memory_underive(
+        &self,
+        project_key: Option<&str>,
+        from_id: i64,
+        to_id: i64,
+    ) -> Result<MemCall<DeriveResponse>> {
+        let body = UnderiveRequest { project_key: project_key.map(str::to_string), from_id, to_id };
+        self.memory_post("underive", &body).await
+    }
+
+    /// `POST /memory/why` — the Why-Graph justification tree for a note.
+    pub async fn memory_why(
+        &self,
+        project_key: Option<&str>,
+        id: i64,
+    ) -> Result<MemCall<WhyNode>> {
+        let body = WhyRequest { project_key: project_key.map(str::to_string), id, depth: None };
+        self.memory_post("why", &body).await
     }
 
     /// `GET /memory/projects` — the scopes the server already knows.
