@@ -20,15 +20,19 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
 
 - **Server-side memory (opt-in, off by default)** — `vulkanforge serve` can host a **persistent, project-scoped,
   semantic memory** embedded in the API process. It is gated **twice** and off by default: build with
-  `cargo build --release --features memory`, then activate at runtime with `serve --memory` (or
+  `cargo build --release --features memory` (Rust 1.89+; the lean default build needs only 1.85), then activate at
+  runtime with `serve --memory` (or
   `VULKANFORGE_MEMORY=1`). VF-native endpoints write notes on purpose and read them back by meaning:
   `POST /memory/remember` (optional `type`), `POST /memory/recall` (`{hits:[{id,kind,name,text,status,type,score}]}`;
   optional `explain` for diagnostics, `type` filter, `include_superseded`), `POST`/`GET /memory/projects`, curation
   `POST /memory/archive` · `/unarchive` · `/delete` · `/retype` (a missing id returns **404**, not 500), and a
   **connection layer** — `POST /memory/supersede` · `/unsupersede` (versioning: a superseded note is suppressed from
   recall, which **backfills to `k`**), `POST /memory/derive` · `/underive` · `/why` (a why-graph of `DERIVES_FROM`
-  links that **never changes recall results**). An opt-in relevance threshold (`VF_RECALL_MARGIN`, off by default)
-  trims recall to notes near the top hit. [SQLiteGraph](https://github.com/oldnordic/sqlitegraph) (nodes + edges +
+  links that **never changes recall results**), and `POST /memory/contradict` · `/uncontradict` (a **symmetric
+  conflict** edge — awareness only, surfaced in `--explain` and resolved with `/supersede`; recall is unchanged). An
+  opt-in relevance threshold (`VF_RECALL_MARGIN`, off by default) trims recall to notes near the top hit; an opt-in
+  retrieval **frontier** (`--frontier`, off by default) pulls a top hit's `DERIVES_FROM`-linked evidence into a few
+  reserved slots (edge-type priors let a `CONTRADICTS` edge hold contested evidence back). [SQLiteGraph](https://github.com/maeddesg/sqlitegraph) (nodes + edges +
   per-project HNSW indexes in one SQLite file) + a CPU embedder ([fastembed](https://github.com/maeddesg/fastembed-rs),
   Nomic-Embed v1.5-Q, 768-dim, AVX-512/VNNI). Each project gets its own index — recall in one project **cannot**
   return another's notes — and the store survives restarts (vectors restore with no re-embed). The memory path
@@ -41,9 +45,10 @@ hardware** (`V_WMMA_F32_16X16X16_FP8_FP8` via Mesa 26.1+
   **[Memory](https://github.com/maeddesg/vulkanforge/wiki/Memory)** page. See `CHANGELOG.md`.
   **Client access (`vf-clide`):** the agent reaches this store through `recall`/`remember`/`archive` tools
   (tool-driven and visible, never silently auto-injected), and the REPL exposes the full set:
-  `/project · /recall <q> [--explain] [--type <T>] [--include-superseded] · /remember [--type <T>] <text> ·
+  `/project · /recall <q> [--explain] [--frontier] [--type <T>] [--include-superseded] · /remember [--type <T>] <text> ·
   /retype <id> <T> · /supersede <new> <old> · /unsupersede <new> <old> · /derive <A> from <B> [<C> …] ·
-  /underive <A> from <B> · /why <id> · /archive <id> · /unarchive <id> · /forget <id>`. The agent may `archive` a
+  /underive <A> from <B> · /why <id> · /contradict <id> <id> · /uncontradict <id> <id> · /archive <id> ·
+  /unarchive <id> · /forget <id>`. The agent may `archive` a
   note it recalled this session — through an always-on confirmation that shows the note's **real** stored text
   (never the model's claim) and a required reason; archiving is **reversible** (`/unarchive <id>` restores a note).
   **Curation and the connection layer (`/unarchive`, `/forget`, `/retype`, `/supersede`, `/derive`, …) stay

@@ -31,12 +31,14 @@ pub enum Command {
     /// `/project` (no arg → show current scope + list known projects) or
     /// `/project <key>` (switch the session's memory scope).
     Project(Option<String>),
-    /// `/recall <query> [--explain] [--type <T>] [--include-superseded]` —
-    /// manual semantic recall against the current project's memory; displays
-    /// hits (no auto-inject — that is B-2). `--explain` adds the diagnostics
-    /// view; `--type <T>` filters to one layer type; `--include-superseded`
-    /// surfaces stale (superseded) notes that are otherwise suppressed.
-    Recall { query: String, explain: bool, note_type: Option<String>, include_superseded: bool },
+    /// `/recall <query> [--explain] [--type <T>] [--include-superseded]
+    /// [--frontier]` — manual semantic recall against the current project's
+    /// memory; displays hits (no auto-inject — that is B-2). `--explain` adds
+    /// the diagnostics view; `--type <T>` filters to one layer type;
+    /// `--include-superseded` surfaces stale (superseded) notes; `--frontier`
+    /// reserves slots for `DERIVES_FROM`-linked evidence below the similarity
+    /// cut (opt-in; default recall is unchanged).
+    Recall { query: String, explain: bool, note_type: Option<String>, include_superseded: bool, frontier: bool },
     /// `/remember [--type <T>] <text>` — store a manual note (`kind:"Note"`).
     /// `--type` sets the layer type (else untyped).
     Remember { text: String, note_type: Option<String> },
@@ -55,6 +57,13 @@ pub enum Command {
     Underive { from_id: i64, to_id: i64 },
     /// `/why <id>` — print the Why-Graph justification tree for a note.
     Why { id: i64 },
+    /// `/contradict <a> <b>` — record that two notes conflict (`CONTRADICTS`,
+    /// symmetric). Flagged in `--explain`, never suppressed; resolve via
+    /// `/supersede`. User curation.
+    Contradict { a: i64, b: i64 },
+    /// `/uncontradict <a> <b>` — release a contradiction. Inverse of
+    /// `/contradict` (direction-independent).
+    Uncontradict { a: i64, b: i64 },
     /// `/archive <id>` — drop a note from recall (kept as an archived record).
     Archive(i64),
     /// `/unarchive <id>` — restore an archived note to recall (inverse of
@@ -93,14 +102,14 @@ pub fn parse_command(line: &str) -> Option<Command> {
         },
         "/project" => Command::Project(arg),
         "/recall" => {
-            let (query, explain, note_type, include_superseded) =
+            let (query, explain, note_type, include_superseded, frontier) =
                 parse_recall_flags(arg.as_deref().unwrap_or(""));
             if query.is_empty() {
                 Command::Unknown(
-                    "usage: /recall <query> [--explain] [--type <T>] [--include-superseded]".into(),
+                    "usage: /recall <query> [--explain] [--type <T>] [--include-superseded] [--frontier]".into(),
                 )
             } else {
-                Command::Recall { query, explain, note_type, include_superseded }
+                Command::Recall { query, explain, note_type, include_superseded, frontier }
             }
         }
         "/remember" => match arg {
@@ -152,6 +161,14 @@ pub fn parse_command(line: &str) -> Option<Command> {
             Some(id) => Command::Why { id },
             None => Command::Unknown("usage: /why <id>  (id from /recall)".into()),
         },
+        "/contradict" => match two_ids(arg.as_deref()) {
+            Some((a, b)) => Command::Contradict { a, b },
+            None => Command::Unknown("usage: /contradict <id> <id>  (the two notes conflict)".into()),
+        },
+        "/uncontradict" => match two_ids(arg.as_deref()) {
+            Some((a, b)) => Command::Uncontradict { a, b },
+            None => Command::Unknown("usage: /uncontradict <id> <id>".into()),
+        },
         "/archive" => match arg.and_then(|a| a.parse::<i64>().ok()) {
             Some(id) => Command::Archive(id),
             None => Command::Unknown("usage: /archive <id>  (id from /recall)".into()),
@@ -173,20 +190,23 @@ pub fn parse_command(line: &str) -> Option<Command> {
 const MEMORY_OFF_HINT: &str = "memory is not enabled on this server (start it with `serve --memory`)";
 
 /// Parse `/recall` flags out of the arg: `--explain` (bool), `--type <T>`
-/// (value), `--include-superseded` (bool). Returns `(query, explain, note_type,
-/// include_superseded)` with all flags removed from the query text. Query
-/// whitespace is collapsed (it's embedded — insensitive).
-fn parse_recall_flags(arg: &str) -> (String, bool, Option<String>, bool) {
+/// (value), `--include-superseded` (bool), `--frontier` (bool). Returns
+/// `(query, explain, note_type, include_superseded, frontier)` with all flags
+/// removed from the query text. Query whitespace is collapsed (it's embedded —
+/// insensitive).
+fn parse_recall_flags(arg: &str) -> (String, bool, Option<String>, bool, bool) {
     let toks: Vec<&str> = arg.split_whitespace().collect();
     let mut explain = false;
     let mut note_type = None;
     let mut include_superseded = false;
+    let mut frontier = false;
     let mut rest: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < toks.len() {
         match toks[i] {
             "--explain" => explain = true,
             "--include-superseded" => include_superseded = true,
+            "--frontier" => frontier = true,
             "--type" => {
                 note_type = toks.get(i + 1).map(|s| s.to_string());
                 i += 1; // also consume the value token
@@ -195,7 +215,7 @@ fn parse_recall_flags(arg: &str) -> (String, bool, Option<String>, bool) {
         }
         i += 1;
     }
-    (rest.join(" "), explain, note_type, include_superseded)
+    (rest.join(" "), explain, note_type, include_superseded, frontier)
 }
 
 /// Parse two whitespace-separated note ids (`<new_id> <old_id>`) for the
@@ -218,6 +238,28 @@ fn parse_derive(arg: Option<&str>) -> Option<(i64, Vec<i64>)> {
         return None;
     }
     Some((from, tos))
+}
+
+/// `"  ↑ frontier via #4"` for a hit the `--frontier` mode pulled into a
+/// reserved slot, or `""` for a plain similarity (seed) hit. Marks *what* the
+/// frontier rescued so the user can judge whether it earned its slot.
+fn frontier_suffix(frontier_via: Option<i64>) -> String {
+    match frontier_via {
+        Some(seed) => format!("  \u{2191} frontier via #{seed}"),
+        None => String::new(),
+    }
+}
+
+/// `"  ⚠ conflicts with #3, #7"` for a hit that is party to a `CONTRADICTS`
+/// edge, or `""` when it conflicts with nothing. **Awareness only** — symmetric,
+/// no side is suppressed; the user reconciles with `/supersede`.
+fn conflicts_suffix(conflicts_with: &[i64]) -> String {
+    if conflicts_with.is_empty() {
+        String::new()
+    } else {
+        let ids: Vec<String> = conflicts_with.iter().map(|id| format!("#{id}")).collect();
+        format!("  \u{26a0} conflicts with {}", ids.join(", "))
+    }
 }
 
 /// `" · derives from #3, #7"` for the `--explain` line, or `""` when the note
@@ -296,8 +338,10 @@ fn format_explain(query: &str, resp: &RecallResponse) -> String {
     } else {
         for (i, h) in resp.hits.iter().enumerate() {
             let _ = writeln!(
-                out, "  {:>2}. [{} · {:.3}]  {}   (id {}){}",
-                i + 1, h.note_type, h.score, snippet(&h.text), h.id, derives_suffix(&h.derives_from),
+                out, "  {:>2}. [{} · {:.3}]  {}   (id {}){}{}{}",
+                i + 1, h.note_type, h.score, snippet(&h.text), h.id,
+                frontier_suffix(h.frontier_via), derives_suffix(&h.derives_from),
+                conflicts_suffix(&h.conflicts_with),
             );
         }
     }
@@ -311,16 +355,41 @@ fn format_explain(query: &str, resp: &RecallResponse) -> String {
             let rank = resp.hits.len() + i + 1;
             // Label the gate that cut it: below the relevance threshold, or
             // beyond the top-k cap. (Server sends "threshold" / "top-k".)
-            // Label the gate that cut it. For `superseded`, name the superseder.
-            let cut = match (nm.cut.as_str(), h.superseded_by) {
-                ("superseded", Some(by)) => format!("superseded by #{by}"),
-                ("", _) => "top-k".to_string(),
-                (other, _) => other.to_string(),
+            // Label the gate that cut it. For `superseded`, name the superseder;
+            // for `frontier-withheld` (Edge-Type-Priors negative signal), name
+            // the contesting seed (`⚠ frontier withheld — contested by #seed`).
+            let cut = match (nm.cut.as_str(), h.superseded_by, h.contested_by) {
+                ("superseded", Some(by), _) => format!("superseded by #{by}"),
+                ("frontier-withheld", _, Some(seed)) => format!("\u{26a0} frontier withheld — contested by #{seed}"),
+                ("frontier-withheld", _, None) => "\u{26a0} frontier withheld".to_string(),
+                ("", _, _) => "top-k".to_string(),
+                (other, _, _) => other.to_string(),
             };
             let _ = writeln!(
-                out, "  {:>2}. [{} · {:.3}]  {}   (id {}, cut: {}){}",
-                rank, h.note_type, h.score, snippet(&h.text), h.id, cut, derives_suffix(&h.derives_from),
+                out, "  {:>2}. [{} · {:.3}]  {}   (id {}, cut: {}){}{}",
+                rank, h.note_type, h.score, snippet(&h.text), h.id, cut,
+                derives_suffix(&h.derives_from), conflicts_suffix(&h.conflicts_with),
             );
+        }
+    }
+
+    // Conflict pairs with BOTH parties in the returned set — the high-value
+    // case: the contradiction is visible side by side, ready to reconcile.
+    let returned_ids: std::collections::HashSet<i64> = resp.hits.iter().map(|h| h.id).collect();
+    let mut pairs: Vec<(i64, i64)> = Vec::new();
+    for h in &resp.hits {
+        for &other in &h.conflicts_with {
+            if h.id < other && returned_ids.contains(&other) {
+                pairs.push((h.id, other));
+            }
+        }
+    }
+    pairs.sort();
+    pairs.dedup();
+    if !pairs.is_empty() {
+        let _ = writeln!(out, "CONFLICT PAIRS ({}):", pairs.len());
+        for (a, b) in &pairs {
+            let _ = writeln!(out, "  \u{26a0} conflict pair: #{a} \u{2194} #{b}  (resolve with /supersede)");
         }
     }
 
@@ -459,14 +528,16 @@ impl Repl {
         }
     }
 
-    /// `/recall <query> [--explain] [--type <T>]`: display the current
-    /// project's matches (no auto-inject). Shows `id` + layer `type` per hit so
-    /// it can be targeted by `/archive`/`/forget`/`/retype`. `--explain` renders
-    /// the retrieval-diagnostics view; `--type <T>` filters to one layer type.
-    async fn recall(&self, query: &str, explain: bool, note_type: Option<&str>, include_superseded: bool) {
+    /// `/recall <query> [--explain] [--type <T>] [--frontier]`: display the
+    /// current project's matches (no auto-inject). Shows `id` + layer `type` per
+    /// hit so it can be targeted by `/archive`/`/forget`/`/retype`. `--explain`
+    /// renders the retrieval-diagnostics view; `--type <T>` filters to one layer
+    /// type; `--frontier` reserves slots for `DERIVES_FROM`-linked evidence
+    /// below the similarity cut (a frontier hit is marked `↑ via #seed`).
+    async fn recall(&self, query: &str, explain: bool, note_type: Option<&str>, include_superseded: bool, frontier: bool) {
         let call = self
             .client
-            .memory_recall_opts(self.project.as_deref(), query, 5, explain, note_type, include_superseded)
+            .memory_recall_opts(self.project.as_deref(), query, 5, explain, note_type, include_superseded, frontier)
             .await;
         match call {
             Ok(MemCall::Ok(resp)) => {
@@ -476,7 +547,7 @@ impl Repl {
                     println!("(no matches)");
                 } else {
                     for h in &resp.hits {
-                        println!("  #{} [{} · {:.2}] {}", h.id, h.note_type, h.score, snippet(&h.text));
+                        println!("  #{} [{} · {:.2}] {}{}", h.id, h.note_type, h.score, snippet(&h.text), frontier_suffix(h.frontier_via));
                     }
                 }
             }
@@ -550,6 +621,26 @@ impl Repl {
         }
     }
 
+    /// `/contradict <a> <b>`: record that two notes conflict (symmetric). Never
+    /// suppresses — surfaced in `--explain`; resolve with `/supersede`.
+    async fn contradict(&self, a: i64, b: i64) {
+        match self.client.memory_contradict(self.project.as_deref(), a, b).await {
+            Ok(MemCall::Ok(_)) => println!("(conflict recorded: #{a} ↔ #{b} — flagged in --explain, recall unchanged; resolve with /supersede)"),
+            Ok(MemCall::Disabled) => println!("({MEMORY_OFF_HINT})"),
+            Err(e) => eprintln!("error: {e}"),
+        }
+    }
+
+    /// `/uncontradict <a> <b>`: release a contradiction (inverse of
+    /// `/contradict`, direction-independent).
+    async fn uncontradict(&self, a: i64, b: i64) {
+        match self.client.memory_uncontradict(self.project.as_deref(), a, b).await {
+            Ok(MemCall::Ok(_)) => println!("(released: #{a} and #{b} no longer flagged as conflicting)"),
+            Ok(MemCall::Disabled) => println!("({MEMORY_OFF_HINT})"),
+            Err(e) => eprintln!("error: {e}"),
+        }
+    }
+
     /// `/why <id>`: print the Why-Graph justification tree (read-only).
     async fn why(&self, id: i64) {
         match self.client.memory_why(self.project.as_deref(), id).await {
@@ -599,9 +690,10 @@ impl Repl {
         println!(
             "commands: /quit /clear /model <name> /max-tokens <N> /think /no-think · \
              memory: /project [key] /recall <query> [--explain] [--type <T>] \
-             [--include-superseded] /remember [--type <T>] <text> /retype <id> <T> \
+             [--include-superseded] [--frontier] /remember [--type <T>] <text> /retype <id> <T> \
              /supersede <new> <old> /unsupersede <new> <old> \
              /derive <id> from <id…> /underive <id> from <id> /why <id> \
+             /contradict <id> <id> /uncontradict <id> <id> \
              /archive <id> /unarchive <id> /forget <id>",
         );
         // Pinned status line — only when stdout is a TTY (no-op otherwise).
@@ -647,8 +739,8 @@ impl Repl {
                         self.project = Some(key.clone());
                         println!("(project → {key})");
                     }
-                    Command::Recall { query, explain, note_type, include_superseded } => {
-                        self.recall(&query, explain, note_type.as_deref(), include_superseded).await
+                    Command::Recall { query, explain, note_type, include_superseded, frontier } => {
+                        self.recall(&query, explain, note_type.as_deref(), include_superseded, frontier).await
                     }
                     Command::Remember { text, note_type } => {
                         self.remember(&text, note_type.as_deref()).await
@@ -659,6 +751,8 @@ impl Repl {
                     Command::Derive { from_id, to_ids } => self.derive(from_id, to_ids).await,
                     Command::Underive { from_id, to_id } => self.underive(from_id, to_id).await,
                     Command::Why { id } => self.why(id).await,
+                    Command::Contradict { a, b } => self.contradict(a, b).await,
+                    Command::Uncontradict { a, b } => self.uncontradict(a, b).await,
                     Command::Archive(id) => self.archive(id).await,
                     Command::Unarchive(id) => self.unarchive(id).await,
                     Command::Forget(id) => self.forget(id).await,
@@ -865,7 +959,7 @@ mod tests {
     #[test]
     fn recall_command_needs_a_query() {
         assert_eq!(parse_command("/recall do fewer barriers help?"),
-            Some(Command::Recall { query: "do fewer barriers help?".into(), explain: false, note_type: None, include_superseded: false }));
+            Some(Command::Recall { query: "do fewer barriers help?".into(), explain: false, note_type: None, include_superseded: false, frontier: false }));
         assert!(matches!(parse_command("/recall"), Some(Command::Unknown(_))));
         assert!(matches!(parse_command("/recall   "), Some(Command::Unknown(_))));
     }
@@ -875,26 +969,36 @@ mod tests {
         // `--explain` anywhere flips the flag and is removed from the query.
         assert_eq!(
             parse_command("/recall magic number --explain"),
-            Some(Command::Recall { query: "magic number".into(), explain: true, note_type: None, include_superseded: false }),
+            Some(Command::Recall { query: "magic number".into(), explain: true, note_type: None, include_superseded: false, frontier: false }),
         );
         // `--type <T>` consumes its value and is stripped from the query.
         assert_eq!(
             parse_command("/recall design --type decision --explain"),
-            Some(Command::Recall { query: "design".into(), explain: true, note_type: Some("decision".into()), include_superseded: false }),
+            Some(Command::Recall { query: "design".into(), explain: true, note_type: Some("decision".into()), include_superseded: false, frontier: false }),
         );
         assert_eq!(
             parse_command("/recall --type working kernel speed"),
-            Some(Command::Recall { query: "kernel speed".into(), explain: false, note_type: Some("working".into()), include_superseded: false }),
+            Some(Command::Recall { query: "kernel speed".into(), explain: false, note_type: Some("working".into()), include_superseded: false, frontier: false }),
         );
         // `--include-superseded` is a bool flag, stripped from the query.
         assert_eq!(
             parse_command("/recall old design --include-superseded --type decision"),
-            Some(Command::Recall { query: "old design".into(), explain: false, note_type: Some("decision".into()), include_superseded: true }),
+            Some(Command::Recall { query: "old design".into(), explain: false, note_type: Some("decision".into()), include_superseded: true, frontier: false }),
         );
         // Without flags they stay default.
         assert_eq!(
             parse_command("/recall magic number"),
-            Some(Command::Recall { query: "magic number".into(), explain: false, note_type: None, include_superseded: false }),
+            Some(Command::Recall { query: "magic number".into(), explain: false, note_type: None, include_superseded: false, frontier: false }),
+        );
+        // `--frontier` is a bool flag, stripped from the query, default false.
+        assert_eq!(
+            parse_command("/recall kv reuse rationale --frontier"),
+            Some(Command::Recall { query: "kv reuse rationale".into(), explain: false, note_type: None, include_superseded: false, frontier: true }),
+        );
+        // `--frontier` composes with `--explain` and `--type`, order-insensitive.
+        assert_eq!(
+            parse_command("/recall design --frontier --explain --type decision"),
+            Some(Command::Recall { query: "design".into(), explain: true, note_type: Some("decision".into()), include_superseded: false, frontier: true }),
         );
         // Flags with no query is a usage error, not an empty recall.
         assert!(matches!(parse_command("/recall --explain"), Some(Command::Unknown(_))));
@@ -923,6 +1027,85 @@ mod tests {
         assert_eq!(parse_command("/why 5"), Some(Command::Why { id: 5 }));
         assert!(matches!(parse_command("/why"), Some(Command::Unknown(_))));
         assert!(matches!(parse_command("/why abc"), Some(Command::Unknown(_))));
+    }
+
+    #[test]
+    fn contradict_commands_parse_two_ids() {
+        assert_eq!(parse_command("/contradict 9 5"), Some(Command::Contradict { a: 9, b: 5 }));
+        assert_eq!(parse_command("/uncontradict 9 5"), Some(Command::Uncontradict { a: 9, b: 5 }));
+        // missing / non-numeric id → usage hint, not a crash.
+        assert!(matches!(parse_command("/contradict 9"), Some(Command::Unknown(_))));
+        assert!(matches!(parse_command("/contradict a b"), Some(Command::Unknown(_))));
+        assert!(matches!(parse_command("/uncontradict"), Some(Command::Unknown(_))));
+    }
+
+    #[test]
+    fn format_explain_flags_conflicts_and_conflict_pairs() {
+        use crate::types::{ExplainInfo, MemoryHit, RecallResponse};
+        let mk = |id: i64, score: f32, text: &str, conflicts: Vec<i64>| MemoryHit {
+            id, kind: "fact".into(), name: String::new(), text: text.into(),
+            status: "active".into(), note_type: "decision".into(), superseded_by: None,
+            derives_from: Vec::new(), frontier_via: None, conflicts_with: conflicts, contested_by: None, score,
+        };
+        // #1 and #2 conflict and are BOTH returned (the pair case); #3 conflicts
+        // with #9 which is NOT in the result (flag only, no pair).
+        let resp = RecallResponse {
+            hits: vec![
+                mk(1, 0.95, "We default KV reuse to on", vec![2]),
+                mk(2, 0.92, "We keep KV reuse off for safety", vec![1]),
+                mk(3, 0.70, "Sliding window masks tokens", vec![9]),
+            ],
+            explain: Some(ExplainInfo {
+                top_k: 3, threshold: None, query_dim: 768, near_miss: vec![], separation: None,
+            }),
+        };
+        let out = format_explain("kv reuse default", &resp);
+        assert!(out.contains("\u{26a0} conflicts with #2"), "hit flags its conflict partner: {out}");
+        assert!(out.contains("\u{26a0} conflicts with #1"), "symmetric flag on the other side: {out}");
+        assert!(out.contains("\u{26a0} conflicts with #9"), "flags a partner outside the result too: {out}");
+        // The pair section appears ONCE for #1↔#2 (both present), not for #3↔#9.
+        assert!(out.contains("CONFLICT PAIRS (1)"), "exactly one in-result pair: {out}");
+        assert!(out.contains("conflict pair: #1 \u{2194} #2"), "names the pair both ways: {out}");
+        assert!(!out.contains("#3 \u{2194}") && !out.contains("\u{2194} #9"), "no pair when one party is absent: {out}");
+        assert!(out.contains("resolve with /supersede"), "points to the resolution path: {out}");
+    }
+
+    #[test]
+    fn format_explain_renders_frontier_withheld_with_contesting_seed() {
+        use crate::types::{ExplainInfo, MemoryHit, NearMiss, RecallResponse};
+        let base = |id: i64, score: f32, text: &str| MemoryHit {
+            id, kind: "fact".into(), name: String::new(), text: text.into(),
+            status: "active".into(), note_type: "working".into(), superseded_by: None,
+            derives_from: Vec::new(), frontier_via: None, conflicts_with: Vec::new(),
+            contested_by: None, score,
+        };
+        // A frontier candidate withheld because it contests seed #7.
+        let mut withheld = base(4, 0.61, "Contested premise the frontier did not amplify");
+        withheld.contested_by = Some(7);
+        let resp = RecallResponse {
+            hits: vec![base(7, 0.95, "The seed that the candidate contradicts")],
+            explain: Some(ExplainInfo {
+                top_k: 3, threshold: None, query_dim: 768,
+                near_miss: vec![NearMiss { hit: withheld, cut: "frontier-withheld".into() }],
+                separation: None,
+            }),
+        };
+        let out = format_explain("kv reuse rationale", &resp);
+        assert!(out.contains("frontier withheld \u{2014} contested by #7"),
+            "withheld candidate names the contesting seed: {out}");
+        // A withheld candidate with no contested_by still renders honestly.
+        let mut bare = base(5, 0.60, "Withheld but seed unknown");
+        bare.contested_by = None;
+        let resp2 = RecallResponse {
+            hits: vec![],
+            explain: Some(ExplainInfo {
+                top_k: 3, threshold: None, query_dim: 768,
+                near_miss: vec![NearMiss { hit: bare, cut: "frontier-withheld".into() }],
+                separation: None,
+            }),
+        };
+        assert!(format_explain("q", &resp2).contains("\u{26a0} frontier withheld"),
+            "withheld renders even without a named seed");
     }
 
     #[test]
@@ -980,7 +1163,7 @@ mod tests {
         let hit = |id: i64, score: f32, text: &str| MemoryHit {
             id, kind: "fact".into(), name: String::new(), text: text.into(),
             status: "active".into(), note_type: "decision".into(), superseded_by: None,
-            derives_from: Vec::new(), score,
+            derives_from: Vec::new(), frontier_via: None, conflicts_with: Vec::new(), contested_by: None, score,
         };
         let nm = |id: i64, score: f32, text: &str, cut: &str| NearMiss {
             hit: hit(id, score, text), cut: cut.into(),
@@ -1027,6 +1210,39 @@ mod tests {
         assert!(out2.contains("none (pure top-k ranking)"), "honest about no threshold: {out2}");
         assert!(out2.contains("NEAR-MISS: none"), "explicit no-near-miss line: {out2}");
         assert!(out2.contains("separation: n/a"), "n/a separation when no near-miss: {out2}");
+    }
+
+    #[test]
+    fn format_explain_labels_frontier_picks_and_reserved_seeds() {
+        use crate::types::{ExplainInfo, MemoryHit, NearMiss, RecallResponse};
+        let base = |id: i64, score: f32, text: &str| MemoryHit {
+            id, kind: "fact".into(), name: String::new(), text: text.into(),
+            status: "active".into(), note_type: "working".into(), superseded_by: None,
+            derives_from: Vec::new(), frontier_via: None, conflicts_with: Vec::new(), contested_by: None, score,
+        };
+        // A returned set with one seed and one frontier-rescued pick (via #1).
+        let mut pick = base(4, 0.62, "Linked evidence pulled up by the frontier");
+        pick.frontier_via = Some(1);
+        let resp = RecallResponse {
+            hits: vec![base(1, 0.95, "The seed that anchored the frontier"), pick],
+            explain: Some(ExplainInfo {
+                top_k: 2,
+                threshold: None,
+                query_dim: 768,
+                // A seed displaced to make room for the frontier pick.
+                near_miss: vec![NearMiss {
+                    hit: base(2, 0.80, "A seed displaced by the reservation"),
+                    cut: "frontier-reserved".into(),
+                }],
+                separation: Some(-0.18),
+            }),
+        };
+        let out = format_explain("kv reuse rationale", &resp);
+        assert!(out.contains("\u{2191} frontier via #1"), "frontier pick labelled with its seed: {out}");
+        assert!(out.contains("cut: frontier-reserved"), "displaced seed labelled frontier-reserved: {out}");
+        // The plain seed line must NOT carry a frontier marker.
+        assert!(out.contains("The seed that anchored the frontier   (id 1)"),
+            "seed hit has no frontier marker: {out}");
     }
 
     #[test]

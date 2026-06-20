@@ -729,3 +729,384 @@ fn recall_threshold_errs_to_include_borderline_relevant() {
     let hits = store.recall_with_margin(Some("borderline"), q, 5, Some(0.2)).expect("recall");
     assert_eq!(hits.len(), 2, "a generous margin must keep both close-relevant notes (err to include)");
 }
+
+/// Retrieval step 1 — the **opt-in one-hop `DERIVES_FROM` frontier**: a note
+/// anchored (via `DERIVES_FROM`) in a top seed but scored *below the top-k cut*
+/// is pulled into a **reserved slot** — while **default recall stays byte-
+/// identical** (the v1.0.4 contract: `DERIVES_FROM` does not change default
+/// recall). `--explain` labels the pick (`frontier_via`) and the displaced seed
+/// (`frontier-reserved`). This proves the *mechanism*; the relevant-vs-noise
+/// verdict is the live measurement in the report.
+#[test]
+fn frontier_pulls_below_cut_evidence_and_default_recall_is_byte_identical() {
+    use std::collections::HashSet;
+    let store = store_or_skip!("frontier");
+    let q = "GPU compute kernel dispatch on Vulkan";
+    // Seed strongly matches q; two notes match moderately (they fill the cut);
+    // the evidence is off-topic to q (so pure similarity drops it below the
+    // cut) but is the note the user anchored the seed in.
+    let seed = store.remember(Some("frontier"), "fact", "Vulkan compute shaders dispatch GPU kernels on RDNA4 gfx1201", None, Some(json!({"type":"decision"}))).expect("seed").id;
+    let n1 = store.remember(Some("frontier"), "fact", "The GPU runs matrix-vector multiply shaders for inference", None, None).expect("n1").id;
+    let n2 = store.remember(Some("frontier"), "fact", "Compute pipelines bind descriptor sets for storage buffers", None, None).expect("n2").id;
+    let evidence = store.remember(Some("frontier"), "fact", "A sourdough loaf needs flour water salt and a long patient rise", None, Some(json!({"type":"working"}))).expect("ev").id;
+    assert_eq!([seed, n1, n2, evidence].iter().collect::<HashSet<_>>().len(), 4, "seed deduped");
+
+    // Precondition (else the scenario isn't adversarial): the seed is a top-2
+    // hit, the evidence is BELOW the top-2 similarity cut.
+    let base: Vec<i64> = store.recall(Some("frontier"), q, 2).expect("base").iter().map(|h| h.id).collect();
+    assert!(base.contains(&seed), "seed must be a top hit: {base:?}");
+    assert!(!base.contains(&evidence), "evidence must fall below the top-2 cut (not adversarial otherwise): {base:?}");
+
+    // No edge yet → frontier-on == frontier-off (nothing to pull), no markers.
+    let pre = store.recall_frontier(Some("frontier"), q, 2, 1, None, None, false, false).expect("pre");
+    assert_eq!(pre.returned.iter().map(|h| h.id).collect::<Vec<_>>(), base, "no DERIVES_FROM → frontier == default");
+    assert!(pre.returned.iter().all(|h| h.frontier_via.is_none()), "no frontier marker without edges");
+
+    // The user anchors the seed in the evidence.
+    store.derive(Some("frontier"), seed, &[evidence]).expect("derive");
+
+    // CRITICAL byte-identity: default recall is UNCHANGED by the edge.
+    let after: Vec<i64> = store.recall(Some("frontier"), q, 2).expect("after").iter().map(|h| h.id).collect();
+    assert_eq!(after, base, "default recall (no frontier) byte-identical with the edge present");
+
+    // Frontier ON (F=1): the evidence is pulled into a reserved slot, marked
+    // `frontier_via = seed`; the lowest seed is displaced. Still exactly k=2.
+    let fr = store.recall_frontier(Some("frontier"), q, 2, 1, None, None, false, false).expect("frontier");
+    let ids: Vec<i64> = fr.returned.iter().map(|h| h.id).collect();
+    assert_eq!(ids.len(), 2, "still exactly k=2 slots: {ids:?}");
+    assert!(ids.contains(&seed), "the top seed is kept: {ids:?}");
+    assert!(ids.contains(&evidence), "frontier pulled the linked evidence into a slot: {ids:?}");
+    let ev_hit = fr.returned.iter().find(|h| h.id == evidence).expect("evidence present");
+    assert_eq!(ev_hit.frontier_via, Some(seed), "evidence labelled as pulled via the seed");
+    assert_eq!(fr.returned.iter().find(|h| h.id == seed).expect("seed present").frontier_via, None, "the seed itself is not a frontier pick");
+
+    // --explain (annotate_why): the seed shows its derivation, and the displaced
+    // seed is a near-miss cut `frontier-reserved`.
+    let ex = store.recall_frontier(Some("frontier"), q, 2, 1, None, None, false, true).expect("frontier explain");
+    let seed_hit = ex.returned.iter().find(|h| h.id == seed).expect("seed in explain returned");
+    assert!(seed_hit.derives_from.contains(&evidence), "explain fills the seed's derivation: {:?}", seed_hit.derives_from);
+    assert!(ex.near_miss.iter().any(|nm| nm.cut == CutReason::FrontierReserved), "a displaced seed is labelled frontier-reserved");
+}
+
+/// The frontier honors the slot budget `F` and never duplicates a seed: with
+/// two below-cut linked notes, `F=1` pulls exactly **one** and `F=2` pulls
+/// **both**, the returned set is always exactly `k` with no id twice, and the
+/// top seed is always kept.
+#[test]
+fn frontier_caps_at_f_slots_and_never_duplicates() {
+    use std::collections::HashSet;
+    let store = store_or_skip!("frontier_cap");
+    let q = "Vulkan GPU compute pipeline dispatch";
+    let s = store.remember(Some("frontier_cap"), "fact", "Vulkan compute shaders dispatch GPU kernels on RDNA4 gfx1201", None, Some(json!({"type":"decision"}))).expect("s").id;
+    let n1 = store.remember(Some("frontier_cap"), "fact", "The GPU executes matrix-vector multiply shaders each step", None, None).expect("n1").id;
+    let n2 = store.remember(Some("frontier_cap"), "fact", "Descriptor sets bind storage buffers into the compute pipeline", None, None).expect("n2").id;
+    // Two off-topic premises (below the cut), both anchored in the seed.
+    let e1 = store.remember(Some("frontier_cap"), "fact", "Medieval guild apprenticeships often lasted about seven years", None, Some(json!({"type":"working"}))).expect("e1").id;
+    let e2 = store.remember(Some("frontier_cap"), "fact", "Arctic narwhals navigate dark winter waters by echolocation", None, Some(json!({"type":"working"}))).expect("e2").id;
+    assert_eq!([s, n1, n2, e1, e2].iter().collect::<HashSet<_>>().len(), 5, "seed deduped");
+
+    // Precondition: the on-topic three hold the top-3; both premises are below.
+    let top3: Vec<i64> = store.recall(Some("frontier_cap"), q, 3).expect("top3").iter().map(|h| h.id).collect();
+    assert!(top3.contains(&s), "seed in top-3: {top3:?}");
+    assert!(!top3.contains(&e1) && !top3.contains(&e2), "both premises below the top-3 cut: {top3:?}");
+
+    store.derive(Some("frontier_cap"), s, &[e1, e2]).expect("derive both");
+
+    let pulled = |slots: usize| -> (usize, usize, bool) {
+        let fr = store.recall_frontier(Some("frontier_cap"), q, 3, slots, None, None, false, false).expect("frontier");
+        let ids: Vec<i64> = fr.returned.iter().map(|h| h.id).collect();
+        let uniq = ids.iter().collect::<HashSet<_>>().len();
+        let n_ev = ids.iter().filter(|id| **id == e1 || **id == e2).count();
+        let marked = fr.returned.iter().filter(|h| h.frontier_via.is_some()).count();
+        assert_eq!(ids.len(), 3, "exactly k=3 returned: {ids:?}");
+        assert_eq!(uniq, 3, "no id appears twice: {ids:?}");
+        assert!(ids.contains(&s), "the top seed is always kept: {ids:?}");
+        assert_eq!(n_ev, marked, "every pulled premise carries a frontier marker");
+        (n_ev, marked, true)
+    };
+    // F=1 → exactly ONE premise pulled (the cap holds).
+    assert_eq!(pulled(1).0, 1, "F=1 reserves exactly one slot");
+    // F=2 → BOTH premises pulled (the budget scales to the cap).
+    assert_eq!(pulled(2).0, 2, "F=2 reserves both slots");
+}
+
+/// `CONTRADICTS` — the symmetric conflict edge: flagged in `--explain` on **both**
+/// parties regardless of which direction the edge was stored, **never** suppressed
+/// (no winner), **default recall byte-identical** with the edge present, resolved
+/// user-driven via `/supersede` (the existing suppression), reversible and
+/// direction-independent via `uncontradict`.
+#[test]
+fn contradicts_flags_both_sides_byte_identical_and_resolves_via_supersede() {
+    use std::collections::HashSet;
+    let store = store_or_skip!("contra");
+    // Two notes that genuinely disagree + a neutral third — all relevant to q.
+    let a = store.remember(Some("contra"), "fact", "We default KV prefix reuse to ON for memory-augmented turns", None, Some(json!({"type":"decision"}))).expect("a").id;
+    let b = store.remember(Some("contra"), "fact", "We keep KV prefix reuse OFF to stay fully stateless", None, Some(json!({"type":"decision"}))).expect("b").id;
+    let c = store.remember(Some("contra"), "fact", "KV prefix reuse matching uses the longest common token run", None, None).expect("c").id;
+    assert_eq!([a, b, c].iter().collect::<HashSet<_>>().len(), 3, "seed deduped");
+    let q = "kv prefix reuse default policy";
+
+    // conflicts_with of an id across the whole explain candidate set (or None if
+    // the id isn't a candidate). Avoids naming the (un-imported) Hit type.
+    let cw = |ex: &vulkanforge::server::memory::RecallExplain, id: i64| -> Option<Vec<i64>> {
+        ex.returned.iter().chain(ex.near_miss.iter().map(|nm| &nm.hit))
+            .find(|h| h.id == id).map(|h| h.conflicts_with.clone())
+    };
+
+    // Baseline default recall (no edges yet).
+    let before: Vec<(i64, f32)> = store.recall(Some("contra"), q, 5).expect("before").iter().map(|h| (h.id, h.score)).collect();
+
+    // Store ONE directed edge a→b. Symmetric semantics: both sides must flag.
+    store.contradict(Some("contra"), a, b).expect("contradict");
+
+    // CRITICAL byte-id: default recall is UNCHANGED by the CONTRADICTS edge.
+    let after: Vec<(i64, f32)> = store.recall(Some("contra"), q, 5).expect("after").iter().map(|h| (h.id, h.score)).collect();
+    assert_eq!(before, after, "CONTRADICTS must not change default recall (ids/scores/order)");
+    assert!(store.recall(Some("contra"), q, 5).expect("r").iter().all(|h| h.conflicts_with.is_empty()),
+        "default recall hits must omit conflicts_with (explain-only)");
+
+    // --explain flags BOTH a and b, each pointing at the other (symmetric, even
+    // though the edge was stored a→b only); the neutral note c is unflagged.
+    let ex = store.recall_explain(Some("contra"), q, 5, 5, None, None, false).expect("explain");
+    assert!(cw(&ex, a).expect("a present").contains(&b), "a flags conflict with b");
+    assert!(cw(&ex, b).expect("b present").contains(&a), "b flags conflict with a (symmetric)");
+    assert!(cw(&ex, c).expect("c present").is_empty(), "neutral note has no conflict flag");
+
+    // Idempotent in BOTH directions: contradict(b,a) is a no-op (same conflict).
+    store.contradict(Some("contra"), b, a).expect("idempotent reverse");
+    let ex2 = store.recall_explain(Some("contra"), q, 5, 5, None, None, false).expect("explain2");
+    assert_eq!(cw(&ex2, a).expect("a"), vec![b], "exactly one partner after reverse-direction contradict (idempotent)");
+
+    // Resolution: /supersede a b → b suppressed (the EXISTING suppression does
+    // the work; CONTRADICTS only surfaced it). Conflict effectively resolved.
+    store.supersede(Some("contra"), a, b).expect("supersede resolves");
+    let resolved = store.recall(Some("contra"), q, 5).expect("resolved");
+    assert!(resolved.iter().all(|h| h.id != b), "loser suppressed after /supersede: {:?}", resolved.iter().map(|h| h.id).collect::<Vec<_>>());
+    assert!(resolved.iter().any(|h| h.id == a), "winner stays in recall");
+
+    // uncontradict is direction-independent: release with (b,a) though stored a→b.
+    store.unsupersede(Some("contra"), a, b).expect("restore b for the flag check");
+    store.uncontradict(Some("contra"), b, a).expect("uncontradict reverse-direction");
+    let ex3 = store.recall_explain(Some("contra"), q, 5, 5, None, None, false).expect("explain3");
+    assert!(cw(&ex3, a).expect("a").is_empty() && cw(&ex3, b).expect("b").is_empty(),
+        "uncontradict (reverse direction) clears the flag on both sides");
+
+    // missing id → typed NotFound (→ 404).
+    assert!(matches!(store.contradict(Some("contra"), a, 999_999), Err(CurateError::NotFound(_))));
+    assert!(matches!(store.uncontradict(Some("contra"), 999_999, a), Err(CurateError::NotFound(_))));
+}
+
+/// Edge-Type-Priors — `CONTRADICTS` as the frontier **negative signal**: a
+/// `DERIVES_FROM`-linked frontier candidate that `CONTRADICTS` a **seed** is
+/// **withheld** from the reserved slots (the freed slot goes to the next clean
+/// candidate), transparently surfaced in `--explain` as `frontier-withheld`
+/// with the contesting seed. Categorical, no scalar weights. Default recall
+/// byte-identical; `--frontier` with no `CONTRADICTS` edge == step-1; the
+/// trigger fires ONLY for a seed conflict (a non-seed conflict is left alone).
+#[test]
+fn frontier_negative_signal_withholds_seed_contested_evidence() {
+    use std::collections::HashSet;
+    let store = store_or_skip!("prio");
+    let q = "Vulkan GPU compute pipeline dispatch on RDNA4";
+    // 3 on-topic notes → the top-3 seeds.
+    let s = store.remember(Some("prio"), "fact", "Vulkan compute shaders dispatch GPU kernels on RDNA4 gfx1201", None, Some(json!({"type":"decision"}))).expect("s").id;
+    let t = store.remember(Some("prio"), "fact", "The GPU executes matrix-vector multiply shaders for inference each step", None, Some(json!({"type":"decision"}))).expect("t").id;
+    let u = store.remember(Some("prio"), "fact", "Compute pipelines bind descriptor sets to storage buffers on the device", None, None).expect("u").id;
+    // 2 off-topic premises anchored in S (below the cut) + 1 off-topic non-seed.
+    let e  = store.remember(Some("prio"), "fact", "Medieval guild apprenticeships often lasted about seven years", None, Some(json!({"type":"working"}))).expect("e").id;
+    let e2 = store.remember(Some("prio"), "fact", "Arctic narwhals navigate dark winter waters using echolocation", None, Some(json!({"type":"working"}))).expect("e2").id;
+    let x  = store.remember(Some("prio"), "fact", "A sourdough loaf needs flour water salt and a long patient rise", None, None).expect("x").id;
+    assert_eq!([s, t, u, e, e2, x].iter().collect::<HashSet<_>>().len(), 6, "seed deduped");
+
+    // Precondition: the on-topic notes hold the top-3; the premises/non-seed are below.
+    let top3: Vec<i64> = store.recall(Some("prio"), q, 3).expect("top3").iter().map(|h| h.id).collect();
+    assert!(top3.contains(&s) && top3.contains(&t) && top3.contains(&u), "on-topic notes hold top-3: {top3:?}");
+    assert!(![e, e2, x].iter().any(|id| top3.contains(id)), "premises/non-seed below the cut: {top3:?}");
+
+    // Baseline default recall (no edges) — for the byte-id invariant.
+    let base_default: Vec<(i64, f32)> = store.recall(Some("prio"), q, 6).expect("base").iter().map(|h| (h.id, h.score)).collect();
+
+    // Anchor both premises in S (DERIVES_FROM) so step-1 would pull them.
+    store.derive(Some("prio"), s, &[e, e2]).expect("derive");
+
+    let fids = || -> Vec<i64> {
+        store.recall_frontier(Some("prio"), q, 3, 2, None, None, false, false).expect("fr").returned.iter().map(|h| h.id).collect()
+    };
+
+    // (A) step-1 reference: no CONTRADICTS edge → both premises pulled (F=2).
+    let step1 = fids();
+    assert!(step1.contains(&e) && step1.contains(&e2), "step-1 frontier pulls both linked premises: {step1:?}");
+
+    // (B) negative signal: E CONTRADICTS a SEED (T) → E withheld, E2 still pulled.
+    store.contradict(Some("prio"), e, t).expect("contradict e<->t");
+    let with_neg = fids();
+    assert!(!with_neg.contains(&e), "E withheld (contests seed T): {with_neg:?}");
+    assert!(with_neg.contains(&e2), "clean premise E2 still pulled: {with_neg:?}");
+    // --explain: E is frontier-withheld, contested_by = T.
+    let ex = store.recall_frontier(Some("prio"), q, 3, 2, None, None, false, true).expect("ex");
+    let ew = ex.near_miss.iter().find(|nm| nm.hit.id == e).expect("E in near_miss");
+    assert_eq!(ew.cut, CutReason::FrontierWithheld, "E cut as frontier-withheld");
+    assert_eq!(ew.hit.contested_by, Some(t), "E contested by seed T");
+    // Returned (pulled) hits never carry contested_by.
+    assert!(ex.returned.iter().all(|h| h.contested_by.is_none()), "returned hits carry no contested_by");
+
+    // (C) control: E2 CONTRADICTS a NON-seed (X) → E2 is NOT withheld (the
+    // trigger is exclusively "contradicts a seed").
+    store.contradict(Some("prio"), e2, x).expect("contradict e2<->x");
+    let with_nonseed = fids();
+    assert!(with_nonseed.contains(&e2), "E2 not withheld — X is not a seed: {with_nonseed:?}");
+    assert!(!with_nonseed.contains(&e), "E still withheld (contests seed T): {with_nonseed:?}");
+
+    // (D) byte-id: default recall is unchanged by ALL the edges.
+    let after_default: Vec<(i64, f32)> = store.recall(Some("prio"), q, 6).expect("after").iter().map(|h| (h.id, h.score)).collect();
+    assert_eq!(base_default, after_default, "DERIVES_FROM + CONTRADICTS must not change default recall");
+
+    // (E) == step-1 invariant: with NO CONTRADICTS edge left, the frontier picks
+    // return exactly to the step-1 result (the negative signal is fast-skipped).
+    store.uncontradict(Some("prio"), e, t).expect("uncontradict e-t");
+    store.uncontradict(Some("prio"), e2, x).expect("uncontradict e2-x");
+    let restored = fids();
+    assert_eq!(restored.iter().collect::<HashSet<_>>(), step1.iter().collect::<HashSet<_>>(),
+        "no CONTRADICTS edge → frontier == step-1: {restored:?} vs {step1:?}");
+}
+
+// ---- SQLiteGraph 3.3.1: cross-process HNSW recall determinism ----
+//
+// 3.3.1 honors `multilayer_deterministic_seed` (pinned as VF_HNSW_SEED in
+// hnsw_cfg()). This proves the payoff: two SEPARATE OS processes that build the
+// same store from the same notes in the same order recall **byte-identically**.
+// Pre-3.3.1 the level distributor used `from_entropy()`, so independent index
+// builds (even within one process) could land nodes on different layers →
+// recall could shift across process restarts.
+
+/// Fixture size: large enough that the HNSW **multilayer** structure is actually
+/// exercised. With M=16 the level distribution puts ~1/16 of nodes on layer ≥1;
+/// 256 notes ⇒ ~16 upper-layer nodes (≈1 on layer ≥2), so the *seeded* level
+/// distributor — exactly what 3.3.1 fixes — genuinely governs the graph. A
+/// handful of notes would all sit on layer 0 and search quasi-exactly, proving
+/// nothing.
+const DET_N: usize = 256;
+const DET_QUERY: &str = "Vulkan compute kernel dispatch on RDNA4 gfx1201";
+
+/// Deterministic, dedup-dodging note generator: a fixed-seed LCG draws words
+/// from a varied vocab so the notes are (a) byte-identical across both child
+/// processes and (b) semantically diverse enough to clear the 0.92 dedup
+/// threshold (templated near-identical sentences would fold together and shrink
+/// the store below the multilayer regime).
+fn det_notes() -> Vec<String> {
+    const VOCAB: &[&str] = &[
+        "vulkan", "shader", "kernel", "dispatch", "barrier", "tensor", "quantize", "decode",
+        "prefill", "attention", "softmax", "embedding", "gradient", "matrix", "vector", "cosine",
+        "sourdough", "flour", "yeast", "oven", "mountain", "river", "glacier", "forest",
+        "neutron", "quasar", "photon", "entropy", "velocity", "gravity", "orbit", "comet",
+        "harbor", "compass", "anchor", "voyage", "lantern", "copper", "granite", "marble",
+        "saffron", "cardamom", "basil", "ginger", "walnut", "apricot", "juniper", "clover",
+        "violin", "trumpet", "timpani", "octave", "sonata", "ballad", "rhythm", "tempo",
+        "falcon", "otter", "lynx", "heron", "beetle", "salmon", "cobra", "ibex",
+        "ledger", "invoice", "cipher", "protocol", "latency", "throughput", "cache", "buffer",
+        "amber", "cobalt", "crimson", "indigo", "ochre", "teal", "scarlet", "ivory",
+    ];
+    let mut state: u64 = 0x1234_5678_9ABC_DEF0; // fixed → identical notes across processes
+    let mut out = Vec::with_capacity(DET_N);
+    for i in 0..DET_N {
+        let mut words = Vec::with_capacity(12);
+        for _ in 0..12 {
+            // LCG (Knuth MMIX constants); the high bits are the well-mixed ones.
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            words.push(VOCAB[((state >> 33) as usize) % VOCAB.len()]);
+        }
+        out.push(format!("note {i}: {}", words.join(" ")));
+    }
+    out
+}
+
+/// Throwaway db, directly under the shared `vf_mem_tests/` dir so the ONNX model
+/// cache (`embed-cache/`, a sibling of the db file) is reused, not re-downloaded.
+/// The `.db` is wiped each call → every process builds a **fresh** index and
+/// never reopens a persisted one.
+fn det_db() -> std::path::PathBuf {
+    let base = std::env::temp_dir().join("vf_mem_tests");
+    let _ = std::fs::create_dir_all(&base);
+    let db = base.join("det_probe.db");
+    for suf in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{}", db.display(), suf));
+    }
+    db
+}
+
+/// Child probe (one OS process): build a fresh store, insert DET_N notes in
+/// order, recall DET_QUERY, print `id:score_bits` between markers. `#[ignore]`
+/// so it never runs in the normal suite — the parent spawns it by exact name.
+#[test]
+#[ignore]
+fn determinism_subprocess_probe() {
+    let store = match MemoryStore::new(det_db()) {
+        Ok(s) => s,
+        Err(e) => {
+            println!("PROBE_SKIP {e}");
+            return;
+        }
+    };
+    for note in det_notes() {
+        store.remember(Some("seedeval"), "Note", &note, None, None).expect("remember");
+    }
+    let hits = store.recall(Some("seedeval"), DET_QUERY, 10).expect("recall");
+    println!("PROBE_BEGIN");
+    for h in &hits {
+        // bit-exact score so a 1-ULP divergence can't hide behind formatting.
+        println!("{}:{}", h.id, h.score.to_bits());
+    }
+    println!("PROBE_END");
+    store.shutdown();
+}
+
+/// Parent: spawn the probe in TWO separate processes and diff their recall
+/// output byte-for-byte. Identical ⇒ recall is reproducible across process
+/// restarts — the property 3.3.1 + the pinned seed deliver, and on which the
+/// dogfood store relies.
+#[test]
+fn cross_process_recall_is_deterministic() {
+    // Same embedder gate as the rest of the suite: skip cleanly if the model is
+    // absent (the spawned probe would self-skip too).
+    if MemoryStore::new(db_for("seedeval_gate")).is_err() {
+        eprintln!("SKIP cross_process_recall_is_deterministic: embedder unavailable");
+        return;
+    }
+    let exe = std::env::current_exe().expect("test binary path");
+    let run = || -> String {
+        let out = std::process::Command::new(&exe)
+            .args(["--ignored", "--exact", "--nocapture", "--test-threads=1", "determinism_subprocess_probe"])
+            .output()
+            .expect("spawn determinism probe");
+        let s = String::from_utf8_lossy(&out.stdout).into_owned();
+        match (s.find("PROBE_BEGIN"), s.find("PROBE_END")) {
+            (Some(b), Some(e)) if e > b => s[b + "PROBE_BEGIN".len()..e].trim().to_string(),
+            _ if s.contains("PROBE_SKIP") => "PROBE_SKIP".to_string(),
+            _ => panic!(
+                "probe emitted no markers\n--- stdout ---\n{s}\n--- stderr ---\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        }
+    };
+    let a = run();
+    if a == "PROBE_SKIP" {
+        eprintln!("SKIP cross_process_recall_is_deterministic: probe self-skipped");
+        return;
+    }
+    let b = run();
+    assert!(a.lines().count() >= 5, "expected several recall hits, got:\n{a}");
+    assert_eq!(
+        a, b,
+        "cross-process recall diverged:\n--- process A ---\n{a}\n--- process B ---\n{b}"
+    );
+    eprintln!(
+        "cross-process determinism OK: {} hit lines byte-identical across 2 processes",
+        a.lines().count()
+    );
+    // Throwaway db removed; the shared embed-cache and the real memory db are
+    // never touched (temp dir only).
+    let base = std::env::temp_dir().join("vf_mem_tests");
+    for suf in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{}", base.join("det_probe.db").display(), suf));
+    }
+}

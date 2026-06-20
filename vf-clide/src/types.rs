@@ -198,6 +198,10 @@ pub struct RecallRequest {
     /// Omitted when `None` → request unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_superseded: Option<bool>,
+    /// Opt-in one-hop `DERIVES_FROM` frontier (`--frontier`). Omitted when
+    /// `None` → the request is byte-identical to plain recall.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frontier: Option<bool>,
 }
 
 /// `POST /memory/recall` response: ranked hits (highest score first). With
@@ -265,6 +269,19 @@ pub struct MemoryHit {
     /// `--explain` path; empty in default recall.
     #[serde(default)]
     pub derives_from: Vec<i64>,
+    /// Set only in `--frontier` mode: the seed id whose `DERIVES_FROM` edge
+    /// pulled this note into a reserved slot. Absent on every other hit.
+    #[serde(default)]
+    pub frontier_via: Option<i64>,
+    /// Ids this note conflicts with (`CONTRADICTS`, symmetric). Populated only on
+    /// the `--explain` path; empty in default recall. Awareness only — a conflict
+    /// is flagged, never suppressed.
+    #[serde(default)]
+    pub conflicts_with: Vec<i64>,
+    /// Set only on a frontier candidate withheld because it contests a seed
+    /// (Edge-Type-Priors): the contesting seed id. Absent on every other hit.
+    #[serde(default)]
+    pub contested_by: Option<i64>,
     #[serde(default)]
     pub score: f32,
 }
@@ -350,6 +367,25 @@ pub struct DeriveResponse {
     pub to_ids: Vec<i64>,
     #[serde(default)]
     pub derived: bool,
+}
+
+/// `POST /memory/contradict` | `/memory/uncontradict` request — `a` and `b`
+/// conflict (`CONTRADICTS`, symmetric; order doesn't matter).
+#[derive(Debug, Serialize)]
+pub struct ContradictRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+    pub a: i64,
+    pub b: i64,
+}
+
+/// `POST /memory/contradict` | `/memory/uncontradict` response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContradictResponse {
+    pub a: i64,
+    pub b: i64,
+    #[serde(default)]
+    pub contradicts: bool,
 }
 
 /// `POST /memory/why` request — the Why-Graph trace for a note.

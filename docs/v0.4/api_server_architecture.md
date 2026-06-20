@@ -1045,9 +1045,10 @@ Logs umfassen:
 
 Server-seitiges Gedächtnis, **embedded** im API-Prozess (`src/server/memory.rs` + `handlers/memory.rs`).
 VF-native `/memory/*`-Endpoints (getrennt von `/v1/*`): `POST /memory/remember` (optional `type`),
-`POST /memory/recall` (optional `explain`/`type`/`include_superseded`), `POST`/`GET /memory/projects`, Kuration
-`POST /memory/archive` · `/unarchive` · `/delete` · `/retype` (fehlende id → **404** via typisiertem `CurateError`),
-und die **Verbindungs-Schicht** `POST /memory/supersede` · `/unsupersede` · `/derive` · `/underive` · `/why`.
+`POST /memory/recall` (optional `explain`/`type`/`include_superseded`/`frontier`), `POST`/`GET /memory/projects`,
+Kuration `POST /memory/archive` · `/unarchive` · `/delete` · `/retype` (fehlende id → **404** via typisiertem
+`CurateError`), und die **Verbindungs-Schicht** `POST /memory/supersede` · `/unsupersede` · `/derive` · `/underive` ·
+`/why` · `/contradict` · `/uncontradict`.
 `AppState.memory: Option<Arc<MemoryStore>>` (None → 503, Inference läuft weiter).
 
 **Opt-in — zwei Gates (default OFF).** Das Subsystem ist doppelt gegated, damit der Standard-Build schlank bleibt:
@@ -1062,9 +1063,11 @@ und die **Verbindungs-Schicht** `POST /memory/supersede` · `/unsupersede` · `/
 
 Das deckt die „deliberate notebook"-Philosophie auch baulich: Gedächtnis ist eine bewusste Aktivierung, kein Default.
 
-**Bausteine.** Eine `sg.db` ([SQLiteGraph](https://github.com/oldnordic/sqlitegraph) — Nodes + Edges + per-Projekt-
+**Bausteine.** Eine `sg.db` ([SQLiteGraph](https://github.com/maeddesg/sqlitegraph) — Nodes + Edges + per-Projekt-
 HNSW-Indizes) + CPU-Embedder ([fastembed](https://github.com/maeddesg/fastembed-rs), Nomic-Embed v1.5-Q, 768-dim,
-INT8/VNNI). Beide git-deps **gepinnt**: SG rev `d8219a8` (3.2.5), fastembed rev `3a9588a` (5.16.2).
+INT8/VNNI). Beide git-deps **gepinnt**: SG rev `80a3168` (3.3.1, maeddesg-Fork — HNSW-Determinismus-Fix +
+`delete_vector`-Entry-Point-Re-Election), fastembed rev `3a9588a` (5.16.2). **`--features memory` braucht Rust 1.89**
+(lean-Default bleibt 1.85).
 
 **Scoping & Persistenz.** Pro `project_key` ein persistenter HNSW-Index (768/cosine/m16/ef200); ein reservierter
 `__global__`-Default für scope-lose Calls. Recall trifft **nur** den Projekt-Index → physische Isolation, kein
@@ -1094,13 +1097,35 @@ byte-identisch zu vorher):
   separation), über-fetcht `k+5`. Opt-in `VF_RECALL_MARGIN` (default off): relative-to-top-Threshold (`score ≥
   top_score − margin`), unset → pure top-k.
 
+**Neu in v1.0.5 — Konflikt-Kante, Frontier-Retrieval, Edge-Type-Priors, Determinismus** (weiter additiv; Default-recall
+byte-identisch, Opt-ins default OFF):
+- **`CONTRADICTS`-Kante** (3. Kante, **symmetrisch**, reine Konflikt-Awareness — **kein** Auto-Urteil, **keine**
+  Suppression, kein Gewinner). `POST /memory/contradict` · `/uncontradict` (idempotent beidseitig; fehlende id →
+  **404**, Selbst-Konflikt → **400**). Sichtbar **nur** in `--explain` (`⚠ conflicts with #X` + Konflikt-Paare
+  `⚠ #A ↔ #B`); Auflösung über das bestehende `/supersede` (der User wählt den Gewinner). Symmetrie: eine gerichtete
+  Kante, beidseitig per `UNION` (`idx_edges_from/to`) abgefragt. **Default-recall byte-identisch.**
+- **Frontier-Retrieval** (opt-in `frontier`/`--frontier`, **default OFF**). Reserviert `F` Slots (`VF_FRONTIER_SLOTS`,
+  Default 2) für `DERIVES_FROM`-verlinkte Evidenz einer top-k-**Seed** (1 Hop) und zieht so eine unter-dem-Cut-Prämisse
+  neben den Treffer, den sie stützt; `--explain` labelt Seed vs. Frontier-Pick. Ohne Flag **byte-identisch** zum reinen
+  top-k. Default-on ist mg's Entscheidung.
+- **Edge-Type-Priors** (kategoriale Edge-Rollen, **keine** Scalar-Gewichte). `DERIVES_FROM` = *ziehen*, `CONTRADICTS` =
+  *zurückhalten*: eine Frontier-Kandidatin, die einen **Seed** per `CONTRADICTS` widerspricht, wird aus den
+  reservierten Slots **zurückgehalten** (freier Slot → nächste saubere Kandidatin), transparent in `--explain`
+  (`frontier withheld — contested by #seed`). `--frontier` **ohne** `CONTRADICTS`-Kante == das reine Frontier
+  (EXISTS-Fast-Skip). Defensiver Hebel: der Frontier verstärkt keine Evidenz, die ein relevanterer Treffer bestreitet.
+- **HNSW-Determinismus.** `hnsw_cfg()` pinnt `multilayer_deterministic_seed` (`VF_HNSW_SEED`, **geehrt ab SG 3.3.1** —
+  vorher `from_entropy()` → Layer-Counts variierten pro Prozess) → recall ist **über Prozess-Neustarts
+  reproduzierbar**. Belegt durch einen **committeten Cross-Prozess-Integrationstest** (zwei getrennte Prozesse, gleicher
+  Seed-Store, byte-identische recall-Ausgabe inkl. f32-score-bits).
+
 **Realisierungs-/Upgrade-Disziplin (wichtig).**
 - Der HNSW-Index vergibt die **Vektor-id selbst** (kein public id-spezifizierender Insert) → der Graph-`node_id`
   liegt in der **Vektor-Metadata** und wird beim Recall via `search → get_vector(vid) → node_id → get_entity`
   zurückgeholt.
 - find/list gehen über **raw-SQL auf dem public `graph.pool`** gegen die Tabelle `graph_entities(id,kind,name,data)`
   (Cypher-Subset bewusst vermieden — siehe `results/pre_memory_analyse.md`). **Beim Anheben der SG-rev MUSS diese
-  Tabellen-Form re-verifiziert werden**, sonst brechen find/list still.
+  Tabellen-Form re-verifiziert werden**, sonst brechen find/list still (beim 3.2.5 → 3.3.1-Bump bestätigt —
+  `tests/memory.rs` grün).
 - `statistics().vector_count` ist nach Reopen stale → **nicht** für Korrektheit/Kapazität nutzen.
 
 **Kosten (nur mit `--features memory`).** Die zwei direkt genutzten Crates — **SQLiteGraph** (bringt SQLite via

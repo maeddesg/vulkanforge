@@ -66,7 +66,11 @@ pub fn build_router(state: Arc<AppState>, cors_enabled: bool) -> Router {
             // Why-Graph: DERIVES_FROM edge (+ release) + the /why trace.
             .route("/memory/derive", post(handlers::memory::derive))
             .route("/memory/underive", post(handlers::memory::underive))
-            .route("/memory/why", post(handlers::memory::why));
+            .route("/memory/why", post(handlers::memory::why))
+            // Conflict awareness: symmetric CONTRADICTS edge (+ release). Never
+            // suppresses — flagged in --explain, reconciled via /supersede.
+            .route("/memory/contradict", post(handlers::memory::contradict))
+            .route("/memory/uncontradict", post(handlers::memory::uncontradict));
     }
 
     router.layer(cors_layer).with_state(state)

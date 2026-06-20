@@ -1,5 +1,43 @@
 # Changelog
 
+## v1.0.5 — conflict edges, opt-in frontier retrieval, edge-type priors, and cross-process recall determinism (2026-06-20)
+
+**The memory subsystem gains a third edge (`CONTRADICTS`), an opt-in retrieval frontier that pulls linked evidence
+into recall, edge-type priors that let conflict edges damp contested evidence, and — via SQLiteGraph 3.3.1 — a pinned
+HNSW seed that makes recall reproducible across process restarts.** Everything here is additive and opt-in: default
+recall stays byte-identical, the frontier is off by default, and the conflict edge never changes ranking.
+
+- **Changed — `sqlitegraph` bumped to 3.3.1** (maeddesg fork @ `80a3168`, from oldnordic 3.2.5 @ `d8219a8`). 3.3.1
+  honors `multilayer_deterministic_seed` (the HNSW level distributor no longer falls back to `from_entropy()`) and
+  re-elects the HNSW entry point on `delete_vector`. **`--features memory` now requires Rust 1.89**; the lean default
+  build stays on 1.85.
+- **Added — `CONTRADICTS` edge (conflict awareness, no auto-verdict).** A third, **symmetric** edge that flags two
+  notes as in conflict. `/contradict <id> <id>` and `/uncontradict` (HTTP `POST /memory/contradict` ·
+  `/uncontradict`; idempotent both directions, missing id → 404, self-conflict → 400). It introduces **no suppression
+  and no winner** — the conflict is surfaced in `--explain` only (`⚠ conflicts with #X` plus conflict pairs), and the
+  user resolves it with the existing `/supersede`. **Default recall is byte-identical.**
+- **Added — opt-in frontier retrieval (`--frontier`, default OFF).** When enabled, recall reserves a few slots
+  (`VF_FRONTIER_SLOTS`, default 2) for evidence linked to a top-k seed by `DERIVES_FROM` (one hop), pulling a
+  below-cut premise up next to the hit it supports; `--explain` labels seed vs. frontier picks. Unset → pure top-k,
+  **byte-identical** to before. Off by default; the default-on decision is mg's.
+- **Added — edge-type priors (`CONTRADICTS` as a frontier negative signal).** Edge types carry **categorical** roles
+  (no scalar weights): `DERIVES_FROM` pulls, `CONTRADICTS` withholds. A frontier candidate that `CONTRADICTS` a
+  **seed** is held back from the reserved slots (the freed slot goes to the next clean candidate), surfaced
+  transparently in `--explain` (`frontier withheld — contested by #seed`). `--frontier` with no `CONTRADICTS` edge is
+  identical to the plain frontier (fast-skipped). A defensive lever: the frontier never amplifies evidence that a more
+  relevant hit disputes.
+- **Added — cross-process recall determinism (`VF_HNSW_SEED`).** `hnsw_cfg()` pins `multilayer_deterministic_seed`
+  (honored on SG 3.3.1), so two separate processes that build the same store recall byte-identically — the property
+  the dogfood store relies on. A new committed integration test spawns two processes and diffs their recall (ids +
+  bit-exact scores).
+
+**Validation.** `cargo build --features memory` **0 new rustc warnings**; lib **306** (lean) / **308** (`--features
+memory`), single-threaded; `tests/memory.rs` **29** (real embedder; +1 ignored subprocess probe driven by the
+cross-process test); `vf-clide` (**0.3.4**) **115**; `cargo tree` carries no SQLiteGraph/fastembed/ort/rusqlite in the
+lean build or the client; `cargo build --release --examples` and `cargo test --release --no-run` clean (both crates).
+Recall is **byte-identical** with and without edges, and `--frontier` with no `CONTRADICTS` edge equals the plain
+frontier — both asserted by tests. Decode is untouched (memory-path only).
+
 ## v1.0.4 — KV prefix-reuse on by default, recall diagnostics, note typing, and memory edges (2026-06-18)
 
 **The memory subsystem gains a connection layer (typed edges + a why-graph) and recall gains diagnostics, an

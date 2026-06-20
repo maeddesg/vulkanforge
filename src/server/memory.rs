@@ -55,6 +55,14 @@ const DEDUP_SIMILARITY: f32 = 0.92;
 /// The whole pass is gated on suppression being active — no edges → never runs.
 const SUPERSEDE_BACKFILL_EXTRA: usize = 20;
 
+/// Candidate-pool over-fetch for the opt-in `--frontier` recall (Retrieval
+/// step 1). The one-hop `DERIVES_FROM` frontier can only rescue evidence that
+/// is **in this pool** (moderately similar, but below the top-k cut) AND linked
+/// from a top seed; evidence with very-low similarity (outside the pool) needs
+/// per-note scoring and is **out of scope** for this hop. Generous so a deep-
+/// but-linked premise is reachable; clamped to 100 (HNSW cap) at the call site.
+const FRONTIER_POOL_EXTRA: usize = 20;
+
 /// One recall result (vector hit enriched with its graph node).
 #[derive(Debug, Clone, Serialize)]
 pub struct Hit {
@@ -79,6 +87,27 @@ pub struct Hit {
     /// is byte-identical even with `DERIVES_FROM` edges (awareness ≠ injection).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub derives_from: Vec<i64>,
+    /// Set **only in the opt-in `--frontier` recall mode**: the id of the top
+    /// seed whose outgoing `DERIVES_FROM` edge pulled this note into a reserved
+    /// slot (it scored below the top-k cut on similarity alone). `None`/omitted
+    /// otherwise — so default recall (no `--frontier`) is byte-identical: a
+    /// frontier hit is the only Hit that ever carries this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frontier_via: Option<i64>,
+    /// Ids this note `CONTRADICTS` (symmetric — both edge directions). **Populated
+    /// only on the `--explain` path** — empty/omitted in default recall, so
+    /// default recall is byte-identical even with `CONTRADICTS` edges. Awareness
+    /// only: a conflict is *flagged*, never suppressed and never resolved (that
+    /// is the user's `/supersede` call).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub conflicts_with: Vec<i64>,
+    /// Set **only** on a frontier candidate that was *withheld* from the reserved
+    /// slots because it `CONTRADICTS` a seed (Edge-Type-Priors negative signal):
+    /// the id of the contesting seed. `None`/omitted everywhere else — so the
+    /// returned set never carries it (withheld notes appear only as `--explain`
+    /// near-misses cut `frontier-withheld`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contested_by: Option<i64>,
     /// Cosine **similarity** in `[0,1]` = `1 - cosine_distance` (the HNSW
     /// index returns distance; we present similarity, higher = closer).
     pub score: f32,
@@ -150,17 +179,33 @@ pub enum CutReason {
     /// Above the threshold but beyond the `top_k` cap.
     #[serde(rename = "top-k")]
     TopK,
+    /// A seed that would have made the top-k on similarity, but its slot was
+    /// reserved for a `DERIVES_FROM`-linked frontier note (only ever produced in
+    /// the opt-in `--frontier` mode). Surfaced so `--explain` shows exactly what
+    /// the frontier displaced.
+    #[serde(rename = "frontier-reserved")]
+    FrontierReserved,
+    /// A `DERIVES_FROM`-linked frontier candidate that was **withheld** from the
+    /// reserved slots because it `CONTRADICTS` a seed (Edge-Type-Priors negative
+    /// signal). It was *not* silently dropped — surfaced in `--explain` with the
+    /// contesting seed in [`Hit::contested_by`] so the user can inspect it.
+    #[serde(rename = "frontier-withheld")]
+    FrontierWithheld,
 }
 
 /// Typed relationships between notes (the connection axis). `SUPERSEDES`
-/// suppresses recall (stale → out); `DERIVES_FROM` is the Why-Graph (a note is
-/// anchored in the notes that justify it) and **never** changes recall — it is
-/// additive awareness only. Extensible (`CONTRADICTS` later). User-created;
-/// the agent never makes edges.
+/// suppresses recall (stale → out, **directed**: A replaces B); `DERIVES_FROM`
+/// is the Why-Graph (a note is anchored in the notes that justify it) and
+/// **never** changes recall — additive awareness only; `CONTRADICTS` is the
+/// **symmetric** conflict edge (these two disagree — *neither* side is declared
+/// right) and so it **never suppresses** and **never picks a winner**: it only
+/// makes the conflict visible in `--explain` so the user can reconcile it with
+/// `/supersede`. All user-created; the agent never makes edges.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeType {
     Supersedes,
     DerivesFrom,
+    Contradicts,
 }
 
 impl EdgeType {
@@ -168,6 +213,7 @@ impl EdgeType {
         match self {
             EdgeType::Supersedes => "SUPERSEDES",
             EdgeType::DerivesFrom => "DERIVES_FROM",
+            EdgeType::Contradicts => "CONTRADICTS",
         }
     }
 }
@@ -279,6 +325,16 @@ pub struct MemoryStore {
     db_path: PathBuf,
 }
 
+/// Fixed seed for the HNSW multilayer level distributor → **cross-process recall
+/// determinism**. SQLiteGraph 3.3.1 honors `multilayer_deterministic_seed`; before
+/// it, the distributor used `StdRng::from_entropy()`, so layer counts (and thus
+/// recall order) could shift across process restarts. A **hardcoded const, not an
+/// env var** — determinism must not depend on the environment (and it sidesteps the
+/// known env-flake class). The value is arbitrary; only its fixedness matters, and
+/// fixing it ourselves pins VF's behavior independent of any future change to
+/// SQLiteGraph's internal default.
+const VF_HNSW_SEED: u64 = 0xF0E9_5EED;
+
 fn hnsw_cfg() -> HnswConfig {
     // 768/cosine/m16/ef200 — the concept's parameters (results/recall_scoping_smoke.md).
     HnswConfigBuilder::new()
@@ -286,6 +342,7 @@ fn hnsw_cfg() -> HnswConfig {
         .m_connections(16)
         .ef_construction(200)
         .distance_metric(DistanceMetric::Cosine)
+        .multilayer_deterministic_seed(Some(VF_HNSW_SEED))
         .build()
         .expect("static HNSW config is valid")
 }
@@ -623,6 +680,20 @@ impl MemoryStore {
         // ids it DERIVES_FROM. Deliberately NOT done in `recall_inner`/
         // `recall_filtered`, so default recall stays byte-identical even with
         // DERIVES_FROM edges (awareness ≠ injection; recall never changes).
+        self.fill_derives_from(&mut returned, &mut near_miss);
+        // CONTRADICTS edges: flag conflicts (symmetric, explain-only, no
+        // suppression). Same byte-id invariant — never on the default path.
+        self.fill_conflicts(&mut returned, &mut near_miss);
+        Ok(RecallExplain { returned, near_miss, top_k: k, threshold, query_dim, separation })
+    }
+
+    /// Annotate each shown hit with the ids it `DERIVES_FROM` (the Why-Graph) —
+    /// the `--explain`-only awareness fill, shared by [`recall_explain`] and the
+    /// frontier explain path so there is one source of truth. Best-effort: a
+    /// lock/DB hiccup leaves `derives_from` empty rather than failing recall.
+    /// **Never** called on the default recall path — that is what keeps default
+    /// recall byte-identical even with `DERIVES_FROM` edges present.
+    fn fill_derives_from(&self, returned: &mut [Hit], near_miss: &mut [NearMiss]) {
         if let Ok(graph) = self.graph.lock() {
             if let Ok(conn) = graph.pool.get() {
                 if let Ok(mut stmt) = conn.prepare_cached(
@@ -633,14 +704,227 @@ impl MemoryStore {
                             h.derives_from = rows.filter_map(|r| r.ok()).collect();
                         }
                     };
-                    for h in &mut returned {
+                    for h in returned.iter_mut() {
                         fill(h);
                     }
-                    for nm in &mut near_miss {
+                    for nm in near_miss.iter_mut() {
                         fill(&mut nm.hit);
                     }
                 }
             }
+        }
+    }
+
+    /// Annotate each shown hit with the ids it `CONTRADICTS` — the `--explain`-
+    /// only conflict-awareness fill, shared by [`recall_explain`] and the
+    /// frontier explain path. `CONTRADICTS` is **symmetric**, so a note conflicts
+    /// with the *other* party regardless of which direction the edge was stored:
+    /// the union of `(from=id → to)` and `(to=id ← from)`, both index-backed
+    /// (`idx_edges_from` + `idx_edges_to`). Best-effort. **Never** called on the
+    /// default recall path → default recall stays byte-identical even with
+    /// `CONTRADICTS` edges, and a conflict is *flagged*, never suppressed.
+    fn fill_conflicts(&self, returned: &mut [Hit], near_miss: &mut [NearMiss]) {
+        if let Ok(graph) = self.graph.lock() {
+            if let Ok(conn) = graph.pool.get() {
+                if let Ok(mut stmt) = conn.prepare_cached(
+                    "SELECT to_id FROM graph_edges WHERE from_id=?1 AND edge_type='CONTRADICTS' \
+                     UNION SELECT from_id FROM graph_edges WHERE to_id=?1 AND edge_type='CONTRADICTS' \
+                     ORDER BY 1",
+                ) {
+                    let mut fill = |h: &mut Hit| {
+                        if let Ok(rows) = stmt.query_map([h.id], |r| r.get::<_, i64>(0)) {
+                            h.conflicts_with = rows.filter_map(|r| r.ok()).collect();
+                        }
+                    };
+                    for h in returned.iter_mut() {
+                        fill(h);
+                    }
+                    for nm in near_miss.iter_mut() {
+                        fill(&mut nm.hit);
+                    }
+                }
+            }
+        }
+    }
+
+    /// **Opt-in one-hop `DERIVES_FROM` frontier** (Retrieval step 1) — lets the
+    /// user's `DERIVES_FROM` edges pay into *retrieval* for the first time. Over-
+    /// fetch a wider candidate pool; apply the same gates as default recall
+    /// (superseded → type → threshold); take the top-`k` of the gated pool as
+    /// the **seeds**; collect the seeds' outgoing `DERIVES_FROM` targets; then
+    /// **reserve up to `slots` (`F`) of the `k`** for the highest-scoring linked
+    /// pool members that would NOT have made the top-k on similarity alone. The
+    /// kept seeds (the highest similarity) fill the rest. Each frontier pick
+    /// carries `frontier_via = Some(seed_id)`; the displaced seeds become
+    /// `near_miss` cut `frontier-reserved`.
+    ///
+    /// The result is a [`RecallExplain`]: the plain `--frontier` path uses
+    /// `.returned`; the `--frontier --explain` path also renders `near_miss`
+    /// (set `annotate_why` to fill `derives_from` for display).
+    ///
+    /// **Contract:** this is reached ONLY when `--frontier` is set. Default
+    /// recall (no flag) never calls it and is byte-identical — the v1.0.4
+    /// promise that `DERIVES_FROM` does not change default recall is untouched.
+    /// **Honest limit:** rescues only pool-internal linked evidence; a premise
+    /// with very-low similarity (outside the pool) needs per-note scoring and is
+    /// out of scope for this hop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn recall_frontier(
+        &self,
+        project_key: Option<&str>,
+        query: &str,
+        k: usize,
+        slots: usize,
+        margin: Option<f32>,
+        type_filter: Option<NoteType>,
+        include_superseded: bool,
+        annotate_why: bool,
+    ) -> Result<RecallExplain, String> {
+        let k = k.clamp(1, 100);
+        let f = slots.min(k);
+        let width = (k + FRONTIER_POOL_EXTRA).clamp(1, 100);
+        let (pool, query_dim, threshold) = self.recall_inner(project_key, query, width, margin)?;
+
+        // Per-candidate gate (same order/priority as `recall_filtered` /
+        // `recall_explain`): superseded → type → threshold. `None` = eligible.
+        let gate = |h: &Hit| -> Option<CutReason> {
+            if !include_superseded && h.superseded_by.is_some() {
+                Some(CutReason::Superseded)
+            } else if type_filter.is_some_and(|t| h.note_type != t.as_str()) {
+                Some(CutReason::Type)
+            } else if threshold.is_some_and(|t| h.score < t) {
+                Some(CutReason::Threshold)
+            } else {
+                None
+            }
+        };
+        let gates: Vec<Option<CutReason>> = pool.iter().map(&gate).collect();
+        // Eligible pool indices, already in score (nearest-first) order.
+        let eligible_idx: Vec<usize> = (0..pool.len()).filter(|&i| gates[i].is_none()).collect();
+        let topk_n = eligible_idx.len().min(k);
+
+        // Seeds = the top-k eligible (the notes default recall would return).
+        // Collect their outgoing DERIVES_FROM targets → which target was pulled
+        // by which seed (first writer = highest-scoring seed, since seeds are in
+        // score order). One `idx_edges_from`-backed query per seed (O(log n)).
+        let mut frontier_via: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        if topk_n > 0 {
+            if let Ok(graph) = self.graph.lock() {
+                if let Ok(conn) = graph.pool.get() {
+                    if let Ok(mut stmt) = conn.prepare_cached(
+                        "SELECT to_id FROM graph_edges WHERE from_id=?1 AND edge_type='DERIVES_FROM'",
+                    ) {
+                        for &si in &eligible_idx[..topk_n] {
+                            let seed_id = pool[si].id;
+                            if let Ok(rows) = stmt.query_map([seed_id], |r| r.get::<_, i64>(0)) {
+                                for t in rows.flatten() {
+                                    frontier_via.entry(t).or_insert(seed_id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Edge-Type-Priors — the **negative signal** (categorical role, no scalar
+        // weights): a frontier candidate that `CONTRADICTS` a **seed** (a returned
+        // top-k note) must NOT be silently amplified as a clean premise. Build
+        // `contested_by`: candidate-id → the contesting seed (the first seed, in
+        // score order, it conflicts with). Reuses the symmetric CONTRADICTS UNION
+        // (`idx_edges_from` + `idx_edges_to`, O(log n) per candidate × few
+        // candidates). Fast-skipped when the store holds no CONTRADICTS edge at
+        // all → `--frontier` without CONTRADICTS edges is byte-identical to
+        // step-1 (same picks). Trigger is **only** "contradicts a seed"; a
+        // candidate that contradicts a non-seed note is left alone.
+        let seed_ids: Vec<i64> = eligible_idx[..topk_n].iter().map(|&i| pool[i].id).collect();
+        let mut contested_by: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        if !seed_ids.is_empty() {
+            if let Ok(graph) = self.graph.lock() {
+                if let Ok(conn) = graph.pool.get() {
+                    let any: bool = conn
+                        .query_row("SELECT EXISTS(SELECT 1 FROM graph_edges WHERE edge_type='CONTRADICTS')", [], |r| r.get(0))
+                        .unwrap_or(false);
+                    if any {
+                        let seed_set: std::collections::HashSet<i64> = seed_ids.iter().copied().collect();
+                        if let Ok(mut stmt) = conn.prepare_cached(
+                            "SELECT to_id FROM graph_edges WHERE from_id=?1 AND edge_type='CONTRADICTS' \
+                             UNION SELECT from_id FROM graph_edges WHERE to_id=?1 AND edge_type='CONTRADICTS'",
+                        ) {
+                            for &i in eligible_idx.iter().skip(topk_n) {
+                                let cid = pool[i].id;
+                                if !frontier_via.contains_key(&cid) {
+                                    continue; // only DERIVES_FROM-linked candidates can be picked
+                                }
+                                let conflicts: Vec<i64> = stmt
+                                    .query_map([cid], |r| r.get::<_, i64>(0))
+                                    .map(|rows| rows.filter_map(|r| r.ok()).filter(|x| seed_set.contains(x)).collect())
+                                    .unwrap_or_default();
+                                // Deterministic contesting seed: the highest-scoring
+                                // seed (seeds are in score order) this candidate conflicts with.
+                                if let Some(seed) = seed_ids.iter().copied().find(|s| conflicts.contains(s)) {
+                                    contested_by.insert(cid, seed);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Frontier picks: eligible members BEYOND the top-k cut that are linked
+        // from a seed, highest score first, capped at `f`. (`eligible_idx[..topk_n]`
+        // are the seeds, so a pick is never a seed — dedup is structural.) A
+        // candidate that contests a seed is **withheld** (skipped) → the freed
+        // slot goes to the next clean linked candidate (or stays empty if none).
+        let mut pick_idx: Vec<usize> = Vec::new();
+        for &i in eligible_idx.iter().skip(topk_n) {
+            if pick_idx.len() >= f {
+                break;
+            }
+            if frontier_via.contains_key(&pool[i].id) && !contested_by.contains_key(&pool[i].id) {
+                pick_idx.push(i);
+            }
+        }
+        let pick_set: std::collections::HashSet<usize> = pick_idx.iter().copied().collect();
+        let n_frontier = pick_idx.len();
+        let keep = topk_n.saturating_sub(n_frontier);
+
+        // Single score-ordered pass over the pool → returned + near_miss.
+        let mut returned: Vec<Hit> = Vec::with_capacity(topk_n);
+        let mut near_miss: Vec<NearMiss> = Vec::new();
+        let mut elig_rank = 0usize;
+        for (i, mut hit) in pool.into_iter().enumerate() {
+            if let Some(cut) = gates[i] {
+                near_miss.push(NearMiss { hit, cut });
+                continue;
+            }
+            let rank = elig_rank;
+            elig_rank += 1;
+            if rank < keep {
+                returned.push(hit); // kept seed (highest similarity)
+            } else if rank < topk_n {
+                // Seed displaced by the frontier reservation.
+                near_miss.push(NearMiss { hit, cut: CutReason::FrontierReserved });
+            } else if pick_set.contains(&i) {
+                hit.frontier_via = frontier_via.get(&hit.id).copied();
+                returned.push(hit); // frontier-rescued evidence (reserved slot)
+            } else if let Some(&seed) = contested_by.get(&hit.id) {
+                // Negative signal: a frontier candidate withheld because it
+                // contests a seed. Transparent, not silently dropped.
+                hit.contested_by = Some(seed);
+                near_miss.push(NearMiss { hit, cut: CutReason::FrontierWithheld });
+            } else {
+                near_miss.push(NearMiss { hit, cut: CutReason::TopK });
+            }
+        }
+        let separation = match (returned.last(), near_miss.first()) {
+            (Some(last), Some(first)) => Some(last.score - first.hit.score),
+            _ => None,
+        };
+        if annotate_why {
+            self.fill_derives_from(&mut returned, &mut near_miss);
+            self.fill_conflicts(&mut returned, &mut near_miss);
         }
         Ok(RecallExplain { returned, near_miss, top_k: k, threshold, query_dim, separation })
     }
@@ -707,6 +991,9 @@ impl MemoryStore {
                     note_type,
                     superseded_by: None,
                     derives_from: Vec::new(),
+                    frontier_via: None,
+                    conflicts_with: Vec::new(),
+                    contested_by: None,
                     score: 1.0 - dist,
                 });
             }
@@ -1075,6 +1362,82 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Record that `a` and `b` **contradict** each other — a `CONTRADICTS` edge.
+    /// **Symmetric**: stored as one directed edge (`a → b`), but a conflict is a
+    /// conflict regardless of direction, so it is **idempotent in either
+    /// direction** (an existing `a↔b` edge → no-op) and queried both ways
+    /// ([`fill_conflicts`]). **Never** suppresses or picks a winner — it only
+    /// surfaces the clash in `--explain`; the user reconciles with `/supersede`.
+    /// User curation. `NotFound` if either id is missing.
+    pub fn contradict(
+        &self,
+        _project_key: Option<&str>,
+        a: i64,
+        b: i64,
+    ) -> Result<(), CurateError> {
+        let graph = self.graph.lock().map_err(|_| "memory: graph lock poisoned".to_string())?;
+        graph.get_entity(a).map_err(|_| CurateError::NotFound(a))?;
+        graph.get_entity(b).map_err(|_| CurateError::NotFound(b))?;
+        // Idempotent symmetrically: skip if a CONTRADICTS edge already links the
+        // pair in *either* direction (the conflict is the same fact).
+        let exists: bool = {
+            let conn = graph.pool.get().map_err(|e| format!("memory: pool: {e}"))?;
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM graph_edges WHERE edge_type='CONTRADICTS' \
+                 AND ((from_id=?1 AND to_id=?2) OR (from_id=?2 AND to_id=?1)))",
+                (a, b),
+                |r| r.get::<_, bool>(0),
+            )
+            .map_err(|e| format!("memory: contradict exists: {e}"))?
+        };
+        if !exists {
+            graph
+                .insert_edge(&GraphEdge {
+                    id: 0,
+                    from_id: a,
+                    to_id: b,
+                    edge_type: EdgeType::Contradicts.as_str().to_string(),
+                    data: json!({ "created_at": now_iso() }),
+                })
+                .map_err(|e| format!("memory: contradict insert {a}<->{b}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Release a contradiction between `a` and `b`. Inverse of
+    /// [`contradict`](Self::contradict); deletes the `CONTRADICTS` edge in
+    /// **both** directions (direction-independent — however it was stored).
+    /// Idempotent. `NotFound` if either id is missing.
+    pub fn uncontradict(
+        &self,
+        _project_key: Option<&str>,
+        a: i64,
+        b: i64,
+    ) -> Result<(), CurateError> {
+        let graph = self.graph.lock().map_err(|_| "memory: graph lock poisoned".to_string())?;
+        graph.get_entity(a).map_err(|_| CurateError::NotFound(a))?;
+        graph.get_entity(b).map_err(|_| CurateError::NotFound(b))?;
+        let edge_ids: Vec<i64> = {
+            let conn = graph.pool.get().map_err(|e| format!("memory: pool: {e}"))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM graph_edges WHERE edge_type='CONTRADICTS' \
+                     AND ((from_id=?1 AND to_id=?2) OR (from_id=?2 AND to_id=?1))",
+                )
+                .map_err(|e| format!("memory: uncontradict prepare: {e}"))?;
+            let rows = stmt
+                .query_map((a, b), |r| r.get::<_, i64>(0))
+                .map_err(|e| format!("memory: uncontradict query: {e}"))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        for eid in edge_ids {
+            graph
+                .delete_edge(eid)
+                .map_err(|e| format!("memory: uncontradict delete edge {eid}: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// `/why <id>`: walk **outgoing `DERIVES_FROM` edges** from `id` and return
     /// the justification tree (`id → [premises] → …`). Read-only. Loads the
     /// `DERIVES_FROM` adjacency once (one `idx_edges_type`-backed query) and
@@ -1258,7 +1621,7 @@ impl MemoryStore {
         let text = node.data.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let status = node.data.get("status").and_then(|v| v.as_str()).unwrap_or("active").to_string();
         let note_type = node.data.get("type").and_then(|v| v.as_str()).unwrap_or("untyped").to_string();
-        Some(Hit { id: node.id, kind: node.kind, name: node.name, text, status, note_type, superseded_by: None, derives_from: Vec::new(), score: 1.0 })
+        Some(Hit { id: node.id, kind: node.kind, name: node.name, text, status, note_type, superseded_by: None, derives_from: Vec::new(), frontier_via: None, conflicts_with: Vec::new(), contested_by: None, score: 1.0 })
     }
 
     /// Idempotent: create the project structure node + its index (no error on

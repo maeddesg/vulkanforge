@@ -10,11 +10,11 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::types::{
-    ArchiveResponse, ChatChunk, ChatMessage, ChatRequest, ChatResponse, CurateRequest,
-    DeleteResponse, ProjectsResponse, RecallRequest, RecallResponse, RememberRequest,
-    DeriveRequest, DeriveResponse, RememberResponse, RetypeRequest, RetypeResponse, StreamOptions,
-    SupersedeRequest, SupersedeResponse, Tool, ToolCall, UnarchiveResponse, UnderiveRequest, Usage,
-    WhyNode, WhyRequest,
+    ArchiveResponse, ChatChunk, ChatMessage, ChatRequest, ChatResponse, ContradictRequest,
+    ContradictResponse, CurateRequest, DeleteResponse, ProjectsResponse, RecallRequest,
+    RecallResponse, RememberRequest, DeriveRequest, DeriveResponse, RememberResponse, RetypeRequest,
+    RetypeResponse, StreamOptions, SupersedeRequest, SupersedeResponse, Tool, ToolCall,
+    UnarchiveResponse, UnderiveRequest, Usage, WhyNode, WhyRequest,
 };
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -227,7 +227,7 @@ impl Client {
         query: &str,
         k: u32,
     ) -> Result<MemCall<RecallResponse>> {
-        self.memory_recall_opts(project_key, query, k, false, None, false).await
+        self.memory_recall_opts(project_key, query, k, false, None, false, false).await
     }
 
     /// `POST /memory/recall` with `explain: true` — the retrieval-diagnostics
@@ -239,13 +239,14 @@ impl Client {
         query: &str,
         k: u32,
     ) -> Result<MemCall<RecallResponse>> {
-        self.memory_recall_opts(project_key, query, k, true, None, false).await
+        self.memory_recall_opts(project_key, query, k, true, None, false, false).await
     }
 
     /// `POST /memory/recall` with optional `explain` + `type` filter +
-    /// `include_superseded`. The single source for the recall variants;
-    /// `(false, None, false)` is byte-identical to plain recall (all flags
-    /// omitted from the wire).
+    /// `include_superseded` + `frontier`. The single source for the recall
+    /// variants; `(false, None, false, false)` is byte-identical to plain
+    /// recall (all flags omitted from the wire).
+    #[allow(clippy::too_many_arguments)]
     pub async fn memory_recall_opts(
         &self,
         project_key: Option<&str>,
@@ -254,6 +255,7 @@ impl Client {
         explain: bool,
         note_type: Option<&str>,
         include_superseded: bool,
+        frontier: bool,
     ) -> Result<MemCall<RecallResponse>> {
         let body = RecallRequest {
             project_key: project_key.map(str::to_string),
@@ -262,6 +264,7 @@ impl Client {
             explain: explain.then_some(true),
             note_type: note_type.map(str::to_string),
             include_superseded: include_superseded.then_some(true),
+            frontier: frontier.then_some(true),
         };
         self.memory_post("recall", &body).await
     }
@@ -355,6 +358,30 @@ impl Client {
     ) -> Result<MemCall<DeriveResponse>> {
         let body = UnderiveRequest { project_key: project_key.map(str::to_string), from_id, to_id };
         self.memory_post("underive", &body).await
+    }
+
+    /// `POST /memory/contradict` — record that `a` and `b` conflict (symmetric
+    /// `CONTRADICTS`). Flagged in `--explain`, never suppressed.
+    pub async fn memory_contradict(
+        &self,
+        project_key: Option<&str>,
+        a: i64,
+        b: i64,
+    ) -> Result<MemCall<ContradictResponse>> {
+        let body = ContradictRequest { project_key: project_key.map(str::to_string), a, b };
+        self.memory_post("contradict", &body).await
+    }
+
+    /// `POST /memory/uncontradict` — release the contradiction between `a` and
+    /// `b` (direction-independent).
+    pub async fn memory_uncontradict(
+        &self,
+        project_key: Option<&str>,
+        a: i64,
+        b: i64,
+    ) -> Result<MemCall<ContradictResponse>> {
+        let body = ContradictRequest { project_key: project_key.map(str::to_string), a, b };
+        self.memory_post("uncontradict", &body).await
     }
 
     /// `POST /memory/why` — the Why-Graph justification tree for a note.

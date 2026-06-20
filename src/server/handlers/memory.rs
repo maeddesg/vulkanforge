@@ -294,6 +294,49 @@ pub async fn underive(
     Ok(Json(DeriveResp { from_id, to_ids: vec![to_id], derived: false }))
 }
 
+#[derive(Deserialize)]
+pub struct ContradictReq {
+    pub project_key: Option<String>,
+    /// The two notes that conflict — `CONTRADICTS` is **symmetric**, so order
+    /// doesn't matter.
+    pub a: i64,
+    pub b: i64,
+}
+#[derive(Serialize)]
+pub struct ContradictResp {
+    pub a: i64,
+    pub b: i64,
+    pub contradicts: bool,
+}
+
+/// `POST /memory/contradict` — record that `a` and `b` conflict (a symmetric
+/// `CONTRADICTS` edge). Flagged in `--explain`, **never** suppressed and never
+/// auto-resolved. Missing id → 404; self-contradiction (`a == b`) → 400.
+pub async fn contradict(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ContradictReq>,
+) -> Result<Json<ContradictResp>, ApiError> {
+    let mem = store(&state)?;
+    let (a, b) = (req.a, req.b);
+    if a == b {
+        return Err((StatusCode::BAD_REQUEST, "a note cannot contradict itself".to_string()));
+    }
+    run_blocking(move || mem.contradict(req.project_key.as_deref(), req.a, req.b)).await?;
+    Ok(Json(ContradictResp { a, b, contradicts: true }))
+}
+
+/// `POST /memory/uncontradict` — release the `CONTRADICTS` edge between `a` and
+/// `b` (direction-independent). Inverse of `/memory/contradict`. Missing id → 404.
+pub async fn uncontradict(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ContradictReq>,
+) -> Result<Json<ContradictResp>, ApiError> {
+    let mem = store(&state)?;
+    let (a, b) = (req.a, req.b);
+    run_blocking(move || mem.uncontradict(req.project_key.as_deref(), req.a, req.b)).await?;
+    Ok(Json(ContradictResp { a, b, contradicts: false }))
+}
+
 /// Default `/why` traversal depth cap (kept small; the store clamps to [1,32]).
 const WHY_DEFAULT_DEPTH: usize = 8;
 
@@ -334,6 +377,12 @@ pub struct RecallReq {
     /// suppressed). They are never deleted, so this surfaces them again.
     #[serde(default)]
     pub include_superseded: Option<bool>,
+    /// Opt-in **one-hop `DERIVES_FROM` frontier** (Retrieval step 1). Default/
+    /// absent → `false` → default recall, byte-identical to today. When `true`,
+    /// up to `VF_FRONTIER_SLOTS` of the `k` are reserved for `DERIVES_FROM`-
+    /// linked evidence that fell below the top-k similarity cut.
+    #[serde(default)]
+    pub frontier: Option<bool>,
 }
 /// Near-miss + cutoff metadata for `recall --explain`. Only serialised when
 /// explain was requested (`skip_serializing_if`), so the default recall
@@ -369,6 +418,22 @@ fn recall_margin() -> Option<f32> {
         .filter(|m| m.is_finite() && *m > 0.0)
 }
 
+/// Default frontier slot budget (`F`). How many of the `k` recall slots the
+/// opt-in `--frontier` mode may reserve for `DERIVES_FROM`-linked evidence.
+const FRONTIER_SLOTS_DEFAULT: usize = 2;
+
+/// Frontier slot budget from the environment (`VF_FRONTIER_SLOTS`). A small cap
+/// — the frontier is a precision lever, not a re-rank. Unset/unparseable →
+/// [`FRONTIER_SLOTS_DEFAULT`]. Only consulted when `--frontier` is set, so it
+/// never touches default recall. (`0` disables the reservation, leaving the
+/// frontier path == plain top-k.)
+fn frontier_slots() -> usize {
+    std::env::var("VF_FRONTIER_SLOTS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(FRONTIER_SLOTS_DEFAULT)
+}
+
 pub async fn recall(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RecallReq>,
@@ -382,7 +447,24 @@ pub async fn recall(
         None => None,
     };
     let include_superseded = req.include_superseded == Some(true);
-    if req.explain == Some(true) {
+    let explain = req.explain == Some(true);
+    if req.frontier == Some(true) {
+        // Opt-in one-hop DERIVES_FROM frontier. Reuses RecallExplain: plain
+        // `--frontier` serialises only `.returned` (frontier picks carry
+        // `frontier_via`, default-omitted otherwise); `--frontier --explain`
+        // also renders the near-misses (displaced seeds cut `frontier-reserved`).
+        let slots = frontier_slots();
+        let RecallExplain { returned, near_miss, top_k, threshold, query_dim, separation } =
+            run_blocking(move || {
+                mem.recall_frontier(
+                    req.project_key.as_deref(), &req.query, k, slots, margin, type_filter, include_superseded, explain,
+                )
+            })
+            .await?;
+        let explain_resp = explain
+            .then_some(ExplainResp { top_k, threshold, query_dim, near_miss, separation });
+        Ok(Json(RecallResp { hits: returned, explain: explain_resp }))
+    } else if explain {
         let RecallExplain { returned, near_miss, top_k, threshold, query_dim, separation } =
             run_blocking(move || {
                 mem.recall_explain(
@@ -477,6 +559,9 @@ mod tests {
                 note_type: "untyped".into(),
                 superseded_by: None,
                 derives_from: Vec::new(),
+                frontier_via: None,
+                conflicts_with: Vec::new(),
+                contested_by: None,
                 score: 0.9,
             }],
             explain: None,
