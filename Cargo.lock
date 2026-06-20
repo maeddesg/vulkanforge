@@ -2560,8 +2560,8 @@ dependencies = [
 
 [[package]]
 name = "sqlitegraph"
-version = "3.2.5"
-source = "git+https://github.com/oldnordic/sqlitegraph?rev=d8219a83de4d22ed71d218c0d57407b1c672de39#d8219a83de4d22ed71d218c0d57407b1c672de39"
+version = "3.3.1"
+source = "git+https://github.com/maeddesg/sqlitegraph?rev=80a3168aa4f837adef518bef0b203b27ab90c45b#80a3168aa4f837adef518bef0b203b27ab90c45b"
 dependencies = [
  "ahash",
  "arc-swap",

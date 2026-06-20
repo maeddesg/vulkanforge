@@ -44,7 +44,7 @@ tokio-stream = "0.1"
 # the default build is lean (~25 MB, neither SQLiteGraph nor fastembed, so no
 # rusqlite/SQLite and no ort/ONNX Runtime). Build with `--features memory` to
 # compile the subsystem in, then activate it at runtime with `serve --memory`.
-sqlitegraph = { git = "https://github.com/oldnordic/sqlitegraph", rev = "d8219a83de4d22ed71d218c0d57407b1c672de39", package = "sqlitegraph", optional = true }
+sqlitegraph = { git = "https://github.com/maeddesg/sqlitegraph", rev = "80a3168aa4f837adef518bef0b203b27ab90c45b", package = "sqlitegraph", optional = true }
 fastembed = { git = "https://github.com/maeddesg/fastembed-rs", rev = "3a9588ac52c0d825118b44775526caac02175193", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"], optional = true }
 
 [features]
